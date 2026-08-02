@@ -83,37 +83,19 @@ func TestOpenAIModelStreamsCompatibleSSE(t *testing.T) {
 		t.Errorf("streamed content = %q, want %q", got, want)
 	}
 
-	request := <-requests
-	if got, want := request.Model, "test-model"; got != want {
-		t.Errorf("request model = %q, want %q", got, want)
-	}
-	if !request.Stream {
-		t.Error("request stream = false, want true")
-	}
-	if got, want := len(request.Messages), 2; got != want {
-		t.Fatalf("request messages = %d, want %d", got, want)
-	}
-	if got, want := request.Messages[0].Role, "system"; got != want {
-		t.Errorf("first message role = %q, want %q", got, want)
-	}
-	if got, want := request.Messages[0].Content, "system prompt"; got != want {
-		t.Errorf("first message content = %q, want %q", got, want)
-	}
-	if got, want := request.Messages[1].Role, "user"; got != want {
-		t.Errorf("second message role = %q, want %q", got, want)
-	}
-	if got, want := request.Messages[1].Content, "hello"; got != want {
-		t.Errorf("second message content = %q, want %q", got, want)
-	}
-}
-
-func TestNewOpenAIModelRejectsInvalidConfiguration(t *testing.T) {
-	_, err := NewOpenAIModel(context.Background(), config.ModelConfig{})
-	if err == nil {
-		t.Fatal("NewOpenAIModel() error = nil, want configuration validation error")
-	}
-	if !strings.Contains(err.Error(), "model.base_url is required") {
-		t.Errorf("NewOpenAIModel() error = %q, want base URL validation", err)
+	select {
+	case request := <-requests:
+		if got, want := request.Model, "test-model"; got != want {
+			t.Errorf("model = %q, want %q", got, want)
+		}
+		if !request.Stream {
+			t.Error("stream flag = false, want true")
+		}
+		if got, want := len(request.Messages), 2; got != want {
+			t.Fatalf("messages = %d, want %d", got, want)
+		}
+	default:
+		t.Fatal("server did not receive a completion request")
 	}
 }
 

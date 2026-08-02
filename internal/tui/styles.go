@@ -1,0 +1,207 @@
+package tui
+
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+// Quiet dark palette — closer to Claude Code / Codex than bright accent chrome.
+// Avoid filled status bars and neon borders; keep structure with dim rules.
+var (
+	userStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("117")).
+			Bold(true)
+
+	assistantStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+
+	toolStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("180"))
+
+	toolBodyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("245"))
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("203")).
+			Bold(true)
+
+	systemStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("244"))
+
+	statusStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("245"))
+
+	spinnerStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("114"))
+
+	separatorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("238"))
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("242"))
+
+	// Soft gray border — not a "selected field" blue/purple highlight.
+	composerBorder = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			Padding(0, 1)
+)
+
+func renderUser(text string) string {
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return userStyle.Render("› ")
+	}
+	if len(lines) == 1 {
+		return userStyle.Render("› ") + text
+	}
+	var b strings.Builder
+	b.WriteString(userStyle.Render("› "))
+	b.WriteString(lines[0])
+	for _, line := range lines[1:] {
+		b.WriteByte('\n')
+		b.WriteString("  ")
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func renderError(text string) string {
+	return errorStyle.Render("! ") + text
+}
+
+func renderSystem(text string) string {
+	return systemStyle.Render("· ") + text
+}
+
+func renderSeparator(width int) string {
+	if width < 8 {
+		width = 8
+	}
+	return separatorStyle.Render(strings.Repeat("─", width))
+}
+
+// renderStatusBar is a quiet single line (no reverse-video strip).
+func renderStatusBar(width int, label string) string {
+	if width < 8 {
+		width = 8
+	}
+	// Dim rule above status to separate transcript from chrome, Claude-style.
+	rule := separatorStyle.Render(strings.Repeat("─", width))
+	line := statusStyle.Width(width).MaxWidth(width).Render(label)
+	return rule + "\n" + line
+}
+
+func renderComposer(width int, view string) string {
+	if width < 12 {
+		width = 12
+	}
+	// Outer width ≈ terminal width; leave a small margin so the box doesn't clip.
+	return composerBorder.Width(width - 2).MaxWidth(width).Render(view)
+}
+
+
+var (
+	slashMenuNameStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114")).
+				Bold(true)
+	slashMenuDescStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("245"))
+	slashMenuSelectedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252")).
+				Background(lipgloss.Color("236")).
+				Bold(true)
+	slashMenuSelectedDescStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("250")).
+					Background(lipgloss.Color("236"))
+	slashMenuCursorStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114")).
+				Bold(true)
+)
+
+// renderSlashMenu paints the prefix-filtered command list above the composer.
+// selected is clamped by the caller; out-of-range values are treated as 0.
+func renderSlashMenu(width int, items []slashCommand, selected int) string {
+	if len(items) == 0 {
+		return ""
+	}
+	if width < 20 {
+		width = 20
+	}
+	if selected < 0 {
+		selected = 0
+	}
+	if selected >= len(items) {
+		selected = len(items) - 1
+	}
+
+	// Visible window follows the selection when the list is longer than the cap.
+	start, end := slashMenuWindow(len(items), selected, maxSlashMenuRows)
+	var b strings.Builder
+	for i := start; i < end; i++ {
+		if i > start {
+			b.WriteByte('\n')
+		}
+		item := items[i]
+		cursor := "  "
+		nameStyle := slashMenuNameStyle
+		descStyle := slashMenuDescStyle
+		if i == selected {
+			cursor = slashMenuCursorStyle.Render("› ")
+			nameStyle = slashMenuSelectedStyle
+			descStyle = slashMenuSelectedDescStyle
+		}
+		name := nameStyle.Render(item.Name)
+		// Leave room for cursor + name + gap.
+		descBudget := max(0, width-lipgloss.Width(item.Name)-4)
+		desc := item.Description
+		if descBudget < 8 {
+			desc = ""
+		} else if lipgloss.Width(desc) > descBudget {
+			runes := []rune(desc)
+			if descBudget > 1 && len(runes) > descBudget-1 {
+				desc = string(runes[:descBudget-1]) + "…"
+			}
+		}
+		line := cursor + name
+		if desc != "" {
+			line += "  " + descStyle.Render(desc)
+		}
+		// Pad selected row background across the menu width.
+		if i == selected {
+			pad := width - lipgloss.Width(line)
+			if pad > 0 {
+				line += slashMenuSelectedDescStyle.Render(strings.Repeat(" ", pad))
+			}
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// slashMenuWindow returns [start,end) for a capped list centered on selected.
+func slashMenuWindow(n, selected, maxRows int) (start, end int) {
+	if n <= 0 {
+		return 0, 0
+	}
+	if maxRows <= 0 || n <= maxRows {
+		return 0, n
+	}
+	if selected < 0 {
+		selected = 0
+	}
+	if selected >= n {
+		selected = n - 1
+	}
+	start = selected - maxRows/2
+	if start < 0 {
+		start = 0
+	}
+	end = start + maxRows
+	if end > n {
+		end = n
+		start = end - maxRows
+	}
+	return start, end
+}

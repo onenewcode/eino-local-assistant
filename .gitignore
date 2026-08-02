@@ -10,3 +10,5 @@ coverage.out
 
 # 本机元数据
 .DS_Store
+.claude/
+.codex/
