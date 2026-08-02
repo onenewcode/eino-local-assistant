@@ -1,0 +1,9 @@
+# 复制为 config.yml 后填写本地模型服务信息；不要提交真实 config.yml。
+model:
+  base_url: "https://your-compatible-endpoint/v1"
+  api_key: "replace-with-your-api-key"
+  name: "your-model-name"
+  timeout_seconds: 60
+
+assistant:
+  system_prompt: "你是一个严谨、实用的编程助手。"

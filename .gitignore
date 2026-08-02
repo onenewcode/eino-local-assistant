@@ -1,0 +1,12 @@
+# 本地模型配置及其密钥
+config.yml
+
+# Go 构建和测试产物
+eino-local-assistant
+bin/
+coverage.out
+.coverprofile
+*.test
+
+# 本机元数据
+.DS_Store
