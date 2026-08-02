@@ -8,7 +8,10 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/memory"
+	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
+	"eino-local-assistant/internal/tools"
 	"eino-local-assistant/internal/usage"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -25,6 +28,22 @@ type StatusInfo struct {
 	Tools []string
 	// MaxStep is the ReAct step budget (0 omits from /status).
 	MaxStep int
+	// CmdPolicy is the status-bar fragment like "cmd=ask" or "cmd=auto".
+	CmdPolicy string
+	// Sandbox supplies compact worker-boundary state for the status bar.
+	Sandbox SandboxInfo
+	// Runtime supplies per-turn limits for /status.
+	Runtime RuntimeInfo
+}
+
+// StatusFragment returns compact command-policy and sandbox state.
+func (info StatusInfo) StatusFragment() string {
+	fragments := make([]string, 0, 4)
+	if fragment := strings.TrimSpace(info.CmdPolicy); fragment != "" {
+		fragments = append(fragments, fragment)
+	}
+	fragments = append(fragments, info.Sandbox.statusFragments()...)
+	return strings.Join(fragments, " · ")
 }
 
 // Deps wires the interactive app to a chat session.
@@ -36,9 +55,29 @@ type Deps struct {
 	// is omitted, newModel obtains the same required ledger from Session.
 	Store        store.ThreadRepository
 	SystemPrompt string
+	// ComposeSystemPrompt rebuilds persona+rules+memory when creating a new
+	// session (/new, /clear). When nil, SystemPrompt is used as-is.
+	// Mid-session /memory, /resume, and /compact do not recompose: the durable
+	// thread system prompt is frozen for prefix-cache stability.
+	ComposeSystemPrompt func() (string, error)
 	// SessionOpts is reused for /new and /resume so pricing/context stay consistent.
 	SessionOpts chat.SessionOptions
 	Status      StatusInfo
+	// TurnOptions enforce the configured total turn deadline and tool-call
+	// budget for every interactive turn.
+	TurnOptions runtimeguard.TurnOptions
+	// HideTurnUsage skips the post-turn API usage footer when true.
+	// Default (false) shows the footer. Wired from ui.show_turn_usage.
+	HideTurnUsage bool
+	// Approval is the TUI bridge for run_command ask decisions. Optional.
+	Approval *ApprovalBridge
+	// PolicyInfo drives /permissions and the cmd= status badge.
+	PolicyInfo CommandPolicyInfo
+	// Memory is the project-scoped semantic memory store (optional).
+	Memory *memory.Store
+	// NotifyActiveSession reports the current thread id to background workers
+	// (e.g. memory consolidator). Optional.
+	NotifyActiveSession func(sessionID string)
 }
 
 type mode int
@@ -62,6 +101,9 @@ const (
 	lineTool
 	lineError
 	lineSystem
+	// lineUsage is TUI chrome only (turn token/cost footer). It is never
+	// written to the session ledger and never included in the model prompt.
+	lineUsage
 	lineSep
 )
 
@@ -105,6 +147,9 @@ type model struct {
 	events           chan tea.Msg
 	turnDone         chan turnDoneMsg
 	pendingTurnDone  *turnDoneMsg
+	turnUsage        usage.APIUsage
+	turnUsageSeen    bool
+	turnUsageCallIDs map[string]struct{}
 	compactID        int
 	compactCancel    context.CancelFunc
 	compactStart     time.Time
@@ -113,6 +158,14 @@ type model struct {
 	streamingAssistant bool
 	err                error
 	quitting           bool
+
+	// pendingApproval is set while run_command waits for a human decision.
+	pendingApproval *approvalRequestMsg
+	approvalFocus   int
+	approvalScroll  int
+	// composerReady is set by newModel once textarea/viewport are constructed.
+	// Approval layout must not run against a zero-value model (unit tests).
+	composerReady bool
 }
 
 // tryHistoryUp handles ↑ when the cursor is on the first composer line.
@@ -327,6 +380,7 @@ func newModel(deps Deps) *model {
 		inputHist:     newInputHistory(),
 		openToolCards: make(map[string]int),
 		openToolNames: make(map[string]string),
+		composerReady: true,
 	}
 	// CLI resume (and any Session with a loaded transcript) must show prior turns.
 	// In-TUI /resume uses the same seed helper for a single source of truth.
@@ -335,6 +389,7 @@ func newModel(deps Deps) *model {
 		if hasReplayableTranscript(transcript) {
 			m.lines = seedLinesFromTranscript(transcript, resumeBanner(deps.Session.ID(), len(transcript)), deps.Session.Title())
 		}
+		m.appendLegacyCheckpointResetNotice(deps.Session)
 		// Prefill Up/Down history from prior user turns.
 		m.inputHist.seedFromMessages(transcript)
 	}
@@ -363,7 +418,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
+	case approvalRequestMsg:
+		m.handleApprovalRequest(msg)
+		return m, nil
+
+	case approvalCancelMsg:
+		m.handleApprovalCancel(msg)
+		return m, nil
+
 	case tea.KeyMsg:
+		if m.hasPendingApproval() {
+			// Approval modal owns keys; Ctrl+C still cancels the whole turn.
+			if msg.Type == tea.KeyCtrlC {
+				m.clearPendingApproval(tools.ApprovalDeny)
+				if m.mode == modeBusy {
+					m.interruptTurn("interrupted")
+				}
+				return m, nil
+			}
+			return m.handleApprovalKey(msg)
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			if m.mode == modeBusy {
@@ -519,6 +593,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentTool = m.firstOpenToolName()
 		return m, m.nextEventCmd()
 
+	case turnUsageMsg:
+		if msg.turnID != m.turnID {
+			return m, m.nextEventCmd()
+		}
+		m.addTurnUsage(msg.usage)
+		return m, m.nextEventCmd()
+
 	case turnDoneMsg:
 		if msg.turnID != m.turnID {
 			return m, nil
@@ -583,7 +664,13 @@ func (m *model) View() string {
 
 	status := renderStatusBar(m.width, m.statusLabel())
 	helpTextLine := "enter send · ↑↓ history · ctrl+j newline · pgup/pgdn scroll · esc interrupt · /help"
-	if m.slashMenuOpen() {
+	if m.hasPendingApproval() {
+		if approvalAllowsSession(m.pendingApproval.Request) {
+			helpTextLine = "1 once · 2 session · 3 deny · enter confirm · esc deny"
+		} else {
+			helpTextLine = "1 once · 2 deny · pgup/pgdn review · enter confirm · esc deny"
+		}
+	} else if m.slashMenuOpen() {
 		helpTextLine = "↑↓ select · tab complete · enter accept · esc dismiss · ctrl+j newline"
 	}
 	help := helpStyle.Render(helpTextLine)
@@ -592,11 +679,13 @@ func (m *model) View() string {
 	// Transcript
 	// ────────
 	// status
-	// [slash menu]
+	// [approval modal | slash menu]
 	// ╭ composer ╮
 	// help
 	parts := []string{m.viewport.View(), status}
-	if m.slashMenuOpen() {
+	if m.hasPendingApproval() {
+		parts = append(parts, m.approvalModalPage().content)
+	} else if m.slashMenuOpen() {
 		parts = append(parts, renderSlashMenu(m.width, m.slashItems, m.slashSel))
 	}
 	parts = append(parts, composer, help)
@@ -606,20 +695,20 @@ func (m *model) View() string {
 // statusLabel is the unstyled status text (spinner glyphs included when busy).
 func (m *model) statusLabel() string {
 	follow := !m.stickBottom && !m.viewport.AtBottom()
+	cmdPolicy := m.statusPolicyFragment()
+	extras := collectStatusExtras(m.deps.Session, len(m.queue), follow, cmdPolicy)
 
 	if m.mode == modeIdle {
-		parts := collectIdleStatus(m.deps.Session, m.deps.Status.Model, len(m.queue), follow)
+		parts := collectIdleStatus(m.deps.Session, m.deps.Status.Model, len(m.queue), follow, cmdPolicy)
 		// Leave a little room for bar padding.
 		return formatIdleStatus(max(20, m.width-4), parts)
 	}
 
-	queueSuffix := ""
-	if n := len(m.queue); n > 0 {
-		queueSuffix = fmt.Sprintf(" · queued:%d", n)
-	}
-	followSuffix := ""
-	if follow {
-		followSuffix = " · ↑ End to follow"
+	suffix := joinStatusSuffix(extras)
+	if m.hasPendingApproval() {
+		elapsed := time.Since(m.turnStart).Round(time.Second)
+		return m.spinner.View() + " " +
+			fmt.Sprintf("Awaiting approval · tool (%s · esc deny)%s", elapsed, suffix)
 	}
 	if m.mode == modeCompacting {
 		elapsed := time.Since(m.compactStart).Round(time.Second)
@@ -628,7 +717,7 @@ func (m *model) statusLabel() string {
 			kind = "automatic"
 		}
 		return m.spinner.View() + " " +
-			fmt.Sprintf("Compacting context · %s (%s · esc)%s%s", kind, elapsed, queueSuffix, followSuffix)
+			fmt.Sprintf("Compacting context · %s (%s · esc)%s", kind, elapsed, suffix)
 	}
 	activity := "thinking"
 	if m.currentTool != "" {
@@ -638,7 +727,28 @@ func (m *model) statusLabel() string {
 	}
 	elapsed := time.Since(m.turnStart).Round(time.Second)
 	return m.spinner.View() + " " +
-		fmt.Sprintf("Working · %s (%s · esc)%s%s", activity, elapsed, queueSuffix, followSuffix)
+		fmt.Sprintf("Working · %s (%s · esc)%s", activity, elapsed, suffix)
+}
+
+func (m *model) statusPolicyFragment() string {
+	fragments := make([]string, 0, 4)
+	command := strings.TrimSpace(m.deps.Status.CmdPolicy)
+	if command == "" {
+		command = m.deps.PolicyInfo.CmdPolicyFragment()
+	}
+	if command != "" {
+		fragments = append(fragments, command)
+	}
+
+	// runTUI historically supplies only Status.CmdPolicy. Keep PolicyInfo as a
+	// fallback source for the new sandbox posture without duplicating it when
+	// callers pass the same state to both display DTOs.
+	sandbox := m.deps.Status.Sandbox
+	if !sandbox.Configured() {
+		sandbox = m.deps.PolicyInfo.Sandbox
+	}
+	fragments = append(fragments, sandbox.statusFragments()...)
+	return strings.Join(fragments, " · ")
 }
 
 // statusLine keeps a styled single-line form for tests and lightweight callers.
@@ -660,13 +770,62 @@ func (m *model) layout() {
 		innerW = 10
 	}
 	m.textarea.SetWidth(innerW)
-	// viewport = total - composer border - status(rule+line) - help - slash menu
+	// viewport = total - composer border - status(rule+line) - help - slash/approval
 	// border +2; status rule+label +2; help +1; menu rows when open.
 	composerHeight := m.textarea.Height() + 2
-	reserved := composerHeight + 3 + m.slashMenuHeight()
+	extra := m.slashMenuHeight()
+	if m.hasPendingApproval() {
+		extra = m.approvalModalHeight()
+	}
+	reserved := composerHeight + 3 + extra
 	h := max(5, m.height-reserved)
 	m.viewport.Width = m.width
 	m.viewport.Height = h
+}
+
+func (m *model) approvalModalPage() approvalModalPage {
+	if !m.hasPendingApproval() {
+		return approvalModalPage{}
+	}
+	return renderApprovalModalPage(
+		m.width,
+		m.approvalDetailRows(),
+		m.pendingApproval.Request,
+		m.approvalFocus,
+		m.approvalScroll,
+	)
+}
+
+func (m *model) approvalModalHeight() int {
+	page := m.approvalModalPage()
+	if page.content == "" {
+		return 0
+	}
+	return lipgloss.Height(page.content)
+}
+
+func (m *model) approvalDetailRows() int {
+	if !m.hasPendingApproval() {
+		return 0
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	height := m.height
+	if height <= 0 {
+		height = 24
+	}
+	composerHeight := m.textarea.Height() + 2
+	if composerHeight <= 2 {
+		composerHeight = composerMinHeight + 2
+	}
+	header, _ := approvalModalSections(width, m.pendingApproval.Request)
+	// Keep a usable transcript viewport while reserving border, blank line,
+	// choices, footer, and (when needed) the detail-page indicator.
+	availableModalRows := max(8, height-composerHeight-3-5)
+	fixedRows := len(header) + 6
+	return max(1, availableModalRows-fixedRows)
 }
 
 // syncComposerHeight grows/shrinks the textarea with content (clamped).
@@ -730,6 +889,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSystem, m.statusReport())
 		m.appendLine(lineSep, "")
 		return m, nil
+	case slashUsage:
+		return m.cmdUsage(arg)
 	case slashContext:
 		return m.cmdContext(arg)
 	case slashCompact:
@@ -746,6 +907,12 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdDelete(arg)
 	case slashQueue:
 		return m.cmdQueue(arg)
+	case slashPermissions:
+		m.appendLine(lineSystem, m.deps.PolicyInfo.FormatPermissions())
+		m.appendLine(lineSep, "")
+		return m, nil
+	case slashMemory:
+		return m.cmdMemory(arg)
 	case slashUnknown:
 		m.appendLine(lineError, "unknown command: "+input+"  (try /help)")
 		return m, nil
@@ -754,6 +921,30 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 	m.appendLine(lineUser, input)
 	m.streamingAssistant = false
 	return m.startTurn(input)
+}
+
+// cmdUsage toggles or sets the display-only per-turn API usage footer.
+// This never affects the session ledger or model prompt.
+func (m *model) cmdUsage(arg string) (tea.Model, tea.Cmd) {
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	switch arg {
+	case "", "toggle":
+		m.deps.HideTurnUsage = !m.deps.HideTurnUsage
+	case "on", "show", "enable":
+		m.deps.HideTurnUsage = false
+	case "off", "hide", "disable":
+		m.deps.HideTurnUsage = true
+	default:
+		m.appendLine(lineError, "usage: /usage [on|off|toggle]")
+		return m, nil
+	}
+	state := "on"
+	if m.deps.HideTurnUsage {
+		state = "off"
+	}
+	m.appendLine(lineSystem, "turn usage footer: "+state+"  (display only; not sent to the model)")
+	m.appendLine(lineSep, "")
+	return m, nil
 }
 
 func (m *model) cmdClear() (tea.Model, tea.Cmd) {
@@ -821,6 +1012,17 @@ func (m *model) createSession(title string) (*chat.Session, error) {
 		return nil, errors.New("chat model is unavailable")
 	}
 	system := m.deps.SystemPrompt
+	if m.deps.ComposeSystemPrompt != nil {
+		rebuilt, err := m.deps.ComposeSystemPrompt()
+		if err != nil {
+			return nil, fmt.Errorf("compose system prompt: %w", err)
+		}
+		if strings.TrimSpace(rebuilt) == "" {
+			return nil, errors.New("composed system prompt is empty")
+		}
+		system = rebuilt
+		m.deps.SystemPrompt = rebuilt
+	}
 	if system == "" {
 		system = m.deps.Session.SystemPrompt()
 	}
@@ -829,7 +1031,14 @@ func (m *model) createSession(title string) (*chat.Session, error) {
 	opts.Title = title
 	opts.ModelName = m.deps.Status.Model
 	opts.ID = ""
-	return chat.NewSession(model, system, opts)
+	session, err := chat.NewSession(model, system, opts)
+	if err != nil {
+		return nil, err
+	}
+	if m.deps.NotifyActiveSession != nil {
+		m.deps.NotifyActiveSession(session.ID())
+	}
+	return session, nil
 }
 
 func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
@@ -866,13 +1075,15 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 		if title == "" {
 			title = "(untitled)"
 		}
-		fmt.Fprintf(&b, "%s%s  %s  msgs=%d  tokens=%s  cost=%s  %s\n",
+		apiUsage := usage.APIUsageFromMeta(meta)
+		fmt.Fprintf(&b, "%s%s  %s  msgs=%d  %s  %s  %s  %s\n",
 			mark,
 			meta.ID,
 			title,
 			meta.MessageCount,
-			usage.FormatTokens(meta.TotalTokens),
-			usage.FormatUSD(meta.CostUSD),
+			usage.FormatAPIUsage(apiUsage),
+			usage.FormatContextSnapshot(meta.LastContext),
+			usage.FormatCostEstimate(apiUsage.CostUSD, apiUsage.Status),
 			meta.UpdatedAt.Local().Format("2006-01-02 15:04"),
 		)
 	}
@@ -885,14 +1096,14 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) cmdResume(id string) (tea.Model, tea.Cmd) {
+func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	if m.mode != modeIdle {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
 		return m, nil
 	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		m.appendLine(lineError, "usage: /resume <session-id>")
+	id, recoverInterrupted, ok := parseResumeArgs(arg)
+	if !ok {
+		m.appendLine(lineError, "usage: /resume <session-id> [--recover]")
 		return m, nil
 	}
 	if m.deps.Store == nil {
@@ -907,20 +1118,54 @@ func (m *model) cmdResume(id string) (tea.Model, tea.Cmd) {
 	opts := m.deps.SessionOpts
 	opts.Store = m.deps.Store
 	opts.ModelName = m.deps.Status.Model
+	// Recovery is deliberately scoped to this command. In particular, a
+	// startup --recover must not authorize later plain /resume commands.
+	opts.RecoverInterrupted = recoverInterrupted
 	session, err := chat.OpenSession(model, m.deps.Store, id, opts)
 	if err != nil {
 		m.appendLine(lineError, "resume: "+err.Error())
 		return m, nil
 	}
 	m.deps.Session = session
+	if m.deps.NotifyActiveSession != nil {
+		m.deps.NotifyActiveSession(session.ID())
+	}
+	// Resume keeps the durable thread system prompt (create-time snapshot).
 	m.streamingAssistant = false
 	m.stickBottom = true
 	m.queue = nil
 	transcript := session.Transcript()
 	m.lines = seedLinesFromTranscript(transcript, resumeBanner(session.ID(), len(transcript)), session.Title())
+	m.appendLegacyCheckpointResetNotice(session)
 	m.inputHist.seedFromMessages(transcript)
 	m.refreshViewport()
 	return m, nil
+}
+
+// parseResumeArgs accepts one thread ID and an optional exact trailing
+// --recover acknowledgement. Thread IDs cannot contain whitespace.
+func parseResumeArgs(arg string) (id string, recoverInterrupted, ok bool) {
+	fields := strings.Fields(arg)
+	switch len(fields) {
+	case 1:
+		if fields[0] == "--recover" {
+			return "", false, false
+		}
+		return fields[0], false, true
+	case 2:
+		if fields[0] != "--recover" && fields[1] == "--recover" {
+			return fields[0], true, true
+		}
+	}
+	return "", false, false
+}
+
+func (m *model) appendLegacyCheckpointResetNotice(session *chat.Session) {
+	if session == nil || !session.CheckpointResetDuringOpen() {
+		return
+	}
+	m.appendLine(lineSystem, "legacy checkpoint reset; raw history retained and prompt rebuilt from source events")
+	m.appendLine(lineSep, "")
 }
 
 func (m *model) cmdTitle(title string) (tea.Model, tea.Cmd) {
@@ -991,24 +1236,57 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Context\n")
-	fmt.Fprintf(&b, "budget=%s  output_reserve=%s  trigger=%s  target=%s\n",
+	fmt.Fprintf(&b, "API snapshot: %s\n", usage.FormatContextSnapshot(sessionContextSnapshot(m.deps.Session)))
+	b.WriteString("Planner estimate (local truncation/compaction only; not API usage)\n")
+	fmt.Fprintf(&b, "budget=%s  max_output=%s  trigger=%s  target=%s\n",
 		usage.FormatTokens(status.BudgetTokens),
-		usage.FormatTokens(cfg.OutputReserveTokens),
+		usage.FormatTokens(cfg.MaxOutputTokens),
 		usage.FormatTokens(status.TriggerTokens),
 		usage.FormatTokens(status.TargetTokens),
 	)
-	fmt.Fprintf(&b, "current=%s  source_estimate=%s  hot_groups=%d  omitted_groups=%d\n",
+	fmt.Fprintf(&b, "planned_view=%s  source_estimate=%s  hot_groups=%d  omitted_groups=%d\n",
 		usage.FormatTokens(status.CurrentTokens),
 		usage.FormatTokens(status.OriginalTokens),
 		status.HotTurnGroups,
 		status.OmittedTurnGroups,
 	)
-	fmt.Fprintf(&b, "checkpoint=%s  summary_max=%s  auto_paused=%v  low_gain_streak=%d\n",
+	fmt.Fprintf(&b, "checkpoint=%s  summary_max=%s  auto_paused=%v\n",
 		checkpoint,
 		usage.FormatTokens(cfg.SummaryMaxTokens),
 		status.AutoCompactionPaused,
-		status.LowGainStreak,
 	)
+	if status.LowGainStreak > 0 {
+		fmt.Fprintf(&b, "legacy_low_gain_streak=%d\n", status.LowGainStreak)
+	}
+	if status.AutoCompactionPauseReason != "" {
+		fmt.Fprintf(&b, "auto_pause_reason=%s\n", status.AutoCompactionPauseReason)
+	}
+	if status.LastCompaction != nil {
+		outcome := status.LastCompaction
+		fmt.Fprintf(&b, "last_compaction=%s  automatic=%v", outcome.Status, outcome.Automatic)
+		if outcome.CheckpointID != "" {
+			fmt.Fprintf(&b, "  checkpoint=%s", outcome.CheckpointID)
+		}
+		if outcome.OperationID != "" {
+			fmt.Fprintf(&b, "  operation=%s", outcome.OperationID)
+		}
+		b.WriteByte('\n')
+		if outcome.Reason != "" {
+			fmt.Fprintf(&b, "last_compaction_reason=%s\n", outcome.Reason)
+		}
+	}
+	if status.LastCompactionUsage != nil {
+		compactionUsage := status.LastCompactionUsage
+		fmt.Fprintf(&b, "last_compaction_provider_usage: calls=%d  input=%s  output=%s  total=%s  cache_read=%s  status=%s\n",
+			compactionUsage.ModelCallCount,
+			usage.FormatTokens(compactionUsage.PromptTokens),
+			usage.FormatTokens(compactionUsage.CompletionTokens),
+			usage.FormatTokens(compactionUsage.TotalTokens),
+			usage.FormatTokens(compactionUsage.CachedTokens),
+			compactionUsage.Status,
+		)
+		b.WriteString("cache_read is provider-reported cache-read input tokens; local planner estimates are not cache telemetry\n")
+	}
 	if len(status.LastFallbacks) > 0 {
 		b.WriteString("fallbacks:")
 		for _, fallback := range status.LastFallbacks {
@@ -1030,7 +1308,8 @@ func (m *model) cmdCompact(focus string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
 	}
-	m.appendLine(lineSystem, "compacting context; raw turns are retained")
+	// Progress is status-bar only (mode=compacting). Do not emit a transcript
+	// banner: no-candidate compact finishes as a silent no-op.
 	return m.startCompaction(strings.TrimSpace(focus), false)
 }
 
@@ -1100,13 +1379,37 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 
 	if msg.err != nil {
 		switch {
+		case errors.Is(msg.err, chat.ErrNoCompactionCandidates):
+			// Benign no-op: every completed turn is still in the hot window or
+			// already covered. Manual and automatic paths stay silent so short
+			// sessions and auto-compact races do not spam the transcript.
+			return m.drainQueue()
+		case msg.automatic && errors.Is(msg.err, chat.ErrCompactionStale):
+			// A concurrent turn/checkpoint invalidated the frozen candidate. This
+			// is not a user-visible failure. Do not immediately retry here: a
+			// continuously changing ledger could otherwise create an unbounded,
+			// charged provider loop. The next stable turn re-evaluates the signal.
+			return m.drainQueue()
+		case msg.automatic:
+			status := m.deps.Session.ContextStatus()
+			line := "automatic context compaction failed; active checkpoint unchanged"
+			if errors.Is(msg.err, context.Canceled) || isCanceled(msg.err) {
+				line = "automatic context compaction interrupted; active checkpoint unchanged"
+				if status.AutoCompactionPaused {
+					line += "; automatic compaction paused"
+				}
+			} else if status.AutoCompactionPaused {
+				line += "; automatic compaction paused"
+				if status.AutoCompactionPauseReason != "" {
+					line += " (" + status.AutoCompactionPauseReason + ")"
+				}
+				line += "; use /compact [focus] to retry"
+			}
+			m.appendLine(lineSystem, line)
 		case errors.Is(msg.err, context.Canceled), isCanceled(msg.err):
 			m.appendLine(lineSystem, "context compaction interrupted; active checkpoint unchanged")
-		case errors.Is(msg.err, chat.ErrNoCompactionCandidates) && msg.automatic:
-			// A benign race with a just-finished turn should not look like an error.
-			m.appendLine(lineSystem, "automatic context compaction not needed")
 		default:
-			m.appendLine(lineError, "context compaction: "+msg.err.Error())
+			m.appendLine(lineError, "context compaction failed; active checkpoint unchanged: "+msg.err.Error())
 		}
 	} else {
 		kind := "manual"
@@ -1119,12 +1422,6 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 			usage.FormatTokens(msg.result.BeforeTokens),
 			usage.FormatTokens(msg.result.AfterTokens),
 		)
-		if msg.result.UsedFallback {
-			line += "; deterministic fallback"
-		}
-		if msg.result.AutoPaused {
-			line += "; automatic compact paused after low-gain attempts"
-		}
 		m.appendLine(lineSystem, line)
 	}
 	m.appendLine(lineSep, "")
@@ -1141,13 +1438,23 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 	m.stickBottom = true
 	m.setBusyPlaceholder()
 
-	// Derive from process context so SIGTERM cancels in-flight turns.
-	ctx, cancel := context.WithCancel(m.processCtx())
+	// Derive from process context so SIGTERM cancels in-flight turns, then add
+	// the configured turn deadline and tool-call budget shared by all tools.
+	ctx, cancel, err := runtimeguard.WithTurnContext(m.processCtx(), m.deps.TurnOptions)
+	if err != nil {
+		m.mode = modeIdle
+		m.setIdlePlaceholder()
+		m.err = fmt.Errorf("configure runtime guard: %w", err)
+		return m, nil
+	}
 	m.turnCancel = cancel
 	// Buffered enough for tool chatter; sends still block rather than drop.
 	m.events = make(chan tea.Msg, 256)
 	m.turnDone = make(chan turnDoneMsg, 1)
 	m.pendingTurnDone = nil
+	m.turnUsage = usage.APIUsage{Status: store.UsageStatusExact}
+	m.turnUsageSeen = false
+	m.turnUsageCallIDs = make(map[string]struct{})
 
 	session := m.deps.Session
 	events := m.events
@@ -1156,6 +1463,9 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 
 	go func() {
 		err := session.AskWithEvents(ctx, input, nil, emit)
+		if runtimeguard.IsTurnDeadlineExceeded(ctx) {
+			err = runtimeguard.ErrTurnDeadlineExceeded
+		}
 		// Completion has its own slot so a saturated display-event queue cannot
 		// strand the TUI in busy mode after cancellation.
 		close(events)
@@ -1173,6 +1483,9 @@ func (m *model) nextEventCmd() tea.Cmd {
 }
 
 func (m *model) interruptTurn(reason string) {
+	if m.hasPendingApproval() {
+		m.clearPendingApproval(tools.ApprovalDeny)
+	}
 	if m.turnCancel != nil {
 		m.turnCancel()
 	}
@@ -1182,6 +1495,9 @@ func (m *model) interruptTurn(reason string) {
 }
 
 func (m *model) finishTurn(err error) tea.Cmd {
+	if m.hasPendingApproval() {
+		m.clearPendingApproval(tools.ApprovalDeny)
+	}
 	if m.turnCancel != nil {
 		m.turnCancel()
 		m.turnCancel = nil
@@ -1197,20 +1513,26 @@ func (m *model) finishTurn(err error) tea.Cmd {
 	m.setIdlePlaceholder()
 
 	if err != nil {
-		if isCanceled(err) {
+		if errors.Is(err, runtimeguard.ErrTurnDeadlineExceeded) {
+			m.appendLine(lineSystem, runtimeguard.TurnTimeoutReason)
+		} else if isCanceled(err) {
 			m.appendLine(lineSystem, "interrupted")
 		} else {
 			m.appendLine(lineError, err.Error())
 		}
-	} else if m.deps.Session != nil {
-		if line := formatTurnUsageLine(m.deps.Session); line != "" {
-			m.appendLine(lineSystem, line)
+	}
+	// Turn token/cost footer is display-only chrome (lineUsage). It must never
+	// enter the session ledger or model prompt. Context stays on the status bar.
+	// Gated by ui.show_turn_usage.
+	if !m.deps.HideTurnUsage {
+		if line := formatTurnUsageLine(m.turnUsage, m.turnUsageSeen); line != "" {
+			m.appendLine(lineUsage, line)
 		}
 	}
 	m.appendLine(lineSep, "")
 	m.textarea.Focus()
 	if err == nil && m.deps.Session != nil && m.deps.Session.NeedsAutoCompaction() {
-		m.appendLine(lineSystem, "context pressure reached; compacting before queued follow-ups")
+		// Status bar shows mode=compacting; only a successful install is logged.
 		_, cmd := m.startCompaction("", true)
 		return cmd
 	}
@@ -1244,36 +1566,39 @@ func (m *model) setIdlePlaceholder() {
 	m.textarea.Placeholder = "Message the assistant…  (/help)"
 }
 
-func formatTurnUsageLine(session *chat.Session) string {
-	turn := session.LastTurnUsage()
-	if turn.TotalTokens == 0 && turn.PromptTokens == 0 && turn.CompletionTokens == 0 {
+func (m *model) addTurnUsage(event chat.ModelUsageEvent) {
+	callID := strings.TrimSpace(event.CallID)
+	if callID != "" {
+		if m.turnUsageCallIDs == nil {
+			m.turnUsageCallIDs = make(map[string]struct{})
+		}
+		if _, seen := m.turnUsageCallIDs[callID]; seen {
+			return
+		}
+		m.turnUsageCallIDs[callID] = struct{}{}
+	}
+	m.turnUsageSeen = true
+	m.turnUsage.CallCount++
+	if !event.Available {
+		m.turnUsage.Status = store.UsageStatusIncomplete
+		return
+	}
+	m.turnUsage.PromptTokens += event.Usage.PromptTokens
+	m.turnUsage.CompletionTokens += event.Usage.CompletionTokens
+	m.turnUsage.CachedTokens += event.Usage.CachedTokens
+	m.turnUsage.TotalTokens += event.Usage.TotalTokens
+	m.turnUsage.CostUSD += event.Usage.CostUSD
+}
+
+// formatTurnUsageLine is the post-turn footer: API usage + turn cost.
+// Display-only: callers must append as lineUsage and never persist this text
+// into Session/store messages. Context belongs on the global status bar.
+func formatTurnUsageLine(turn usage.APIUsage, seen bool) string {
+	if !seen {
 		return ""
 	}
-	est := ""
-	if turn.Estimated {
-		est = " ~est"
-	}
-	ctxPart := ""
-	status := session.ContextStatus()
-	if status.BudgetTokens > 0 && status.CurrentTokens > 0 {
-		pct := min(100, status.CurrentTokens*100/status.BudgetTokens)
-		ctxPart = fmt.Sprintf("  ctx=%d%%", pct)
-		if status.OmittedTurnGroups > 0 || len(status.LastFallbacks) > 0 {
-			ctxPart += "*"
-		}
-		if status.CurrentTokens > status.BudgetTokens {
-			ctxPart += "!"
-		}
-	}
-	_, _, _, sessionCost, _ := session.UsageTotals()
-	return fmt.Sprintf("tokens in=%s out=%s  cost=%s  session=%s%s%s",
-		usage.FormatTokens(turn.PromptTokens),
-		usage.FormatTokens(turn.CompletionTokens),
-		usage.FormatUSD(turn.CostUSD),
-		usage.FormatUSD(sessionCost),
-		est,
-		ctxPart,
-	)
+	return usage.FormatAPIUsage(turn) + "  turn " +
+		usage.FormatCostEstimate(turn.CostUSD, turn.Status)
 }
 
 func (m *model) appendAssistantChunk(chunk string) {
@@ -1340,8 +1665,9 @@ func (m *model) refreshViewport() {
 		case lineTool:
 			b.WriteString(renderToolCard(line.text))
 		case lineError:
-			b.WriteString(renderError(line.text))
-		case lineSystem:
+			b.WriteString(renderError(line.text, m.viewport.Width))
+		case lineSystem, lineUsage:
+			// lineUsage shares system styling but is never part of model context.
 			b.WriteString(renderSystem(line.text))
 		case lineSep:
 			b.WriteString(renderSeparator(m.viewport.Width))
@@ -1391,23 +1717,19 @@ func (m *model) statusReport() string {
 			sessionID = id
 		}
 		title = m.deps.Session.Title()
-		p, c, total, cost, est := m.deps.Session.UsageTotals()
-		if total > 0 || p > 0 || c > 0 {
-			usageLine = fmt.Sprintf("\ntokens prompt=%s completion=%s total=%s  cost=%s",
-				usage.FormatTokens(p), usage.FormatTokens(c), usage.FormatTokens(total), usage.FormatUSD(cost))
-			if est {
-				usageLine += " (includes estimates)"
-			}
-		}
+		apiUsage := sessionAPIUsage(m.deps.Session)
+		usageLine = "\n" + usage.FormatAPIUsage(apiUsage) + "  " +
+			usage.FormatCostEstimate(apiUsage.CostUSD, apiUsage.Status)
+		ctxLine = "\n" + usage.FormatContextSnapshot(sessionContextSnapshot(m.deps.Session))
 		cfg := m.deps.Session.ContextConfig()
 		contextStatus := m.deps.Session.ContextStatus()
 		if budget := contextStatus.BudgetTokens; budget > 0 {
 			if contextStatus.OriginalTokens > 0 || contextStatus.CurrentTokens > 0 {
 				pct := 0
 				if contextStatus.CurrentTokens > 0 {
-					pct = min(100, contextStatus.CurrentTokens*100/budget)
+					pct = contextStatus.CurrentTokens * 100 / budget
 				}
-				ctxLine = fmt.Sprintf("\ncontext view=%s/%s (%d%%) source_estimate=%s omitted_groups=%d fallbacks=%d",
+				ctxLine += fmt.Sprintf("\ncontext planner estimate: view=%s/%s (%d%%) source_estimate=%s omitted_groups=%d fallbacks=%d",
 					usage.FormatTokens(contextStatus.CurrentTokens),
 					usage.FormatTokens(budget),
 					pct,
@@ -1416,14 +1738,14 @@ func (m *model) statusReport() string {
 					len(contextStatus.LastFallbacks),
 				)
 			} else {
-				ctxLine = fmt.Sprintf("\ncontext budget=%s keep_recent=%d summary_max=%s",
+				ctxLine += fmt.Sprintf("\ncontext planner estimate: budget=%s keep_recent=%d summary_max=%s",
 					usage.FormatTokens(budget),
 					cfg.KeepRecentTurns,
 					usage.FormatTokens(cfg.SummaryMaxTokens),
 				)
 			}
 		} else if budget := cfg.UsableInputTokens(); budget > 0 {
-			ctxLine = fmt.Sprintf("\ncontext budget=%s keep_recent=%d summary_max=%s",
+			ctxLine += fmt.Sprintf("\ncontext planner estimate: budget=%s keep_recent=%d summary_max=%s",
 				usage.FormatTokens(budget),
 				cfg.KeepRecentTurns,
 				usage.FormatTokens(cfg.SummaryMaxTokens),
@@ -1434,13 +1756,33 @@ func (m *model) statusReport() string {
 	if modelName == "" {
 		modelName = "(unknown)"
 	}
-	report := fmt.Sprintf("model=%s  session=%s  transcript=%d  tools=%s  mode=%s",
-		modelName, sessionID, transcriptCount, tools, modeName(m.mode))
+	turnUsage := "on"
+	if m.deps.HideTurnUsage {
+		turnUsage = "off"
+	}
+	report := fmt.Sprintf("model=%s  session=%s  transcript=%d  tools=%s  mode=%s  turn_usage=%s",
+		modelName, sessionID, transcriptCount, tools, modeName(m.mode), turnUsage)
 	if title != "" {
 		report += "  title=" + title
 	}
 	if m.deps.Status.MaxStep > 0 {
 		report += fmt.Sprintf("  max_step=%d", m.deps.Status.MaxStep)
+	}
+	if frag := m.statusPolicyFragment(); frag != "" {
+		report += "  " + frag
+	}
+	runtime := m.deps.Status.Runtime
+	if !runtime.Configured() {
+		runtime = m.deps.PolicyInfo.Runtime
+	}
+	if runtime.MaxTurnSeconds > 0 {
+		report += fmt.Sprintf("  max_turn_seconds=%d", runtime.MaxTurnSeconds)
+	}
+	if runtime.MaxReactSteps > 0 {
+		report += fmt.Sprintf("  max_react_steps=%d", runtime.MaxReactSteps)
+	}
+	if runtime.MaxToolCalls > 0 {
+		report += fmt.Sprintf("  max_tool_calls=%d", runtime.MaxToolCalls)
 	}
 	if n := len(m.queue); n > 0 {
 		report += fmt.Sprintf("  queued=%d", n)

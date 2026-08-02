@@ -5,6 +5,21 @@ import (
 	"testing"
 )
 
+func TestRenderErrorWrapsLongProviderMessage(t *testing.T) {
+	long := "start response stream: [NodeRunError] error, status code: 400, status: 400 Bad Request, message: An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message)\n------------------------\nnode path: [chat]"
+	out := renderError(long, 40)
+	lines := strings.Split(out, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected multi-line wrap, got %d lines: %q", len(lines), out)
+	}
+	for i, line := range lines[1:] {
+		// Continuation lines should start with two spaces (possibly after ANSI).
+		if !strings.Contains(line, "  ") {
+			t.Fatalf("continuation line %d not indented: %q", i+1, line)
+		}
+	}
+}
+
 func TestFormatToolCardPrettyJSON(t *testing.T) {
 	card := formatToolCard("get_current_time", `{"datetime":"2026-07-14","tz":"UTC"}`, "ok")
 	if !strings.HasPrefix(card, "get_current_time\n") {

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/store"
+
+	"github.com/cloudwego/eino/schema"
 )
 
 func executeForTest(args ...string) (stdout, stderr string, err error) {
@@ -100,6 +102,17 @@ func TestResumeRequiresID(t *testing.T) {
 	}
 }
 
+func TestResumeRecoveryHelpExplainsPendingCompaction(t *testing.T) {
+	t.Parallel()
+	stdout, _, err := executeForTest("resume", "--help")
+	if err != nil {
+		t.Fatalf("resume --help: %v", err)
+	}
+	if !strings.Contains(stdout, "pending compaction") {
+		t.Fatalf("resume recovery help omitted pending compaction:\n%s", stdout)
+	}
+}
+
 func TestSessionsListsV2ThreadStore(t *testing.T) {
 	dataDir := t.TempDir()
 	threadStore, err := store.NewThreadStore(dataDir)
@@ -114,16 +127,68 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateThread: %v", err)
 	}
-	configPath := filepath.Join(t.TempDir(), "config.yml")
-	config := "model:\n" +
-		"  base_url: https://api.example.test/v1\n" +
-		"  api_key: test-key\n" +
-		"  name: test-model\n" +
-		"  timeout_seconds: 60\n" +
-		"assistant:\n" +
-		"  system_prompt: system\n" +
-		"storage:\n" +
-		"  data_dir: " + dataDir + "\n"
+	state, err := threadStore.LoadThread(context.Background(), "20260715-120000-abc123")
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	state, err = threadStore.StartTurn(context.Background(), state.ID, state.Revision, store.TurnStart{
+		TurnID: "cli-usage",
+		Input:  "seed",
+	})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	state, err = threadStore.RecordUsage(context.Background(), state.ID, store.ModelUsage{
+		CallID:              "cli-usage-model-1",
+		TurnID:              "cli-usage",
+		Operation:           store.UsageOperationAgent,
+		HasProviderUsage:    true,
+		PromptTokens:        1000,
+		CompletionTokens:    30,
+		TotalTokens:         1030,
+		ContextBudgetTokens: 4000,
+		CostUSD:             0.01,
+	})
+	if err != nil {
+		t.Fatalf("RecordUsage: %v", err)
+	}
+	state, err = threadStore.RecordUsage(context.Background(), state.ID, store.ModelUsage{
+		CallID:              "cli-usage-model-2",
+		TurnID:              "cli-usage",
+		Operation:           store.UsageOperationAgent,
+		HasProviderUsage:    true,
+		PromptTokens:        200,
+		CompletionTokens:    4,
+		TotalTokens:         204,
+		ContextBudgetTokens: 4000,
+		CostUSD:             0.0023,
+	})
+	if err != nil {
+		t.Fatalf("RecordUsage second call: %v", err)
+	}
+	_, err = threadStore.CommitTurn(context.Background(), state.ID, state.Revision, store.TurnCommit{
+		TurnID: "cli-usage",
+		Messages: []*schema.Message{
+			schema.UserMessage("seed"),
+			schema.AssistantMessage("done", nil),
+		},
+	})
+	if err != nil {
+		t.Fatalf("CommitTurn: %v", err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	config := "[model]\n" +
+		"base_url = \"https://api.example.test/v1\"\n" +
+		"api_key = \"test-key\"\n" +
+		"name = \"test-model\"\n" +
+		"timeout_seconds = 60\n" +
+		"[model.context]\n" +
+		"window_tokens = 32000\n" +
+		"max_output_tokens = 4096\n" +
+		"[assistant]\n" +
+		"system_prompt = \"system\"\n" +
+		"[storage]\n" +
+		"data_dir = \"" + dataDir + "\"\n"
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -133,5 +198,17 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "20260715-120000-abc123") || !strings.Contains(stdout, "v2 ledger") {
 		t.Fatalf("sessions output omitted v2 thread:\n%s", stdout)
+	}
+	for _, want := range []string{
+		"API USAGE", "CONTEXT", "COST~",
+		"API usage (exact): input=1.2k completion=34 cached=0 total=1.2k calls=2",
+		"context=200/4.0k (5%)", "cost~=$0.012",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("sessions output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "\tTOKENS\t") {
+		t.Fatalf("sessions should not label API usage as TOKENS:\n%s", stdout)
 	}
 }

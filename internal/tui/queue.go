@@ -57,10 +57,16 @@ func queuedSystemLine(n int, input string) string {
 // classifyBusyInput keeps context/session mutations behind an idle boundary,
 // while allowing operational inspection and queue control to run immediately.
 func classifyBusyInput(input string) busyInputDisposition {
-	action, _ := parseSlash(input)
+	action, arg := parseSlash(input)
 	switch action {
-	case slashHelp, slashContext, slashStatus, slashSessions, slashQueue:
+	case slashHelp, slashContext, slashStatus, slashUsage, slashSessions, slashQueue, slashPermissions:
 		return busyInputExecuteImmediately
+	case slashMemory:
+		// list/status are read-only; mutations must wait for idle.
+		if memoryCommandAllowsBusy(arg) {
+			return busyInputExecuteImmediately
+		}
+		return busyInputReject
 	case slashCompact, slashClear, slashNew, slashResume, slashTitle, slashDelete, slashExit:
 		return busyInputReject
 	default:

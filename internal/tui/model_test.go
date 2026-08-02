@@ -2,12 +2,15 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
+	"eino-local-assistant/internal/usage"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cloudwego/eino/schema"
@@ -133,6 +136,161 @@ func TestStaleTurnEventsAreIgnored(t *testing.T) {
 	mm := next.(*model)
 	if len(mm.lines) != before {
 		t.Fatalf("stale chunk should be ignored")
+	}
+}
+
+func TestTurnUsageAccumulatorAggregatesCallsWithoutDoubleCounting(t *testing.T) {
+	m := newTestModel(t)
+	m.turnUsageCallIDs = make(map[string]struct{})
+	m.turnUsage.Status = store.UsageStatusExact
+
+	m.addTurnUsage(chat.ModelUsageEvent{
+		CallID:    "call-1",
+		Usage:     usage.Turn{PromptTokens: 10, CompletionTokens: 1, TotalTokens: 11, CachedTokens: 2, CostUSD: 1.25},
+		Available: true,
+	})
+	m.addTurnUsage(chat.ModelUsageEvent{
+		CallID:    "call-2",
+		Usage:     usage.Turn{PromptTokens: 20, CompletionTokens: 5, TotalTokens: 25, CachedTokens: 4, CostUSD: 2.5},
+		Available: true,
+	})
+	// Replayed event notifications must not inflate the visual round summary.
+	m.addTurnUsage(chat.ModelUsageEvent{
+		CallID:    "call-1",
+		Usage:     usage.Turn{PromptTokens: 10, CompletionTokens: 1, TotalTokens: 11, CachedTokens: 2, CostUSD: 1.25},
+		Available: true,
+	})
+
+	if !m.turnUsageSeen || m.turnUsage.CallCount != 2 || m.turnUsage.PromptTokens != 30 ||
+		m.turnUsage.CompletionTokens != 6 || m.turnUsage.CachedTokens != 6 || m.turnUsage.TotalTokens != 36 || m.turnUsage.CostUSD != 3.75 {
+		t.Fatalf("turn usage=%+v seen=%v", m.turnUsage, m.turnUsageSeen)
+	}
+	line := formatTurnUsageLine(m.turnUsage, m.turnUsageSeen)
+	// input = uncached = PromptTokens - CachedTokens = 30 - 6 = 24
+	for _, want := range []string{"API usage (exact)", "input=24", "completion=6", "cached=6", "total=36", "calls=2", "turn cost~=$3.750"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("round usage line %q missing %q", line, want)
+		}
+	}
+	if strings.Contains(line, "prompt=") {
+		t.Fatalf("turn footer must not label prompt=: %q", line)
+	}
+	if strings.Contains(line, "context=") {
+		t.Fatalf("turn footer must not repeat context (global status bar owns ctx): %q", line)
+	}
+}
+
+func TestFinishTurnShowsUsageAfterError(t *testing.T) {
+	m := newTestModel(t)
+	m.mode = modeBusy
+	m.turnUsage = usage.APIUsage{
+		PromptTokens:     10,
+		CompletionTokens: 2,
+		CachedTokens:     0,
+		TotalTokens:      12,
+		CallCount:        1,
+		CostUSD:          0.25,
+		Status:           store.UsageStatusExact,
+	}
+	m.turnUsageSeen = true
+
+	m.finishTurn(errors.New("stream failed"))
+	if !hasLineContaining(m.lines, lineError, "stream failed") {
+		t.Fatalf("turn error missing: %#v", m.lines)
+	}
+	if !hasLineContaining(m.lines, lineUsage, "API usage (exact)") || !hasLineContaining(m.lines, lineUsage, "turn cost~=$0.250") {
+		t.Fatalf("usage after error missing: %#v", m.lines)
+	}
+	if hasLineContaining(m.lines, lineUsage, "context=") {
+		t.Fatalf("turn footer must not include context=: %#v", m.lines)
+	}
+}
+
+func TestFinishTurnShowsStableRuntimeDeadlineReason(t *testing.T) {
+	m := newTestModel(t)
+	m.mode = modeBusy
+
+	m.finishTurn(runtimeguard.ErrTurnDeadlineExceeded)
+	if !hasLineContaining(m.lines, lineSystem, runtimeguard.TurnTimeoutReason) {
+		t.Fatalf("runtime deadline reason missing: %#v", m.lines)
+	}
+	if hasLineContaining(m.lines, lineError, "deadline") {
+		t.Fatalf("runtime deadline must not render as an opaque error: %#v", m.lines)
+	}
+}
+
+func TestFinishTurnHidesUsageWhenConfigured(t *testing.T) {
+	m := newTestModel(t)
+	m.deps.HideTurnUsage = true
+	m.mode = modeBusy
+	m.turnUsage = usage.APIUsage{
+		PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12, CallCount: 1,
+		CostUSD: 0.25, Status: store.UsageStatusExact,
+	}
+	m.turnUsageSeen = true
+
+	m.finishTurn(nil)
+	if hasLineContaining(m.lines, lineUsage, "API usage") || hasLineContaining(m.lines, lineSystem, "API usage") {
+		t.Fatalf("usage footer must be hidden when HideTurnUsage: %#v", m.lines)
+	}
+}
+
+func TestUsageCommandTogglesDisplayOnlyFooter(t *testing.T) {
+	m := newTestModel(t)
+	if m.deps.HideTurnUsage {
+		t.Fatal("default must show turn usage footer")
+	}
+	next, _ := m.submit("/usage off")
+	mm := next.(*model)
+	if !mm.deps.HideTurnUsage {
+		t.Fatal("/usage off should hide footer")
+	}
+	if !hasLineContaining(mm.lines, lineSystem, "turn usage footer: off") {
+		t.Fatalf("expected off confirmation: %#v", mm.lines)
+	}
+	next, _ = mm.submit("/usage")
+	mm = next.(*model)
+	if mm.deps.HideTurnUsage {
+		t.Fatal("/usage (toggle) should re-enable footer")
+	}
+	if !hasLineContaining(mm.lines, lineSystem, "turn usage footer: on") {
+		t.Fatalf("expected on confirmation: %#v", mm.lines)
+	}
+	next, _ = mm.submit("/usage on")
+	mm = next.(*model)
+	if mm.deps.HideTurnUsage {
+		t.Fatal("/usage on must keep footer enabled")
+	}
+}
+
+func TestTurnUsageFooterNeverEntersSessionTranscript(t *testing.T) {
+	m := newTestModel(t)
+	m.mode = modeBusy
+	m.turnUsage = usage.APIUsage{
+		PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12, CallCount: 1,
+		CostUSD: 0.25, Status: store.UsageStatusExact,
+	}
+	m.turnUsageSeen = true
+	before := append([]*schema.Message(nil), m.deps.Session.Transcript()...)
+
+	m.finishTurn(nil)
+	if !hasLineContaining(m.lines, lineUsage, "API usage (exact)") {
+		t.Fatalf("expected display footer: %#v", m.lines)
+	}
+	after := m.deps.Session.Transcript()
+	if len(after) != len(before) {
+		t.Fatalf("session transcript length changed %d -> %d; usage chrome must not persist", len(before), len(after))
+	}
+	for i, msg := range after {
+		if msg == nil {
+			continue
+		}
+		if strings.Contains(msg.Content, "API usage") || strings.Contains(msg.Content, "turn cost~=") {
+			t.Fatalf("session message %d contains usage chrome (would reach the model): %q", i, msg.Content)
+		}
+		if i < len(before) && before[i] != nil && msg.Content != before[i].Content {
+			t.Fatalf("session transcript mutated at %d", i)
+		}
 	}
 }
 

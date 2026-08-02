@@ -49,13 +49,25 @@ func TestThreadStoreJournalLifecycleAndCAS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ToolCompleted: %v", err)
 	}
+	state, err = store.RecordUsage(ctx, state.ID, ModelUsage{
+		CallID:           "model-call-1",
+		TurnID:           "turn-1",
+		Operation:        UsageOperationAgent,
+		HasProviderUsage: true,
+		PromptTokens:     10,
+		CompletionTokens: 4,
+		TotalTokens:      14,
+		CostUSD:          0.02,
+	})
+	if err != nil {
+		t.Fatalf("RecordUsage: %v", err)
+	}
 	state, err = store.CommitTurn(ctx, state.ID, state.Revision, TurnCommit{
 		TurnID: "turn-1",
 		Messages: []*schema.Message{
 			schema.UserMessage("hello"),
 			schema.AssistantMessage("hi", nil),
 		},
-		Usage: UsageDelta{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14, CostUSD: 0.02},
 	})
 	if err != nil {
 		t.Fatalf("CommitTurn: %v", err)
@@ -96,7 +108,7 @@ func TestThreadStoreJournalLifecycleAndCAS(t *testing.T) {
 		t.Fatalf("second page = %#v, hasMore=%v", page, hasMore)
 	}
 
-	journal := filepath.Join(store.Root(), threadsDirName, state.ID, journalFileName)
+	journal := filepath.Join(store.Root(), sessionsDirName, state.ID, journalFileName)
 	data, err := os.ReadFile(journal)
 	if err != nil {
 		t.Fatal(err)
@@ -150,6 +162,40 @@ func TestThreadStoreRejectsInvalidLifecycleTransitions(t *testing.T) {
 	}
 	if _, err := threadStore.CommitTurn(ctx, state.ID, state.Revision, TurnCommit{TurnID: "turn-1", Messages: []*schema.Message{schema.UserMessage("hello"), schema.AssistantMessage("done", nil)}}); !errors.Is(err, ErrInvalidThreadLifecycle) {
 		t.Fatalf("duplicate commit error = %v, want ErrInvalidThreadLifecycle", err)
+	}
+}
+
+func TestThreadStoreFinishTurnRebasesUnrelatedRevision(t *testing.T) {
+	threadStore, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	state, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "thread-finish-rebase"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: "turn-1", Input: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.SetThreadTitle(ctx, state.ID, state.Revision, "external writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.FinishTurn(ctx, state.ID, TurnFinish{TurnID: "turn-1", Reason: "stream failed"})
+	if err != nil {
+		t.Fatalf("FinishTurn: %v", err)
+	}
+	if state.Meta.Title != "external writer" {
+		t.Fatalf("rebase lost external title: %#v", state.Meta)
+	}
+	groups, err := threadStore.LoadTurnGroups(ctx, state.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0].Failed == nil || groups[0].Failed.Error != "stream failed" {
+		t.Fatalf("terminal group = %#v", groups)
 	}
 }
 
@@ -239,7 +285,7 @@ func TestThreadStoreReplayRejectsSecondActiveTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newThreadEvent: %v", err)
 	}
-	journal := filepath.Join(threadStore.Root(), threadsDirName, state.ID, journalFileName)
+	journal := filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName)
 	if err := appendJournalEvent(journal, event); err != nil {
 		t.Fatalf("append invalid lifecycle event: %v", err)
 	}
@@ -289,7 +335,7 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(store.Root(), threadsDirName, state.ID, journalFileName)
+	journal := filepath.Join(store.Root(), sessionsDirName, state.ID, journalFileName)
 	f, err := os.OpenFile(journal, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -316,7 +362,7 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if next.Revision != recovered.Revision+1 {
 		t.Fatalf("next revision = %d", next.Revision)
 	}
-	dir := filepath.Join(store.Root(), threadsDirName, state.ID)
+	dir := filepath.Join(store.Root(), sessionsDirName, state.ID)
 	if err := os.Remove(filepath.Join(dir, stateFileName)); err != nil {
 		t.Fatal(err)
 	}
@@ -411,20 +457,21 @@ func TestThreadStoreArtifactTruncationAndCheckpointRecovery(t *testing.T) {
 		BeforeTokens:   100,
 		AfterTokens:    40,
 		Automatic:      true,
-		LowGain:        true,
 		AutoPaused:     true,
 	})
 	if err != nil {
 		t.Fatalf("CommitCheckpoint: %v", err)
 	}
-	if next.ActiveCheckpointID != checkpoint.ID || !next.AutoCompactionPaused || next.LowGainStreak != 1 {
+	// Successful install always clears the low-gain streak; AutoPaused may still
+	// be carried on the checkpoint for historical pause reasons.
+	if next.ActiveCheckpointID != checkpoint.ID || !next.AutoCompactionPaused || next.LowGainStreak != 0 {
 		t.Fatalf("checkpoint state = %#v", next)
 	}
 	if string(checkpoint.Payload) != string(payload) || checkpoint.SourceHash == "" {
 		t.Fatalf("checkpoint = %#v", checkpoint)
 	}
 
-	checkpointFile := filepath.Join(store.Root(), threadsDirName, state.ID, checkpointsDir, checkpoint.ID+".json")
+	checkpointFile := filepath.Join(store.Root(), sessionsDirName, state.ID, checkpointsDir, checkpoint.ID+".json")
 	if err := os.Remove(checkpointFile); err != nil {
 		t.Fatal(err)
 	}
@@ -602,7 +649,7 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if first.Truncated {
 		t.Fatalf("first artifact unexpectedly truncated: %#v", first)
 	}
-	if _, err := os.Stat(filepath.Join(store.Root(), threadsDirName, state.ID, artifactsDir, first.SHA256+".blob")); err != nil {
+	if _, err := os.Stat(filepath.Join(store.Root(), sessionsDirName, state.ID, artifactsDir, first.SHA256+".blob")); err != nil {
 		t.Fatalf("full artifact blob: %v", err)
 	}
 	read, err := store.ReadArtifact(ctx, state.ID, first.ID, 2, 4)
@@ -612,7 +659,7 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if got, want := string(read.Data), "3456"; got != want || !read.HasMore {
 		t.Fatalf("full artifact range = %q hasMore=%v", got, read.HasMore)
 	}
-	metadata, err := os.ReadFile(filepath.Join(store.Root(), threadsDirName, state.ID, artifactsDir, first.SHA256+".json"))
+	metadata, err := os.ReadFile(filepath.Join(store.Root(), sessionsDirName, state.ID, artifactsDir, first.SHA256+".json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -658,7 +705,7 @@ func TestThreadStoreMetadataListAndDelete(t *testing.T) {
 	}, "sys"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(store.Root(), threadsDirName, ".creating-crashed"), 0o700); err != nil {
+	if err := os.Mkdir(filepath.Join(store.Root(), sessionsDirName, ".creating-crashed"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	metas, err := store.ListThreads(ctx)

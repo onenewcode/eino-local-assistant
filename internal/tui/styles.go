@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wrap"
 )
 
 // Quiet dark palette — closer to Claude Code / Codex than bright accent chrome.
@@ -67,8 +68,28 @@ func renderUser(text string) string {
 	return b.String()
 }
 
-func renderError(text string) string {
-	return errorStyle.Render("! ") + text
+func renderError(text string, width int) string {
+	prefix := "! "
+	indent := "  "
+	bodyWidth := width - lipgloss.Width(prefix)
+	if bodyWidth < 16 {
+		bodyWidth = 16
+	}
+	// Hard-wrap long tokens so provider errors (often one long line) fit the terminal.
+	wrapped := wrap.String(strings.ReplaceAll(text, "\t", " "), bodyWidth)
+	lines := strings.Split(wrapped, "\n")
+	if len(lines) == 0 {
+		return errorStyle.Render(prefix)
+	}
+	var b strings.Builder
+	b.WriteString(errorStyle.Render(prefix))
+	b.WriteString(lines[0])
+	for _, line := range lines[1:] {
+		b.WriteByte('\n')
+		b.WriteString(indent)
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 func renderSystem(text string) string {
@@ -100,7 +121,6 @@ func renderComposer(width int, view string) string {
 	// Outer width ≈ terminal width; leave a small margin so the box doesn't clip.
 	return composerBorder.Width(width - 2).MaxWidth(width).Render(view)
 }
-
 
 var (
 	slashMenuNameStyle = lipgloss.NewStyle().

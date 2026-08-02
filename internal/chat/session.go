@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/contextbuild"
+	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
@@ -38,6 +39,9 @@ var (
 	// but still-live writer. Callers must explicitly request recovery after they
 	// have established that the prior process is gone.
 	ErrThreadHasActiveTurn = errors.New("thread has an active turn")
+	// ErrThreadHasPendingCompaction prevents a resume from silently retrying a
+	// provider operation that may have charged before the prior process stopped.
+	ErrThreadHasPendingCompaction = errors.New("thread has a pending compaction")
 )
 
 const (
@@ -69,7 +73,26 @@ const (
 	TurnEventToolStart
 	TurnEventToolEnd
 	TurnEventToolError
+	TurnEventModelUsage
 )
+
+const (
+	// ModelUsageOperationAgent identifies a chat-model request made while
+	// handling a user turn, including every ReAct loop iteration.
+	ModelUsageOperationAgent = "agent"
+	// ModelUsageOperationCompaction identifies a no-tools checkpoint request.
+	ModelUsageOperationCompaction = "compaction"
+)
+
+// ModelUsageEvent is one completed provider model call. Available is false
+// only when the provider completed the call without reporting token usage.
+// A missing value is deliberately not replaced with a local heuristic.
+type ModelUsageEvent struct {
+	CallID    string
+	Operation string
+	Usage     usage.Turn
+	Available bool
+}
 
 // TurnEvent is a raw observation during Session.AskWithEvents. Tool payloads
 // intentionally remain untruncated here: the durable artifact recorder owns
@@ -82,16 +105,19 @@ type TurnEvent struct {
 	Output     string
 	Chunk      string
 	Err        error
+	ModelUsage *ModelUsageEvent
 }
 
 // EventEmitter receives progressive turn events. It may be called from a
 // non-UI goroutine; callers should only enqueue lightweight work.
 type EventEmitter func(TurnEvent)
 
-// EventAwareModel optionally exposes tool/stream events for richer UIs.
+// EventAwareModel optionally exposes tool/stream events for richer UIs. The
+// returned done channel closes only after every event for this request has been
+// emitted, including callbacks from background model goroutines.
 type EventAwareModel interface {
 	Model
-	StreamWithEvents(ctx context.Context, messages []*schema.Message, emit EventEmitter) (Stream, error)
+	StreamWithEvents(ctx context.Context, messages []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error)
 }
 
 // SessionOptions configures a new or opened session.
@@ -110,6 +136,11 @@ type SessionOptions struct {
 	Pricing usage.Pricing
 	// Context controls the hot prompt, checkpoints, and compaction budgets.
 	Context contextbuild.Config
+	// MaxLowGainAttempts is consecutive automatic low-gain failures before
+	// auto-compaction pauses. Zero uses store.DefaultMaxLowGainAttempts.
+	// Hard failures still pause immediately. This is session runtime policy,
+	// not a prompt/compactor budget.
+	MaxLowGainAttempts int
 	// Compactor must be a no-tools implementation using the configured base
 	// model. It is intentionally separate from the ReAct turn model.
 	Compactor contextbuild.CheckpointCompactor
@@ -122,32 +153,64 @@ type SessionOptions struct {
 // CompactionResult is a user-facing account of one installed checkpoint.
 type CompactionResult struct {
 	CheckpointID   string
+	OperationID    string
 	SourceEventIDs []string
 	BeforeTokens   int
 	AfterTokens    int
 	ReleasedTokens int
 	GainPercent    int
 	Automatic      bool
-	UsedFallback   bool
-	LowGain        bool
-	AutoPaused     bool
 	CompactorCalls int
 }
 
 // ContextStatus exposes the active context projection without exposing raw
 // checkpoint payloads in the normal status bar.
 type ContextStatus struct {
-	BudgetTokens         int
-	TriggerTokens        int
-	TargetTokens         int
-	CurrentTokens        int
-	OriginalTokens       int
-	ActiveCheckpointID   string
-	AutoCompactionPaused bool
-	LowGainStreak        uint64
-	HotTurnGroups        int
-	OmittedTurnGroups    int
-	LastFallbacks        []contextbuild.PlanFallback
+	BudgetTokens              int
+	TriggerTokens             int
+	TargetTokens              int
+	CurrentTokens             int
+	MeasuredTokens            int
+	MeasuredBudgetTokens      int
+	MeasuredKnown             bool
+	OriginalTokens            int
+	ActiveCheckpointID        string
+	AutoCompactionPaused      bool
+	AutoCompactionPauseReason string
+	LowGainStreak             uint64
+	LastCompaction            *store.CompactionOutcome
+	LastCompactionUsage       *CompactionUsageSummary
+	HotTurnGroups             int
+	OmittedTurnGroups         int
+	LastFallbacks             []contextbuild.PlanFallback
+}
+
+// CompactionUsageSummary is provider-reported accounting for one compaction
+// operation. CachedTokens means provider-reported cache-read input tokens; it
+// is never inferred from the local prompt planner.
+type CompactionUsageSummary struct {
+	OperationID      string
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CachedTokens     int
+	ReasoningTokens  int
+	ModelCallCount   int
+	CostUSD          float64
+	Status           store.UsageStatus
+}
+
+// UsageSummary separates durable API accounting from the current context
+// window snapshot. Counts are exact only while Status is exact.
+type UsageSummary struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CachedTokens     int
+	ReasoningTokens  int
+	ModelCallCount   int
+	CostUSD          float64
+	Status           store.UsageStatus
 }
 
 // Session owns a model-visible projection. Its v2 ThreadRepository is the
@@ -156,16 +219,17 @@ type Session struct {
 	model      Model
 	transcript []*schema.Message
 
-	threads      store.ThreadRepository
-	id           string
-	title        string
-	modelName    string
-	pricing      usage.Pricing
-	contextCfg   contextbuild.Config
-	compactor    contextbuild.CheckpointCompactor
-	systemPrompt string
-	revision     uint64
-	checkpoint   *contextbuild.Checkpoint
+	threads            store.ThreadRepository
+	id                 string
+	title              string
+	modelName          string
+	pricing            usage.Pricing
+	contextCfg         contextbuild.Config
+	maxLowGainAttempts int
+	compactor          contextbuild.CheckpointCompactor
+	systemPrompt       string
+	revision           uint64
+	checkpoint         *contextbuild.Checkpoint
 	// checkpointCoverage is the exact cold-path source manifest reconstructed
 	// from the active checkpoint lineage. The checkpoint JSON itself only holds
 	// bounded evidence anchors so it remains installable after many compactions.
@@ -176,19 +240,30 @@ type Session struct {
 	transcriptOffset  int
 	transcriptHasMore bool
 
-	// Usage totals are mirrored atomically by ThreadStore commits.
+	// Usage totals are projected from one durable usage.recorded event per
+	// completed provider call. Context is deliberately stored separately.
 	promptTokens     int
 	completionTokens int
 	totalTokens      int
+	cachedTokens     int
+	reasoningTokens  int
+	modelCallCount   int
 	costUSD          float64
-	usageEstimated   bool
-	lastTurn         usage.Turn
+	usageStatus      store.UsageStatus
+	lastContext      *store.ContextSnapshot
 	lastPlan         contextbuild.PromptPlan
 	autoCompact      bool
 	// Durable anti-thrashing state is projected from ThreadState after every
 	// local mutation and checked before automatic compaction.
-	autoCompactionPaused bool
-	lowGainStreak        uint64
+	autoCompactionPaused      bool
+	autoCompactionPauseReason string
+	lowGainStreak             uint64
+	lastCompaction            *store.CompactionOutcome
+	lastCompactionUsage       *CompactionUsageSummary
+	// checkpointResetDuringOpen reports only a reset performed by this specific
+	// OpenSession call, so UI entry points can notify once without replaying an
+	// old durable outcome on every later resume.
+	checkpointResetDuringOpen bool
 
 	// opMu makes a Session a single-writer actor even outside the TUI. The
 	// ThreadStore's revision CAS remains the cross-process safety boundary.
@@ -220,16 +295,17 @@ func NewSession(model Model, systemPrompt string, opts SessionOptions) (*Session
 	}
 
 	s := &Session{
-		model:        model,
-		transcript:   []*schema.Message{schema.SystemMessage(systemPrompt)},
-		threads:      opts.Store,
-		id:           id,
-		title:        strings.TrimSpace(opts.Title),
-		modelName:    strings.TrimSpace(opts.ModelName),
-		pricing:      opts.Pricing,
-		contextCfg:   opts.Context.Normalize(),
-		compactor:    opts.Compactor,
-		systemPrompt: systemPrompt,
+		model:              model,
+		transcript:         []*schema.Message{schema.SystemMessage(systemPrompt)},
+		threads:            opts.Store,
+		id:                 id,
+		title:              strings.TrimSpace(opts.Title),
+		modelName:          strings.TrimSpace(opts.ModelName),
+		pricing:            opts.Pricing,
+		contextCfg:         opts.Context.Normalize(),
+		maxLowGainAttempts: opts.MaxLowGainAttempts,
+		compactor:          opts.Compactor,
+		systemPrompt:       systemPrompt,
 	}
 	state, err := s.threads.CreateThread(context.Background(), store.ThreadMeta{
 		ID:        id,
@@ -280,6 +356,33 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 			return nil, fmt.Errorf("reload recovered thread transcript: %w", err)
 		}
 	}
+	if state.PendingCompaction != nil {
+		pending := *state.PendingCompaction
+		if !opts.RecoverInterrupted {
+			return nil, fmt.Errorf("%w %q; confirm the prior process stopped and resume with explicit recovery", ErrThreadHasPendingCompaction, pending.OperationID)
+		}
+		failure := store.CompactionFailure{
+			OperationID:        pending.OperationID,
+			Automatic:          pending.Automatic,
+			Cancelled:          true,
+			Reason:             "explicitly recovered during session resume",
+			MaxLowGainAttempts: opts.MaxLowGainAttempts,
+		}
+		if !pending.Automatic {
+			// Recovering a manual operation must not clear a pause left by an
+			// earlier automatic failure. Automatic recoveries recompute pause
+			// under the store write lock.
+			failure.AutoPaused = state.AutoCompactionPaused
+			failure.AutoPauseReason = state.AutoCompactionPauseReason
+			if failure.AutoPaused && strings.TrimSpace(failure.AutoPauseReason) == "" {
+				failure.AutoPauseReason = "automatic compaction paused by a legacy checkpoint"
+			}
+		}
+		state, err = st.RecordCompactionFailure(context.Background(), id, state.Revision, failure)
+		if err != nil {
+			return nil, fmt.Errorf("recover interrupted compaction: %w", err)
+		}
+	}
 	if len(transcript) == 0 {
 		transcript = []*schema.Message{schema.SystemMessage(state.SystemPrompt)}
 	}
@@ -290,16 +393,17 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		return nil, fmt.Errorf("thread %q has no system prompt", id)
 	}
 	s := &Session{
-		model:        model,
-		transcript:   transcript,
-		threads:      st,
-		id:           state.ID,
-		title:        state.Meta.Title,
-		modelName:    state.Meta.Model,
-		pricing:      opts.Pricing,
-		contextCfg:   opts.Context.Normalize(),
-		compactor:    opts.Compactor,
-		systemPrompt: state.SystemPrompt,
+		model:              model,
+		transcript:         transcript,
+		threads:            st,
+		id:                 state.ID,
+		title:              state.Meta.Title,
+		modelName:          state.Meta.Model,
+		pricing:            opts.Pricing,
+		contextCfg:         opts.Context.Normalize(),
+		maxLowGainAttempts: opts.MaxLowGainAttempts,
+		compactor:          opts.Compactor,
+		systemPrompt:       state.SystemPrompt,
 	}
 	s.applyThreadState(state)
 	bodyCount := countVisibleBodyMessages(transcript)
@@ -310,21 +414,42 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		if err != nil {
 			return nil, fmt.Errorf("load active checkpoint %q: %w", state.ActiveCheckpointID, err)
 		}
-		checkpoint, err := contextbuild.ParseCheckpointJSON(persisted.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("active checkpoint %q is invalid: %w", state.ActiveCheckpointID, err)
+		schemaVersion, schemaErr := contextbuild.CheckpointSchemaVersionFromJSON(persisted.Payload)
+		if schemaErr != nil {
+			return nil, fmt.Errorf("read active checkpoint %q schema: %w", state.ActiveCheckpointID, schemaErr)
 		}
-		checkpoint.ID = persisted.ID
-		s.checkpoint = &checkpoint
-		coverage, coverageErr := checkpointCoverage(context.Background(), st, id, persisted.ID)
-		if coverageErr != nil {
-			return nil, fmt.Errorf("load active checkpoint lineage %q: %w", persisted.ID, coverageErr)
+		if schemaVersion == 1 {
+			if err := contextbuild.ValidateLegacyV1CheckpointJSON(persisted.Payload); err != nil {
+				return nil, fmt.Errorf("active legacy checkpoint %q is invalid: %w", state.ActiveCheckpointID, err)
+			}
+			// V1 conflated inherited and direct evidence. It cannot be safely
+			// reinterpreted as v2, so drop only the active pointer and rebuild the
+			// Prompt View from the retained raw ledger.
+			state, err = st.ResetIncompatibleCheckpoint(context.Background(), id, state.Revision, store.CheckpointSchemaReset{
+				OperationID:  newLocalID("checkpoint-reset"),
+				CheckpointID: persisted.ID,
+				Reason:       "active checkpoint schema version 1 is incompatible with schema version 2",
+			})
+			if err != nil {
+				return nil, fmt.Errorf("reset legacy active checkpoint %q: %w", persisted.ID, err)
+			}
+			s.applyThreadState(state)
+			s.setCheckpoint(nil, nil)
+			s.mu.Lock()
+			s.checkpointResetDuringOpen = true
+			s.mu.Unlock()
+		} else {
+			checkpoint, coverage, loadErr := loadVerifiedActiveCheckpoint(context.Background(), st, id, persisted.ID, turns)
+			if loadErr != nil {
+				return nil, fmt.Errorf("load active checkpoint lineage %q: %w", persisted.ID, loadErr)
+			}
+			s.setCheckpoint(&checkpoint, coverage)
 		}
-		s.checkpointCoverage = coverage
 	}
 	if err := s.refreshContextProjection(); err != nil {
 		return nil, fmt.Errorf("build resumed context: %w", err)
 	}
+	s.refreshLastCompactionUsage(context.Background())
 	return s, nil
 }
 
@@ -342,7 +467,8 @@ func (s *Session) Title() string {
 	return s.title
 }
 
-// SystemPrompt returns the immutable instruction recorded for this thread.
+// SystemPrompt returns the durable create-time system instruction for this thread.
+// It is not hot-reloaded mid-session; open a new session to pick up new AGENTS.md / memory.
 func (s *Session) SystemPrompt() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -357,7 +483,7 @@ func (s *Session) SetTitle(ctx context.Context, title string) error {
 	title = strings.TrimSpace(title)
 	state, err := s.threads.SetThreadTitle(ctx, s.id, s.revision, title)
 	if err != nil {
-		return err
+		return turnTerminationError(ctx, err)
 	}
 	s.applyThreadState(state)
 	return nil
@@ -366,21 +492,32 @@ func (s *Session) SetTitle(ctx context.Context, title string) error {
 // Store returns the v2 thread ledger backing this session.
 func (s *Session) Store() store.ThreadRepository { return s.threads }
 
+// CheckpointResetDuringOpen reports whether this Session's OpenSession call
+// reset an otherwise valid legacy v1 active checkpoint.
+func (s *Session) CheckpointResetDuringOpen() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.checkpointResetDuringOpen
+}
+
 // Model returns the chat model used for turns.
 func (s *Session) Model() Model { return s.model }
 
-// UsageTotals returns cumulative token/cost stats for this session.
-func (s *Session) UsageTotals() (prompt, completion, total int, costUSD float64, estimated bool) {
+// UsageSummary returns the durable API-usage projection for the current
+// session. It intentionally does not describe context-window occupancy.
+func (s *Session) UsageSummary() UsageSummary {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.promptTokens, s.completionTokens, s.totalTokens, s.costUSD, s.usageEstimated
-}
-
-// LastTurnUsage returns accounting for the most recent successful Ask.
-func (s *Session) LastTurnUsage() usage.Turn {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.lastTurn
+	return UsageSummary{
+		PromptTokens:     s.promptTokens,
+		CompletionTokens: s.completionTokens,
+		TotalTokens:      s.totalTokens,
+		CachedTokens:     s.cachedTokens,
+		ReasoningTokens:  s.reasoningTokens,
+		ModelCallCount:   s.modelCallCount,
+		CostUSD:          s.costUSD,
+		Status:           s.usageStatus,
+	}
 }
 
 // ContextConfig returns the active prompt-budget config.
@@ -400,13 +537,27 @@ func (s *Session) ContextStatus() ContextStatus {
 		OmittedTurnGroups: len(s.lastPlan.OmittedGroupIDs),
 		LastFallbacks:     append([]contextbuild.PlanFallback(nil), s.lastPlan.Fallbacks...),
 	}
+	if s.lastContext != nil {
+		status.MeasuredTokens = s.lastContext.PromptTokens
+		status.MeasuredBudgetTokens = s.lastContext.BudgetTokens
+		status.MeasuredKnown = true
+	}
 	if s.checkpoint != nil {
 		status.ActiveCheckpointID = s.checkpoint.ID
 	}
 	// The durable values are refreshed after every local mutation. A stale
 	// external writer will be caught by the next CAS rather than hidden here.
 	status.AutoCompactionPaused = s.autoCompactionPaused
+	status.AutoCompactionPauseReason = s.autoCompactionPauseReason
 	status.LowGainStreak = s.lowGainStreak
+	if s.lastCompaction != nil {
+		outcome := *s.lastCompaction
+		status.LastCompaction = &outcome
+	}
+	if s.lastCompactionUsage != nil {
+		usage := *s.lastCompactionUsage
+		status.LastCompactionUsage = &usage
+	}
 	return status
 }
 
@@ -449,12 +600,20 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		if terminalErr := s.terminateUncommittedTurn(recorder, false, "build context: "+err.Error()); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
-		return err
+		return turnTerminationError(ctx, err)
 	}
 	s.setPlan(plan)
 
+	usageTracker := &turnUsageTracker{}
 	combinedEmit := func(event TurnEvent) {
-		recorder.record(event)
+		if event.Kind == TurnEventModelUsage && event.ModelUsage != nil {
+			tracked := usageTracker.normalize(*event.ModelUsage)
+			normalized, record := s.normalizedModelUsage(turnID, tracked)
+			event.ModelUsage = &normalized
+			recorder.recordUsage(record)
+		} else {
+			recorder.record(event)
+		}
 		if emit != nil {
 			emit(event)
 		}
@@ -462,13 +621,27 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	turnCtx := store.WithThreadAccess(ctx, s.threads, s.id)
 	answer, err := s.streamAnswer(turnCtx, view, onChunk, combinedEmit)
 	if err != nil {
-		if terminalErr := s.terminateUncommittedTurn(recorder, isCancelledContext(ctx, err), err.Error()); terminalErr != nil {
+		if answer != nil && !usageTracker.hasEvents() {
+			// A direct model stream can fail after it has produced an assistant
+			// chunk. Preserve reported usage, or record the started call as
+			// unavailable, before closing the durable turn lifecycle.
+			fallback := s.providerUsageEvent("final", answer)
+			combinedEmit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &fallback})
+		}
+		if terminalErr := s.terminateUncommittedTurn(recorder, isCancelledContext(ctx, err), turnTerminationReason(ctx, err)); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
 		if recorder.err() != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", recorder.err())
 		}
-		return err
+		return turnTerminationError(ctx, err)
+	}
+	if !usageTracker.hasEvents() {
+		// Non-ReAct models do not emit per-call events. Their completed final
+		// response is still one provider call, but never falls back to a local
+		// tokenizer when usage is absent.
+		fallback := s.providerUsageEvent("final", answer)
+		combinedEmit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &fallback})
 	}
 	if recorder.err() != nil {
 		if terminalErr := s.terminateUncommittedTurn(recorder, false, recorder.err().Error()); terminalErr != nil {
@@ -477,26 +650,18 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		return fmt.Errorf("persist tool lifecycle: %w", recorder.err())
 	}
 	if err := ctx.Err(); err != nil {
-		if terminalErr := s.terminateUncommittedTurn(recorder, true, err.Error()); terminalErr != nil {
+		if terminalErr := s.terminateUncommittedTurn(recorder, true, turnTerminationReason(ctx, err)); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
 		if recorder.err() != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", recorder.err())
 		}
-		return err
+		return turnTerminationError(ctx, err)
 	}
 
-	turn := s.usageFor(view, answer)
 	state, err = recorder.commit(store.TurnCommit{
 		TurnID:   turnID,
 		Messages: []*schema.Message{userMsg, answer},
-		Usage: store.UsageDelta{
-			PromptTokens:     turn.PromptTokens,
-			CompletionTokens: turn.CompletionTokens,
-			TotalTokens:      turn.TotalTokens,
-			CostUSD:          turn.CostUSD,
-			Estimated:        turn.Estimated,
-		},
 	})
 	if err != nil {
 		if terminalErr := s.reconcileUncommittedTurn(turnID, false, "commit failed: "+err.Error()); terminalErr != nil {
@@ -505,10 +670,6 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		return fmt.Errorf("persist completed turn: %w", err)
 	}
 	s.applyThreadState(state)
-	s.mu.Lock()
-	// CommitTurn has already applied the usage delta to ThreadState/meta.
-	s.lastTurn = turn
-	s.mu.Unlock()
 	// The ledger remains authoritative. Refresh the bounded replay window rather
 	// than retaining an unbounded in-memory copy of raw turn data.
 	s.refreshVisibleTranscript()
@@ -519,8 +680,8 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 }
 
 // terminateUncommittedTurn first uses the recorder's expected revision, then
-// rebases once against the ledger if another writer changed unrelated metadata
-// during the stream. This prevents a failed CAS from stranding an active turn.
+// closes the known active turn atomically if another writer changed unrelated
+// metadata during the stream.
 func (s *Session) terminateUncommittedTurn(recorder *threadTurnRecorder, cancelled bool, reason string) error {
 	if recorder == nil {
 		return errors.New("turn recorder is required")
@@ -539,38 +700,34 @@ func (s *Session) terminateUncommittedTurn(recorder *threadTurnRecorder, cancell
 }
 
 func (s *Session) reconcileUncommittedTurn(turnID string, cancelled bool, reason string) error {
-	for attempt := 0; attempt < 2; attempt++ {
-		state, err := s.threads.LoadThread(context.Background(), s.id)
-		if err != nil {
-			return err
-		}
-		var next store.ThreadState
-		if cancelled {
-			next, err = s.threads.CancelTurn(context.Background(), s.id, state.Revision, store.TurnCancel{TurnID: turnID, Reason: reason})
-		} else {
-			next, err = s.threads.FailTurn(context.Background(), s.id, state.Revision, store.TurnFailure{TurnID: turnID, Error: reason})
-		}
-		if err == nil {
-			s.applyThreadState(next)
-			return nil
-		}
-		if errors.Is(err, store.ErrRevisionConflict) {
-			continue
-		}
-		// Another writer may have already closed the same turn after a lost CAS.
-		if errors.Is(err, store.ErrInvalidThreadLifecycle) {
-			s.applyThreadState(state)
-			return nil
-		}
-		return err
+	next, err := s.threads.FinishTurn(context.Background(), s.id, store.TurnFinish{
+		TurnID:    turnID,
+		Cancelled: cancelled,
+		Reason:    reason,
+	})
+	if err == nil {
+		s.applyThreadState(next)
+		return nil
 	}
-	return store.ErrRevisionConflict
+	// Another writer may have already closed the same turn after a lost CAS.
+	if errors.Is(err, store.ErrInvalidThreadLifecycle) {
+		state, loadErr := s.threads.LoadThread(context.Background(), s.id)
+		if loadErr != nil {
+			return loadErr
+		}
+		s.applyThreadState(state)
+		return nil
+	}
+	return err
 }
 
 func (s *Session) streamAnswer(ctx context.Context, view []*schema.Message, onChunk func(string) error, emit EventEmitter) (*schema.Message, error) {
-	stream, err := s.openStream(ctx, view, emit)
+	stream, eventsDone, err := s.openStream(ctx, view, emit)
 	if err != nil {
 		return nil, fmt.Errorf("start response stream: %w", err)
+	}
+	if eventsDone != nil {
+		defer func() { <-eventsDone }()
 	}
 	var closeOnce sync.Once
 	closeStream := func() { closeOnce.Do(stream.Close) }
@@ -592,48 +749,92 @@ func (s *Session) streamAnswer(ctx context.Context, view []*schema.Message, onCh
 	chunks := make([]*schema.Message, 0)
 	for {
 		chunk, recvErr := stream.Recv()
+		if chunk != nil {
+			chunks = append(chunks, chunk)
+			if chunk.Content != "" {
+				if emit != nil {
+					emit(TurnEvent{Kind: TurnEventChunk, Chunk: chunk.Content})
+				}
+				if onChunk != nil {
+					if err := onChunk(chunk.Content); err != nil {
+						return partialResponse(chunks), fmt.Errorf("write response chunk: %w", err)
+					}
+				}
+			}
+		}
 		if errors.Is(recvErr, io.EOF) {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return partialResponse(chunks), err
 			}
 			break
 		}
 		if recvErr != nil {
-			return nil, fmt.Errorf("read response stream: %w", recvErr)
+			return partialResponse(chunks), fmt.Errorf("read response stream: %w", recvErr)
 		}
 		if chunk == nil {
-			return nil, errors.New("read response stream: received an empty message chunk")
-		}
-		chunks = append(chunks, chunk)
-		if chunk.Content == "" {
-			continue
-		}
-		if emit != nil {
-			emit(TurnEvent{Kind: TurnEventChunk, Chunk: chunk.Content})
-		}
-		if onChunk != nil {
-			if err := onChunk(chunk.Content); err != nil {
-				return nil, fmt.Errorf("write response chunk: %w", err)
-			}
+			return partialResponse(chunks), errors.New("read response stream: received an empty message chunk")
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return partialResponse(chunks), err
 	}
 	answer, err := completeMessage(chunks)
 	if err != nil {
-		return nil, fmt.Errorf("combine response stream: %w", err)
+		return partialResponse(chunks), fmt.Errorf("combine response stream: %w", err)
+	}
+	// A final assistant that still carries tool_calls means the ReAct loop
+	// ended before tools ran. Committing it pollutes history and every later
+	// request fails with provider 400 (tool_calls without tool results).
+	if len(answer.ToolCalls) > 0 {
+		return answer, fmt.Errorf("incomplete tool call response: assistant still has %d open tool call(s)", len(answer.ToolCalls))
 	}
 	return answer, nil
 }
 
-func (s *Session) openStream(ctx context.Context, pending []*schema.Message, emit EventEmitter) (Stream, error) {
-	if emit != nil {
-		if aware, ok := s.model.(EventAwareModel); ok {
-			return aware.StreamWithEvents(ctx, pending, emit)
+func partialResponse(chunks []*schema.Message) *schema.Message {
+	if len(chunks) == 0 {
+		return nil
+	}
+	answer, err := completeMessage(chunks)
+	if err == nil {
+		return answer
+	}
+	// A malformed later chunk must not erase the completed call's provider
+	// usage. Preserve the last report we saw; otherwise mark the started call
+	// unavailable with a minimal synthetic assistant response.
+	for i := len(chunks) - 1; i >= 0; i-- {
+		chunk := chunks[i]
+		if chunk == nil || chunk.ResponseMeta == nil || chunk.ResponseMeta.Usage == nil {
+			continue
+		}
+		usageCopy := *chunk.ResponseMeta.Usage
+		return &schema.Message{
+			Role:         schema.Assistant,
+			ResponseMeta: &schema.ResponseMeta{Usage: &usageCopy},
 		}
 	}
-	return s.model.Stream(ctx, pending)
+	return schema.AssistantMessage("", nil)
+}
+
+func (s *Session) openStream(ctx context.Context, pending []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error) {
+	if emit != nil {
+		if aware, ok := s.model.(EventAwareModel); ok {
+			stream, done, err := aware.StreamWithEvents(ctx, pending, emit)
+			if err != nil {
+				return stream, done, err
+			}
+			if stream == nil {
+				return nil, nil, errors.New("event-aware model returned no stream")
+			}
+			if done != nil {
+				return stream, done, nil
+			}
+			stream.Close()
+			return nil, nil, errors.New("event-aware model returned no event completion signal")
+		}
+	}
+	stream, err := s.model.Stream(ctx, pending)
+	return stream, nil, err
 }
 
 func completeMessage(chunks []*schema.Message) (*schema.Message, error) {
@@ -746,37 +947,35 @@ func (s *Session) compact(ctx context.Context, focus string, automatic bool) (Co
 	if automatic && state.AutoCompactionPaused {
 		return CompactionResult{}, ErrNoCompactionCandidates
 	}
+	if state.PendingCompaction != nil {
+		return CompactionResult{}, fmt.Errorf("%w %q", ErrThreadHasPendingCompaction, state.PendingCompaction.OperationID)
+	}
+	operationID := newLocalID("compact")
 	groups, err := s.threads.LoadTurnGroups(context.Background(), s.id)
 	if err != nil {
 		return CompactionResult{}, fmt.Errorf("load compaction turns: %w", err)
 	}
 	all := durableContextGroups(groups)
-	evidenceAll, err := durableCompactionGroups(ctx, s.threads, s.id, groups)
-	if err != nil {
-		return CompactionResult{}, fmt.Errorf("load compaction artifacts: %w", err)
-	}
 	checkpoint, coverage := s.checkpointAndCoverage()
 	if state.ActiveCheckpointID == "" {
 		checkpoint = nil
 		coverage = nil
 	} else if checkpoint == nil || checkpoint.ID != state.ActiveCheckpointID {
-		persisted, loadErr := s.threads.LoadCheckpoint(context.Background(), s.id, state.ActiveCheckpointID)
+		parsed, parsedCoverage, loadErr := loadVerifiedActiveCheckpoint(context.Background(), s.threads, s.id, state.ActiveCheckpointID, groups)
 		if loadErr != nil {
-			return CompactionResult{}, fmt.Errorf("load active checkpoint: %w", loadErr)
-		}
-		parsed, parseErr := contextbuild.ParseCheckpointJSON(persisted.Payload)
-		if parseErr != nil {
-			return CompactionResult{}, fmt.Errorf("parse active checkpoint: %w", parseErr)
-		}
-		parsed.ID = persisted.ID
-		checkpoint = &parsed
-		coverage, loadErr = checkpointCoverage(context.Background(), s.threads, s.id, persisted.ID)
-		if loadErr != nil {
+			if automatic {
+				return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, true, fmt.Errorf("load active checkpoint lineage: %w", loadErr))
+			}
 			return CompactionResult{}, fmt.Errorf("load active checkpoint lineage: %w", loadErr)
 		}
+		checkpoint = &parsed
+		coverage = parsedCoverage
 	}
 	plan, err := s.planForGroups(all, checkpoint, coverage, nil)
 	if err != nil {
+		if automatic {
+			return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, true, err)
+		}
 		return CompactionResult{}, err
 	}
 	if automatic && !plan.ShouldCompact {
@@ -788,114 +987,262 @@ func (s *Session) compact(ctx context.Context, focus string, automatic bool) (Co
 		return CompactionResult{}, ErrNoCompactionCandidates
 	}
 	directSourceIDs := sourceIDsForGroups(candidates)
-	sourceGroups, err := sourceGroupsWithEvidence(evidenceAll, candidates)
+	sourceGroups, err := durableCompactionSourceGroups(ctx, s.threads, s.id, groups, directSourceIDs)
 	if err != nil {
-		return CompactionResult{}, err
-	}
-	// Carry bounded inherited anchors into the no-tools compactor so claims in
-	// the merged handoff can still cite prior evidence. Exact ancestor coverage
-	// stays in checkpointCoverage and is never copied into the hot JSON.
-	sourceIDs := sourceIDsForGroups(sourceGroups)
-	if checkpoint != nil {
-		sourceIDs = mergeSourceEventIDs(checkpoint.SourceEventIDs, sourceIDs)
+		if automatic {
+			return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, true, fmt.Errorf("load compaction artifacts: %w", err))
+		}
+		return CompactionResult{}, fmt.Errorf("load compaction artifacts: %w", err)
 	}
 	sourceHash, err := contextbuild.HashTurnGroups(sourceGroups)
 	if err != nil {
+		if automatic {
+			return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, true, fmt.Errorf("hash compaction source: %w", err))
+		}
 		return CompactionResult{}, fmt.Errorf("hash compaction source: %w", err)
 	}
 	goal := s.compactionGoal(all)
 	recursive, err := contextbuild.NewRecursiveCompactor(s.compactor, s.contextCfg)
 	if err != nil {
+		if automatic {
+			return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, true, fmt.Errorf("configure recursive compactor: %w", err))
+		}
 		return CompactionResult{}, fmt.Errorf("configure recursive compactor: %w", err)
 	}
-	generated, err := recursive.CompactWithResult(ctx, contextbuild.CompactionRequest{
-		TaskGoal:       goal,
-		Focus:          strings.TrimSpace(focus),
-		Trigger:        compactionTrigger(automatic),
-		SourceGroups:   sourceGroups,
-		SourceEventIDs: sourceIDs,
-		SourceHash:     sourceHash,
-		Previous:       checkpoint,
+	state, err = s.threads.StartCompaction(ctx, s.id, state.Revision, store.CompactionStart{
+		OperationID: operationID,
+		Automatic:   automatic,
 	})
 	if err != nil {
-		return CompactionResult{}, fmt.Errorf("generate checkpoint: %w", err)
+		if errors.Is(err, store.ErrRevisionConflict) {
+			return CompactionResult{}, ErrCompactionStale
+		}
+		return CompactionResult{}, fmt.Errorf("start compaction: %w", err)
+	}
+	s.applyThreadState(state)
+	compactionCtx, cancelCompaction := context.WithCancel(ctx)
+	defer cancelCompaction()
+	var (
+		usageErr       error
+		candidateStale bool
+		usageMu        sync.Mutex
+		usageCalls     = make(map[string]struct{})
+	)
+	observer := contextbuild.CompactionUsageObserver(func(callID string, turn usage.Turn, available bool) {
+		usageMu.Lock()
+		defer usageMu.Unlock()
+		event := ModelUsageEvent{
+			CallID:    callID,
+			Operation: ModelUsageOperationCompaction,
+			Usage:     turn,
+			Available: available,
+		}
+		_, record := s.normalizedModelUsage("", event)
+		record.OperationID = operationID
+		_, seen := usageCalls[record.CallID]
+		expectedRevision := state.Revision
+		next, recordErr := s.threads.RecordUsage(context.Background(), s.id, record)
+		if recordErr != nil {
+			if usageErr == nil {
+				usageErr = fmt.Errorf("persist compaction usage: %w", recordErr)
+			}
+			// No later compactor request can be safely accounted for once durable
+			// usage persistence has failed.
+			cancelCompaction()
+			return
+		}
+		if (!seen && next.Revision != expectedRevision+1) || (seen && next.Revision != expectedRevision) {
+			candidateStale = true
+			// The candidate can no longer commit. Stop recursive chunks before
+			// they spend more provider calls on a known-stale snapshot.
+			cancelCompaction()
+		}
+		usageCalls[record.CallID] = struct{}{}
+		state = next
+		s.applyThreadState(next)
+	})
+	generated, err := recursive.CompactWithResult(compactionCtx, contextbuild.CompactionRequest{
+		TaskGoal:             goal,
+		Focus:                strings.TrimSpace(focus),
+		Trigger:              compactionTrigger(automatic),
+		SourceGroups:         sourceGroups,
+		DirectSourceEventIDs: directSourceIDs,
+		DirectSourceHash:     sourceHash,
+		Previous:             checkpoint,
+	}, observer)
+	usageMu.Lock()
+	recordedUsageErr := usageErr
+	staleCandidate := candidateStale
+	usageMu.Unlock()
+	if staleCandidate {
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, ErrCompactionStale)
+	}
+	if recordedUsageErr != nil {
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, recordedUsageErr)
+	}
+	if err != nil {
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, fmt.Errorf("generate checkpoint: %w", err))
 	}
 	if err := ctx.Err(); err != nil {
-		return CompactionResult{}, err
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, err)
 	}
 	cp := generated.Checkpoint
 	cp.ID = newLocalID("cmp")
 	summaryBudget := s.contextCfg.Normalize().SummaryMaxTokens
 	if cp.EstimatedTokens() > summaryBudget {
-		return CompactionResult{}, fmt.Errorf("%w: %d > %d", contextbuild.ErrCheckpointTooLarge, cp.EstimatedTokens(), summaryBudget)
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, fmt.Errorf("%w: %d > %d", contextbuild.ErrCheckpointTooLarge, cp.EstimatedTokens(), summaryBudget))
 	}
 	payload, err := json.Marshal(cp)
 	if err != nil {
-		return CompactionResult{}, fmt.Errorf("encode checkpoint: %w", err)
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, fmt.Errorf("encode checkpoint: %w", err))
 	}
 	// Estimate the release against the same logical source snapshot. A stale
 	// commit is rejected by expectedRevision, not silently installed.
 	nextCoverage := mergeSourceEventIDs(coverage, directSourceIDs)
 	afterPlan, err := s.planWithCheckpoint(all, &cp, nextCoverage, nil)
 	if err != nil {
-		return CompactionResult{}, err
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, err)
 	}
 	if planHasFallback(afterPlan, "checkpoint_omitted") {
-		return CompactionResult{}, ErrCheckpointNotInstallable
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, ErrCheckpointNotInstallable)
 	}
 	before := plan.ResultTokens
 	after := afterPlan.ResultTokens
 	released := max(0, before-after)
 	gain := percentGain(before, after)
-	// The pre-compaction prompt may already omit old groups under pressure, so
-	// compare the selected source range with its checkpoint rather than two
-	// partially rendered views when deciding whether automatic compaction helps.
-	lowGain := automatic && generated.GainPercent < s.contextCfg.LowGainThresholdPercent
-	autoPaused := automatic && lowGain && state.LowGainStreak+1 >= uint64(s.contextCfg.MaxLowGainAttempts)
 	if err := ctx.Err(); err != nil {
-		return CompactionResult{}, err
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, err)
 	}
 	persisted, nextState, err := s.threads.CommitCheckpoint(ctx, s.id, state.Revision, store.CheckpointInput{
 		ID:       cp.ID,
 		ParentID: state.ActiveCheckpointID,
 		Kind:     "structured",
 		Payload:  payload,
-		// Keep exact direct coverage in the cold ledger. cp.SourceEventIDs are
-		// bounded evidence anchors for the model-visible structured handoff.
+		// Keep exact direct coverage in the cold ledger. The v2 checkpoint holds
+		// only bounded evidence anchors in its model-visible provenance.
 		SourceEventIDs: directSourceIDs,
-		SourceHash:     cp.SourceHash,
+		SourceHash:     cp.DirectSourceHash(),
 		Focus:          strings.TrimSpace(focus),
 		BeforeTokens:   before,
 		AfterTokens:    after,
 		Automatic:      automatic,
-		LowGain:        lowGain,
-		AutoPaused:     autoPaused,
+		OperationID:    operationID,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRevisionConflict) {
-			return CompactionResult{}, ErrCompactionStale
+			return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, ErrCompactionStale)
 		}
-		return CompactionResult{}, fmt.Errorf("commit checkpoint: %w", err)
+		return CompactionResult{}, s.persistCompactionFailure(ctx, state, operationID, automatic, fmt.Errorf("commit checkpoint: %w", err))
 	}
 	cp.ID = persisted.ID
+	cp.StorageHash = persisted.Hash
 	s.setCheckpoint(&cp, nextCoverage)
 	s.applyThreadState(nextState)
+	s.refreshLastCompactionUsage(context.Background())
 	s.setPlan(afterPlan)
 	s.setAutoCompact(false)
 	s.refreshVisibleTranscript()
 	return CompactionResult{
 		CheckpointID:   persisted.ID,
+		OperationID:    operationID,
 		SourceEventIDs: append([]string(nil), directSourceIDs...),
 		BeforeTokens:   before,
 		AfterTokens:    after,
 		ReleasedTokens: released,
 		GainPercent:    gain,
 		Automatic:      automatic,
-		UsedFallback:   generated.UsedFallback,
-		LowGain:        lowGain,
-		AutoPaused:     autoPaused,
 		CompactorCalls: generated.Attempts,
 	}, nil
+}
+
+// persistCompactionFailure records a terminal failure without changing the
+// active checkpoint. Automatic pause policy is applied by the store under its
+// write lock from the latest LowGainStreak. If a stale candidate still owns a
+// pending operation, it is finalized against the latest revision so provider
+// usage cannot be orphaned.
+func (s *Session) persistCompactionFailure(ctx context.Context, state store.ThreadState, operationID string, automatic bool, cause error) error {
+	stale := errors.Is(cause, ErrCompactionStale)
+	cancelled := isCancelledContext(ctx, cause)
+	reason := compactionFailureReason(cause, cancelled)
+	failure := store.CompactionFailure{
+		OperationID:        operationID,
+		Automatic:          automatic,
+		Cancelled:          cancelled || stale,
+		Reason:             reason,
+		MaxLowGainAttempts: s.maxLowGainAttempts,
+	}
+	if !automatic {
+		// A manual retry must not accidentally clear an existing automatic pause
+		// unless it completes successfully and commits a new checkpoint.
+		failure.AutoPaused = state.AutoCompactionPaused
+		failure.AutoPauseReason = state.AutoCompactionPauseReason
+		if failure.AutoPaused && strings.TrimSpace(failure.AutoPauseReason) == "" {
+			// Old checkpoint events predate an explicit pause reason. Preserve the
+			// pause rather than making a later manual failure unrecordable.
+			failure.AutoPauseReason = "automatic compaction paused by a legacy checkpoint"
+		}
+	}
+	next, err := s.threads.RecordCompactionFailure(context.Background(), s.id, state.Revision, failure)
+	if errors.Is(err, store.ErrRevisionConflict) {
+		latest, loadErr := s.threads.LoadThread(context.Background(), s.id)
+		if loadErr != nil {
+			return fmt.Errorf("reload compaction state after revision conflict: %w", loadErr)
+		}
+		if latest.PendingCompaction == nil || latest.PendingCompaction.OperationID != operationID || latest.PendingCompaction.Automatic != automatic {
+			// Preflight failures have no started operation to reconcile, and another
+			// writer may have terminalized this operation and started a new one. In
+			// either case, never let an old result close a different operation.
+			s.applyThreadState(latest)
+			s.refreshLastCompactionUsage(context.Background())
+			return ErrCompactionStale
+		}
+		// A pending operation is identity-bound, so it can safely be finalized
+		// under the store lock after any number of unrelated revisions. This
+		// prevents a second concurrent write from orphaning charged usage.
+		next, err = s.threads.FinishCompaction(context.Background(), s.id, failure)
+		if errors.Is(err, store.ErrCompactionOperationNotPending) {
+			latest, loadErr := s.threads.LoadThread(context.Background(), s.id)
+			if loadErr != nil {
+				return fmt.Errorf("reload compaction state after operation changed: %w", loadErr)
+			}
+			s.applyThreadState(latest)
+			s.refreshLastCompactionUsage(context.Background())
+			return ErrCompactionStale
+		}
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrRevisionConflict) {
+			return ErrCompactionStale
+		}
+		return fmt.Errorf("record compaction failure: %w", err)
+	}
+	s.applyThreadState(next)
+	s.refreshLastCompactionUsage(context.Background())
+	if stale {
+		return ErrCompactionStale
+	}
+	return cause
+}
+
+func compactionFailureReason(err error, cancelled bool) string {
+	switch {
+	case errors.Is(err, ErrCompactionStale):
+		return store.CompactionFailureReasonStale
+	case cancelled:
+		return "cancelled"
+	case errors.Is(err, contextbuild.ErrCompactionLowGain):
+		return store.CompactionFailureReasonLowGain
+	case errors.Is(err, contextbuild.ErrCheckpointTooLarge):
+		return "checkpoint_too_large"
+	case errors.Is(err, contextbuild.ErrCompactionRecursionLimit):
+		return "recursion_limit"
+	case errors.Is(err, contextbuild.ErrUnexpectedCompactorToolCall):
+		return "unexpected_tool_call"
+	case errors.Is(err, ErrCheckpointNotInstallable):
+		return "checkpoint_not_installable"
+	default:
+		return "generation_failed"
+	}
 }
 
 func (s *Session) threadPrompt(current *schema.Message) ([]*schema.Message, contextbuild.PromptPlan, error) {
@@ -1017,15 +1364,6 @@ func (s *Session) compactionGoal(groups []contextbuild.TurnGroup) string {
 	return "Continue the current task safely."
 }
 
-func (s *Session) usageFor(prompt []*schema.Message, answer *schema.Message) usage.Turn {
-	turn, ok := usage.FromMessageUsage(answer)
-	if !ok {
-		turn = usage.EstimateTurn(prompt, answer)
-	}
-	turn.CostUSD = usage.CostUSD(turn.PromptTokens, turn.CompletionTokens, s.pricing)
-	return turn
-}
-
 func (s *Session) setPlan(plan contextbuild.PromptPlan) {
 	s.mu.Lock()
 	s.lastPlan = plan
@@ -1037,8 +1375,8 @@ func (s *Session) checkpointAndCoverage() (*contextbuild.Checkpoint, []string) {
 	defer s.mu.RUnlock()
 	var checkpoint *contextbuild.Checkpoint
 	if s.checkpoint != nil {
-		copy := *s.checkpoint
-		checkpoint = &copy
+		checkpointCopy := *s.checkpoint
+		checkpoint = &checkpointCopy
 	}
 	return checkpoint, append([]string(nil), s.checkpointCoverage...)
 }
@@ -1048,8 +1386,8 @@ func (s *Session) setCheckpoint(checkpoint *contextbuild.Checkpoint, coverage []
 	if checkpoint == nil {
 		s.checkpoint = nil
 	} else {
-		copy := *checkpoint
-		s.checkpoint = &copy
+		checkpointCopy := *checkpoint
+		s.checkpoint = &checkpointCopy
 	}
 	s.checkpointCoverage = append([]string(nil), coverage...)
 	s.mu.Unlock()
@@ -1059,6 +1397,61 @@ func (s *Session) setAutoCompact(value bool) {
 	s.mu.Lock()
 	s.autoCompact = value
 	s.mu.Unlock()
+}
+
+// refreshLastCompactionUsage joins the durable outcome to the provider-call
+// records written under its operation ID. Telemetry failures never prevent a
+// session from opening or a checkpoint transaction from completing.
+func (s *Session) refreshLastCompactionUsage(ctx context.Context) {
+	s.mu.RLock()
+	repo := s.threads
+	threadID := s.id
+	var outcome *store.CompactionOutcome
+	if s.lastCompaction != nil {
+		outcomeCopy := *s.lastCompaction
+		outcome = &outcomeCopy
+	}
+	s.mu.RUnlock()
+	if repo == nil || outcome == nil || strings.TrimSpace(outcome.OperationID) == "" {
+		s.mu.Lock()
+		if s.lastCompaction == nil || outcome == nil || s.lastCompaction.OperationID == outcome.OperationID {
+			s.lastCompactionUsage = nil
+		}
+		s.mu.Unlock()
+		return
+	}
+	records, err := repo.LoadCompactionUsage(ctx, threadID, outcome.OperationID)
+	if err != nil {
+		return
+	}
+	summary := summarizeCompactionUsage(outcome.OperationID, records)
+	s.mu.Lock()
+	if s.lastCompaction != nil && s.lastCompaction.OperationID == outcome.OperationID {
+		s.lastCompactionUsage = &summary
+	}
+	s.mu.Unlock()
+}
+
+func summarizeCompactionUsage(operationID string, records []store.ModelUsage) CompactionUsageSummary {
+	summary := CompactionUsageSummary{OperationID: operationID, Status: store.UsageStatusUnavailable}
+	if len(records) == 0 {
+		return summary
+	}
+	summary.Status = store.UsageStatusExact
+	for _, record := range records {
+		summary.ModelCallCount++
+		if !record.HasProviderUsage {
+			summary.Status = store.UsageStatusIncomplete
+			continue
+		}
+		summary.PromptTokens += record.PromptTokens
+		summary.CompletionTokens += record.CompletionTokens
+		summary.TotalTokens += record.TotalTokens
+		summary.CachedTokens += record.CachedTokens
+		summary.ReasoningTokens += record.ReasoningTokens
+		summary.CostUSD += record.CostUSD
+	}
+	return summary
 }
 
 func (s *Session) applyThreadState(state store.ThreadState) {
@@ -1089,10 +1482,37 @@ func (s *Session) applyThreadStateLocked(state store.ThreadState) {
 	s.promptTokens = state.Meta.PromptTokens
 	s.completionTokens = state.Meta.CompletionTokens
 	s.totalTokens = state.Meta.TotalTokens
+	s.cachedTokens = state.Meta.CachedTokens
+	s.reasoningTokens = state.Meta.ReasoningTokens
+	s.modelCallCount = state.Meta.ModelCallCount
 	s.costUSD = state.Meta.CostUSD
-	s.usageEstimated = state.Meta.UsageEstimated
+	s.usageStatus = state.Meta.UsageStatus
+	if state.Meta.LastContext == nil {
+		s.lastContext = nil
+	} else {
+		contextCopy := *state.Meta.LastContext
+		s.lastContext = &contextCopy
+	}
 	s.autoCompactionPaused = state.AutoCompactionPaused
+	s.autoCompactionPauseReason = state.AutoCompactionPauseReason
 	s.lowGainStreak = state.LowGainStreak
+	previousOperationID := ""
+	if s.lastCompaction != nil {
+		previousOperationID = s.lastCompaction.OperationID
+	}
+	if state.LastCompaction == nil {
+		s.lastCompaction = nil
+	} else {
+		outcome := *state.LastCompaction
+		s.lastCompaction = &outcome
+	}
+	currentOperationID := ""
+	if s.lastCompaction != nil {
+		currentOperationID = s.lastCompaction.OperationID
+	}
+	if previousOperationID != currentOperationID {
+		s.lastCompactionUsage = nil
+	}
 }
 
 // threadTurnRecorder serializes lifecycle event revisions while callbacks may
@@ -1205,6 +1625,24 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 		r.revision = state.Revision
 		r.lastState = state
 	}
+}
+
+// recordUsage keeps usage events in the same revision sequence as tool
+// lifecycle events. This matters because model callbacks can arrive while a
+// tool callback is persisting its artifact.
+func (r *threadTurnRecorder) recordUsage(input store.ModelUsage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return
+	}
+	state, err := r.repo.RecordUsage(context.Background(), r.threadID, input)
+	if err != nil {
+		r.failure = err
+		return
+	}
+	r.revision = state.Revision
+	r.lastState = state
 }
 
 func (r *threadTurnRecorder) commit(input store.TurnCommit) (store.ThreadState, error) {
@@ -1357,6 +1795,17 @@ func buildDurableContextGroups(groups []store.TurnGroup, artifactDigest func(sto
 
 func turnGroupMessages(group store.TurnGroup) []*schema.Message {
 	base := cloneMessages(group.Committed.Messages)
+	// Committed assistants are final answers; tool pairs are rebuilt from the
+	// tool lifecycle below. Strip any residual tool_calls so a polluted commit
+	// cannot be replayed to the provider.
+	for i, message := range base {
+		if message == nil || message.Role != schema.Assistant || len(message.ToolCalls) == 0 {
+			continue
+		}
+		cp := *message
+		cp.ToolCalls = nil
+		base[i] = &cp
+	}
 	if len(group.Tools) == 0 {
 		return base
 	}
@@ -1373,7 +1822,9 @@ func turnGroupMessages(group store.TurnGroup) []*schema.Message {
 	}
 	toolMessages := make([]*schema.Message, 0, len(group.Tools)*2)
 	for i, tool := range group.Tools {
-		if tool.Started == nil {
+		// Only rebuild complete tool pairs. A started-but-unfinished tool must
+		// not reintroduce dangling tool_calls into the model prompt.
+		if tool.Started == nil || tool.Completed == nil {
 			continue
 		}
 		callID := tool.Started.ToolCallID
@@ -1385,12 +1836,10 @@ func turnGroupMessages(group store.TurnGroup) []*schema.Message {
 			Type: "function",
 			Function: schema.FunctionCall{
 				Name:      tool.Started.ToolName,
-				Arguments: tool.Started.Input,
+				Arguments: canonicalToolArguments(tool.Started.Input),
 			},
 		}}))
-		if tool.Completed != nil {
-			toolMessages = append(toolMessages, schema.ToolMessage(tool.Completed.Output, callID, schema.WithToolName(tool.Started.ToolName)))
-		}
+		toolMessages = append(toolMessages, schema.ToolMessage(tool.Completed.Output, callID, schema.WithToolName(tool.Started.ToolName)))
 	}
 	if len(toolMessages) == 0 {
 		return base
@@ -1400,6 +1849,17 @@ func turnGroupMessages(group store.TurnGroup) []*schema.Message {
 	out = append(out, toolMessages...)
 	out = append(out, base[insertAt:]...)
 	return out
+}
+
+// canonicalToolArguments keeps replayed tool calls portable across providers.
+// Anthropic requires a JSON object, while historical OpenAI-compatible logs
+// may contain an empty string, a scalar, or malformed JSON.
+func canonicalToolArguments(arguments string) string {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(arguments), &object); err != nil || object == nil {
+		return "{}"
+	}
+	return arguments
 }
 
 func uncoveredGroups(groups []contextbuild.TurnGroup, coverage []string) []contextbuild.TurnGroup {
@@ -1454,23 +1914,65 @@ func compactionCandidates(all []contextbuild.TurnGroup, coverage []string, keepR
 	return candidates
 }
 
-func sourceGroupsWithEvidence(evidenceAll, candidates []contextbuild.TurnGroup) ([]contextbuild.TurnGroup, error) {
-	if len(candidates) == 0 {
-		return nil, nil
+// durableCompactionSourceGroups hydrates only the durable groups selected by
+// one exact source manifest. A checkpoint lineage and a new compaction both
+// need artifact bytes for hashing, but unrelated hot or covered turns must not
+// make resume or a candidate compaction fail.
+func durableCompactionSourceGroups(ctx context.Context, repo store.ThreadRepository, threadID string, groups []store.TurnGroup, sourceEventIDs []string) ([]contextbuild.TurnGroup, error) {
+	selected, err := completeDurableSourceGroups(groups, sourceEventIDs)
+	if err != nil {
+		return nil, err
 	}
-	byID := make(map[string]contextbuild.TurnGroup, len(evidenceAll))
-	for _, group := range evidenceAll {
-		byID[group.ID] = group
-	}
-	out := make([]contextbuild.TurnGroup, 0, len(candidates))
-	for _, candidate := range candidates {
-		group, ok := byID[candidate.ID]
-		if !ok {
-			return nil, fmt.Errorf("compaction evidence missing turn group %q", candidate.ID)
+	return durableCompactionGroups(ctx, repo, threadID, selected)
+}
+
+// completeDurableSourceGroups resolves a cold source manifest without reading
+// artifacts. Checkpoint source IDs always select complete turn transactions,
+// so a partial or missing match is a durable integrity failure.
+func completeDurableSourceGroups(groups []store.TurnGroup, sourceEventIDs []string) ([]store.TurnGroup, error) {
+	wanted := make(map[string]struct{}, len(sourceEventIDs))
+	for _, id := range sourceEventIDs {
+		if strings.TrimSpace(id) == "" {
+			return nil, errors.New("source event ids contain an empty value")
 		}
-		out = append(out, group)
+		if _, exists := wanted[id]; exists {
+			return nil, fmt.Errorf("source event id %q is duplicated", id)
+		}
+		wanted[id] = struct{}{}
 	}
-	return out, nil
+	if len(wanted) == 0 {
+		return nil, errors.New("source event ids are required")
+	}
+
+	selected := make([]store.TurnGroup, 0)
+	for _, group := range groups {
+		matched := 0
+		for _, id := range group.SourceEventIDs {
+			if _, ok := wanted[id]; ok {
+				matched++
+			}
+		}
+		if matched == 0 {
+			continue
+		}
+		if group.Started == nil || group.Committed == nil {
+			return nil, fmt.Errorf("source event ids select incomplete turn group %q", group.TurnID)
+		}
+		if matched != len(group.SourceEventIDs) {
+			return nil, fmt.Errorf("source event ids select only part of turn group %q", group.TurnID)
+		}
+		selected = append(selected, group)
+	}
+
+	actual := make([]string, 0)
+	for _, group := range selected {
+		actual = append(actual, group.SourceEventIDs...)
+	}
+	actual = uniqueSourceEventIDs(actual)
+	if !sameSourceEventIDs(actual, sourceEventIDs) {
+		return nil, errors.New("source event ids do not match durable turn groups")
+	}
+	return selected, nil
 }
 
 func sourceIDsForGroups(groups []contextbuild.TurnGroup) []string {
@@ -1502,6 +2004,125 @@ func mergeSourceEventIDs(parts ...[]string) []string {
 		ids = append(ids, part...)
 	}
 	return uniqueSourceEventIDs(ids)
+}
+
+// loadVerifiedActiveCheckpoint binds the model-visible v2 payload to the cold
+// checkpoint lineage before a session can use it. Store checkpoint metadata is
+// authoritative for the direct source manifest and durable parent binding.
+func loadVerifiedActiveCheckpoint(ctx context.Context, repo store.ThreadRepository, threadID, checkpointID string, groups []store.TurnGroup) (contextbuild.Checkpoint, []string, error) {
+	if repo == nil || checkpointID == "" {
+		return contextbuild.Checkpoint{}, nil, errors.New("active checkpoint repository and id are required")
+	}
+	lineage, err := repo.LoadCheckpointLineage(ctx, threadID, checkpointID)
+	if err != nil {
+		return contextbuild.Checkpoint{}, nil, err
+	}
+	if len(lineage) == 0 {
+		return contextbuild.Checkpoint{}, nil, errors.New("active checkpoint lineage is empty")
+	}
+
+	parts := make([][]string, 0, len(lineage))
+	var (
+		parent   *contextbuild.ParentCheckpointRef
+		parentID string
+		active   contextbuild.Checkpoint
+	)
+	// The store returns active-to-root. Validate root-to-active so each payload
+	// can bind to the actual persisted parent hash and lineage hash.
+	for i := len(lineage) - 1; i >= 0; i-- {
+		persisted := lineage[i]
+		if persisted.ParentID != parentID {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q parent %q does not match verified parent %q", persisted.ID, persisted.ParentID, parentID)
+		}
+		evidence, evidenceErr := durableCompactionSourceGroups(ctx, repo, threadID, groups, persisted.SourceEventIDs)
+		if evidenceErr != nil {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q cold source: %w", persisted.ID, evidenceErr)
+		}
+		if err := validateCheckpointColdSource(persisted, evidence); err != nil {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q cold source: %w", persisted.ID, err)
+		}
+		expected, provenanceErr := contextbuild.CheckpointProvenanceForSource(persisted.SourceEventIDs, persisted.SourceHash, parent)
+		if provenanceErr != nil {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q cold provenance: %w", persisted.ID, provenanceErr)
+		}
+		parsed, parseErr := contextbuild.ParseCheckpointJSONForSource(persisted.Payload, expected, persisted.SourceEventIDs)
+		if parseErr != nil {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q payload provenance: %w", persisted.ID, parseErr)
+		}
+		parsed.ID = persisted.ID
+		parsed.StorageHash = persisted.Hash
+		active = parsed
+		parts = append(parts, persisted.SourceEventIDs)
+		parentID = persisted.ID
+		parent = &contextbuild.ParentCheckpointRef{
+			ID:          persisted.ID,
+			Hash:        persisted.Hash,
+			LineageHash: parsed.Provenance.LineageHash,
+		}
+	}
+	return active, mergeSourceEventIDs(parts...), nil
+}
+
+// validateCheckpointColdSource binds persisted direct-source metadata to the
+// immutable raw ledger representation. Payload and checkpoint metadata being
+// self-consistent is not enough: otherwise a forged source list could hide raw
+// groups from the next prompt projection.
+func validateCheckpointColdSource(checkpoint store.Checkpoint, evidenceAll []contextbuild.TurnGroup) error {
+	wanted := make(map[string]struct{}, len(checkpoint.SourceEventIDs))
+	for _, id := range checkpoint.SourceEventIDs {
+		if strings.TrimSpace(id) == "" {
+			return errors.New("source event ids contain an empty value")
+		}
+		if _, exists := wanted[id]; exists {
+			return fmt.Errorf("source event id %q is duplicated", id)
+		}
+		wanted[id] = struct{}{}
+	}
+	if len(wanted) == 0 {
+		return errors.New("source event ids are required")
+	}
+
+	groups := make([]contextbuild.TurnGroup, 0)
+	for _, group := range evidenceAll {
+		ids := group.EffectiveSourceEventIDs()
+		matched := 0
+		for _, id := range ids {
+			if _, ok := wanted[id]; ok {
+				matched++
+			}
+		}
+		if matched == 0 {
+			continue
+		}
+		if matched != len(ids) {
+			return fmt.Errorf("source event ids select only part of turn group %q", group.ID)
+		}
+		groups = append(groups, group)
+	}
+	actualIDs := sourceIDsForGroups(groups)
+	if !sameSourceEventIDs(actualIDs, checkpoint.SourceEventIDs) {
+		return errors.New("source event ids do not match durable turn groups")
+	}
+	hash, err := contextbuild.HashTurnGroups(groups)
+	if err != nil {
+		return fmt.Errorf("hash durable source groups: %w", err)
+	}
+	if hash != checkpoint.SourceHash {
+		return errors.New("source hash does not match durable turn groups")
+	}
+	return nil
+}
+
+func sameSourceEventIDs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func checkpointCoverage(ctx context.Context, repo store.ThreadRepository, threadID, checkpointID string) ([]string, error) {
@@ -1557,6 +2178,26 @@ func isCancelledContext(ctx context.Context, err error) bool {
 		return true
 	}
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "context canceled")
+}
+
+func turnTerminationReason(ctx context.Context, err error) string {
+	if runtimeguard.IsTurnDeadlineExceeded(ctx) {
+		return runtimeguard.TurnTimeoutReason
+	}
+	if err == nil {
+		return "turn terminated"
+	}
+	return err.Error()
+}
+
+func turnTerminationError(ctx context.Context, err error) error {
+	if runtimeguard.IsTurnDeadlineExceeded(ctx) {
+		if err == nil {
+			return runtimeguard.ErrTurnDeadlineExceeded
+		}
+		return fmt.Errorf("%v: %w", err, runtimeguard.ErrTurnDeadlineExceeded)
+	}
+	return err
 }
 
 func newLocalID(prefix string) string {

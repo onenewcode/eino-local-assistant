@@ -103,6 +103,15 @@ type TurnGroup struct {
 	Artifacts      []ArtifactRef     `json:"artifacts,omitempty"`
 	TokenEstimate  int               `json:"token_estimate,omitempty"`
 	Required       bool              `json:"required,omitempty"`
+
+	// derivedCheckpoint marks an in-memory recursive merge input. It is never
+	// serialized to a provider, and prevents a second merge-of-merges from
+	// severing interior raw-event provenance.
+	derivedCheckpoint bool
+	// visibleCheckpointEventIDs is the subset of a synthetic checkpoint's direct
+	// events that its merge prompt actually exposes. It remains in memory so a
+	// final merge cannot cite an arbitrary event from the larger cold manifest.
+	visibleCheckpointEventIDs []string
 }
 
 // EffectiveSourceEventIDs returns explicit event IDs, falling back to the

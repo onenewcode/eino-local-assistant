@@ -34,7 +34,7 @@ func NewGetCurrentTime(clock func() time.Time) (tool.InvokableTool, error) {
 
 	return utils.InferTool(
 		"get_current_time",
-		"Return the real current local date and time. Call this whenever the user asks about today's date, the current time, weekday, timezone, or whether something is overdue. Never guess the current date or time.",
+		"Return the real current local date and time from the host clock. Call this whenever the user asks about today's date, the current time, weekday, timezone, relative deadlines, or whether something is overdue. Never guess or invent the current date or time.",
 		func(_ context.Context, input GetCurrentTimeInput) (GetCurrentTimeOutput, error) {
 			now := clock()
 			loc := time.Local

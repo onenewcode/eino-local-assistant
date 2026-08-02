@@ -1,0 +1,339 @@
+package tools
+
+import (
+	"context"
+	"sort"
+	"strings"
+	"sync"
+)
+
+// ApprovalMode controls how DecisionAsk is handled at the tool boundary.
+type ApprovalMode string
+
+const (
+	// ApprovalOnRequest prompts the user (or denys when no Approver is wired).
+	ApprovalOnRequest ApprovalMode = "on_request"
+	// ApprovalNever auto-allows ask decisions (hard deny still applies).
+	ApprovalNever ApprovalMode = "never"
+)
+
+// NormalizeApprovalMode maps empty / Codex "on-request" to on_request.
+func NormalizeApprovalMode(mode string) ApprovalMode {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", string(ApprovalOnRequest), "on-request":
+		return ApprovalOnRequest
+	case string(ApprovalNever):
+		return ApprovalNever
+	default:
+		return ApprovalMode(strings.ToLower(strings.TrimSpace(mode)))
+	}
+}
+
+// ApprovalAction is the user's choice for an ask decision.
+type ApprovalAction string
+
+const (
+	ApprovalOnce    ApprovalAction = "once"
+	ApprovalSession ApprovalAction = "session"
+	ApprovalDeny    ApprovalAction = "deny"
+)
+
+// Well-known deny / approval reasons (stable strings for models and tests).
+const (
+	ReasonPolicyDenied      = "policy_denied"
+	ReasonUserDenied        = "user_denied"
+	ReasonUserDeniedSession = "user_denied_session"
+	ReasonApprovalTimedOut  = "approval_timed_out"
+	ReasonApprovalCancelled = "approval_cancelled"
+	ReasonApproverNotReady  = "approver_not_ready"
+	ReasonApproverMissing   = "approval required but no approver is configured"
+	ReasonWorkspaceOnly     = "workspace_only"
+	// ReasonWorkspaceSymlink identifies a path that would escape through a
+	// workspace-internal symlink.
+	ReasonWorkspaceSymlink = "workspace_symlink"
+	// ReasonSandboxUnavailable indicates that a strict tool sandbox could not
+	// be started. Callers must not silently retry the command on the host.
+	ReasonSandboxUnavailable = "sandbox_unavailable"
+	// ReasonHostEscalationDenied identifies a user rejection of a one-shot
+	// request to leave the sandbox.
+	ReasonHostEscalationDenied = "host_escalation_denied"
+	ReasonUnknownApproval      = "unknown_approval_action"
+	// ReasonStopRetryingSuffix is attached after repeated soft denials of the same rule_key.
+	ReasonStopRetryingSuffix = "stop_retrying: repeated denials for this command prefix; change approach or ask the user—do not spam the same blocked prefix"
+	// ReasonUserDeniedNoRetry tells the model a human rejection is final for this action.
+	// Unlike policy_denied, equivalent shell rewrites (touch→redirect, other write tools) are not appropriate.
+	ReasonUserDeniedNoRetry = "stop_retrying: the human rejected this action; do not retry with equivalent shell forms or apply_patch workarounds; acknowledge the rejection and ask what they want instead"
+)
+
+// defaultMaxDenyStreak is how many consecutive soft denials for the same
+// rule_key trigger a stop_retrying hint (anti R2 storm within MaxStep).
+const defaultMaxDenyStreak = 3
+
+// ApprovalRequest is shown to the user when policy returns ask.
+type ApprovalRequest struct {
+	Tool       string
+	Command    string
+	WorkingDir string
+	Reason     string
+	RuleID     string
+	// RuleKey is the session-allow fingerprint for "allow for session".
+	RuleKey string
+	// Escalated marks a request to run a command outside the configured
+	// sandbox. It is intentionally displayed as a higher-risk approval.
+	Escalated bool
+	// AllowSession controls whether the UI may offer an "allow for session"
+	// response. Host escalations are always one-shot.
+	AllowSession bool
+}
+
+// ApprovalResponse is the user's answer to an ApprovalRequest.
+type ApprovalResponse struct {
+	Action ApprovalAction
+	// Reason is set by the Approver on automatic deny (timeout, cancel, not ready).
+	Reason string
+}
+
+// Approver blocks until the user (or a test double) answers an ask decision.
+type Approver interface {
+	Request(ctx context.Context, req ApprovalRequest) (ApprovalResponse, error)
+}
+
+// SessionAllowlist remembers rule keys approved for the current process/session.
+type SessionAllowlist struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+// NewSessionAllowlist returns an empty allowlist.
+func NewSessionAllowlist() *SessionAllowlist {
+	return &SessionAllowlist{keys: make(map[string]struct{})}
+}
+
+// Allow records a session-scoped allow for key.
+func (s *SessionAllowlist) Allow(key string) {
+	if s == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.keys == nil {
+		s.keys = make(map[string]struct{})
+	}
+	s.keys[key] = struct{}{}
+}
+
+// Contains reports whether key was session-allowed.
+func (s *SessionAllowlist) Contains(key string) bool {
+	if s == nil {
+		return false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.keys[key]
+	return ok
+}
+
+// List returns sorted keys for stable /permissions display.
+func (s *SessionAllowlist) List() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.keys))
+	for k := range s.keys {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SessionDenylist remembers rule keys the user explicitly denied this session.
+// Re-requests with the same RuleKey soft-deny without re-prompting.
+// This does not cover every equivalent rewrite (touch vs echo>); user_denied
+// results still set stop_retrying so the model is told not to rewrite for effect.
+type SessionDenylist struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+// NewSessionDenylist returns an empty denylist.
+func NewSessionDenylist() *SessionDenylist {
+	return &SessionDenylist{keys: make(map[string]struct{})}
+}
+
+// Deny records a session-scoped deny for key.
+func (s *SessionDenylist) Deny(key string) {
+	if s == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.keys == nil {
+		s.keys = make(map[string]struct{})
+	}
+	s.keys[key] = struct{}{}
+}
+
+// Contains reports whether key was session-denied by the user.
+func (s *SessionDenylist) Contains(key string) bool {
+	if s == nil {
+		return false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.keys[key]
+	return ok
+}
+
+// Clear removes a session deny (e.g. after an explicit later allow).
+func (s *SessionDenylist) Clear(key string) {
+	if s == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.keys, key)
+}
+
+// List returns sorted keys for /permissions display.
+func (s *SessionDenylist) List() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.keys))
+	for k := range s.keys {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DenyStreak tracks consecutive soft denials per rule_key to hint the model
+// to stop R2-retrying the same blocked command prefix.
+type DenyStreak struct {
+	mu        sync.Mutex
+	counts    map[string]int
+	maxStreak int
+}
+
+// NewDenyStreak returns a tracker; limit<=0 uses defaultMaxDenyStreak.
+func NewDenyStreak(limit int) *DenyStreak {
+	if limit <= 0 {
+		limit = defaultMaxDenyStreak
+	}
+	return &DenyStreak{counts: make(map[string]int), maxStreak: limit}
+}
+
+// RecordDeny increments the streak for key and reports whether to attach stop_retrying.
+func (d *DenyStreak) RecordDeny(key string) (count int, stopRetrying bool) {
+	if d == nil {
+		return 0, false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.counts == nil {
+		d.counts = make(map[string]int)
+	}
+	d.counts[key]++
+	count = d.counts[key]
+	return count, count >= d.maxStreak
+}
+
+// Reset clears the streak after a successful authorization/execution path.
+func (d *DenyStreak) Reset(key string) {
+	if d == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.counts, key)
+}
+
+// RuleKey builds a stable session-allow fingerprint for a command.
+// Uses the first two tokens when available so "git push origin" and
+// "git push --force" share a key without allowing all of "git".
+func RuleKey(tool, command, workspaceRoot string) string {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		tool = "shell"
+	}
+	tokens := strings.Fields(strings.TrimSpace(command))
+	prefix := ""
+	switch {
+	case len(tokens) >= 2:
+		prefix = tokens[0] + " " + tokens[1]
+	case len(tokens) == 1:
+		prefix = tokens[0]
+	default:
+		prefix = "(empty)"
+	}
+	ws := strings.TrimSpace(workspaceRoot)
+	if ws == "" {
+		ws = "(no-workspace)"
+	}
+	return tool + "|" + prefix + "|" + ws
+}
+
+// PathRuleKey builds a session-allow fingerprint for path-scoped tools
+// (apply_patch). Uses the canonical absolute path.
+func PathRuleKey(tool, absPath, workspaceRoot string) string {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		tool = "path"
+	}
+	path := canonicalizePath(absPath)
+	if path == "" {
+		path = "(empty)"
+	}
+	ws := strings.TrimSpace(workspaceRoot)
+	if ws == "" {
+		ws = "(no-workspace)"
+	}
+	return tool + "|" + path + "|" + ws
+}
+
+// AutoApprover always returns the configured action (for tests / never mode helpers).
+type AutoApprover struct {
+	Action ApprovalAction
+	Reason string
+}
+
+// Request implements Approver.
+func (a AutoApprover) Request(_ context.Context, _ ApprovalRequest) (ApprovalResponse, error) {
+	action := a.Action
+	if action == "" {
+		action = ApprovalOnce
+	}
+	return ApprovalResponse{Action: action, Reason: a.Reason}, nil
+}

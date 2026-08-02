@@ -1,0 +1,83 @@
+# 复制为 config.toml 后填写；不要提交含密钥的 config.toml。
+#
+# 工具面 = Codex 子集：shell + apply_patch（另加 get_current_time / read_artifact）
+# 权限语法：approval_policy + [workspace] + [sandbox] + [permissions] allow/ask/deny
+#   Shell(...)  — shell 命令
+#   ApplyPatch(path-glob) — 文件补丁
+
+approval_policy = "on-request"
+
+[model]
+provider = "openai"
+base_url = "https://your-openai-endpoint/v1"
+api_key = "replace-with-your-api-key"
+name = "your-model-name"
+timeout_seconds = 60
+
+[model.context]
+window_tokens = 32000
+max_output_tokens = 4096
+keep_recent_turns = 12
+auto_compact_trigger_percent = 75
+post_compact_target_percent = 45
+summary_max_tokens = 2048
+max_low_gain_attempts = 2
+low_gain_threshold_percent = 15
+
+[model.pricing]
+input_per_million = 0.0
+output_per_million = 0.0
+
+[assistant]
+system_prompt = "你是一个严谨、实用的编程助手。"
+
+[workspace]
+root = ""
+
+# 默认 workspace-write：shell 与 apply_patch 在短生命周期 worker 中运行，
+# 只能修改 workspace；read-only 会将 workspace 以只读方式暴露。
+[sandbox]
+mode = "workspace-write"
+# 仅接受已存在的绝对目录；按真实路径规范化后以只读方式挂载。
+# read_only_roots = ["/absolute/path/to/go-or-node-toolchain"]
+# 这里只能追加字面工作区路径或字面 `/**` 子树；内建 .git、.agents、.codex、.eino、.env 永远受保护。
+# protected_paths = [".env.local", "secrets/**"]
+
+# 空列表表示无网络。仅允许精确 DNS 主机名（不接受 URL、端口、IP 或通配符）。
+# [sandbox.network]
+# allowed_domains = ["proxy.golang.org", "registry.npmjs.org"]
+
+# 单个 ReAct turn 的总预算；0 也会采用下列默认值。
+[runtime]
+max_turn_seconds = 600
+max_react_steps = 8
+max_tool_calls = 16
+
+[permissions]
+profile = "cautious"
+# allow = ["Shell(go test *)", "ApplyPatch(src/**)"]
+# ask = ["Shell(git push *)"]
+# deny = ["Shell(sudo *)", "ApplyPatch(.env)"]
+
+# [tools.shell]
+# timeout_seconds = 60
+# max_output_bytes = 65536
+#
+# [tools.apply_patch]
+# max_bytes = 262144
+
+[storage]
+data_dir = ""
+
+# Project instructions + semantic memory (not session resume). See docs/memory.md.
+[rules]
+enabled = true
+# max_tokens = 8000
+
+[memory]
+enabled = true              # inject summary + expose memory_* read tools
+generate = true             # idle auto-extract candidates from session journals
+# max_summary_tokens = 2500
+# idle_after = "6h"
+# max_rollouts_per_scan = 2
+# scan_max_age = "10d"

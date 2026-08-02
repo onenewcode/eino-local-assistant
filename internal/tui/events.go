@@ -35,6 +35,14 @@ type turnToolErrorMsg struct {
 	err    error
 }
 
+// turnUsageMsg carries one completed provider call for the turn footer line.
+// Durable accounting stays in the session ledger; context occupancy is on the
+// global status bar (not repeated in this footer).
+type turnUsageMsg struct {
+	turnID int
+	usage  chat.ModelUsageEvent
+}
+
 type turnDoneMsg struct {
 	turnID int
 	err    error
@@ -99,6 +107,12 @@ func emitFromTurnEvent(ctx context.Context, turnID int, ch chan<- tea.Msg) chat.
 			msg = turnToolEndMsg{turnID: turnID, tool: ev.Tool, callID: ev.ToolCallID, output: ev.Output}
 		case chat.TurnEventToolError:
 			msg = turnToolErrorMsg{turnID: turnID, tool: ev.Tool, callID: ev.ToolCallID, err: ev.Err}
+		case chat.TurnEventModelUsage:
+			if ev.ModelUsage == nil {
+				return
+			}
+			// The producer may reuse its event object after Emit returns.
+			msg = turnUsageMsg{turnID: turnID, usage: *ev.ModelUsage}
 		default:
 			return
 		}

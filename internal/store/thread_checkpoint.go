@@ -15,6 +15,7 @@ import (
 // checkpoint file is written before its journal event, so an interrupted write
 // can only leave an unreferenced file and never a dangling active state.
 func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedRevision uint64, input CheckpointInput) (Checkpoint, ThreadState, error) {
+	input.OperationID = strings.TrimSpace(input.OperationID)
 	if err := validateCheckpointInput(input); err != nil {
 		return Checkpoint{}, ThreadState{}, err
 	}
@@ -33,6 +34,13 @@ func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedR
 	if strings.TrimSpace(input.ParentID) != state.ActiveCheckpointID {
 		return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint parent %q does not match active checkpoint %q", input.ParentID, state.ActiveCheckpointID)
 	}
+	if state.PendingCompaction != nil {
+		if strings.TrimSpace(input.OperationID) != state.PendingCompaction.OperationID || input.Automatic != state.PendingCompaction.Automatic {
+			return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint does not match pending compaction operation %q", state.PendingCompaction.OperationID)
+		}
+	} else if input.OperationID != "" {
+		return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint for operation %q requires a pending compaction", input.OperationID)
+	}
 	if input.ParentID != "" {
 		if _, err := checkpointFromJournal(events, input.ParentID); err != nil {
 			return Checkpoint{}, ThreadState{}, fmt.Errorf("load checkpoint parent: %w", err)
@@ -45,6 +53,9 @@ func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedR
 	}
 
 	checkpoint := checkpointFromInput(id, state, input, time.Now().UTC())
+	if _, existingErr := checkpointFromJournal(events, checkpoint.ID); existingErr == nil {
+		return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint %q already exists in journal", checkpoint.ID)
+	}
 	path := checkpointPath(dir, checkpoint.ID)
 	if _, err := os.Stat(path); err == nil {
 		return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint %q already exists", checkpoint.ID)
@@ -157,8 +168,11 @@ func checkpointFromInput(threadID string, state ThreadState, input CheckpointInp
 		BeforeTokens:   input.BeforeTokens,
 		AfterTokens:    input.AfterTokens,
 		Automatic:      input.Automatic,
-		LowGain:        input.LowGain,
-		AutoPaused:     input.AutoPaused,
+		// LowGain is never written for new checkpoints; streak lives on failures.
+		LowGain:         false,
+		AutoPaused:      input.AutoPaused,
+		AutoPauseReason: strings.TrimSpace(input.AutoPauseReason),
+		OperationID:     strings.TrimSpace(input.OperationID),
 	}
 	if checkpoint.Kind == "" {
 		checkpoint.Kind = "compaction"

@@ -27,18 +27,63 @@ func shortSessionID(id string) string {
 	return id[:8] + "…"
 }
 
-type idleStatusParts struct {
-	model   string
-	shortID string
-	title   string
-	tokens  string
-	cost    string
-	ctx     string
-	queued  string
-	follow  string
+// sessionCtxFragment returns a status-bar ctx segment when a measurement is
+// available, otherwise "".
+func sessionCtxFragment(session *chat.Session) string {
+	if session == nil {
+		return ""
+	}
+	return usage.FormatCompactContextSnapshot(sessionContextSnapshot(session))
 }
 
-func collectIdleStatus(session *chat.Session, modelName string, queueN int, followHint bool) idleStatusParts {
+// statusExtras are optional fragments shared by idle and busy status lines.
+type statusExtras struct {
+	cmdPolicy string
+	context   string
+	queued    string
+	follow    string
+}
+
+func collectStatusExtras(session *chat.Session, queueN int, followHint bool, cmdPolicy string) statusExtras {
+	e := statusExtras{
+		context:   sessionCtxFragment(session),
+		cmdPolicy: strings.TrimSpace(cmdPolicy),
+	}
+	if queueN > 0 {
+		e.queued = fmt.Sprintf("queued:%d", queueN)
+	}
+	if followHint {
+		e.follow = "↑ End to follow"
+	}
+	return e
+}
+
+// joinStatusSuffix joins non-empty extras with " · " separators, each prefixed
+// by " · " when the result is non-empty (ready to append after a base label).
+func joinStatusSuffix(e statusExtras) string {
+	var parts []string
+	for _, s := range []string{e.cmdPolicy, e.context, e.queued, e.follow} {
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(parts, " · ")
+}
+
+type idleStatusParts struct {
+	model     string
+	shortID   string
+	title     string
+	cmdPolicy string
+	context   string
+	queued    string
+	follow    string
+}
+
+func collectIdleStatus(session *chat.Session, modelName string, queueN int, followHint bool, cmdPolicy string) idleStatusParts {
 	p := idleStatusParts{}
 	if modelName != "" {
 		p.model = modelName
@@ -55,36 +100,17 @@ func collectIdleStatus(session *chat.Session, modelName string, queueN int, foll
 			}
 			p.title = t
 		}
-		prompt, completion, total, cost, _ := session.UsageTotals()
-		if total > 0 || prompt > 0 || completion > 0 {
-			p.tokens = usage.FormatTokens(total)
-		}
-		if cost > 0 || total > 0 {
-			p.cost = usage.FormatUSD(cost)
-		}
-		contextStatus := session.ContextStatus()
-		if contextStatus.BudgetTokens > 0 && contextStatus.CurrentTokens > 0 {
-			pct := min(100, contextStatus.CurrentTokens*100/contextStatus.BudgetTokens)
-			p.ctx = fmt.Sprintf("ctx=%d%%", pct)
-			if contextStatus.OmittedTurnGroups > 0 || len(contextStatus.LastFallbacks) > 0 {
-				p.ctx += "*"
-			}
-			if contextStatus.CurrentTokens > contextStatus.BudgetTokens {
-				p.ctx += "!"
-			}
-		}
 	}
-	if queueN > 0 {
-		p.queued = fmt.Sprintf("queued:%d", queueN)
-	}
-	if followHint {
-		p.follow = "↑ End to follow"
-	}
+	extras := collectStatusExtras(session, queueN, followHint, cmdPolicy)
+	p.cmdPolicy = extras.cmdPolicy
+	p.context = extras.context
+	p.queued = extras.queued
+	p.follow = extras.follow
 	return p
 }
 
 // formatIdleStatus builds a width-aware idle status label (without styling).
-// Drop order when too wide: title → shortID → model → tokens (keep ready/cost/queue/follow).
+// Drop order when too wide keeps the context signal longer than decoration.
 func formatIdleStatus(width int, p idleStatusParts) string {
 	type seg struct {
 		key  string
@@ -96,9 +122,8 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 		{"title", p.title},
 		{"id", p.shortID},
 		{"model", p.model},
-		{"tokens", p.tokens},
-		{"cost", p.cost},
-		{"ctx", p.ctx},
+		{"cmd", p.cmdPolicy},
+		{"context", p.context},
 		{"queued", p.queued},
 		{"follow", p.follow},
 	}
@@ -106,7 +131,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	join := func(include map[string]bool) string {
 		parts := []string{base}
 		// Preferred display order (not drop order).
-		order := []string{"model", "id", "title", "tokens", "cost", "ctx", "queued", "follow"}
+		order := []string{"model", "id", "title", "cmd", "context", "queued", "follow"}
 		for _, k := range order {
 			if !include[k] {
 				continue
@@ -121,14 +146,14 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	}
 
 	include := map[string]bool{
-		"title": true, "id": true, "model": true, "tokens": true,
-		"cost": true, "ctx": true, "queued": true, "follow": true,
+		"title": true, "id": true, "model": true, "cmd": true,
+		"context": true, "queued": true, "follow": true,
 	}
 	if width <= 0 {
 		width = 80
 	}
-	// Drop priority when over width.
-	dropOrder := []string{"title", "id", "model", "tokens", "ctx"}
+	// Drop priority when over width — keep cmd/ctx longer than decoration.
+	dropOrder := []string{"title", "id", "model", "cmd", "context"}
 	out := join(include)
 	for _, key := range dropOrder {
 		if len(out) <= width {

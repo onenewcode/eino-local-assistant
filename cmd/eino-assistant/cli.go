@@ -12,6 +12,7 @@ import (
 
 	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/store"
+	"eino-local-assistant/internal/usage"
 
 	"github.com/spf13/cobra"
 )
@@ -34,7 +35,7 @@ func newRootCommand() *cobra.Command {
 		Short: "Eino local coding assistant",
 		Long:  "Eino local coding assistant — interactive TUI chat with ReAct tools and session persistence.",
 		Example: fmt.Sprintf(
-			"  %[1]s\n  %[1]s chat --config config.yml\n  %[1]s chat --title \"debug flaky test\"\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
+			"  %[1]s\n  %[1]s chat --config config.toml\n  %[1]s chat --title \"debug flaky test\"\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
 			appName,
 		),
 		Args:          cobra.NoArgs,
@@ -46,7 +47,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 
-	root.PersistentFlags().StringVar(&opts.configPath, "config", "config.yml", "path to the YAML configuration file")
+	root.PersistentFlags().StringVar(&opts.configPath, "config", "config.toml", "path to the TOML configuration file")
 
 	root.AddCommand(
 		newChatCommand(opts),
@@ -96,7 +97,7 @@ func newResumeCommand(opts *rootOptions) *cobra.Command {
 			return runTUI(opts.configPath, sessionStart{resumeID: strings.TrimSpace(args[0]), recoverInterrupted: recoverInterrupted}, cmd.ErrOrStderr())
 		},
 	}
-	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn before resuming")
+	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn or pending compaction before resuming")
 	return cmd
 }
 
@@ -149,18 +150,21 @@ func listSessions(configPath string, stdout io.Writer) error {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tTITLE\tMSGS\tTOKENS\tCOST\tUPDATED")
+	fmt.Fprintln(tw, "ID\tTITLE\tMSGS\tAPI USAGE\tCONTEXT\tCOST~\tUPDATED")
 	for _, meta := range list {
 		title := meta.Title
 		if title == "" {
 			title = "(untitled)"
 		}
-		cost := fmt.Sprintf("$%.4f", meta.CostUSD)
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%s\t%s\n",
+		apiUsage := usage.FormatAPIUsage(usage.APIUsageFromMeta(meta))
+		contextSnapshot := usage.FormatContextSnapshot(meta.LastContext)
+		cost := usage.FormatCostEstimate(meta.CostUSD, meta.UsageStatus)
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
 			meta.ID,
 			title,
 			meta.MessageCount,
-			meta.TotalTokens,
+			apiUsage,
+			contextSnapshot,
 			cost,
 			meta.UpdatedAt.Local().Format(time.RFC3339),
 		)

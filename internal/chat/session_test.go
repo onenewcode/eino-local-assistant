@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/contextbuild"
+	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
@@ -21,6 +22,22 @@ func TestNewSessionRequiresThreadStore(t *testing.T) {
 	_, err := NewSession(&scriptedModel{}, "system instructions", SessionOptions{})
 	if err == nil || !strings.Contains(err.Error(), "thread store is required") {
 		t.Fatalf("NewSession error = %v, want required thread store", err)
+	}
+}
+
+func TestTurnTerminationUsesStableRuntimeDeadlineReason(t *testing.T) {
+	ctx, cancel, err := runtimeguard.WithTurnContext(context.Background(), runtimeguard.TurnOptions{Timeout: time.Nanosecond})
+	if err != nil {
+		t.Fatalf("WithTurnContext() error = %v", err)
+	}
+	defer cancel()
+	<-ctx.Done()
+
+	if got := turnTerminationReason(ctx, context.DeadlineExceeded); got != runtimeguard.TurnTimeoutReason {
+		t.Fatalf("turnTerminationReason() = %q, want %q", got, runtimeguard.TurnTimeoutReason)
+	}
+	if err := turnTerminationError(ctx, context.DeadlineExceeded); !errors.Is(err, runtimeguard.ErrTurnDeadlineExceeded) {
+		t.Fatalf("turnTerminationError() = %v, want runtime deadline sentinel", err)
 	}
 }
 
@@ -128,6 +145,75 @@ func TestSessionAskRollsBackOnStreamFailure(t *testing.T) {
 	assertMessages(t, session.Transcript(), []messageExpectation{
 		{role: schema.System, content: "system instructions"},
 	})
+	if summary := session.UsageSummary(); summary.Status != store.UsageStatusIncomplete || summary.ModelCallCount != 1 || summary.TotalTokens != 0 {
+		t.Fatalf("partial failed stream usage = %+v, want one unavailable call", summary)
+	}
+}
+
+func TestSessionPreservesProviderUsageFromFinalErroredChunk(t *testing.T) {
+	wantErr := errors.New("connection dropped")
+	stream := &scriptedStream{events: []streamEvent{{
+		message: assistantWithProviderUsage("partial reply", 10, 2),
+		err:     wantErr,
+	}}}
+	session, err := NewSession(&scriptedModel{streams: []Stream{stream}}, "system instructions", SessionOptions{
+		Store: newDurableThreadStore(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = session.Ask(context.Background(), "question", nil)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Ask error = %v, want wrapped %v", err, wantErr)
+	}
+	if summary := session.UsageSummary(); summary.Status != store.UsageStatusExact || summary.ModelCallCount != 1 || summary.PromptTokens != 10 || summary.CompletionTokens != 2 || summary.TotalTokens != 12 {
+		t.Fatalf("errored final chunk usage = %+v", summary)
+	}
+}
+
+func TestSessionRecordsProviderUsageForIncompleteToolCallResponse(t *testing.T) {
+	answer := assistantWithProviderUsage("", 10, 2)
+	answer.ToolCalls = []schema.ToolCall{{
+		ID:   "tool-1",
+		Type: "function",
+		Function: schema.FunctionCall{
+			Name:      "get_current_time",
+			Arguments: "{}",
+		},
+	}}
+	session, err := NewSession(&scriptedModel{streams: []Stream{
+		&scriptedStream{events: []streamEvent{{message: answer}}},
+	}}, "system instructions", SessionOptions{Store: newDurableThreadStore(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = session.Ask(context.Background(), "question", nil)
+	if err == nil || !strings.Contains(err.Error(), "incomplete tool call response") {
+		t.Fatalf("Ask error = %v, want incomplete tool call response", err)
+	}
+	if summary := session.UsageSummary(); summary.Status != store.UsageStatusExact || summary.ModelCallCount != 1 || summary.PromptTokens != 10 || summary.CompletionTokens != 2 || summary.TotalTokens != 12 {
+		t.Fatalf("incomplete tool-call usage = %+v", summary)
+	}
+}
+
+func TestSessionPreservesUsageWhenResponseChunksCannotConcat(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{
+		{message: assistantWithProviderUsage("partial", 10, 2)},
+		{message: schema.ToolMessage("malformed stream", "tool-1")},
+	}}
+	session, err := NewSession(&scriptedModel{streams: []Stream{stream}}, "system instructions", SessionOptions{
+		Store: newDurableThreadStore(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = session.Ask(context.Background(), "question", nil)
+	if err == nil || !strings.Contains(err.Error(), "combine response stream") {
+		t.Fatalf("Ask error = %v, want combine response error", err)
+	}
+	if summary := session.UsageSummary(); summary.Status != store.UsageStatusExact || summary.ModelCallCount != 1 || summary.TotalTokens != 12 {
+		t.Fatalf("malformed stream usage = %+v", summary)
+	}
 }
 
 func TestSessionAskRollsBackOnChunkCallbackFailure(t *testing.T) {
@@ -342,9 +428,154 @@ func TestSessionDoesNotPersistFailedTurn(t *testing.T) {
 	})
 }
 
-func TestSessionDoesNotCommitMemoryWhenThreadRevisionChanges(t *testing.T) {
+func TestSessionRejectsIncompleteToolCallFinalAnswer(t *testing.T) {
+	// Simulates a ReAct END that still carries tool_calls (text-then-tool_calls
+	// mis-detection). Must not commit; otherwise the next turn 400s forever.
 	stream := &scriptedStream{events: []streamEvent{
-		{message: schema.AssistantMessage("ok", nil)},
+		{message: &schema.Message{
+			Role:    schema.Assistant,
+			Content: "好的，我帮你看一下现在的时间！",
+			ToolCalls: []schema.ToolCall{{
+				ID:   "call_time_1",
+				Type: "function",
+				Function: schema.FunctionCall{
+					Name:      "get_current_time",
+					Arguments: `{}`,
+				},
+			}},
+		}},
+	}}
+	model := &scriptedModel{streams: []Stream{stream}}
+	st := newDurableThreadStore(t)
+	session, err := NewSession(model, "system instructions", SessionOptions{
+		Store: st,
+		ID:    "sess-tool-incomplete",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	err = session.Ask(context.Background(), "现在时间", nil)
+	if err == nil || !strings.Contains(err.Error(), "incomplete tool call response") {
+		t.Fatalf("Ask error = %v, want incomplete tool call response", err)
+	}
+	state, err := st.LoadThread(context.Background(), "sess-tool-incomplete")
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	if state.Meta.MessageCount != 1 {
+		t.Fatalf("message count = %d, want only system (no polluted commit)", state.Meta.MessageCount)
+	}
+	groups, err := st.LoadTurnGroups(context.Background(), "sess-tool-incomplete")
+	if err != nil {
+		t.Fatalf("LoadTurnGroups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Committed != nil || groups[0].Failed == nil {
+		t.Fatalf("lifecycle = %#v, want failed uncommitted turn", groups)
+	}
+}
+
+func TestTurnGroupMessagesStripsDanglingToolCalls(t *testing.T) {
+	// Polluted commit: final assistant still has tool_calls and no tool lifecycle.
+	// Prompt reconstruction must strip tool_calls so follow-ups can recover.
+	group := store.TurnGroup{
+		TurnID: "turn-polluted",
+		Started: &store.TurnStart{
+			TurnID: "turn-polluted",
+			Input:  "现在时间",
+		},
+		Committed: &store.TurnCommit{
+			TurnID: "turn-polluted",
+			Messages: []*schema.Message{
+				schema.UserMessage("现在时间"),
+				{
+					Role:    schema.Assistant,
+					Content: "好的，我帮你看一下现在的时间！",
+					ToolCalls: []schema.ToolCall{{
+						ID:   "call_time_1",
+						Type: "function",
+						Function: schema.FunctionCall{
+							Name:      "get_current_time",
+							Arguments: `{}`,
+						},
+					}},
+				},
+			},
+		},
+	}
+	msgs := turnGroupMessages(group)
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2: %#v", len(msgs), msgs)
+	}
+	if msgs[1] == nil || msgs[1].Role != schema.Assistant {
+		t.Fatalf("assistant missing: %#v", msgs)
+	}
+	if len(msgs[1].ToolCalls) != 0 {
+		t.Fatalf("dangling tool_calls must be stripped: %#v", msgs[1].ToolCalls)
+	}
+	if msgs[1].Content != "好的，我帮你看一下现在的时间！" {
+		t.Fatalf("content = %q", msgs[1].Content)
+	}
+}
+
+func TestTurnGroupMessagesNormalizesReplayedToolArguments(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "blank", input: "", want: "{}"},
+		{name: "whitespace", input: " \t\n", want: "{}"},
+		{name: "malformed", input: "not-json", want: "{}"},
+		{name: "array", input: "[]", want: "{}"},
+		{name: "object preserved", input: ` { "timezone": "UTC" } `, want: ` { "timezone": "UTC" } `},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			group := store.TurnGroup{
+				TurnID: "turn-replay-tool",
+				Started: &store.TurnStart{
+					TurnID: "turn-replay-tool",
+					Input:  "现在时间",
+				},
+				Tools: []store.ToolGroup{{
+					Started: &store.ToolStarted{
+						TurnID:     "turn-replay-tool",
+						ToolCallID: "call-time",
+						ToolName:   "get_current_time",
+						Input:      tt.input,
+					},
+					Completed: &store.ToolCompleted{
+						TurnID:     "turn-replay-tool",
+						ToolCallID: "call-time",
+						ToolName:   "get_current_time",
+						Output:     "tool output",
+					},
+				}},
+				Committed: &store.TurnCommit{
+					TurnID: "turn-replay-tool",
+					Messages: []*schema.Message{
+						schema.UserMessage("现在时间"),
+						schema.AssistantMessage("现在是下午。", nil),
+					},
+				},
+			}
+
+			messages := turnGroupMessages(group)
+			if len(messages) < 2 || messages[1] == nil || len(messages[1].ToolCalls) != 1 {
+				t.Fatalf("replayed tool call missing: %#v", messages)
+			}
+			if got := messages[1].ToolCalls[0].Function.Arguments; got != tt.want {
+				t.Errorf("replayed arguments = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSessionRebasesUsageWhenThreadRevisionChanges(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{
+		{message: assistantWithProviderUsage("ok", 10, 2)},
 	}}
 	st := newDurableThreadStore(t)
 	var concurrentWriteErr error
@@ -369,28 +600,33 @@ func TestSessionDoesNotCommitMemoryWhenThreadRevisionChanges(t *testing.T) {
 	if concurrentWriteErr != nil {
 		t.Fatalf("concurrent thread write: %v", concurrentWriteErr)
 	}
-	if !errors.Is(err, store.ErrRevisionConflict) {
-		t.Fatalf("Ask error = %v, want revision conflict", err)
+	if err != nil {
+		t.Fatalf("Ask error = %v", err)
 	}
 	groups, loadErr := st.LoadTurnGroups(context.Background(), session.ID())
 	if loadErr != nil {
 		t.Fatalf("LoadTurnGroups: %v", loadErr)
 	}
-	if len(groups) != 1 || groups[0].Failed == nil || groups[0].Committed != nil {
-		t.Fatalf("lost-CAS turn was left active: %#v", groups)
+	if len(groups) != 1 || groups[0].Failed != nil || groups[0].Committed == nil {
+		t.Fatalf("rebased turn = %#v", groups)
+	}
+	if summary := session.UsageSummary(); summary.PromptTokens != 10 || summary.CompletionTokens != 2 || summary.ModelCallCount != 1 || summary.Status != store.UsageStatusExact {
+		t.Fatalf("rebased usage summary = %+v", summary)
 	}
 	resumedModel := &scriptedModel{streams: []Stream{
 		&scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("recovered", nil)}}},
 	}}
 	resumed, openErr := OpenSession(resumedModel, st, session.ID(), SessionOptions{Store: st})
 	if openErr != nil {
-		t.Fatalf("OpenSession after CAS conflict: %v", openErr)
+		t.Fatalf("OpenSession after rebase: %v", openErr)
 	}
 	if askErr := resumed.Ask(context.Background(), "retry", nil); askErr != nil {
-		t.Fatalf("Ask after CAS conflict: %v", askErr)
+		t.Fatalf("Ask after rebase: %v", askErr)
 	}
 	assertMessages(t, session.Transcript(), []messageExpectation{
 		{role: schema.System, content: "system instructions"},
+		{role: schema.User, content: "hi"},
+		{role: schema.Assistant, content: "ok"},
 	})
 }
 
@@ -411,16 +647,30 @@ func TestSessionRecordsUsageFromResponseMeta(t *testing.T) {
 	if err := session.Ask(context.Background(), "hi", nil); err != nil {
 		t.Fatal(err)
 	}
-	turn := session.LastTurnUsage()
-	if turn.PromptTokens != 10 || turn.CompletionTokens != 5 || turn.Estimated {
-		t.Fatalf("turn=%+v", turn)
+	summary := session.UsageSummary()
+	if summary.PromptTokens != 10 || summary.CompletionTokens != 5 || summary.TotalTokens != 15 ||
+		summary.Status != store.UsageStatusExact || summary.CostUSD <= 0 {
+		t.Fatalf("usage summary=%+v", summary)
 	}
-	if turn.CostUSD <= 0 {
-		t.Fatalf("cost=%v", turn.CostUSD)
+}
+
+func TestSessionDoesNotEstimateMissingProviderUsage(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("unreported", nil)}}}
+	session, err := NewSession(&scriptedModel{streams: []Stream{stream}}, "system instructions", SessionOptions{
+		Store: newDurableThreadStore(t),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	p, c, total, cost, est := session.UsageTotals()
-	if p != 10 || c != 5 || total != 15 || est || cost <= 0 {
-		t.Fatalf("totals p=%d c=%d t=%d cost=%v est=%v", p, c, total, cost, est)
+	if err := session.Ask(context.Background(), "hello", nil); err != nil {
+		t.Fatal(err)
+	}
+	summary := session.UsageSummary()
+	if summary.Status != store.UsageStatusIncomplete || summary.TotalTokens != 0 || summary.ModelCallCount != 1 {
+		t.Fatalf("usage summary = %+v, want one unavailable call without estimated tokens", summary)
+	}
+	if session.ContextStatus().MeasuredKnown {
+		t.Fatal("missing provider usage must not create an exact context snapshot")
 	}
 }
 
@@ -434,8 +684,8 @@ func TestSessionSendsBudgetedViewNotFullTranscript(t *testing.T) {
 		}})
 	}
 	cfg := contextbuild.Config{
-		ModelContextTokens:        500,
-		OutputReserveTokens:       100,
+		WindowTokens:              500,
+		MaxOutputTokens:           100,
 		AutoCompactTriggerPercent: 75,
 		PostCompactTargetPercent:  45,
 		KeepRecentTurns:           2,
@@ -462,8 +712,8 @@ func TestSessionSendsBudgetedViewNotFullTranscript(t *testing.T) {
 	session, err := OpenSession(model, st, seed.ID(), SessionOptions{
 		Store: st,
 		Context: contextbuild.Config{
-			ModelContextTokens:        500,
-			OutputReserveTokens:       100,
+			WindowTokens:              500,
+			MaxOutputTokens:           100,
 			AutoCompactTriggerPercent: 75,
 			PostCompactTargetPercent:  45,
 			KeepRecentTurns:           2,

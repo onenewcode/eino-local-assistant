@@ -2,10 +2,11 @@ package contextbuild
 
 // Config controls the context planner and compactor.
 type Config struct {
-	// ModelContextTokens is the provider context capacity. Zero uses 32000.
-	ModelContextTokens int
-	// OutputReserveTokens leaves room for the next response. Zero uses 4096.
-	OutputReserveTokens int
+	// WindowTokens is the provider context capacity. Zero uses 32000.
+	WindowTokens int
+	// MaxOutputTokens limits the next response and is reserved from the prompt.
+	// Zero uses 4096 for direct programmatic callers.
+	MaxOutputTokens int
 	// KeepRecentTurns is the complete turn-group hot window. Zero uses 12.
 	KeepRecentTurns int
 	// AutoCompactTriggerPercent starts automatic compaction at this percentage
@@ -16,23 +17,21 @@ type Config struct {
 	PostCompactTargetPercent int
 	// SummaryMaxTokens caps the model-visible structured checkpoint. Zero uses 2048.
 	SummaryMaxTokens int
-	// MaxLowGainAttempts pauses automatic compaction after repeated low gain.
-	// Zero uses 2.
-	MaxLowGainAttempts int
-	// LowGainThresholdPercent is the minimum useful release. Zero uses 15.
+	// LowGainThresholdPercent is the minimum useful release for installing a
+	// checkpoint. Zero uses 15. How many automatic low-gain failures are
+	// tolerated before pause is session/runtime policy, not planner budget.
 	LowGainThresholdPercent int
 }
 
 // DefaultConfig returns the product budget defaults.
 func DefaultConfig() Config {
 	return Config{
-		ModelContextTokens:        32_000,
-		OutputReserveTokens:       4_096,
+		WindowTokens:              32_000,
+		MaxOutputTokens:           4_096,
 		KeepRecentTurns:           12,
 		AutoCompactTriggerPercent: 75,
 		PostCompactTargetPercent:  45,
 		SummaryMaxTokens:          2_048,
-		MaxLowGainAttempts:        2,
 		LowGainThresholdPercent:   15,
 	}
 }
@@ -41,11 +40,11 @@ func DefaultConfig() Config {
 func (c Config) Normalize() Config {
 	out := c
 	defaults := DefaultConfig()
-	if out.ModelContextTokens <= 0 {
-		out.ModelContextTokens = defaults.ModelContextTokens
+	if out.WindowTokens <= 0 {
+		out.WindowTokens = defaults.WindowTokens
 	}
-	if out.OutputReserveTokens <= 0 {
-		out.OutputReserveTokens = defaults.OutputReserveTokens
+	if out.MaxOutputTokens <= 0 {
+		out.MaxOutputTokens = defaults.MaxOutputTokens
 	}
 	if out.KeepRecentTurns <= 0 {
 		out.KeepRecentTurns = defaults.KeepRecentTurns
@@ -59,17 +58,14 @@ func (c Config) Normalize() Config {
 	if out.SummaryMaxTokens <= 0 {
 		out.SummaryMaxTokens = defaults.SummaryMaxTokens
 	}
-	if out.MaxLowGainAttempts <= 0 {
-		out.MaxLowGainAttempts = defaults.MaxLowGainAttempts
-	}
 	if out.LowGainThresholdPercent <= 0 {
 		out.LowGainThresholdPercent = defaults.LowGainThresholdPercent
 	}
 	return out
 }
 
-// UsableInputTokens reports model capacity after the output reserve.
+// UsableInputTokens reports model capacity after the maximum response budget.
 func (c Config) UsableInputTokens() int {
 	c = c.Normalize()
-	return c.ModelContextTokens - c.OutputReserveTokens
+	return c.WindowTokens - c.MaxOutputTokens
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // LoadTurnGroups reconstructs starts, tool lifecycle records, and terminal
@@ -19,6 +20,51 @@ func (s *ThreadStore) LoadTurnGroups(ctx context.Context, id string) ([]TurnGrou
 		return nil, err
 	}
 	return turnGroupsFromEvents(events)
+}
+
+// LoadCompactionUsage returns the immutable provider-call records associated
+// with one compaction transaction. It intentionally returns only compaction
+// calls, so a UI cannot confuse cache-read telemetry with the chat turn.
+func (s *ThreadStore) LoadCompactionUsage(ctx context.Context, id, operationID string) ([]ModelUsage, error) {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return nil, fmt.Errorf("compaction operation id is required")
+	}
+	dir, unlock, err := s.lockThread(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	_, events, err := s.loadThreadLocked(dir, id)
+	if err != nil {
+		return nil, err
+	}
+	usages := make([]ModelUsage, 0)
+	seenCallIDs := make(map[string]struct{})
+	for _, event := range events {
+		if event.Kind != EventUsageRecorded {
+			continue
+		}
+		var usage ModelUsage
+		if err := json.Unmarshal(event.Payload, &usage); err != nil {
+			return nil, fmt.Errorf("decode usage record: %w", err)
+		}
+		normalized, err := normalizeModelUsage(usage)
+		if err != nil {
+			return nil, fmt.Errorf("invalid usage record: %w", err)
+		}
+		if normalized.Operation == UsageOperationCompaction && normalized.OperationID == operationID {
+			if _, seen := seenCallIDs[normalized.CallID]; seen {
+				// Keep this query consistent with replay, where an identical
+				// usage.recorded event is an idempotent retry rather than a
+				// second provider call.
+				continue
+			}
+			seenCallIDs[normalized.CallID] = struct{}{}
+			usages = append(usages, normalized)
+		}
+	}
+	return usages, nil
 }
 
 func turnGroupsFromEvents(events []ThreadEvent) ([]TurnGroup, error) {
@@ -73,6 +119,12 @@ func turnGroupsFromEvents(events []ThreadEvent) ([]TurnGroup, error) {
 			tool := getTool(group, event.TurnID, payload.ToolCallID)
 			tool.Completed = &payload
 			tool.EventIDs = append(tool.EventIDs, event.ID)
+		case EventUsageRecorded:
+			var payload ModelUsage
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				return nil, fmt.Errorf("decode usage record: %w", err)
+			}
+			group.Usages = append(group.Usages, payload)
 		case EventTurnCommitted:
 			var payload TurnCommit
 			if err := json.Unmarshal(event.Payload, &payload); err != nil {

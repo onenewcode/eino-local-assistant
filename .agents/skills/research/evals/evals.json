@@ -1,0 +1,43 @@
+{
+  "skill_name": "research",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "调研主流 CLI coding agent 如何做命令权限与审批（Codex / Claude Code 等），写到 docs/research/",
+      "expected_output": "Industry-only research note under docs/research/, multi-source, no local product-code audit, no repo migration plan",
+      "files": [],
+      "expectations": [
+        "Uses external primary sources (vendor docs / mature agents / independent sources)",
+        "Does not read or cite this repo's internal/ or cmd/ product implementation as research evidence",
+        "Writes docs/research/* and not docs/issues/*",
+        "Includes research date and re-verify caveat",
+        "Compares mechanisms and tradeoffs, not marketing blurbs",
+        "Does not end with 'how this repository should change' unless the user asked for local mapping"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "research how mature agents decide tool-call continuation vs termination",
+      "expected_output": "Mechanistic industry note on provider stop reasons vs agent-loop budgets, with sources",
+      "files": [],
+      "expectations": [
+        "Separates provider-response layer from agent-loop layer",
+        "Covers at least two mature systems or APIs",
+        "Marks inference vs documented behavior",
+        "Avoids local codebase exploration for design answers"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "对比一下上下文压缩/compaction 的业界做法",
+      "expected_output": "Scoped comparative research on compaction strategies with applicability boundaries",
+      "files": [],
+      "expectations": [
+        "Defines scope and out-of-scope",
+        "Shows where serious systems converge or diverge",
+        "Lists pitfalls and open questions",
+        "Remains industry-focused rather than a local implementation plan"
+      ]
+    }
+  ]
+}

@@ -18,6 +18,9 @@ const (
 	slashTitle
 	slashDelete
 	slashQueue
+	slashUsage
+	slashPermissions
+	slashMemory
 	slashUnknown
 )
 
@@ -38,14 +41,17 @@ func slashCatalog() []slashCommand {
 	return []slashCommand{
 		{Name: "/help", Aliases: []string{"/?"}, Description: "show this help"},
 		{Name: "/status", Description: "model, session, tokens, cost, max_step, context"},
+		{Name: "/usage", Description: "toggle turn usage footer (on|off|toggle)", NeedsArg: true},
 		{Name: "/context", Description: "context budget, checkpoints, and compaction status"},
 		{Name: "/compact", Description: "summarize stable turns and free context", NeedsArg: true},
 		{Name: "/sessions", Description: "list saved sessions (tokens/cost)"},
 		{Name: "/new", Description: "start a new session", NeedsArg: true},
-		{Name: "/resume", Description: "resume a saved session", NeedsArg: true},
+		{Name: "/resume", Description: "resume a saved session ([--recover] after confirming prior process stopped)", NeedsArg: true},
 		{Name: "/delete", Description: "delete a saved session (not the active one)", NeedsArg: true},
 		{Name: "/title", Description: "rename the current session", NeedsArg: true},
 		{Name: "/queue", Description: "list queued follow-ups (or: clear)", NeedsArg: true},
+		{Name: "/permissions", Aliases: []string{"/policy"}, Description: "shell/apply_patch policy and session allows"},
+		{Name: "/memory", Description: "project memory (list|add|delete|accept|on|off|generate|status|rebuild)", NeedsArg: true},
 		{Name: "/clear", Description: "clear screen and start a new thread (previous thread retained)"},
 		{Name: "/exit", Aliases: []string{"/quit"}, Description: "quit"},
 	}
@@ -138,6 +144,8 @@ func parseSlash(input string) (slashAction, string) {
 		return slashClear, arg
 	case "/status":
 		return slashStatus, arg
+	case "/usage":
+		return slashUsage, arg
 	case "/context":
 		return slashContext, arg
 	case "/compact":
@@ -154,6 +162,10 @@ func parseSlash(input string) (slashAction, string) {
 		return slashDelete, arg
 	case "/queue":
 		return slashQueue, arg
+	case "/permissions", "/policy":
+		return slashPermissions, arg
+	case "/memory":
+		return slashMemory, arg
 	default:
 		return slashUnknown, trimmed
 	}
@@ -164,15 +176,18 @@ func helpText() string {
 		"Commands:",
 		"  /help              show this help",
 		"  /status            model, session, tokens, cost, max_step, context",
+		"  /usage [on|off]    show/toggle per-turn API usage footer (default on)",
 		"  /context           context budget, checkpoints, and compaction status",
 		"  /compact [focus]   summarize stable turns and free context",
 		"  /sessions          list saved sessions (tokens/cost)",
 		"  /new [title]       start a new session",
-		"  /resume <id>       resume a saved session",
+		"  /resume <id> [--recover]  resume a saved session; explicitly recover an interrupted operation",
 		"  /delete <id>       delete a saved session (not the active one)",
 		"  /title <text>      rename the current session",
 		"  /queue             list queued follow-ups",
 		"  /queue clear       drop all queued follow-ups",
+		"  /permissions       tool policy, workspace clamp, session allows",
+		"  /memory            project memory (list|add|delete|accept|on|off|generate|status|rebuild)",
 		"  /clear             clear screen and start a new thread (previous thread retained)",
 		"  /exit              quit",
 		"",
@@ -181,13 +196,15 @@ func helpText() string {
 		"  up/down   input history (first/last composer line); slash menu when open",
 		"  tab       complete selected slash command",
 		"  ctrl+j    newline",
-		"  pgup/pgdn scroll transcript (stick-to-bottom while at end)",
+		"  pgup/pgdn scroll transcript (or review a long host-escalation command)",
 		"  home/end  jump to top / bottom of transcript",
-		"  esc       dismiss slash menu, or interrupt turn/compaction",
+		"  esc       dismiss slash menu, deny approval, or interrupt turn/compaction",
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
-		"While busy, /help /context /status /sessions /queue run immediately; /queue clear drops follow-ups.",
+		"While busy, /help /context /status /usage /sessions /queue /permissions /memory status|list run immediately; /queue clear drops follow-ups.",
 		"Mutative commands (/compact /clear /new /resume /title /delete /exit) cannot be queued.",
+		"shell/apply_patch may prompt for approval (once / session / deny). Status shows cmd=ask|auto.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",
+		"Persistent memory is project-scoped (not /resume). See docs/memory.md.",
 	}, "\n")
 }

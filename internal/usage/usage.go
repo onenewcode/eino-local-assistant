@@ -1,26 +1,35 @@
-// Package usage estimates tokens and converts them to cost.
+// Package usage extracts provider-reported model usage, estimates only local
+// context-planning budgets, and converts configured token prices to cost.
+//
+// Field names follow eino schema.TokenUsage (and its adapters):
+// PromptTokens, CompletionTokens, TotalTokens, CachedTokens (from
+// PromptTokenDetails), ReasoningTokens (from CompletionTokensDetails).
 package usage
 
 import (
-	"math"
 	"unicode/utf8"
 
 	"github.com/cloudwego/eino/schema"
 )
 
 // Pricing is USD per 1 million tokens.
+// Rate axis names (input/output) describe price configuration, not usage fields.
 type Pricing struct {
 	InputPerMillion  float64
 	OutputPerMillion float64
 }
 
 // Turn holds token accounting for one model call.
+// Names match github.com/cloudwego/eino/schema.TokenUsage.
 type Turn struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
-	Estimated        bool
-	CostUSD          float64
+	// CachedTokens maps schema.PromptTokenDetails.CachedTokens.
+	CachedTokens int
+	// ReasoningTokens maps schema.CompletionTokensDetails.ReasoningTokens.
+	ReasoningTokens int
+	CostUSD         float64
 }
 
 // FromMessageUsage prefers provider-reported usage on the assistant message.
@@ -28,22 +37,30 @@ func FromMessageUsage(msg *schema.Message) (Turn, bool) {
 	if msg == nil || msg.ResponseMeta == nil || msg.ResponseMeta.Usage == nil {
 		return Turn{}, false
 	}
-	u := msg.ResponseMeta.Usage
+	return FromTokenUsage(msg.ResponseMeta.Usage)
+}
+
+// FromTokenUsage copies eino schema.TokenUsage into Turn without renaming.
+// A non-nil report remains authoritative even if every count is zero.
+func FromTokenUsage(u *schema.TokenUsage) (Turn, bool) {
+	if u == nil {
+		return Turn{}, false
+	}
 	t := Turn{
 		PromptTokens:     u.PromptTokens,
 		CompletionTokens: u.CompletionTokens,
 		TotalTokens:      u.TotalTokens,
+		CachedTokens:     u.PromptTokenDetails.CachedTokens,
+		ReasoningTokens:  u.CompletionTokensDetails.ReasoningTokens,
 	}
 	if t.TotalTokens == 0 {
 		t.TotalTokens = t.PromptTokens + t.CompletionTokens
 	}
-	if t.PromptTokens == 0 && t.CompletionTokens == 0 && t.TotalTokens == 0 {
-		return Turn{}, false
-	}
 	return t, true
 }
 
-// EstimateMessages approximates prompt tokens for a message list.
+// EstimateMessages approximates prompt tokens for local context planning only.
+// It must not be used as API usage or cost accounting.
 func EstimateMessages(msgs []*schema.Message) int {
 	total := 0
 	for _, m := range msgs {
@@ -76,34 +93,17 @@ func EstimateText(s string) int {
 	return est
 }
 
-// EstimateTurn builds usage when the provider did not return token counts.
-func EstimateTurn(prompt []*schema.Message, completion *schema.Message) Turn {
-	promptTok := EstimateMessages(prompt)
-	compTok := 0
-	if completion != nil {
-		compTok = EstimateText(completion.Content) + EstimateText(completion.ReasoningContent)
-	}
-	return Turn{
-		PromptTokens:     promptTok,
-		CompletionTokens: compTok,
-		TotalTokens:      promptTok + compTok,
-		Estimated:        true,
-	}
-}
-
 // CostUSD computes dollar cost from token counts and pricing.
+// promptTokens / completionTokens align with schema.TokenUsage field names.
 func CostUSD(promptTokens, completionTokens int, p Pricing) float64 {
 	if p.InputPerMillion <= 0 && p.OutputPerMillion <= 0 {
 		return 0
 	}
 	cost := float64(promptTokens)/1_000_000*p.InputPerMillion +
 		float64(completionTokens)/1_000_000*p.OutputPerMillion
-	return roundCost(cost)
-}
-
-func roundCost(v float64) float64 {
-	// Microdollar precision is enough for UI.
-	return math.Round(v*1_000_000) / 1_000_000
+	// Keep the complete value in the ledger; formatting is the only rounding
+	// boundary so sums of many small calls do not lose micro-costs.
+	return cost
 }
 
 // FormatUSD formats a cost for status lines.

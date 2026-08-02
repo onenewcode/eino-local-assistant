@@ -26,6 +26,10 @@ func Run(ctx context.Context, deps Deps) (sessionID string, err error) {
 		tea.WithMouseCellMotion(),
 		tea.WithContext(ctx),
 	)
+	if deps.Approval != nil {
+		deps.Approval.BindProgram(p)
+		defer deps.Approval.Close()
+	}
 	final, err := p.Run()
 	return sessionIDAtExit(final, deps), err
 }

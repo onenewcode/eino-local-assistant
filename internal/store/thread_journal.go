@@ -28,6 +28,22 @@ type checkpointCommittedPayload struct {
 	Checkpoint Checkpoint `json:"checkpoint"`
 }
 
+func hasRecordedCompactionOperationID(state ThreadState, operationID string) bool {
+	_, exists := state.recordedCompactionOperationIDs[strings.TrimSpace(operationID)]
+	return exists
+}
+
+func recordCompactionOperationID(state *ThreadState, operationID string) {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return
+	}
+	if state.recordedCompactionOperationIDs == nil {
+		state.recordedCompactionOperationIDs = make(map[string]struct{})
+	}
+	state.recordedCompactionOperationIDs[operationID] = struct{}{}
+}
+
 func newThreadEvent(state ThreadState, kind EventKind, threadID, turnID string, expectedRevision uint64, payload any, now time.Time) (ThreadEvent, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -240,6 +256,17 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 		state.ID = payload.Meta.ID
 		state.Meta = payload.Meta
 		state.Meta.ID = state.ID
+		// Journals written before usage.recorded have no status in their
+		// creation payload. Do not pretend their turn-level estimates are exact.
+		if state.Meta.UsageStatus == "" {
+			state.Meta.UsageStatus = UsageStatusUnavailable
+		}
+		if !validUsageStatus(state.Meta.UsageStatus) {
+			return fmt.Errorf("%w: invalid usage status %q", ErrJournalCorrupt, state.Meta.UsageStatus)
+		}
+		if state.Meta.UsageStatus == UsageStatusUnavailable {
+			clearUsageProjection(&state.Meta)
+		}
 		if state.Meta.CreatedAt.IsZero() {
 			state.Meta.CreatedAt = event.Timestamp
 		}
@@ -256,17 +283,89 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 			return fmt.Errorf("decode turn.committed: %w", err)
 		}
 		state.Meta.MessageCount += len(payload.Messages)
-		state.Meta.PromptTokens += payload.Usage.PromptTokens
-		state.Meta.CompletionTokens += payload.Usage.CompletionTokens
-		state.Meta.TotalTokens += payload.Usage.TotalTokens
-		state.Meta.CostUSD += payload.Usage.CostUSD
-		state.Meta.UsageEstimated = state.Meta.UsageEstimated || payload.Usage.Estimated
+	case EventUsageRecorded:
+		var payload ModelUsage
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode usage.recorded: %w", err)
+		}
+		usage, err := normalizeModelUsage(payload)
+		if err != nil {
+			return fmt.Errorf("%w: invalid usage.recorded: %v", ErrJournalCorrupt, err)
+		}
+		if usage.TurnID != event.TurnID {
+			return fmt.Errorf("%w: usage record turn id does not match event", ErrJournalCorrupt)
+		}
+		if state.recordedUsage == nil {
+			state.recordedUsage = make(map[string]ModelUsage)
+		}
+		if previous, exists := state.recordedUsage[usage.CallID]; exists {
+			if previous != usage {
+				return fmt.Errorf("%w: duplicate usage call id %q differs", ErrJournalCorrupt, usage.CallID)
+			}
+			break
+		}
+		if usage.Operation == UsageOperationCompaction && usage.OperationID != "" {
+			if state.PendingCompaction == nil {
+				return fmt.Errorf("%w: compaction usage for operation %q requires a pending compaction", ErrJournalCorrupt, usage.OperationID)
+			}
+			if usage.OperationID != state.PendingCompaction.OperationID {
+				return fmt.Errorf("%w: compaction usage does not match pending operation %q", ErrJournalCorrupt, state.PendingCompaction.OperationID)
+			}
+		}
+		state.recordedUsage[usage.CallID] = usage
+		state.Meta.ModelCallCount++
+		state.Meta.UsageStatus = nextUsageStatus(state.Meta.UsageStatus, usage.HasProviderUsage)
+		if usage.HasProviderUsage {
+			state.Meta.PromptTokens += usage.PromptTokens
+			state.Meta.CompletionTokens += usage.CompletionTokens
+			state.Meta.TotalTokens += usage.TotalTokens
+			state.Meta.CachedTokens += usage.CachedTokens
+			state.Meta.ReasoningTokens += usage.ReasoningTokens
+			state.Meta.CostUSD += usage.CostUSD
+		}
+		if usage.Operation == UsageOperationAgent {
+			if usage.HasProviderUsage {
+				state.Meta.LastContext = &ContextSnapshot{
+					PromptTokens: usage.PromptTokens,
+					BudgetTokens: usage.ContextBudgetTokens,
+				}
+			} else {
+				state.Meta.LastContext = nil
+			}
+		}
 	case EventTitleChanged:
 		var payload titleUpdatedPayload
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
 			return fmt.Errorf("decode title update: %w", err)
 		}
 		state.Meta.Title = payload.Title
+	case EventContextCompactionStarted:
+		var payload CompactionStart
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode compaction start: %w", err)
+		}
+		payload.OperationID = strings.TrimSpace(payload.OperationID)
+		if payload.OperationID == "" {
+			return fmt.Errorf("%w: compaction operation id is required", ErrJournalCorrupt)
+		}
+		if hasRecordedCompactionOperationID(*state, payload.OperationID) {
+			return fmt.Errorf("%w: duplicate compaction operation id %q", ErrJournalCorrupt, payload.OperationID)
+		}
+		if state.PendingCompaction != nil {
+			return fmt.Errorf("%w: compaction operation %q is already pending", ErrJournalCorrupt, state.PendingCompaction.OperationID)
+		}
+		recordCompactionOperationID(state, payload.OperationID)
+		state.PendingCompaction = &CompactionOperation{
+			OperationID: payload.OperationID,
+			Automatic:   payload.Automatic,
+			StartedAt:   event.Timestamp.UTC(),
+		}
+		if payload.Automatic {
+			// Prevent another process from retrying a charged-but-unfinished
+			// automatic operation after a crash or during concurrent resume.
+			state.AutoCompactionPaused = true
+			state.AutoCompactionPauseReason = "automatic compaction is in progress"
+		}
 	case EventContextCompacted:
 		var payload checkpointCommittedPayload
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -278,13 +377,133 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 		if payload.Checkpoint.Revision != event.Revision || payload.Checkpoint.Sequence != event.Sequence {
 			return fmt.Errorf("%w: checkpoint revision mismatch", ErrJournalCorrupt)
 		}
+		operationID := strings.TrimSpace(payload.Checkpoint.OperationID)
+		if state.PendingCompaction != nil {
+			if operationID != state.PendingCompaction.OperationID || payload.Checkpoint.Automatic != state.PendingCompaction.Automatic {
+				return fmt.Errorf("%w: checkpoint does not match pending compaction operation %q", ErrJournalCorrupt, state.PendingCompaction.OperationID)
+			}
+			state.PendingCompaction = nil
+		} else if operationID != "" {
+			return fmt.Errorf("%w: checkpoint for operation %q requires a pending compaction", ErrJournalCorrupt, operationID)
+		}
+		if state.recordedCheckpointIDs == nil {
+			state.recordedCheckpointIDs = make(map[string]struct{})
+		}
+		if _, exists := state.recordedCheckpointIDs[payload.Checkpoint.ID]; exists {
+			return fmt.Errorf("%w: duplicate checkpoint id %q", ErrJournalCorrupt, payload.Checkpoint.ID)
+		}
+		state.recordedCheckpointIDs[payload.Checkpoint.ID] = struct{}{}
 		state.ActiveCheckpointID = payload.Checkpoint.ID
-		if payload.Checkpoint.LowGain {
+		// A successfully installed checkpoint always clears the low-gain streak.
+		// Low-gain candidates are rejected before install; the Checkpoint.LowGain
+		// field is historical metadata and does not advance the anti-thrash counter.
+		state.LowGainStreak = 0
+		state.AutoCompactionPaused = payload.Checkpoint.AutoPaused
+		state.AutoCompactionPauseReason = strings.TrimSpace(payload.Checkpoint.AutoPauseReason)
+		if state.AutoCompactionPaused && state.AutoCompactionPauseReason == "" {
+			// Checkpoints written before pause reasons existed remain replayable.
+			state.AutoCompactionPauseReason = "automatic compaction paused by a legacy checkpoint"
+		}
+		state.LastCompaction = &CompactionOutcome{
+			Status:       CompactionOutcomeSucceeded,
+			OperationID:  operationID,
+			CheckpointID: payload.Checkpoint.ID,
+			Automatic:    payload.Checkpoint.Automatic,
+			At:           event.Timestamp.UTC(),
+		}
+		// A compacted transcript no longer has a reliable prompt-size snapshot
+		// until the next primary model request reports provider usage.
+		state.Meta.LastContext = nil
+	case EventContextCompactionFailed:
+		var payload CompactionFailure
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode compaction failure: %w", err)
+		}
+		payload.OperationID = strings.TrimSpace(payload.OperationID)
+		payload.Reason = strings.TrimSpace(payload.Reason)
+		payload.AutoPauseReason = strings.TrimSpace(payload.AutoPauseReason)
+		if !payload.Cancelled && payload.Reason == "" {
+			return fmt.Errorf("%w: compaction failure reason is required", ErrJournalCorrupt)
+		}
+		if payload.AutoPaused && payload.AutoPauseReason == "" {
+			return fmt.Errorf("%w: compaction pause reason is required", ErrJournalCorrupt)
+		}
+		if !payload.AutoPaused && payload.AutoPauseReason != "" {
+			return fmt.Errorf("%w: compaction pause reason requires pause", ErrJournalCorrupt)
+		}
+		if payload.Automatic && !payload.AutoPaused && !allowsUnpausedAutomaticCompactionFailure(payload) {
+			return fmt.Errorf("%w: automatic compaction failure must pause", ErrJournalCorrupt)
+		}
+		if state.PendingCompaction != nil {
+			if payload.OperationID != state.PendingCompaction.OperationID || payload.Automatic != state.PendingCompaction.Automatic {
+				return fmt.Errorf("%w: compaction failure does not match pending operation %q", ErrJournalCorrupt, state.PendingCompaction.OperationID)
+			}
+			state.PendingCompaction = nil
+		} else if payload.OperationID != "" {
+			if hasRecordedCompactionOperationID(*state, payload.OperationID) {
+				return fmt.Errorf("%w: duplicate compaction operation id %q", ErrJournalCorrupt, payload.OperationID)
+			}
+			recordCompactionOperationID(state, payload.OperationID)
+		}
+		// A failure leaves the active checkpoint and raw transcript untouched.
+		// Prefer the absolute streak stamped under the write lock; fall back to
+		// reason-based mutation only for pre-absolute-streak journal events.
+		switch {
+		case payload.ResultingLowGainStreak != nil:
+			state.LowGainStreak = *payload.ResultingLowGainStreak
+		case payload.Automatic && isLowGainCompactionFailure(payload):
 			state.LowGainStreak++
-		} else {
+		case payload.Automatic && !isStaleCompactionFailure(payload):
 			state.LowGainStreak = 0
 		}
-		state.AutoCompactionPaused = payload.Checkpoint.AutoPaused
+		state.AutoCompactionPaused = payload.AutoPaused
+		state.AutoCompactionPauseReason = payload.AutoPauseReason
+		status := CompactionOutcomeFailed
+		if payload.Cancelled {
+			status = CompactionOutcomeCancelled
+		}
+		state.LastCompaction = &CompactionOutcome{
+			Status:      status,
+			OperationID: payload.OperationID,
+			Automatic:   payload.Automatic,
+			Reason:      payload.Reason,
+			At:          event.Timestamp.UTC(),
+		}
+	case EventContextCheckpointReset:
+		var payload CheckpointSchemaReset
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode checkpoint reset: %w", err)
+		}
+		payload.OperationID = strings.TrimSpace(payload.OperationID)
+		payload.CheckpointID = strings.TrimSpace(payload.CheckpointID)
+		payload.Reason = strings.TrimSpace(payload.Reason)
+		payload.AutoPauseReason = strings.TrimSpace(payload.AutoPauseReason)
+		if payload.CheckpointID == "" || payload.Reason == "" {
+			return fmt.Errorf("%w: checkpoint reset id and reason are required", ErrJournalCorrupt)
+		}
+		if payload.CheckpointID != state.ActiveCheckpointID {
+			return fmt.Errorf("%w: checkpoint reset target %q does not match active checkpoint %q", ErrJournalCorrupt, payload.CheckpointID, state.ActiveCheckpointID)
+		}
+		if payload.AutoPaused && payload.AutoPauseReason == "" {
+			return fmt.Errorf("%w: checkpoint reset pause reason is required", ErrJournalCorrupt)
+		}
+		if !payload.AutoPaused && payload.AutoPauseReason != "" {
+			return fmt.Errorf("%w: checkpoint reset pause reason requires pause", ErrJournalCorrupt)
+		}
+		state.ActiveCheckpointID = ""
+		state.LowGainStreak = 0
+		state.AutoCompactionPaused = payload.AutoPaused
+		state.AutoCompactionPauseReason = payload.AutoPauseReason
+		state.LastCompaction = &CompactionOutcome{
+			Status:       CompactionOutcomeCheckpointReset,
+			OperationID:  payload.OperationID,
+			CheckpointID: payload.CheckpointID,
+			Reason:       payload.Reason,
+			At:           event.Timestamp.UTC(),
+		}
+		// The checkpoint no longer contributes to the prompt, so the former
+		// primary-model context measurement is no longer representative.
+		state.Meta.LastContext = nil
 	case EventTurnStarted, EventToolStarted, EventToolCompleted, EventTurnCancelled, EventTurnFailed:
 		// Lifecycle records do not directly change the materialized projection.
 	default:

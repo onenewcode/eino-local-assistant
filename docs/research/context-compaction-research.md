@@ -1,8 +1,8 @@
 # 智能体上下文压缩：业界方案调研与探索方法
 
-> 状态：调研结论与通用实施建议，不代表任何具体产品已经实现。
+> 状态：研究笔记，不是某个仓库的实施计划。
 >
-> 调研日期：2026-07-15。产品行为、模型能力和框架 API 会持续变化，实际采用前应重新核验引用资料。
+> 调研日期：2026-07-20。产品行为、模型能力和框架 API 会持续变化，实际采用前应重新核验引用资料。
 
 ## 1. 摘要
 
@@ -101,100 +101,20 @@ Anthropic 将 context engineering 定义为在有限上下文中持续策展信�
 Claude Code 的官方文档体现了较完整的终端 agent 上下文管理模型：
 
 - Context 不只含聊天记录，还包括文件内容、命令输出、项目指令、memory、skill、tool 和 system instructions。[3]
-- 接近窗口上限时，优先处理较早 tool output，再在需要时摘要会话；`/compact [focus]` 支持用户声明保留重点。[3][4]
-- 压缩后，项目指令和 auto memory 会重新注入，说明持久规则应存放在权威来源，不应只依赖早期一条聊天消息。[4]
-- 自动压缩使用阈值而不是固定通用数字；持续低收益时停止，避免无限压缩循环。[3][5]
-- `/context` 展示分类用量，MCP tool 定义可按需加载，减少初始 context 占用。[3]
-- Subagent 有独立 context，通常只返回最终摘要；复杂探索不会天然污染主任务窗口。[7]
-- 新输入在安全 action boundary 交付；中断是 best effort，外部命令可能已经产生副作用。[3][8]
+- 接近窗口上限时，Claude Code 先清理较早 tool output，仍不足时再摘要会话；`/compact [instructions]` 可声明摘要重点。[3][4]
+- 压缩后，system prompt 和 output style 保持不变；项目根 `CLAUDE.md`、无路径规则和 auto memory 从权威来源重新注入。路径规则与嵌套 `CLAUDE.md` 要等再次读取匹配文件才恢复；已调用 skill 会重注入，但受每个 5,000 tokens、合计 25,000 tokens 的预算约束，最早的会被丢弃。[4]
+- 自动压缩阈值依模型与运行模式而异；`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 只能在支持主动压缩的场景提前触发，不能据此假定统一百分比。[5]
+- `/context` 展示分类用量；MCP tool schema 默认按需发现。MCP 文本结果超过默认持久化阈值时可被替换为文件引用，另有 10,000-token 警告和默认 25,000-token 上限；这不是所有内建工具输出均采用同一机制的公开保证。[6]
+- 命名 subagent 使用独立 fresh context，通常只把结果摘要回传；其不继承父对话、已读文件或父 auto memory。fork 是例外：它继承完整父会话，但自己的后续 tool call 仍不写回父 history；可 resume 的一般/custom subagent 保留其自身完整历史。[7]
+- `Esc` 可中止当前 response 或 tool call，并保留已经完成的工作；运行时发送 correction 会在当前 action 完成后、下一步决策前被读取。Claude Code 对命令的排队和少数立即执行命令有明确区分，但没有公开承诺所有新输入的 FIFO 调度合同。[8]
 
 可借鉴的不是某个固定百分比或环境变量，而是“先处理可重取输出、再压缩稳定历史、重载权威指令、检测抖动、公开状态”的交互与边界。
 
-### 5.2 Codex CLI：如何压缩活动上下文（案例）
+### 5.2 Codex CLI：公开 compaction 边界（案例）
 
-Codex CLI 不只是把很早的消息从客户端数组中截掉。当前本机可核验的 `codex-cli 0.144.1` 将**模型可见的活动历史**交给专门的 compact 请求，接收一个用于后续请求的 replacement history，并把这次替换作为 thread 内可观察事件安装。[18] 换言之，用户看到的是“总结历史、释放 context”，但实现边界更接近“生成一个新的活动上下文窗口”。
+公开 app-server 合同支持用户发起 `thread/compact/start`，并将自动或手动压缩表现为 `contextCompaction` thread item；手动 compact turn 不接受 steering。[18] 这足以说明压缩应被当成有独立生命周期边界的操作，而不是和普通 agent turn 任意交错的字符串替换。
 
-本节刻意将证据分级。`thread/compact/start`、app-server schema、feature 状态、事件名和二进制中的端点/错误文案属于当前版本可复核证据；服务端实际选择了哪些消息、compact prompt 的全文、摘要文本格式和各模型默认阈值均未公开，不能根据效果反推。官方手册仍是后续复核入口。[17]
-
-#### 5.2.1 先区分三个容易混淆的“压缩”
-
-| 层次 | 当前 0.144.1 的可观察证据 | 是否可作为“历史上下文压缩”的证据 | 结论 |
-| --- | --- | --- | --- |
-| 活动历史 compaction | `remote_compaction_v2` 为 `stable` 且启用；存在 `thread/compact/start`、`ContextCompaction` item、`responses/compact`、`replacement_history`。 | 是。 | 这是本节所说的 Codex context compaction 主路径。 |
-| 请求层 compression | `enable_request_compression` 也是 stable feature。 | 否。 | 名称不足以说明它会怎样选择或总结聊天历史；不要把它当作 compaction 算法或 token 保留策略。 |
-| 本地 thread store compression | `local_thread_store_compression` 是未默认启用的 under-development feature。 | 否。 | 公开契约未表明它会改变下一轮模型可见 prompt；不能把它当作活动历史变短的证据。 |
-
-同理，配置中的 `tool_output_token_limit` 是工具输出尺寸管理的独立旋钮；公开契约没有说明它与 remote compaction 的先后顺序或选取规则。通用设计中应把“工具输出截短/外置”“传输编码”“本地日志压缩”和“模型活动历史压缩”分别观测，不能只看一个“压缩率”。
-
-#### 5.2.2 可确认的主流程
-
-```text
-触发
-  ├─ 用户输入 /compact
-  └─ 有效模型配置的 token 计数达到 auto-compact 限额
-          |
-          v
-thread/compact/start 或内部 auto-compact 请求
-          |
-          v
-专用 compact turn（同一 turn 不接受 steer）
-  ├─ 对应 PreCompact 生命周期 hook
-  ├─ remote compaction v2 -> /responses/compact
-  └─ 响应必须含恰好一个 compaction output item
-          |
-          v
-安装替换后的活动历史（replacement_history）
-  ├─ 记录 contextCompaction thread item / thread-compacted 事件
-  ├─ 关联 compact window 的编号和前驱关系
-  └─ 对应 PostCompact 生命周期 hook
-          |
-          v
-后续普通 turn 使用 replacement history；必要时再次 compact
-```
-
-这个流程的每一层都能由当前版本的接口或静态契约佐证：
-
-1. **触发。**TUI 内含精确提示：`/compact` 会“summarize history and free up context”；app-server 暴露 `thread/compact/start`，其公开入参只有 `threadId`。自动触发的配置契约包含 `model_context_window`、`model_auto_compact_token_limit` 和 `model_auto_compact_token_limit_scope`。后者可按完整 active context（`total`）计数，也可只按 carried window prefix 之后的 sampled output 与增长部分（`body_after_prefix`）计数。[18]
-2. **安全边界。**协议明确把手动 `/compact` 归为不能接受 same-turn steering 的 `compact` turn。这说明压缩不是与工具调用、普通生成或新输入任意交错的后台字符串替换；它有独占的生命周期边界。它不表示已经执行的外部工具副作用可回滚。
-3. **压缩调用。**`remote_compaction_v2` 在 feature 列表中为 stable；当前二进制含 `compact_remote_v2`、`compact_remote_v2_attempt`、`compact_token_budget` 和 `/responses/compact`。更关键的是，其错误契约要求 remote v2 响应“exactly one compaction output item”。因此，应把这个步骤理解成受专用输出类型约束的历史替换请求，而不是普通 agent turn、tool call，或任意一段自由文本总结。
-4. **安装结果。**协议中的 `contextCompaction` 是一个独立 thread item，旧的 `thread/compacted` 通知已标记为兼容路径。二进制的 compact trace/持久化类型还出现 `input_history`、`replacement_history`、`window_number`、`first_window_id` 和 `previous_window_id`。这表明压缩有“输入历史 -> 替代历史”的结果，并追踪多次 compact window 的前驱关系；公开契约未说明 resume 或 fork 如何消费这些字段。
-5. **失败容量回退。**当前二进制包含“Context window exceeded while compacting; removing oldest history item”的兜底文案。它证明 compaction 本身也可能装不下，且实现有移除最旧项的容量 fallback。该文案没有公开重试次数、被移除项类型或所有版本的保留保证，因此不能将其描述为无损策略。
-
-#### 5.2.3 Codex 已知“压什么”和未知“怎么写摘要”
-
-| 问题 | 可以确认 | 不应擅自补全 |
-| --- | --- | --- |
-| 压缩对象 | 目标是后续模型调用所用的 active/replacement history；`input_history` 与 `replacement_history` 是当前 compact 记录的可观察字段。 | 不知道服务端是否先剔除某类 tool output、如何处理 reasoning、图片、MCP 结果或项目指令。 |
-| 输出形态 | UI 将结果描述为历史摘要；remote v2 约束为一个 `compaction` output item，并被安装为 replacement history。 | 不知道该 item 是纯自然语言、结构化 JSON，还是包含服务端不可见的内部表示；不能声称其具备 provenance 字段。 |
-| 自动阈值 | 限额和计量 scope 可由模型/配置提供。 | 不知道任何模型的默认 token 数、触发百分比、目标水位或 hysteresis；也不能断言所有提供商启用自动压缩。 |
-| Compactor 提示 | `ConfigReadResponse` 暴露了可空的 `compact_prompt` 配置字段。 | 该字段不公开默认文本，也不能单凭字段名断言远端 endpoint 的完整提示词、优先级或是否允许用户覆盖。 |
-| 原始记录 | thread 中存在 compaction item 和窗口关联，CLI 可 resume/fork。 | 这不证明所有未压缩原始内容在所有存储后端永久保留、可导出或可逐字恢复。 |
-| 生命周期 | 有 `PreCompact`、`PostCompact` hook 名称及 compaction 事件。 | 不能仅凭 hook 名称假定 hook 可改变 summary、阻止安装或获得完整原文。 |
-
-因此，下面这段伪代码只表达已知的控制流，不虚构服务端提示词或选择算法：
-
-```text
-if user_requests_compact() or charged_tokens_reach_model_limit():
-    begin_non_steerable_compact_turn()
-    emit_pre_compact_lifecycle()
-
-    result = remote_compact(active_history)  # 需要一个 compaction output item
-    install_replacement_history(result)
-    emit_context_compaction_item_and_lifecycle()
-
-    emit_post_compact_lifecycle()
-
-if compaction_cannot_fit_context_window():
-    apply_reported_oldest-history fallback  # 具体选取与重试规则未公开
-```
-
-#### 5.2.4 对通用 Agent 重构的可迁移结论
-
-- **采用专门的 compact transaction，而非让主 ReAct 回答“请总结”。**它应有独立 turn、不可交错的安全边界、输入/输出契约和安装步骤。
-- **将“摘要”视为 replacement view，而非真相源。**Codex 的 `replacement_history` 命名直接提醒我们：这是后续推理的工作视图。通用实现仍应保留原始事件和 artifact，并让 checkpoint 带来源。
-- **触发度量应明确配置。**Codex 的 `total` 与 `body_after_prefix` 表明“计入多少 token”是产品决策；不要用单一百分比掩盖稳定指令前缀、输出 reserve 和滚动窗口的差异。
-- **把结果和降级做成可观察事件。**`contextCompaction` item、生命周期 hook 和最旧项 fallback 是值得借鉴的可观测边界；通用产品还应额外公开释放 token、失败原因和是否损失了可重读证据。
-- **不要照搬未公开细节。**与 Claude Code 已文档化的“先清理旧 tool output、再摘要”或 `/compact [focus]` 不同，Codex 当前公开协议没有 focus 字段，也没有披露服务端摘要规则。[3][4][18]
+公开资料没有披露历史选择算法、保留策略、摘要形状、token 范围/阈值、失败回退、内部 hook、`replacement_history`/`input_history` 字段或 `/responses/compact` 的跨版本合同。因此不能把本机二进制字符串、内部 trace 或某一版本的实现推断写成可迁移产品事实。对通用设计可复用的结论只有：公开开始/完成状态、把 compaction 与普通 turn 区分，并将未公开的服务端细节保持为未知。[17][18]
 
 ### 5.3 LangChain 与 LangGraph
 
@@ -318,7 +238,7 @@ usable_input = min(configured_input_budget, provider_context_limit)
 - 使用上下文隔离 worker 探索；
 - 在无法安全 fit 时明确报错，而不是无限重试。
 
-Claude Code 已将这类循环作为可检测的 thrashing 问题处理，值得借鉴。[3][5]
+Claude Code 的公开 thrashing 定义更窄：压缩已经成功，但某个文件或 tool output 又立即多次填满窗口；产品停止重试以避免无进展循环，并建议分块读取、用有 focus 的 `/compact` 丢弃大输出、迁移到 subagent 或 `/clear`。[5]
 
 ## 7. 如何探索和选择解决方案
 
@@ -349,7 +269,7 @@ Claude Code 已将这类循环作为可检测的 thrashing 问题处理，值得
 - 固定成果卡 schema；
 - 完整 transcript/artifact 的可重开引用。
 
-建议把回传成果卡限制为“结论、证据、反例/风险、不确定性、建议下一步、引用”。Anthropic 建议此类研究/分析由独立 context 的子 agent 深挖，主 agent 只接收 condensed result；但多个冗长 result 回流依然会占满主窗口，因此回传也必须有预算。[1][7]
+建议把回传成果卡限制为“结论、证据、反例/风险、不确定性、建议下一步、引用”。Anthropic 建议此类研究/分析由独立 context 的子 agent 深挖，主 agent 只接收 condensed result；但多个冗长 result 回流依然会占满主窗口，因此回传也必须有预算。[1][7] 这里的“独立 context”指命名/一般 subagent，不包括继承父 history 的 fork；后者节省后续 tool-call 回流，但不节省子任务启动时的输入 context。[7]
 
 ### 7.3 方案选择矩阵
 
@@ -371,9 +291,9 @@ Claude Code 已将这类循环作为可检测的 thrashing 问题处理，值得
 | `/context` | 只读展示 token 预算、各层占用、最大 artifact、活动 checkpoint、最后一次压缩原因和是否为估算值。 |
 | `/compact [focus]` | 用户在稳定边界手动创建结构化 checkpoint；`focus` 指定必须保留的事实或当前任务。 |
 | 自动 compact | 仅在达到软/硬水位且不在工具事务中执行；必须显示开始、成功、失败和释放量。 |
-| `resume` | 恢复完整事件记录和活动工作状态；应避免多个 writer 无声交错写同一会话。 |
-| 新输入排队 | 在当前 action/tool 的安全边界交付，保持 FIFO 和可见状态。 |
-| 中断 | best effort cancel；记录已完成副作用，不能把“停止等待”误表示为“外部操作未发生”。 |
+| `resume` | 恢复持久 transcript 与当前工作视图；并发恢复必须选择 single-writer、lease 或显式冲突展示。Claude Code 允许同一 session 的多终端消息交错，说明这不能被当成默认安全行为。[19] |
+| 新输入排队 | 明确区分 steer、普通 queue、立即命令和 side task；只在已定义的 action/turn 边界交付，展示状态，不能笼统承诺 FIFO。 |
+| 中断 | 取消当前 response/tool 的等待并保留已完成工作；显式记录已观察到的副作用，不能把停止等待误表示为外部操作未发生。[3][8] |
 | 清理/新建 | 区分仅清屏、重置工作上下文、建立新会话和删除持久记录，不能让相近命令产生隐式破坏性语义。 |
 
 压缩后的状态提示应明确说明它是派生视图，例如：
@@ -390,7 +310,7 @@ context compacted: checkpoint cmp-... covers 18 turns; 21.4k -> 8.1k estimated t
 
 | 阶段 | 目标 | 关键产物 | 暂不引入 |
 | --- | --- | --- | --- |
-| P0：可观测与基线 | 先知道上下文为何膨胀。 | 真实 token 估算、消息/工具分组、长 trace fixture、context 统计。 | 自动摘要、向量库。 |
+| P0：可观测与基线 | 先知道上下文为何膨胀。 | 真实 token 估算、消息/工具分组、长 trace fixture、context 统计、cache creation/read 观测。 | 自动摘要、向量库。 |
 | P1：手动结构化压缩 | 证明可恢复的 checkpoint 有用。 | 原始事件保留、schema 校验、`/compact [focus]`、失败回滚、provenance。 | 自动触发、全局记忆。 |
 | P2：Artifact 与自动策略 | 解决日志和工具输出膨胀。 | Artifact digest/reference、软硬水位、输出 reserve、anti-thrashing。 | 自主多 agent。 |
 | P3：检索与隔离探索 | 处理跨会话和高并发研究。 | 混合检索、rerank、retention、只读 worker、成果卡。 | 无边界的跨项目记忆。 |
@@ -416,11 +336,13 @@ LongMemEval 还可作为长期记忆的补充基准，覆盖信息提取、多�
 
 | 类别 | 应记录的指标 |
 | --- | --- |
-| 容量与成本 | 输入/输出 token、prompt utilization、reserve 违例、压缩比、外置工具 token、overflow/retry、压缩次数、任务成本。 |
+| 容量与成本 | 输入/输出 token、`cache_creation_input_tokens`、`cache_read_input_tokens`、compact summary request 的 cache 命中/重建、prompt utilization、reserve 违例、压缩比、外置工具 token、overflow/retry、压缩次数、任务成本。 |
 | 延迟 | Prompt build、compact、retrieval、端到端 turn 的 p50/p95。 |
 | 信息质量 | 标注关键约束的 recall、带来源支持的摘要 precision、矛盾率、引用可重开率、Recall@k/MRR、陈旧证据率。 |
 | 任务质量 | 固定 trace 成功率、测试通过率、相对全历史 baseline 的回归、resume 后同结果比例、人工纠正率。 |
 | 可靠性 | Checkpoint 校验失败、rollback/fallback、低收益压缩、mutex contention、损坏/孤儿事件数。 |
+
+Claude Code 的 prompt cache 文档还说明：用于生成 compact summary 的一次性请求共享当前 history prefix，因此可复用既有 cache；压缩后的下一 turn 只重建较短 summary 的 conversation cache。[4] 这是特定产品的缓存机制，不应假定为所有 provider 的保证。
 
 任何压缩方案至少要满足以下门槛：
 
@@ -446,16 +368,16 @@ LongMemEval 还可作为长期记忆的补充基准，覆盖信息提取、多�
 
 ## 11. 参考资料
 
-以下资料均于 2026-07-15 复核。供应商案例和内部 benchmark 只能作为方向性证据，不能视作通用性能承诺。
+以下资料均于 2026-07-20 复核。供应商案例和内部 benchmark 只能作为方向性证据，不能视作通用性能承诺。
 
 1. Anthropic，[Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)，2025-09-29。
 2. Liu et al.，[Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172)，2023。
 3. Claude Code，[How Claude Code works: the context window](https://code.claude.com/docs/en/how-claude-code-works#the-context-window)。
-4. Claude Code，[What survives compaction](https://code.claude.com/docs/en/context-window#what-survives-compaction) 与 [compacting the conversation](https://code.claude.com/docs/en/prompt-caching#compacting-the-conversation)。
+4. Claude Code，[What survives compaction](https://code.claude.com/docs/en/context-windows#what-survives-compaction) 与 [compacting the conversation](https://code.claude.com/docs/en/prompt-caching#compacting-the-conversation)。
 5. Claude Code，[environment variables for auto compaction](https://code.claude.com/docs/en/env-vars) 与 [auto-compaction troubleshooting](https://code.claude.com/docs/en/troubleshooting#auto-compaction-stops-with-a-thrashing-error)。
-6. Claude Code，[sessions](https://code.claude.com/docs/en/sessions)。
+6. Claude Code，[MCP output limits and warnings](https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings)。
 7. Claude Code，[manage subagent context](https://code.claude.com/docs/en/sub-agents#manage-subagent-context)。
-8. Claude Code，[interactive mode](https://code.claude.com/docs/en/interactive-mode) 与 [streaming versus single mode](https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode)。
+8. Claude Code，[interactive mode](https://code.claude.com/docs/en/interactive-mode) 与 [commands](https://code.claude.com/docs/en/commands)。
 9. LangChain，[short-term memory](https://docs.langchain.com/oss/python/langchain/short-term-memory)。
 10. LlamaIndex，[agent memory](https://developers.llamaindex.ai/python/framework/module_guides/deploying/agents/memory/)。
 11. LlamaIndex，[response synthesizers](https://developers.llamaindex.ai/python/framework/module_guides/querying/response_synthesizers/) 与 Sarthi et al.，[RAPTOR](https://arxiv.org/abs/2401.18059)。
@@ -465,4 +387,5 @@ LongMemEval 还可作为长期记忆的补充基准，覆盖信息提取、多�
 15. LangGraph，[persistence](https://docs.langchain.com/oss/python/langgraph/persistence)。
 16. Wu et al.，[LongMemEval](https://arxiv.org/abs/2410.10813) 及其 [evaluation repository](https://github.com/xiaowu0162/LongMemEval)。
 17. OpenAI，[Codex manual](https://developers.openai.com/codex/codex-manual.md)。
-18. Codex CLI 0.144.1，本地可复核的 feature、app-server 协议和静态契约：`codex --version`；`codex features list`；`codex app-server generate-json-schema --out <DIR>`。本次核验使用 `ThreadCompactStartParams`、`ContextCompactedNotification`、`ThreadItemsListResponse`、`ConfigReadResponse`、`TurnStartedNotification` 与 `TurnCompletedNotification` schema，并核对当前可执行文件中的 compact endpoint、生命周期及错误文案；这是当前已安装版本的接口证据，不是跨版本 API 保证，也不是未公开服务端逻辑的证明。
+18. OpenAI，[Codex app-server protocol](https://developers.openai.com/codex/app-server/)，以公开的 `thread/compact/start`、thread item 与 turn steering 合同为准；未公开的内部实现不作为本笔记证据。
+19. Claude Code，[manage sessions](https://code.claude.com/docs/en/sessions)。

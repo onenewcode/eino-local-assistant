@@ -30,7 +30,7 @@ func PlanContext(input PlannerInput, cfg Config) (PromptPlan, error) {
 // PromptBudgetTokens returns the input capacity after reserving output space.
 func (p *ContextPlanner) PromptBudgetTokens() int {
 	cfg := p.normalizedConfig()
-	return cfg.ModelContextTokens - cfg.OutputReserveTokens
+	return cfg.WindowTokens - cfg.MaxOutputTokens
 }
 
 // AutoCompactTriggerTokens is the soft-watermark threshold for planning an
@@ -53,11 +53,15 @@ func (p *ContextPlanner) ValidateConfig() error {
 		return errors.New("context planner is required")
 	}
 	cfg := p.Config
-	if cfg.ModelContextTokens < 0 {
-		return errors.New("model context tokens must be >= 0")
+	if cfg.WindowTokens < 0 {
+		return errors.New("context window tokens must be >= 0")
 	}
-	if cfg.OutputReserveTokens < 0 {
-		return errors.New("output reserve tokens must be >= 0")
+	if cfg.MaxOutputTokens < 0 {
+		return errors.New("max output tokens must be >= 0")
+	}
+	normalized := cfg.Normalize()
+	if normalized.MaxOutputTokens >= normalized.WindowTokens {
+		return errors.New("max output tokens must be smaller than context window tokens")
 	}
 	if cfg.AutoCompactTriggerPercent < 0 || cfg.AutoCompactTriggerPercent > 100 {
 		return errors.New("auto compact trigger percent must be between 0 and 100")
@@ -68,14 +72,8 @@ func (p *ContextPlanner) ValidateConfig() error {
 	if cfg.SummaryMaxTokens < 0 {
 		return errors.New("summary max tokens must be >= 0")
 	}
-	if cfg.MaxLowGainAttempts < 0 {
-		return errors.New("max low gain attempts must be >= 0")
-	}
 	if cfg.LowGainThresholdPercent < 0 || cfg.LowGainThresholdPercent > 100 {
 		return errors.New("low gain threshold percent must be between 0 and 100")
-	}
-	if p.PromptBudgetTokens() <= 0 {
-		return errors.New("model context must exceed output reserve")
 	}
 	return nil
 }

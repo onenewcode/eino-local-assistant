@@ -18,7 +18,10 @@ import (
 )
 
 const (
-	threadsDirName  = "threads"
+	// sessionsDirName is the on-disk directory for conversation sessions.
+	// Internally the store still uses "thread" terminology for the revisioned
+	// event ledger, but user-facing storage lives under sessions/.
+	sessionsDirName = "sessions"
 	journalFileName = "journal.jsonl"
 	stateFileName   = "state.json"
 	metaFileName    = "meta.json"
@@ -28,7 +31,7 @@ const (
 	writeLockName   = "write.lock"
 )
 
-// ThreadStore persists revisioned, append-only local agent threads.
+// ThreadStore persists revisioned, append-only local agent sessions.
 type ThreadStore struct {
 	root        string
 	locks       sync.Map // map[string]*localThreadLock; serializes flock use in this process.
@@ -45,19 +48,19 @@ func newLocalThreadLock() *localThreadLock {
 	return &localThreadLock{held: make(chan struct{}, 1)}
 }
 
-// NewThreadStore creates the v2 thread root under root/threads.
+// NewThreadStore creates the session store root under root/sessions.
 func NewThreadStore(root string) (*ThreadStore, error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, errors.New("storage root is required")
 	}
-	if err := os.MkdirAll(filepath.Join(root, threadsDirName), 0o700); err != nil {
-		return nil, fmt.Errorf("create threads directory: %w", err)
+	if err := os.MkdirAll(filepath.Join(root, sessionsDirName), 0o700); err != nil {
+		return nil, fmt.Errorf("create sessions directory: %w", err)
 	}
 	return &ThreadStore{root: root, materialize: writeMaterializedState}, nil
 }
 
-// Root returns the data directory containing the threads directory.
+// Root returns the data directory containing the sessions directory.
 func (s *ThreadStore) Root() string {
 	return s.root
 }
@@ -87,7 +90,7 @@ func (s *ThreadStore) threadDir(id string) (string, error) {
 	if err := validateThreadID(id); err != nil {
 		return "", err
 	}
-	return filepath.Join(s.root, threadsDirName, id), nil
+	return filepath.Join(s.root, sessionsDirName, id), nil
 }
 
 func validateThreadID(id string) error {
@@ -152,6 +155,10 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	now := time.Now().UTC()
 	meta.ID = id
 	meta.Title = strings.TrimSpace(meta.Title)
+	// A thread starts with an empty ledger. Only usage.recorded events may
+	// populate token, cost, or context projections after creation.
+	clearUsageProjection(&meta)
+	meta.UsageStatus = UsageStatusExact
 	if meta.CreatedAt.IsZero() {
 		meta.CreatedAt = now
 	} else {
@@ -227,7 +234,7 @@ func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 
 // ListThreads returns thread metadata sorted by most recent update first.
 func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
-	entries, err := os.ReadDir(filepath.Join(s.root, threadsDirName))
+	entries, err := os.ReadDir(filepath.Join(s.root, sessionsDirName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -421,7 +428,8 @@ func (s *ThreadStore) ToolCompleted(ctx context.Context, id string, expectedRevi
 	})
 }
 
-// CommitTurn appends all completed visible messages and usage as one event.
+// CommitTurn appends all completed visible messages as one event. Model usage
+// is recorded separately before this call with RecordUsage.
 func (s *ThreadStore) CommitTurn(ctx context.Context, id string, expectedRevision uint64, input TurnCommit) (ThreadState, error) {
 	if strings.TrimSpace(input.TurnID) == "" {
 		return ThreadState{}, errors.New("turn id is required")
@@ -447,6 +455,41 @@ func (s *ThreadStore) FailTurn(ctx context.Context, id string, expectedRevision 
 		return ThreadState{}, errors.New("turn id and failure are required")
 	}
 	return s.mutate(ctx, id, expectedRevision, EventTurnFailed, input.TurnID, input)
+}
+
+// FinishTurn atomically closes the specified active turn. A terminal event is
+// immutable and bound to TurnID, so unrelated metadata revisions can safely
+// rebase under the store lock without closing a newer turn.
+func (s *ThreadStore) FinishTurn(ctx context.Context, id string, input TurnFinish) (ThreadState, error) {
+	input.TurnID = strings.TrimSpace(input.TurnID)
+	input.Reason = strings.TrimSpace(input.Reason)
+	if input.TurnID == "" {
+		return ThreadState{}, errors.New("turn id is required")
+	}
+	dir, unlock, err := s.lockThread(ctx, id)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	defer unlock()
+	state, events, err := s.loadThreadLocked(dir, id)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	if input.Cancelled {
+		payload := TurnCancel{TurnID: input.TurnID, Reason: input.Reason}
+		if err := validateLifecycleMutation(events, EventTurnCancelled, input.TurnID, payload); err != nil {
+			return ThreadState{}, err
+		}
+		return s.appendLocked(dir, state, state.Revision, EventTurnCancelled, input.TurnID, payload)
+	}
+	if input.Reason == "" {
+		return ThreadState{}, errors.New("turn failure is required")
+	}
+	payload := TurnFailure{TurnID: input.TurnID, Error: input.Reason}
+	if err := validateLifecycleMutation(events, EventTurnFailed, input.TurnID, payload); err != nil {
+		return ThreadState{}, err
+	}
+	return s.appendLocked(dir, state, state.Revision, EventTurnFailed, input.TurnID, payload)
 }
 
 // SetThreadTitle emits title.changed using a revision compare-and-swap.

@@ -30,21 +30,37 @@ var (
 	// ErrInvalidThreadLifecycle means an event violates the turn/tool state
 	// machine even when its hash and revision chain are otherwise valid.
 	ErrInvalidThreadLifecycle = errors.New("invalid thread lifecycle")
+	// ErrUsageRecordConflict means one model-call ID was reused with different
+	// immutable accounting data.
+	ErrUsageRecordConflict = errors.New("model usage record conflict")
+	// ErrCompactionOperationNotPending means an identity-bound compaction was
+	// terminalized or replaced before a late result could reconcile it.
+	ErrCompactionOperationNotPending = errors.New("compaction operation is not pending")
 )
 
 // EventKind is a durable journal event category.
 type EventKind string
 
 const (
-	EventThreadCreated    EventKind = "thread.created"
-	EventTurnStarted      EventKind = "turn.started"
-	EventToolStarted      EventKind = "tool.started"
-	EventToolCompleted    EventKind = "tool.completed"
-	EventTurnCommitted    EventKind = "turn.committed"
-	EventTurnCancelled    EventKind = "turn.cancelled"
-	EventTurnFailed       EventKind = "turn.failed"
-	EventTitleChanged     EventKind = "title.changed"
-	EventContextCompacted EventKind = "context.compacted"
+	EventThreadCreated EventKind = "thread.created"
+	EventTurnStarted   EventKind = "turn.started"
+	EventToolStarted   EventKind = "tool.started"
+	EventToolCompleted EventKind = "tool.completed"
+	EventTurnCommitted EventKind = "turn.committed"
+	EventTurnCancelled EventKind = "turn.cancelled"
+	EventTurnFailed    EventKind = "turn.failed"
+	EventTitleChanged  EventKind = "title.changed"
+	EventUsageRecorded EventKind = "usage.recorded"
+	// EventContextCompactionStarted records a durable operation boundary before
+	// a compactor provider call can incur usage.
+	EventContextCompactionStarted EventKind = "context.compaction.started"
+	EventContextCompacted         EventKind = "context.compacted"
+	// EventContextCompactionFailed records an unsuccessful compaction without
+	// changing the active checkpoint or raw transcript.
+	EventContextCompactionFailed EventKind = "context.compaction.failed"
+	// EventContextCheckpointReset drops an incompatible active checkpoint while
+	// retaining its immutable journal/file record and all raw sources.
+	EventContextCheckpointReset EventKind = "context.checkpoint.reset"
 )
 
 // ThreadEvent is one hash-chained entry in journal.jsonl. Payload is preserved
@@ -68,27 +84,110 @@ type ThreadEvent struct {
 
 // ThreadState is the materialized, recoverable state of a thread.
 type ThreadState struct {
-	FormatVersion        int        `json:"format_version"`
-	ID                   string     `json:"id"`
-	Revision             uint64     `json:"revision"`
-	HeadSequence         uint64     `json:"head_sequence"`
-	LastHash             string     `json:"last_hash,omitempty"`
-	ActiveCheckpointID   string     `json:"active_checkpoint_id,omitempty"`
-	SystemPrompt         string     `json:"system_prompt,omitempty"`
-	AutoCompactionPaused bool       `json:"auto_compaction_paused,omitempty"`
-	LowGainStreak        uint64     `json:"low_gain_streak,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-	Meta                 ThreadMeta `json:"meta"`
+	FormatVersion             int                  `json:"format_version"`
+	ID                        string               `json:"id"`
+	Revision                  uint64               `json:"revision"`
+	HeadSequence              uint64               `json:"head_sequence"`
+	LastHash                  string               `json:"last_hash,omitempty"`
+	ActiveCheckpointID        string               `json:"active_checkpoint_id,omitempty"`
+	SystemPrompt              string               `json:"system_prompt,omitempty"`
+	AutoCompactionPaused      bool                 `json:"auto_compaction_paused,omitempty"`
+	AutoCompactionPauseReason string               `json:"auto_compaction_pause_reason,omitempty"`
+	LowGainStreak             uint64               `json:"low_gain_streak,omitempty"`
+	PendingCompaction         *CompactionOperation `json:"pending_compaction,omitempty"`
+	LastCompaction            *CompactionOutcome   `json:"last_compaction,omitempty"`
+	CreatedAt                 time.Time            `json:"created_at"`
+	UpdatedAt                 time.Time            `json:"updated_at"`
+	Meta                      ThreadMeta           `json:"meta"`
+
+	// recordedUsage is rebuilt from the journal and prevents duplicate call IDs
+	// from being counted twice during replay.
+	recordedUsage map[string]ModelUsage
+	// recordedCheckpointIDs is rebuilt from context.compacted events and rejects
+	// duplicate IDs even when a materialized checkpoint file was lost.
+	recordedCheckpointIDs map[string]struct{}
+	// recordedCompactionOperationIDs is rebuilt from compaction lifecycle events
+	// so a later transaction cannot reuse accounting correlation data.
+	recordedCompactionOperationIDs map[string]struct{}
 }
 
-// UsageDelta is atomically recorded with a committed turn.
-type UsageDelta struct {
-	PromptTokens     int     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int     `json:"completion_tokens,omitempty"`
-	TotalTokens      int     `json:"total_tokens,omitempty"`
-	CostUSD          float64 `json:"cost_usd,omitempty"`
-	Estimated        bool    `json:"estimated,omitempty"`
+// UsageOperation identifies the product operation that made a model request.
+type UsageOperation string
+
+const (
+	// UsageOperationAgent is one model call made while answering an agent turn.
+	UsageOperationAgent UsageOperation = "agent"
+	// UsageOperationCompaction is one model call used to summarize context.
+	UsageOperationCompaction UsageOperation = "compaction"
+)
+
+// ContextSnapshot is the last exact primary-model context measurement. A nil
+// ThreadMeta.LastContext means that no trustworthy measurement is available.
+type ContextSnapshot struct {
+	PromptTokens int `json:"prompt_tokens"`
+	BudgetTokens int `json:"budget_tokens,omitempty"`
+}
+
+// CompactionOutcomeStatus classifies the last completed compaction lifecycle
+// transaction without pretending a failed attempt changed the active view.
+type CompactionOutcomeStatus string
+
+const (
+	CompactionOutcomeSucceeded       CompactionOutcomeStatus = "succeeded"
+	CompactionOutcomeFailed          CompactionOutcomeStatus = "failed"
+	CompactionOutcomeCancelled       CompactionOutcomeStatus = "cancelled"
+	CompactionOutcomeCheckpointReset CompactionOutcomeStatus = "checkpoint_reset"
+)
+
+// CompactionFailureReasonLowGain marks a syntactically valid checkpoint that
+// did not free enough capacity. Automatic low-gain failures may retry until
+// the configured streak limit is reached.
+const CompactionFailureReasonLowGain = "low_gain"
+
+// CompactionFailureReasonStale marks a cancelled automatic operation whose
+// frozen candidate lost a CAS race. It closes the durable operation without
+// latching automatic compaction as failed.
+const CompactionFailureReasonStale = "stale"
+
+// CompactionOutcome is a durable, user-visible summary of one compaction
+// result. Detailed model usage remains in usage.recorded events linked by
+// OperationID.
+type CompactionOutcome struct {
+	Status       CompactionOutcomeStatus `json:"status"`
+	OperationID  string                  `json:"operation_id,omitempty"`
+	CheckpointID string                  `json:"checkpoint_id,omitempty"`
+	Automatic    bool                    `json:"automatic,omitempty"`
+	Reason       string                  `json:"reason,omitempty"`
+	At           time.Time               `json:"at"`
+}
+
+// CompactionOperation identifies a started compaction that has not yet reached
+// a durable success or failure event. Resume requires explicit recovery before
+// another compaction can spend provider tokens on the same thread.
+type CompactionOperation struct {
+	OperationID string    `json:"operation_id"`
+	Automatic   bool      `json:"automatic,omitempty"`
+	StartedAt   time.Time `json:"started_at"`
+}
+
+// ModelUsage is the durable accounting record for one completed model API
+// call. CallID is unique within a thread and makes RecordUsage idempotent.
+// Token values are trusted only when HasProviderUsage is true.
+type ModelUsage struct {
+	CallID    string         `json:"call_id"`
+	TurnID    string         `json:"turn_id,omitempty"`
+	Operation UsageOperation `json:"operation"`
+	// OperationID correlates compaction usage calls with one compaction
+	// transaction. Agent usage deliberately leaves it empty.
+	OperationID         string  `json:"operation_id,omitempty"`
+	HasProviderUsage    bool    `json:"has_provider_usage"`
+	PromptTokens        int     `json:"prompt_tokens,omitempty"`
+	CompletionTokens    int     `json:"completion_tokens,omitempty"`
+	TotalTokens         int     `json:"total_tokens,omitempty"`
+	CachedTokens        int     `json:"cached_tokens,omitempty"`
+	ReasoningTokens     int     `json:"reasoning_tokens,omitempty"`
+	ContextBudgetTokens int     `json:"context_budget_tokens,omitempty"`
+	CostUSD             float64 `json:"cost_usd,omitempty"`
 }
 
 // TurnStart records an input accepted for one agent turn.
@@ -119,7 +218,6 @@ type ToolCompleted struct {
 type TurnCommit struct {
 	TurnID   string            `json:"turn_id"`
 	Messages []*schema.Message `json:"messages"`
-	Usage    UsageDelta        `json:"usage,omitempty"`
 }
 
 // TurnCancel records a cancelled, uncommitted turn.
@@ -132,6 +230,14 @@ type TurnCancel struct {
 type TurnFailure struct {
 	TurnID string `json:"turn_id"`
 	Error  string `json:"error"`
+}
+
+// TurnFinish terminally closes one known active turn without relying on a
+// caller's stale revision. It is used after a model call has already ended.
+type TurnFinish struct {
+	TurnID    string
+	Cancelled bool
+	Reason    string
 }
 
 // ArtifactInput is immutable content addressed by its SHA-256 digest.
@@ -190,8 +296,12 @@ type CheckpointInput struct {
 	BeforeTokens   int             `json:"before_tokens,omitempty"`
 	AfterTokens    int             `json:"after_tokens,omitempty"`
 	Automatic      bool            `json:"automatic,omitempty"`
-	LowGain        bool            `json:"low_gain,omitempty"`
-	AutoPaused     bool            `json:"auto_paused,omitempty"`
+	// LowGain is ignored on write. Kept only so older callers/fixtures compile;
+	// anti-thrash streak is owned exclusively by compaction failure events.
+	LowGain         bool   `json:"low_gain,omitempty"`
+	AutoPaused      bool   `json:"auto_paused,omitempty"`
+	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
+	OperationID     string `json:"operation_id,omitempty"`
 }
 
 // Checkpoint is an immutable checkpoint persisted both in a file and in the
@@ -216,9 +326,61 @@ type Checkpoint struct {
 	BeforeTokens   int             `json:"before_tokens,omitempty"`
 	AfterTokens    int             `json:"after_tokens,omitempty"`
 	Automatic      bool            `json:"automatic,omitempty"`
-	LowGain        bool            `json:"low_gain,omitempty"`
-	AutoPaused     bool            `json:"auto_paused,omitempty"`
-	Hash           string          `json:"hash"`
+	// LowGain is historical journal metadata only. New checkpoints always write
+	// false; successful installs always clear LowGainStreak.
+	LowGain         bool   `json:"low_gain,omitempty"`
+	AutoPaused      bool   `json:"auto_paused,omitempty"`
+	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
+	OperationID     string `json:"operation_id,omitempty"`
+	Hash            string `json:"hash"`
+}
+
+// DefaultMaxLowGainAttempts is consecutive automatic low-gain failures before
+// auto-compaction pauses when MaxLowGainAttempts is unset or zero.
+const DefaultMaxLowGainAttempts = 2
+
+// CompactionFailure appends an unsuccessful compaction result. It is separate
+// from a checkpoint commit so failed model output can never alter the active
+// model-visible work view.
+//
+// For automatic failures, the store materializes AutoPaused / AutoPauseReason
+// and ResultingLowGainStreak under the write lock from the current
+// LowGainStreak and MaxLowGainAttempts. Callers should not precompute those
+// fields for automatic outcomes; only manual failures preserve an explicit
+// AutoPaused snapshot.
+type CompactionFailure struct {
+	OperationID     string `json:"operation_id,omitempty"`
+	Automatic       bool   `json:"automatic,omitempty"`
+	Cancelled       bool   `json:"cancelled,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	AutoPaused      bool   `json:"auto_paused,omitempty"`
+	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
+	// ResultingLowGainStreak is the absolute projected streak after this
+	// automatic non-stale failure (previous+1 for low_gain, 0 for hard fails).
+	// Nil means leave streak unchanged (stale/manual) or apply a legacy
+	// reason-based fallback when replaying older journals.
+	ResultingLowGainStreak *uint64 `json:"resulting_low_gain_streak,omitempty"`
+	// MaxLowGainAttempts is write-time policy only. It is not journaled; the
+	// resulting AutoPaused flag and ResultingLowGainStreak are. Zero means
+	// DefaultMaxLowGainAttempts.
+	MaxLowGainAttempts int `json:"-"`
+}
+
+// CompactionStart opens a durable compaction operation before provider usage
+// is recorded. OperationID must match its terminal checkpoint or failure.
+type CompactionStart struct {
+	OperationID string `json:"operation_id"`
+	Automatic   bool   `json:"automatic,omitempty"`
+}
+
+// CheckpointSchemaReset records an intentional active-pointer reset when a
+// session encounters an incompatible checkpoint schema on resume.
+type CheckpointSchemaReset struct {
+	OperationID     string `json:"operation_id,omitempty"`
+	CheckpointID    string `json:"checkpoint_id"`
+	Reason          string `json:"reason"`
+	AutoPaused      bool   `json:"auto_paused,omitempty"`
+	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
 }
 
 // ToolGroup associates tool start and completion records reconstructed from a
@@ -235,6 +397,7 @@ type TurnGroup struct {
 	TurnID         string       `json:"turn_id"`
 	Started        *TurnStart   `json:"started,omitempty"`
 	Tools          []ToolGroup  `json:"tools,omitempty"`
+	Usages         []ModelUsage `json:"usages,omitempty"`
 	Committed      *TurnCommit  `json:"committed,omitempty"`
 	Cancelled      *TurnCancel  `json:"cancelled,omitempty"`
 	Failed         *TurnFailure `json:"failed,omitempty"`

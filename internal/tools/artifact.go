@@ -43,7 +43,7 @@ type ReadArtifactOutput struct {
 func NewReadArtifact() (tool.InvokableTool, error) {
 	return utils.InferTool(
 		"read_artifact",
-		"Read a bounded range from an artifact:// reference in the current thread. Use this when earlier context cites an artifact and its original evidence is needed. Never assume a truncated artifact contains the complete original output.",
+		"Read a bounded range from an artifact:// reference in the current thread. Use this when earlier context cites an artifact and you need the original evidence. Never assume a truncated artifact contains the complete original output. This tool cannot cross threads.",
 		func(ctx context.Context, input ReadArtifactInput) (ReadArtifactOutput, error) {
 			access, ok := store.ThreadAccessFromContext(ctx)
 			if !ok {

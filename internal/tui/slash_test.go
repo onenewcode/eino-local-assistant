@@ -18,6 +18,8 @@ func TestParseSlash(t *testing.T) {
 		{"/quit", slashExit, ""},
 		{"/clear", slashClear, ""},
 		{"/status", slashStatus, ""},
+		{"/usage", slashUsage, ""},
+		{"/usage off", slashUsage, "off"},
 		{"/context", slashContext, ""},
 		{"/CONTEXT", slashContext, ""},
 		{"/compact", slashCompact, ""},
@@ -30,6 +32,11 @@ func TestParseSlash(t *testing.T) {
 		{"/delete 20260715-120000-abc123", slashDelete, "20260715-120000-abc123"},
 		{"/queue", slashQueue, ""},
 		{"/queue clear", slashQueue, "clear"},
+		{"/permissions", slashPermissions, ""},
+		{"/policy", slashPermissions, ""},
+		{"/memory", slashMemory, ""},
+		{"/memory list", slashMemory, "list"},
+		{"/memory add prefer go", slashMemory, "add prefer go"},
 		{"/unknown", slashUnknown, "/unknown"},
 		{"  /HELP  ", slashHelp, ""},
 	}
@@ -67,9 +74,10 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/usage",
 		"/context", "/compact",
 		"/new", "/sessions", "/resume", "/title", "/delete", "/queue",
+		"/permissions", "/policy",
 	}
 	for _, tok := range tokens {
 		if !catalogCoversToken(catalog, tok) {
@@ -95,9 +103,9 @@ func catalogCoversToken(catalog []slashCommand, tok string) bool {
 func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
 		"/help": false, "/status": false, "/context": false, "/sessions": false,
-		"/clear": false, "/exit": false,
-		"/compact": true, "/new": true, "/resume": true, "/title": true,
-		"/delete": true, "/queue": true,
+		"/clear": false, "/exit": false, "/permissions": false,
+		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/title": true,
+		"/delete": true, "/queue": true, "/memory": true,
 	}
 	for _, cmd := range slashCatalog() {
 		need, ok := want[cmd.Name]

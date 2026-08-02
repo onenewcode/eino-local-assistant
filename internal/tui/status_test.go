@@ -26,13 +26,11 @@ func TestFormatIdleStatusIncludesCoreParts(t *testing.T) {
 		model:   "deepseek",
 		shortID: "abc123",
 		title:   "debug",
-		tokens:  "1.2k",
-		cost:    "$0.01",
-		ctx:     "ctx=40%",
+		context: "ctx=754/6.0k (12%)",
 		queued:  "queued:2",
 	}
 	got := formatIdleStatus(120, p)
-	for _, want := range []string{"ready", "deepseek", "abc123", "debug", "1.2k", "$0.01", "ctx=40%", "queued:2"} {
+	for _, want := range []string{"ready", "deepseek", "abc123", "debug", "ctx=754/6.0k (12%)", "queued:2"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status %q missing %q", got, want)
 		}
@@ -44,8 +42,7 @@ func TestFormatIdleStatusDropsWhenNarrow(t *testing.T) {
 		model:   "very-long-model-name",
 		shortID: "abc123",
 		title:   "a fairly long title here",
-		tokens:  "12.3k",
-		cost:    "$1.23",
+		context: "ctx=12.3k/128k (9%)",
 		queued:  "queued:3",
 		follow:  "↑ End to follow",
 	}
@@ -57,22 +54,66 @@ func TestFormatIdleStatusDropsWhenNarrow(t *testing.T) {
 	if strings.Contains(got, "a fairly long title") {
 		t.Fatalf("narrow width should drop title: %q", got)
 	}
-	// Prefer keeping cost/queue/follow if possible.
-	if !strings.Contains(got, "$1.23") && !strings.Contains(got, "queued:3") {
-		t.Fatalf("expected cost or queue retained: %q", got)
+	// Prefer keeping queue/follow if possible.
+	if !strings.Contains(got, "queued:3") && !strings.Contains(got, "End to follow") {
+		t.Fatalf("expected queue or follow retained: %q", got)
+	}
+}
+
+func TestFormatIdleStatusKeepsContextLongerThanDecoration(t *testing.T) {
+	p := idleStatusParts{
+		model:   "model-name",
+		shortID: "abc123",
+		title:   "title-here",
+		context: "ctx=1.2k/4.0k (30%)",
+	}
+	// Wide enough for ready + ctx but not all decoration.
+	got := formatIdleStatus(28, p)
+	if !strings.Contains(got, "ctx=") {
+		// At very narrow widths ctx may still drop last; use a width that fits base+ctx.
+		got = formatIdleStatus(35, p)
+	}
+	if !strings.Contains(got, "ctx=") {
+		t.Fatalf("expected ctx retained over title/id when possible: %q", got)
+	}
+	if strings.Contains(got, "title-here") && !strings.Contains(got, "ctx=") {
+		t.Fatalf("title must not outrank ctx: %q", got)
+	}
+}
+
+func TestSessionCtxFragmentOmitsUnknown(t *testing.T) {
+	m := newTestModel(t)
+	if got := sessionCtxFragment(m.deps.Session); got != "" {
+		t.Fatalf("no measurement should omit ctx fragment, got %q", got)
+	}
+	if got := sessionCtxFragment(nil); got != "" {
+		t.Fatalf("nil session should omit ctx fragment, got %q", got)
+	}
+}
+
+func TestJoinStatusSuffix(t *testing.T) {
+	if got := joinStatusSuffix(statusExtras{}); got != "" {
+		t.Fatalf("empty extras=%q", got)
+	}
+	got := joinStatusSuffix(statusExtras{context: "ctx=1/2 (50%)", queued: "queued:1", follow: "↑ End to follow"})
+	want := " · ctx=1/2 (50%) · queued:1 · ↑ End to follow"
+	if got != want {
+		t.Fatalf("suffix=%q want %q", got, want)
 	}
 }
 
 func TestStatusLineIdleContainsModelAndID(t *testing.T) {
 	m := newTestModel(t)
-	// Session from newTestModel has an id only if store is set; without store, ID may be empty.
-	// Status model name still comes from deps.
 	line := m.statusLine()
 	if !strings.Contains(line, "ready") {
 		t.Fatalf("idle status should contain ready: %q", line)
 	}
 	if !strings.Contains(line, "test-model") {
 		t.Fatalf("idle status should contain model: %q", line)
+	}
+	// Fresh session has no measured context; do not pollute with ctx=?.
+	if strings.Contains(line, "ctx=") {
+		t.Fatalf("idle status without measurement must omit ctx: %q", line)
 	}
 }
 
@@ -93,5 +134,21 @@ func TestStatusLineFollowHint(t *testing.T) {
 	line = m.statusLine()
 	if strings.Contains(line, "End to follow") {
 		t.Fatalf("follow hint should clear at bottom: %q", line)
+	}
+}
+
+func TestStatusLabelBusyUsesSharedSuffix(t *testing.T) {
+	m := newTestModel(t)
+	m.mode = modeBusy
+	m.queue = []string{"next"}
+	line := m.statusLabel()
+	if !strings.Contains(line, "Working") {
+		t.Fatalf("busy status missing Working: %q", line)
+	}
+	if !strings.Contains(line, "queued:1") {
+		t.Fatalf("busy status should include queue via shared extras: %q", line)
+	}
+	if strings.Contains(line, "ctx=") {
+		t.Fatalf("busy status without measurement must omit ctx: %q", line)
 	}
 }

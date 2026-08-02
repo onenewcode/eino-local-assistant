@@ -23,6 +23,13 @@ func TestFromMessageUsage(t *testing.T) {
 	}
 }
 
+func TestFromTokenUsageKeepsExplicitZeroReport(t *testing.T) {
+	turn, ok := FromTokenUsage(&schema.TokenUsage{})
+	if !ok || turn != (Turn{}) {
+		t.Fatalf("turn=%+v ok=%v", turn, ok)
+	}
+}
+
 func TestEstimateAndCost(t *testing.T) {
 	msgs := []*schema.Message{
 		schema.SystemMessage("hello world"),

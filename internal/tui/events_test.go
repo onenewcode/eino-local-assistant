@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/usage"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -33,6 +34,30 @@ func TestEmitFromTurnEventPreservesRawToolPayload(t *testing.T) {
 	}
 	if end.output != output {
 		t.Fatalf("tool output was truncated: got %d want %d runes", len([]rune(end.output)), len([]rune(output)))
+	}
+}
+
+func TestEmitFromTurnEventForwardsModelUsage(t *testing.T) {
+	ch := make(chan tea.Msg, 1)
+	emit := emitFromTurnEvent(context.Background(), 17, ch)
+	emit(chat.TurnEvent{
+		Kind: chat.TurnEventModelUsage,
+		ModelUsage: &chat.ModelUsageEvent{
+			CallID:    "call-1",
+			Operation: chat.ModelUsageOperationAgent,
+			Usage: usage.Turn{
+				PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12, CachedTokens: 4,
+			},
+			Available: true,
+		},
+	})
+
+	got, ok := (<-ch).(turnUsageMsg)
+	if !ok {
+		t.Fatal("model usage should become a turnUsageMsg")
+	}
+	if got.turnID != 17 || got.usage.CallID != "call-1" || got.usage.Usage.TotalTokens != 12 || got.usage.Usage.CachedTokens != 4 {
+		t.Fatalf("usage msg=%+v", got)
 	}
 }
 

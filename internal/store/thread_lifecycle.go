@@ -50,7 +50,10 @@ func validateLifecycleMutation(events []ThreadEvent, kind EventKind, turnID stri
 
 func (t *lifecycleTracker) apply(event ThreadEvent) error {
 	switch event.Kind {
-	case EventThreadCreated, EventTitleChanged, EventContextCompacted:
+	case EventThreadCreated, EventTitleChanged, EventContextCompactionStarted, EventContextCompacted,
+		EventContextCompactionFailed, EventContextCheckpointReset:
+		// Compaction lifecycle events are independent of an agent turn. They
+		// must not make an idle thread look like it has an unfinished turn.
 		return nil
 	case EventTurnStarted:
 		var payload TurnStart
@@ -145,6 +148,23 @@ func (t *lifecycleTracker) apply(event ThreadEvent) error {
 		turn.terminal = EventTurnFailed
 		t.activeTurnID = ""
 		return nil
+	case EventUsageRecorded:
+		var payload ModelUsage
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return lifecycleError(event, "decode usage record: %v", err)
+		}
+		usage, err := normalizeModelUsage(payload)
+		if err != nil {
+			return lifecycleError(event, "invalid usage record: %v", err)
+		}
+		if usage.TurnID != event.TurnID {
+			return lifecycleError(event, "usage turn id does not match event")
+		}
+		if usage.Operation == UsageOperationCompaction && usage.TurnID == "" {
+			return nil
+		}
+		_, err = t.openTurn(event, usage.TurnID)
+		return err
 	default:
 		return lifecycleError(event, "unknown lifecycle event kind %q", event.Kind)
 	}

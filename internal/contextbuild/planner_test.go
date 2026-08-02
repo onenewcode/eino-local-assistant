@@ -12,11 +12,11 @@ import (
 
 func TestDefaultConfigIncludesPlanningDefaults(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.ModelContextTokens != 32_000 {
-		t.Fatalf("ModelContextTokens = %d, want 32000", cfg.ModelContextTokens)
+	if cfg.WindowTokens != 32_000 {
+		t.Fatalf("WindowTokens = %d, want 32000", cfg.WindowTokens)
 	}
-	if cfg.OutputReserveTokens != 4_096 {
-		t.Fatalf("OutputReserveTokens = %d, want 4096", cfg.OutputReserveTokens)
+	if cfg.MaxOutputTokens != 4_096 {
+		t.Fatalf("MaxOutputTokens = %d, want 4096", cfg.MaxOutputTokens)
 	}
 	if cfg.AutoCompactTriggerPercent != 75 || cfg.PostCompactTargetPercent != 45 {
 		t.Fatalf("trigger/target = %d/%d", cfg.AutoCompactTriggerPercent, cfg.PostCompactTargetPercent)
@@ -24,8 +24,8 @@ func TestDefaultConfigIncludesPlanningDefaults(t *testing.T) {
 	if cfg.SummaryMaxTokens != 2_048 || cfg.KeepRecentTurns != 12 {
 		t.Fatalf("summary/recent = %d/%d", cfg.SummaryMaxTokens, cfg.KeepRecentTurns)
 	}
-	if cfg.LowGainThresholdPercent != 15 || cfg.MaxLowGainAttempts != 2 {
-		t.Fatalf("low gain settings = %d/%d", cfg.LowGainThresholdPercent, cfg.MaxLowGainAttempts)
+	if cfg.LowGainThresholdPercent != 15 {
+		t.Fatalf("low gain threshold = %d", cfg.LowGainThresholdPercent)
 	}
 }
 
@@ -37,10 +37,17 @@ func TestConfigNormalizeTreatsZeroAsProductDefault(t *testing.T) {
 	}
 }
 
+func TestContextPlannerRejectsOutputAtOrAboveWindow(t *testing.T) {
+	planner := NewContextPlanner(Config{WindowTokens: 4_096, MaxOutputTokens: 4_096})
+	if err := planner.ValidateConfig(); err == nil {
+		t.Fatal("ValidateConfig() error = nil, want an invalid budget error")
+	}
+}
+
 func TestContextPlannerKeepsCompleteRecentSuffixAndCurrentLast(t *testing.T) {
 	planner := NewContextPlanner(Config{
-		ModelContextTokens:        1_000,
-		OutputReserveTokens:       100,
+		WindowTokens:              1_000,
+		MaxOutputTokens:           100,
 		AutoCompactTriggerPercent: 75,
 		PostCompactTargetPercent:  45,
 		SummaryMaxTokens:          256,
@@ -113,8 +120,8 @@ func TestArtifactEstimateIncludesRenderedMessageFraming(t *testing.T) {
 
 func TestContextPlannerRejectsImmutableOverBudget(t *testing.T) {
 	planner := NewContextPlanner(Config{
-		ModelContextTokens:  400,
-		OutputReserveTokens: 100,
+		WindowTokens:    400,
+		MaxOutputTokens: 100,
 	})
 	_, err := planner.Plan(PlannerInput{
 		ImmutableMessages: []*schema.Message{schema.SystemMessage(strings.Repeat("s", 2_000))},
@@ -126,7 +133,7 @@ func TestContextPlannerRejectsImmutableOverBudget(t *testing.T) {
 }
 
 func TestContextPlannerArtifactReferencesStayOutsideSourceMessages(t *testing.T) {
-	planner := NewContextPlanner(Config{ModelContextTokens: 2_000, OutputReserveTokens: 200})
+	planner := NewContextPlanner(Config{WindowTokens: 2_000, MaxOutputTokens: 200})
 	plan, err := planner.Plan(PlannerInput{
 		ImmutableMessages: []*schema.Message{schema.SystemMessage("system")},
 		CurrentMessages:   []*schema.Message{schema.UserMessage("question")},
