@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,6 +31,10 @@ type Consolidator struct {
 func (c *Consolidator) RunOnce(ctx context.Context) (int, error) {
 	if c == nil || c.Store == nil || c.Threads == nil || c.Model == nil {
 		return 0, nil
+	}
+	generation, err := c.Store.resetGeneration()
+	if err != nil {
+		return 0, err
 	}
 	if !c.Store.GenerateEnabled() {
 		return 0, nil
@@ -87,14 +92,20 @@ func (c *Consolidator) RunOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		scanned++
-		n, err := c.processThread(ctx, extractor, meta.ID)
+		n, err := c.processThread(ctx, extractor, meta.ID, generation)
 		if err != nil {
-			_ = c.Store.RecordExtractError(err)
+			if errors.Is(err, errResetGenerationChanged) {
+				continue
+			}
+			_ = c.Store.recordExtractErrorAtGeneration(generation, err)
 			// Do not mark processed — allow retry on a later scan.
 			continue
 		}
-		if err := c.Store.MarkExtracted(meta.ID); err != nil {
-			_ = c.Store.RecordExtractError(err)
+		if err := c.Store.markExtractedAtGeneration(generation, meta.ID); err != nil {
+			if errors.Is(err, errResetGenerationChanged) {
+				continue
+			}
+			_ = c.Store.recordExtractErrorAtGeneration(generation, err)
 			continue
 		}
 		written += n
@@ -102,7 +113,12 @@ func (c *Consolidator) RunOnce(ctx context.Context) (int, error) {
 	return written, nil
 }
 
-func (c *Consolidator) processThread(ctx context.Context, extractor *Extractor, threadID string) (int, error) {
+func (c *Consolidator) processThread(
+	ctx context.Context,
+	extractor *Extractor,
+	threadID string,
+	generation uint64,
+) (int, error) {
 	msgs, err := c.Threads.LoadRecentMessages(ctx, threadID, 40)
 	if err != nil {
 		return 0, err
@@ -117,7 +133,7 @@ func (c *Consolidator) processThread(ctx context.Context, extractor *Extractor, 
 	}
 	n := 0
 	for _, d := range drafts {
-		if _, err := c.Store.AddCandidate(d.Key, d.Claim, threadID, nil); err != nil {
+		if _, err := c.Store.addCandidateAtGeneration(generation, d.Key, d.Claim, threadID, nil); err != nil {
 			// Skip refused candidates (e.g. user owns key); other errors abort.
 			if strings.Contains(err.Error(), "candidate refused") {
 				continue

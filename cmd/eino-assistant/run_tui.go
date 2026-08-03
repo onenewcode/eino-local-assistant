@@ -13,18 +13,11 @@ import (
 	"syscall"
 	"time"
 
-	"eino-local-assistant/internal/agent"
-	"eino-local-assistant/internal/chat"
-	"eino-local-assistant/internal/config"
-	"eino-local-assistant/internal/contextbuild"
 	"eino-local-assistant/internal/memory"
-	"eino-local-assistant/internal/provider"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/sandbox"
-	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/tools"
 	"eino-local-assistant/internal/tui"
-	"eino-local-assistant/internal/usage"
 
 	"golang.org/x/term"
 )
@@ -45,209 +38,35 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
 		return errors.New("interactive terminal required (stdin and stdout must be a TTY)")
 	}
 
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		return err
-	}
-
-	dataDir, err := cfg.Storage.ResolveDataDir()
-	if err != nil {
-		return err
-	}
-	sessionStore, err := store.NewThreadStore(dataDir)
-	if err != nil {
-		return fmt.Errorf("open session store: %w", err)
-	}
-
-	chatModel, err := provider.NewChatModel(processCtx, cfg.Model)
-	if err != nil {
-		return err
-	}
-
-	perms, err := cfg.BuildPermissions()
-	if err != nil {
-		return err
-	}
-	workspaceRoot, err := tools.ResolveWorkspaceRoot(cfg.Workspace.Root)
-	if err != nil {
-		return err
-	}
-	protectedPaths, err := effectiveSandboxProtectedPaths(
-		workspaceRoot,
-		cfg.Sandbox.EffectiveProtectedPaths(),
-		configPath,
-		dataDir,
-	)
-	if err != nil {
-		return err
-	}
-	readOnlyRoots, err := cfg.Sandbox.ResolveReadOnlyRoots()
-	if err != nil {
-		return err
-	}
-	sandboxRunner, err := tools.NewSandboxRunner(tools.SandboxRunnerOptions{
-		Mode:           sandbox.Mode(cfg.Sandbox.ModeNormalized()),
-		WorkspaceRoot:  workspaceRoot,
-		ReadOnlyRoots:  readOnlyRoots,
-		ProtectedPaths: protectedPaths,
-		AllowedHosts:   cfg.Sandbox.Network.AllowedDomains,
-	})
-	if err != nil {
-		return fmt.Errorf("create sandbox runner: %w", err)
-	}
-	defer sandboxRunner.Close()
-	runtimeCfg := cfg.Runtime.Normalize()
-	sessionAllows := tools.NewSessionAllowlist()
-	sessionDenies := tools.NewSessionDenylist()
 	approvalBridge := tui.NewApprovalBridge()
-	approvalMode := tools.NormalizeApprovalMode(cfg.ApprovalPolicyNormalized())
-	shell := cfg.Tools.Shell
-	patch := cfg.Tools.ApplyPatch
-
-	memStore, err := memory.Open(memory.Options{
-		WorkspaceRoot:    workspaceRoot,
-		MaxSummaryTokens: cfg.Memory.MemorySummaryTokens(),
-		UseEnabled:       cfg.Memory.MemoryEnabled(),
-		GenerateEnabled:  cfg.Memory.MemoryGenerate(),
-	})
-	if err != nil {
-		return fmt.Errorf("open memory store: %w", err)
-	}
-
-	registry, err := tools.DefaultWithOptions(tools.DefaultOptions{
-		Clock:       time.Now,
-		MemoryStore: memStore,
-		Shell: tools.ShellOptions{
-			Disabled:       shell.Disabled,
-			TimeoutSeconds: shell.TimeoutSeconds,
-			MaxOutputBytes: shell.MaxOutputBytes,
-			WorkingDir:     shell.WorkingDir,
-			Approval:       approvalMode,
-			WorkspaceOnly:  true,
-			WorkspaceRoot:  workspaceRoot,
-			Permissions:    perms,
-			Approver:       approvalBridge,
-			SessionAllows:  sessionAllows,
-			SessionDenies:  sessionDenies,
-			Sandbox:        sandboxRunner,
-		},
-		ApplyPatch: tools.ApplyPatchOptions{
-			Disabled:      patch.Disabled,
-			WorkspaceRoot: workspaceRoot,
-			MaxBytes:      patch.MaxBytes,
-			Approval:      approvalMode,
-			Permissions:   perms,
-			Approver:      approvalBridge,
-			SessionAllows: sessionAllows,
-			SessionDenies: sessionDenies,
-			Sandbox:       sandboxRunner,
-		},
-	})
+	runtime, err := newCommandRuntime(processCtx, configPath, start, approvalBridge)
 	if err != nil {
 		return err
 	}
-	// The task runtime stays in internal/agent, while its three orchestration
-	// tools join the normal policy-enforced workspace tool registry here.
-	taskController := agent.NewTaskController()
-	taskTools, err := agent.NewTaskTools(taskController)
-	if err != nil {
-		return fmt.Errorf("create task tools: %w", err)
-	}
-	allTools := append(registry.All(), taskTools...)
-	registry = tools.New(allTools...)
-
-	model, err := agent.NewReActModelWithOptions(processCtx, chatModel, registry.All(), agent.ReActOptions{
-		MaxStep:        runtimeCfg.MaxReactSteps,
-		TaskController: taskController,
-	})
-	if err != nil {
-		return err
-	}
-	modelContext := cfg.Model.Context
-	contextCfg := contextbuild.Config{
-		WindowTokens:              modelContext.WindowTokens,
-		MaxOutputTokens:           modelContext.MaxOutputTokens,
-		KeepRecentTurns:           modelContext.KeepRecentTurns,
-		AutoCompactTriggerPercent: modelContext.AutoCompactTriggerPercent,
-		PostCompactTargetPercent:  modelContext.PostCompactTargetPercent,
-		SummaryMaxTokens:          modelContext.SummaryMaxTokens,
-		LowGainThresholdPercent:   modelContext.LowGainThresholdPercent,
-	}
-	// The raw provider has no tools bound. Keep compaction on this separate
-	// interface so a checkpoint request cannot enter the ReAct tool loop.
-	compactor, err := contextbuild.NewModelCompactor(chatModel, contextCfg)
-	if err != nil {
-		return fmt.Errorf("create context compactor: %w", err)
-	}
-
-	sessionOpts := chat.SessionOptions{
-		Store:     sessionStore,
-		ModelName: cfg.Model.Name,
-		Pricing: usage.Pricing{
-			InputPerMillion:  cfg.Model.Pricing.InputPerMillion,
-			OutputPerMillion: cfg.Model.Pricing.OutputPerMillion,
-		},
-		Context:            contextCfg,
-		MaxLowGainAttempts: modelContext.MaxLowGainAttempts,
-		Compactor:          compactor,
-		RecoverInterrupted: start.recoverInterrupted,
-	}
-
-	composePrompt := func() (string, error) {
-		memBlock := ""
-		if memStore.UseEnabled() {
-			sum, err := memStore.Summary()
-			if err != nil {
-				return "", err
-			}
-			memBlock = agent.FormatMemoryBlock(sum.Text)
-		}
-		return agent.ComposeWithLayers(cfg.Assistant.SystemPrompt, agent.LayerOptions{
-			WorkspaceRoot:              workspaceRoot,
-			ProjectInstructionsEnabled: cfg.Rules.RulesEnabled(),
-			ProjectInstructionsTokens:  cfg.Rules.RulesMaxTokens(),
-			MemoryBlock:                memBlock,
-		})
-	}
-
-	var session *chat.Session
+	defer runtime.Close()
 	if start.resumeID != "" {
-		session, err = chat.OpenSession(model, sessionStore, start.resumeID, sessionOpts)
-		if err != nil {
-			return fmt.Errorf("resume session: %w", err)
-		}
 		// Keep the durable create-time system prompt. Mid-session rewrites would
 		// bust provider prefix cache and diverge from freeze-until-/new-or-/clear.
-		fmt.Fprintf(stderr, "resumed session %s\n", session.ID())
-	} else {
-		sessionOpts.Title = start.title
-		fullPrompt, err := composePrompt()
-		if err != nil {
-			return fmt.Errorf("compose system prompt: %w", err)
-		}
-		session, err = chat.NewSession(model, fullPrompt, sessionOpts)
-		if err != nil {
-			return err
-		}
+		fmt.Fprintf(stderr, "resumed session %s\n", runtime.session.ID())
 	}
 
-	idleAfter, err := cfg.Memory.MemoryIdleAfterDuration()
+	idleAfter, err := runtime.cfg.Memory.MemoryIdleAfterDuration()
 	if err != nil {
 		return err
 	}
-	scanMaxAge, err := cfg.Memory.MemoryScanMaxAgeDuration()
+	scanMaxAge, err := runtime.cfg.Memory.MemoryScanMaxAgeDuration()
 	if err != nil {
 		return err
 	}
 	var activeSessionID atomic.Value
-	activeSessionID.Store(session.ID())
+	activeSessionID.Store(runtime.session.ID())
 	consolidator := &memory.Consolidator{
-		Store:      memStore,
-		Threads:    sessionStore,
-		Model:      chatModel,
+		Store:      runtime.memStore,
+		Threads:    runtime.sessionStore,
+		Model:      runtime.chatModel,
 		IdleAfter:  idleAfter,
 		ScanMaxAge: scanMaxAge,
-		MaxPerScan: cfg.Memory.MemoryMaxRollouts(),
+		MaxPerScan: runtime.cfg.Memory.MemoryMaxRollouts(),
 		ActiveThreadID: func() string {
 			id, _ := activeSessionID.Load().(string)
 			return id
@@ -256,7 +75,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
 	consolidator.StartLoop(processCtx, 5*time.Minute)
 
 	cmdMode := "ask"
-	if approvalMode == tools.ApprovalNever {
+	if runtime.approvalMode == tools.ApprovalNever {
 		cmdMode = "auto"
 	}
 	availability := sandbox.CurrentAvailability()
@@ -265,54 +84,54 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
 		backend = "unavailable"
 	}
 	sandboxInfo := tui.SandboxInfo{
-		Mode:           cfg.Sandbox.ModeNormalized(),
+		Mode:           runtime.cfg.Sandbox.ModeNormalized(),
 		Backend:        backend,
-		ReadOnlyRoots:  readOnlyRoots,
-		ProtectedPaths: protectedPaths,
-		AllowedDomains: cfg.Sandbox.Network.AllowedDomains,
-		HostEscalation: !cfg.Tools.Shell.Disabled,
+		ReadOnlyRoots:  runtime.readOnlyRoots,
+		ProtectedPaths: runtime.protectedPaths,
+		AllowedDomains: runtime.cfg.Sandbox.Network.AllowedDomains,
+		HostEscalation: !runtime.cfg.Tools.Shell.Disabled,
 	}
 	runtimeInfo := tui.RuntimeInfo{
-		MaxTurnSeconds: runtimeCfg.MaxTurnSeconds,
-		MaxReactSteps:  runtimeCfg.MaxReactSteps,
-		MaxToolCalls:   runtimeCfg.MaxToolCalls,
+		MaxTurnSeconds: runtime.runtimeCfg.MaxTurnSeconds,
+		MaxReactSteps:  runtime.runtimeCfg.MaxReactSteps,
+		MaxToolCalls:   runtime.runtimeCfg.MaxToolCalls,
 	}
 	policyInfo := tui.CommandPolicyInfo{
 		Mode:          cmdMode,
-		Approval:      string(approvalMode),
-		Profile:       cfg.Permissions.PermissionsProfile(),
+		Approval:      string(runtime.approvalMode),
+		Profile:       runtime.cfg.Permissions.PermissionsProfile(),
 		WorkspaceOnly: true,
-		WorkspaceRoot: workspaceRoot,
-		Permissions:   perms,
-		SessionAllows: sessionAllows,
-		SessionDenies: sessionDenies,
+		WorkspaceRoot: runtime.workspaceRoot,
+		Permissions:   runtime.permissions,
+		SessionAllows: runtime.sessionAllows,
+		SessionDenies: runtime.sessionDenies,
 		Sandbox:       sandboxInfo,
 		Runtime:       runtimeInfo,
 	}
 
 	// Deps.SystemPrompt is the full composed prompt used when TUI creates a new
 	// session (/new, /clear); keep it aligned with chat.NewSession above.
-	composedPrompt, err := composePrompt()
+	composedPrompt, err := runtime.composePrompt()
 	if err != nil {
 		return fmt.Errorf("compose system prompt: %w", err)
 	}
 	sessionID, err := tui.Run(processCtx, tui.Deps{
-		Session:      session,
-		Store:        sessionStore,
+		Session:      runtime.session,
+		Store:        runtime.sessionStore,
 		SystemPrompt: composedPrompt,
 		ComposeSystemPrompt: func() (string, error) {
-			return composePrompt()
+			return runtime.composePrompt()
 		},
-		SessionOpts: sessionOpts,
-		Status:      statusFrom(cfg.Model.Provider+"/"+cfg.Model.Name, registry, cmdMode, model.MaxSteps(), sandboxInfo, runtimeInfo),
+		SessionOpts: runtime.sessionOpts,
+		Status:      statusFrom(runtime.cfg.Model.Provider+"/"+runtime.cfg.Model.Name, runtime.registry, cmdMode, runtime.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
 		TurnOptions: runtimeguard.TurnOptions{
-			MaxToolCalls: runtimeCfg.MaxToolCalls,
-			Timeout:      time.Duration(runtimeCfg.MaxTurnSeconds) * time.Second,
+			MaxToolCalls: runtime.runtimeCfg.MaxToolCalls,
+			Timeout:      time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
 		},
-		HideTurnUsage: !cfg.UI.TurnUsageEnabled(),
+		HideTurnUsage: !runtime.cfg.UI.TurnUsageEnabled(),
 		Approval:      approvalBridge,
 		PolicyInfo:    policyInfo,
-		Memory:        memStore,
+		Memory:        runtime.memStore,
 		NotifyActiveSession: func(id string) {
 			activeSessionID.Store(id)
 		},

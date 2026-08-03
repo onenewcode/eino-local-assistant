@@ -48,6 +48,7 @@ type Meta struct {
 	WorkspaceRoot    string     `json:"workspace_root,omitempty"`
 	UseEnabled       bool       `json:"use_enabled"`
 	GenerateEnabled  bool       `json:"generate_enabled"`
+	ResetGeneration  uint64     `json:"reset_generation"`
 	LastConsolidate  *time.Time `json:"last_consolidate_at,omitempty"`
 	LastError        string     `json:"last_error,omitempty"`
 	ClaimedThreads   []string   `json:"claimed_threads,omitempty"`

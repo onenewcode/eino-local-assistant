@@ -37,7 +37,7 @@ func TestRootHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute(%v): %v", args, err)
 			}
-			for _, want := range []string{"Usage:", "chat", "resume", "sessions", "version"} {
+			for _, want := range []string{"Usage:", "chat", "exec", "resume", "sessions", "version"} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("help missing %q:\n%s", want, stdout)
 				}
@@ -54,6 +54,10 @@ func TestCommandHelp(t *testing.T) {
 	}{
 		{[]string{"help", "chat"}, "Start a new interactive chat"},
 		{[]string{"chat", "-h"}, "Start a new interactive chat"},
+		{[]string{"help", "exec"}, "Run one durable assistant turn without a TTY"},
+		{[]string{"exec", "-h"}, "Run one durable assistant turn without a TTY"},
+		{[]string{"help", "exec", "resume"}, "Open the explicitly named durable session"},
+		{[]string{"exec", "resume", "-h"}, "Open the explicitly named durable session"},
 		{[]string{"help", "resume"}, "Resume a previously saved session"},
 		{[]string{"resume", "-h"}, "Resume a previously saved session"},
 		{[]string{"help", "sessions"}, "List saved sessions"},
@@ -99,6 +103,29 @@ func TestResumeRequiresID(t *testing.T) {
 	_, _, err := executeForTest("resume")
 	if err == nil {
 		t.Fatal("expected error when resume id is missing")
+	}
+}
+
+func TestExecResumeRequiresExplicitIDAndDocumentsRecovery(t *testing.T) {
+	t.Parallel()
+	_, _, err := executeForTest("exec", "resume")
+	if err == nil || !strings.Contains(err.Error(), "session id is required") {
+		t.Fatalf("error=%v, want explicit session-id error", err)
+	}
+
+	stdout, _, err := executeForTest("exec", "resume", "--help")
+	if err != nil {
+		t.Fatalf("exec resume --help: %v", err)
+	}
+	for _, want := range []string{"--recover", "never chooses a most-recent session", "[PROMPT]"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("headless resume help missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, forbidden := range []string{"--last", "--ephemeral"} {
+		if strings.Contains(stdout, forbidden) {
+			t.Fatalf("headless resume help unexpectedly exposes %q:\n%s", forbidden, stdout)
+		}
 	}
 }
 

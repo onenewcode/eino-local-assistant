@@ -1,10 +1,10 @@
 # 持久化记忆系统：行业实践
 
-> 状态：研究笔记，不是实施计划。本仓库落地见 [iterations/2026-07-21-persistent-memory.md](../iterations/2026-07-21-persistent-memory.md) 与 [memory.md](../memory.md)。
+> 状态：研究笔记，不是实施计划。
 >
-> 调研日期：2026-07-21。CLI、API、默认开关和数据保留策略变化很快；采用任一结论前应重新核验引用。
+> 调研日期：2026-07-31。CLI、API、默认开关和数据保留策略变化很快；采用任一结论前应重新核验引用。
 >
-> 范围：面向编码 Agent 的**跨会话语义记忆**——持久指令/规则、自动学习与巩固、按需检索的长期事实/偏好、版本与冲突、删除与安全边界。
+> 范围：Agent 与对话产品的**跨会话语义记忆**——持久指令/规则、按用户自动学习与巩固、按需检索的长期事实/偏好、纠正与冲突、删除与安全边界。
 >
 > 不在范围：
 >
@@ -20,6 +20,8 @@
 - **推断**：自动写入需要单独看待。用户明确要求“记住”可在热路径处理；从多轮对话提取、合并和去重更适合后台任务。后者降低交互延迟并便于治理，但需要显示写入状态并能恢复失败。[1][2][4]
 - **推断**：高价值记忆宜带有最小治理元数据：归属/作用域、来源事件、观察时间、有效期、置信度、版本及被替代关系。检索先做权限和时间过滤，再用关键词、向量或图排序；相似度不是授权，也不是事实正确性的证明。[3][4][7]
 - **推断**：安全和遗忘是设计的一等约束：外部文件、工具输出和历史消息都可能携带间接提示注入；删除一条“记忆”也未必删除索引、摘要、巩固产物或缓存。持久记忆必须验证“删除后不可召回/不可注入”，不能只验证 UI 不再显示。[8][9][16]
+- **观察 + 推断**：面向用户的自动记忆正在从“离散 saved memories”转向“持续更新的用户画像/历史综合”。ChatGPT 公开提供自动更新的 memory summary、响应级来源解释和就地纠正；Gemini 从账户历史聊天中个性化，并允许用户直接在对话中纠正。两者都明确暴露一个边界：**纠正当前认识**与**彻底删除所有来源**是两种操作，后者必须覆盖聊天、文件、摘要和连接应用等来源。[32][33]
+- **推断**：按用户自动化的第一控制点不是 embedding，而是可信身份作用域。`tenant/user/project/agent` 必须由认证与运行时传入，模型只能决定候选内容，不能决定记忆属于谁；纠正应生成新版本并使旧版本失效，避免把历史证据静默改写掉。[3][4][7][32][33]
 
 ## 2. 问题边界
 
@@ -55,18 +57,31 @@
 
 ## 3. 行业机制
 
-### 3.1 成熟编码 Agent：规则与自动记忆分别处理
+### 3.1 面向账户的自动记忆：用户画像、来源与纠正
+
+以下是已上线产品公开承诺的用户行为；厂商没有公开完整的抽取模型、排序算法或内部数据表，不能由 UI 反推这些实现。
+
+| 产品 | 自动形成记忆 | 用户如何发现与纠正 | 删除边界 |
+| --- | --- | --- | --- |
+| ChatGPT | 启用后，从聊天、文件和连接应用中自动记住有用上下文；新的 memory summary 会随对话持续更新。summary 是高层综合，不保证展示系统记住的全部细节。[32] | 用户可在 summary 输入修改要求、选中文本定点纠正，也可从回答下方的来源入口查看某条记忆为何被使用并发起纠正。[32] | 完整删除须删除信息出现的每个来源，包括普通/归档聊天、文件、memory summary，并断开仍含该信息的连接应用。只删除 summary 并关闭 memory 不会删除历史聊天；重新开启后仍可能从旧聊天再次形成记忆。[32] |
+| Gemini Apps | 在个人 Google 账户、Memory 与 Keep Activity 开启等条件下，从过去 Gemini 聊天学习用户及其情境；并非所有账户、入口或功能都可用。[33] | 用户可询问某次回答是否用了过去聊天；若认识有误，官方路径是保持 Memory 开启并在聊天中直接纠正。[33] | 要删除某项认识，需删除所有含该信息的历史聊天，生效可能短暂延迟。若来源是连接应用，还要同时删相关聊天并断开应用；应用内原数据更新后，Gemini 体验可能数日后才变化。[33] |
+
+这两种产品形态有一个重要差异。ChatGPT 暴露了一个可编辑的**派生综合视图**，Gemini 的公开控制面更接近**历史来源驱动**；但共同点是账户身份、开关和来源决定可用范围，且“改正当前回答”“更新长期认识”“清除原始来源”没有被当成同一个动作。[32][33]
+
+ChatGPT 还保留 legacy saved memories：用户可明确说“记住”，系统也可能自动保存有未来价值的细节；这些离散项可被自动更新、合并或按要求删除。官方同时说明 saved memories 与聊天历史分开保存，删除聊天并不会自动删除由它形成的 saved memory，删除日志可能为安全和调试保留最多 30 天。[32] 这直接说明持久化系统至少存在原始来源、派生记忆和保留日志三个生命周期。
+
+### 3.2 成熟编码 Agent：规则与自动记忆分别处理
 
 | 产品 | 公开可观察的持久记忆机制 | 重要边界 |
 | --- | --- | --- |
-| Codex CLI | `AGENTS.md` 从 `CODEX_HOME` 与 project 目录形成层级指导；local memories 默认关闭，启用后异步从合格历史聊天生成 summaries、durable entries 等，存放在 `~/.codex/memories/`，并提供 `/memories`、开关及 external-context 禁用项。[11][15] | 历史/线程文件不是语义记忆。自动记忆是后台、可关、有预算与污染隔离的路径，不是“有 transcript 就等于会记住”。[11][21] |
-| Claude Code | auto memory 默认启用；repo 级 `MEMORY.md` 启动时最多加载前 200 行或 25 KB，主题文件按需读取。机器本地、同仓库 worktree 共享、跨机器/云不共享；可由 `/memory`、设置或环境变量查看、编辑、删除和关闭。[1] | `CLAUDE.md`（managed/user/project/local）是 context 级指导，不是不可绕过的配置；与 auto memory 分目录、分控制面。[1][15] |
+| Codex CLI | `AGENTS.md` 从 `CODEX_HOME` 与 project 目录形成层级指导；local memories 默认关闭，启用后异步从合格历史聊天生成 summaries、durable entries 等，存放在 `~/.codex/memories/`，并提供 `/memories`、开关及 external-context 禁用项。当前公开源码还提供 `add_ad_hoc_note`：仅在用户明确要求记住、忘记或更新时写入 append-only note，留待后续 consolidation。[11][15][34] | 历史/线程文件不是语义记忆。自动记忆是后台、可关、有预算与污染隔离的路径，不是“有 transcript 就等于会记住”。ad-hoc note 被明确视为不可信数据而非可执行指令；公开 TUI 提供带二次确认的整体 reset，清 memory 文件、rollout summaries 和 memory rows，但保留既有 thread 及其 memory mode；未公开单条编辑 UI。[11][21][34] |
+| Claude Code | auto memory 默认启用，会根据用户纠正与偏好自行写 notes；repo 级 `MEMORY.md` 启动时最多加载前 200 行或 25 KB，主题文件按需读取。机器本地、同仓库 worktree 共享、跨机器/云不共享；可由 `/memory`、设置或环境变量查看、编辑、删除和关闭。带 YAML frontmatter 的 memory 文件在新版写入时还会记录 `modified` 时间。[1] | `CLAUDE.md`（managed/user/project/local）是 context 级指导，不是不可绕过的配置；与 auto memory 分目录、分控制面。官方允许随时删除 plain Markdown memory 文件，并另行记录可恢复的 session transcript，但截至调研日没有公开“一键重置全部 auto memory”的合同，也没有说明删除 memory 文件会删除 transcript。自动判断“值得记住”的精确算法同样未公开。[1][15] |
 | Continue | `.continue/rules/*.md` 可用 `alwaysApply`、glob、regex 与描述决定何时注入；覆盖 workspace 与用户级 rules。[6] | 这是规则/指令加载面，而非自动学习型 memory。规则进 system message 时，scope、信任与禁用策略是运行时行为的一部分。[6] |
 | Aider | 默认将聊天追加到 `.aider.chat.history.md`；不自动形成跨任务语义事实库。[5][13] | 代表“只持久 transcript、不自动抽取长期事实”的保守路径；与本主题的对照是：有磁盘记录 ≠ 有学习型记忆。[5][14] |
 
 Codex 与 Claude Code 的共同模式：**长期指导（人工维护）** 与 **自动学习（机器归纳、可治理）** 分离。官方还建议对必须执行的团队规则使用 hooks、linters 或 typechecks，而不是只依赖记忆文本。[1][11][15]
 
-### 3.2 框架与专门记忆系统：跨线程事实层
+### 3.3 框架与专门记忆系统：跨线程事实层
 
 | 系统 | 分层机制 | 可观察的取舍/限制 |
 | --- | --- | --- |
@@ -78,7 +93,7 @@ Codex 与 Claude Code 的共同模式：**长期指导（人工维护）** 与 *
 
 这些材料支持“指令层 / 事实层 / 索引层分离 + 生命周期管理”，并不支持统一内部格式或固定 token 阈值。
 
-### 3.3 公开源码中的实际实现：巩固、检索与失效
+### 3.4 公开源码中的实际实现：巩固、检索与失效
 
 本节是**固定公开源码快照的观察**，用于说明主流实现的控制流；它不是稳定 API 合同。
 
@@ -100,6 +115,8 @@ eligible historical idle rollout
 - **读取**：feature flag 与 `use_memories` 同时开启时，将 `memory_summary.md` 截断到约 2,500 tokens 注入 developer-policy fragment；更细内容由受限的 `list` / `search` / `read` 按需读取。[24]
 - **双层开关与有界工作量**：stable `MemoryTool` 默认关闭；开启后 `generate_memories` / `use_memories` 等默认开启。每次启动默认有限扫描窗口、idle 门槛、rate-limit 余量、Phase 2 条数上限与未使用淘汰；这些是成本/吞吐保护，不是事实质量阈值。[27][29]
 - **外部上下文隔离**：若 `disable_on_external_context` 启用，web search、被标为 external/polluting 的工具或 MCP 输出会污染 source thread；stage-1 只接收 `enabled` mode，已纳入 Phase 2 的内容可走遗忘/重整路径。[28]
+
+截至 2026-07-31，Codex 当前公开源码又增加了一条显式用户纠正路径：`add_ad_hoc_note` 的工具描述限定为用户明确要求“remember, forget, or update”时使用；后端以 `create_new` 写入带时间戳的 append-only Markdown note，不覆盖旧 note。consolidation prompt 要求吸收新增或修改内容、不得删除 note，并把 note 当不可信信息而非行动指令；TUI 的 memories 设置则提供 use/generate 开关与带二次确认的“Reset all memories”。reset handler 清 memory database rows 和 memory roots 内容；公开测试验证 memory 文件、rollout summaries 与 rows 被清，原 thread 及其 `enabled` memory mode 保留。[34] 这是一种**追加纠正事件 → 后台重整当前视图**的实现，不等于对旧事实做原地修改或物理擦除。
 
 被使用且较新的 memories 更易进入下一轮 consolidation，长期未用的 stage-1 输出可被 prune——这是**可用性/活跃度信号，不是真值证明**。Phase 1 schema 缺少原文 citation、置信度、冲突与时间有效期字段；secret sanitizer 是 best-effort regex。summary 作为 developer-policy fragment 注入，说明 provenance 与持久化提示注入仍须单独验证。[22][24][29]
 
@@ -213,7 +230,65 @@ LongMemEval 将 temporal reasoning、knowledge update 与 abstention 独立评�
 
 Claude Code 的自动记忆小索引、Codex 的异步 memories、Letta 的 dreaming 都表明：后台整理是实际产品选择；异步意味着刚结束的对话不一定立即对新对话生效。[1][2][11]
 
-### 4.5 检索：先授权过滤，再做相关性排序
+### 4.5 按用户自动记忆：身份先于抽取
+
+以下是跨产品证据支持的**抽象控制流**，不是任何厂商公开的内部实现：
+
+```text
+authenticated event
+  {tenant_id, user_id, project_id?, agent_id?, source_id, privacy_mode}
+        |
+        +-- temporary/private/off/tainted? --> 不进入长期学习
+        |
+        v
+candidate extraction
+  explicit remember | correction | stable preference | repeated fact | transient fact
+        |
+        v
+scope + trust + time + source validation
+        |
+        +-- low confidence / sensitive / conflict --> 待确认或短期 candidate
+        |
+        v
+versioned user memory --> indexes --> authorized retrieval --> bounded prompt view
+```
+
+关键控制点：
+
+1. `tenant_id`、`user_id` 与项目归属来自认证/会话系统，不允许模型从文本猜测；模型只提取“记什么”，不决定“记给谁”。ChatGPT 与 Gemini 均以登录账户、功能开关和产品入口限定个性化范围；Claude Code 则按 Git repository 派生项目目录，所有 worktree 共享该目录。[1][32][33]
+2. 写入前过滤 Temporary Chat、memory off、隐私模式、未授权连接应用和外部污染源。关闭学习与关闭读取应是两个显式状态；否则用户无法判断“本轮没写入”还是“旧记忆仍在使用”。[11][28][32][33]
+3. 将“用户明确要求记住”“用户纠正旧认识”“系统推断稳定偏好”分成不同 trust。前两者可优先进入热路径；推断项宜先成为带来源、可过期的 candidate。
+4. 作用域不应只有 `user_id`。编码 Agent 通常还需要 `project/repository`，企业产品需要 `tenant/org`，专用 sub-agent 可能需要独立 `agent_id`；扩大到全局用户偏好必须是显式升级，而不是因为多个项目文本相似。[1][3][4]
+5. 每次回答只生成有预算的 memory view，并提供“为何使用”的可观测信息。ChatGPT 的 response sources 与 Gemini 的“是否使用过去聊天”询问入口，说明来源解释已成为实际产品控制面，但二者都不保证公开全部内部影响因素。[32][33]
+
+### 4.6 纠正记忆：替代、删除与重新学习必须分开
+
+用户说“不是 npm，是 pnpm”时，合理语义不是原地改一个字符串，而是一次有来源的状态迁移：
+
+```text
+old memory M1 (active)
+  + correction event E2
+  -> new memory M2 (active, supersedes=M1, source=E2)
+  -> M1 (superseded, no longer eligible for current prompt)
+  -> invalidate/rebuild derived summary, keyword/vector/graph indexes and caches
+```
+
+四类动作需要不同结果：
+
+| 用户意图 | 正确状态变化 | 不应承诺的事情 |
+| --- | --- | --- |
+| “你说错了，正确是 B” | 写入 correction event；B 成为当前版本，A 被 supersede；保留历史来源供审计 | 不等于已物理删除 A 的所有痕迹 |
+| “不要再用 A” | A 立即从所有读取/prompt 路径失效，派生索引同步失效 | 不等于底层日志已完成合规擦除 |
+| “忘掉 A” | 建立 deletion job，级联原始来源、事实、summary、embedding、graph、cache 与后台任务，并可验证完成 | 不应只从 UI 列表隐藏 |
+| “关闭记忆” | 停止新的学习；产品需明确旧记忆是否仍读取、是否保留 | 不等于删除已有聊天和记忆 |
+
+ChatGPT 允许直接编辑综合视图，但明确要求完整删除所有来源；Gemini 允许聊天中纠正，却要求删除所有相关聊天才能删除认识；Claude Code 的 plain Markdown 则允许用户直接审阅、编辑或删除文件。[1][32][33] **推断**：行业产品普遍提供了纠正入口，但没有公开证明其内部实现都具备版本化 `supersedes` 或原子级索引失效。因此，版本链是推荐的通用模型，不是对这些产品内部结构的断言。
+
+“重置全部记忆”的产品合同也不能跨产品类推。Codex 当前公开 UI 与测试明确把 reset 限定为 memory 文件、rollout summaries 和 memory rows，并保留 thread 与其 memory mode；Claude Code 只公开 plain Markdown 文件的人工删除能力，未公开等价的一键 reset；ChatGPT 的 “Delete and turn off memory” 明确保留 past chats，重新开启后可能从仍在 chat history 中的旧聊天生成新记忆。[1][32][34] **推断**：清空派生记忆、关闭后续生成、删除历史来源是三个独立控制面；若来源仍保留且生成仍开启，不能承诺“重置后永不重新学回”。
+
+纠正后的验收不能只问一次模型“现在记得什么”，至少要覆盖：精确查询、语义近义查询、新会话启动、后台巩固完成后、缓存未命中/命中、以及旧来源仍存在时是否会把错误值重新学回来。ChatGPT 明确说明重新开启 memory 后可能从未删除的旧聊天重新生成记忆，Gemini 也提示删除后的个性化停止存在延迟。[32][33]
+
+### 4.7 检索：先授权过滤，再做相关性排序
 
 1. 按 tenant/user、agent、repository/project、数据类型、读取权限过滤。
 2. 过滤无效、已删除、已 supersede 或超出时间范围的记录；“最近”与“目前仍为真”应是不同字段。
@@ -223,7 +298,7 @@ Claude Code 的自动记忆小索引、Codex 的异步 memories、Letta 的 drea
 
 LangGraph 对 namespace prefix、limit 截断和后端排序的说明表明：存储 API 默认行为本身足以导致漏召回或跨 scope 误取。[4]
 
-### 4.6 冲突、时间与并发：记录替代关系而不是静默覆盖
+### 4.8 冲突、时间与并发：记录替代关系而不是静默覆盖
 
 适合长期事实的最小记录可包含：
 
@@ -245,7 +320,7 @@ LangGraph 对 namespace prefix、limit 截断和后端排序的说明表明：�
 
 LangGraph 的 `put` 是 store-or-overwrite，Letta 的 memory update 也存在 last-write-wins 类边界；若需保留竞争写入，须在其上增加版本比较、冲突事件或显式 merge。[4][17] Graphiti 以 valid/invalid 时间表达新旧事实并存，适合需要“现在的真值”与“历史时点真值”同时回答的场景。[7]
 
-### 4.7 治理：可见、可编辑、可删除、可测量
+### 4.9 治理：可见、可编辑、可删除、可测量
 
 - **可见性**：列出当前加载了哪些指令/记忆、为什么被选中、占用多少预算、最后何时更新。
 - **可编辑性**：按 scope 浏览、改写、禁用自动学习与撤销单条记忆；Claude Code `/memory` 与 Codex `/memories` 提供了相近控制面。[1][11]
@@ -285,7 +360,7 @@ LongMemEval 将长期交互记忆拆为 information extraction、multi-session r
 
 ## 参考资料
 
-以下资料均于 2026-07-21 访问；除论文和公开源码外均为供应商官方文档。
+资料 [1]-[31] 初次于 2026-07-21 访问，其中 [1] 于 2026-07-31 重新核验；新增资料 [32]-[34] 于 2026-07-31 访问。除论文、标准组织材料和公开源码外均为供应商官方文档。
 
 1. Anthropic, [How Claude remembers your project](https://code.claude.com/docs/en/memory)；[Sessions](https://code.claude.com/docs/en/sessions) 仅作「session 文件 ≠ 语义记忆」对照。
 2. Letta, [Memory & dreaming](https://docs.letta.com/configuration/memory/) and [MemFS](https://docs.letta.com/concepts/memfs/).
@@ -318,3 +393,6 @@ LongMemEval 将长期交互记忆拆为 information extraction、multi-session r
 29. OpenAI Codex public source, [generate/use semantics](https://github.com/openai/codex/blob/1836ae0612052137d0cabaff7807ff8314cee940/codex-rs/config/src/types.rs#L296-L340), [eligible-rollout query and state transition](https://github.com/openai/codex/blob/1836ae0612052137d0cabaff7807ff8314cee940/codex-rs/state/src/runtime/memories.rs#L133-L218), [input filtering and redaction](https://github.com/openai/codex/blob/1836ae0612052137d0cabaff7807ff8314cee940/codex-rs/memories/write/src/phase1.rs#L314-L440), [best-effort sanitizer](https://github.com/openai/codex/blob/1836ae0612052137d0cabaff7807ff8314cee940/codex-rs/secrets/src/sanitizer.rs#L4-L42), [Phase 2 ownership/commit](https://github.com/openai/codex/blob/1836ae0612052137d0cabaff7807ff8314cee940/codex-rs/memories/write/src/phase2.rs#L409-L470), and [parent-derived consolidation permissions](https://github.com/openai/codex/blob/1836ae0612052137d0cabaff7807ff8314cee940/codex-rs/memories/write/src/phase2.rs#L337-L379), same commit.
 30. Letta public source, [`memory-git.ts` synchronization and commits](https://github.com/letta-ai/letta-code/blob/eae673af0aab574c5c50add48e4d32c4ff02b83d/src/agent/memory-git.ts#L1222-L1245), [pull/rebase](https://github.com/letta-ai/letta-code/blob/eae673af0aab574c5c50add48e4d32c4ff02b83d/src/agent/memory-git.ts#L1701-L1780), [post-turn push conflict handling](https://github.com/letta-ai/letta-code/blob/eae673af0aab574c5c50add48e4d32c4ff02b83d/src/agent/memory-git.ts#L2026-L2120), [memory tool writes/deletes](https://github.com/letta-ai/letta-code/blob/eae673af0aab574c5c50add48e4d32c4ff02b83d/src/tools/impl/memory.ts#L106-L273), and [memory prompt/load semantics](https://github.com/letta-ai/letta-code/blob/eae673af0aab574c5c50add48e4d32c4ff02b83d/src/agent/prompts/letta.md#L8-L76), commit `eae673af0aab574c5c50add48e4d32c4ff02b83d`.
 31. Graphiti public source, [`EntityEdge` temporal/provenance fields](https://github.com/getzep/graphiti/blob/ca4d5e9d8c5d25d45917427b63daec17603a0d3a/graphiti_core/edges.py#L265-L340), commit `ca4d5e9d8c5d25d45917427b63daec17603a0d3a`.
+32. OpenAI Help Center, [Memory FAQ](https://help.openai.com/en/articles/8590148-memory-faq)（2026-07-31 页面显示当日更新；覆盖新的 memory summary、自动更新、来源解释、纠正、完整删除和 legacy saved memories 边界）。
+33. Google Gemini Apps Help, [Get personalization with memory of your past Gemini chats](https://support.google.com/gemini/answer/16598469?hl=en) and [Get personalization in Gemini Apps](https://support.google.com/gemini/answer/16598623?hl=en)（账户/开关条件、历史聊天个性化、纠正与删除边界）。
+34. OpenAI Codex public source, [`add_ad_hoc_note` tool contract](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/ext/memories/src/tools/ad_hoc_note.rs), [append-only local write](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/ext/memories/src/local/ad_hoc_note.rs), [ad-hoc consolidation instructions](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/memories/write/templates/extensions/ad_hoc/instructions.md), [TUI reset confirmation](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/tui/src/bottom_pane/memories_settings_view.rs#L70-L130), [`memory/reset` handler](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/app-server/src/request_processors/thread_processor.rs#L1689-L1712), and [reset integration test](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/app-server/tests/suite/v2/memory_reset.rs#L23-L68), commit `f0c30e528a54bdf0fa9a4d52ff74b34383434811`.

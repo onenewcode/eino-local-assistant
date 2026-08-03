@@ -72,6 +72,7 @@ data_dir = ""
 # Project instructions + semantic memory (not session resume). See docs/memory.md.
 [rules]
 enabled = true
+# workspace root: override, then base; symlinks allowed; blank content skipped
 # max_tokens = 8000
 
 [memory]

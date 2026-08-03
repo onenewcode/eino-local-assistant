@@ -63,6 +63,178 @@ func TestMemoryAddDoesNotRewriteSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestMemoryUpdateCorrectsActiveEntry(t *testing.T) {
+	mem, err := memory.Open(memory.Options{
+		WorkspaceRoot:   t.TempDir(),
+		UseEnabled:      true,
+		GenerateEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("memory.Open: %v", err)
+	}
+	old, err := mem.AddCandidate("package-manager", "Use npm", "thread-1", nil)
+	if err != nil {
+		t.Fatalf("AddCandidate: %v", err)
+	}
+	m := newTestModel(t)
+	m.deps.Memory = mem
+	const createSystem = "system"
+	if got := m.deps.Session.SystemPrompt(); got != createSystem {
+		t.Fatalf("test system = %q", got)
+	}
+
+	next, _ := m.cmdMemory("correct " + old.ID + " Use pnpm for this project")
+	mm := next.(*model)
+	if got := mm.deps.Session.SystemPrompt(); got != createSystem {
+		t.Fatalf("system rewritten by /memory correct: %q", got)
+	}
+	if !hasLineContaining(mm.lines, lineSystem, "memory updated:") ||
+		!hasLineContaining(mm.lines, lineSystem, "supersedes "+old.ID) ||
+		!hasLineContaining(mm.lines, lineSystem, projectContextRefreshHint) {
+		t.Fatalf("missing update result: %#v", mm.lines)
+	}
+	active, err := mem.ListActive()
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != 1 || active[0].Claim != "Use pnpm for this project" || active[0].Trust != memory.TrustUser {
+		t.Fatalf("active = %+v", active)
+	}
+}
+
+func TestMemoryUpdateRejectsBusyTurn(t *testing.T) {
+	mem, err := memory.Open(memory.Options{WorkspaceRoot: t.TempDir(), UseEnabled: true})
+	if err != nil {
+		t.Fatalf("memory.Open: %v", err)
+	}
+	old, err := mem.AddUser("lang", "Prefer Go")
+	if err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	m := newTestModel(t)
+	m.deps.Memory = mem
+	m.mode = modeBusy
+
+	next, _ := m.cmdMemory("update " + old.ID + " Prefer Rust")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineError, "busy:") {
+		t.Fatalf("missing busy error: %#v", mm.lines)
+	}
+	active, err := mem.ListActive()
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != 1 || active[0].Claim != "Prefer Go" {
+		t.Fatalf("busy update mutated memory: %+v", active)
+	}
+}
+
+func TestMemoryResetRequiresExactConfirmation(t *testing.T) {
+	mem, err := memory.Open(memory.Options{WorkspaceRoot: t.TempDir(), UseEnabled: true})
+	if err != nil {
+		t.Fatalf("memory.Open: %v", err)
+	}
+	if _, err := mem.AddUser("lang", "Prefer Go"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+
+	for _, arg := range []string{"reset", "reset yes", "reset --confirm now", "reset --CONFIRM"} {
+		m := newTestModel(t)
+		m.deps.Memory = mem
+
+		next, _ := m.cmdMemory(arg)
+		mm := next.(*model)
+		if !hasLineContaining(mm.lines, lineError, memoryResetUsage) {
+			t.Fatalf("%q: missing reset usage: %#v", arg, mm.lines)
+		}
+		active, listErr := mem.ListActive()
+		if listErr != nil {
+			t.Fatalf("%q: ListActive: %v", arg, listErr)
+		}
+		if len(active) != 1 || active[0].Claim != "Prefer Go" {
+			t.Fatalf("%q: unconfirmed reset mutated memory: %+v", arg, active)
+		}
+	}
+}
+
+func TestMemoryResetClearsMemoryAndRetainsSession(t *testing.T) {
+	mem, err := memory.Open(memory.Options{WorkspaceRoot: t.TempDir(), UseEnabled: true})
+	if err != nil {
+		t.Fatalf("memory.Open: %v", err)
+	}
+	if _, err := mem.AddUser("lang", "Prefer Go"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	m := newTestModel(t)
+	m.deps.Memory = mem
+	sessionID := m.deps.Session.ID()
+
+	next, _ := m.cmdMemory("reset --confirm")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineSystem, "current workspace semantic memory cleared") ||
+		!hasLineContaining(mm.lines, lineSystem, "session threads retained") ||
+		!hasLineContaining(mm.lines, lineSystem, projectContextRefreshHint) {
+		t.Fatalf("missing reset result: %#v", mm.lines)
+	}
+	if got := mm.deps.Session.ID(); got != sessionID {
+		t.Fatalf("session changed by memory reset: got %q want %q", got, sessionID)
+	}
+	active, err := mem.ListActive()
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active memory after reset: %+v", active)
+	}
+}
+
+func TestMemoryResetRejectsBusyTurn(t *testing.T) {
+	mem, err := memory.Open(memory.Options{WorkspaceRoot: t.TempDir(), UseEnabled: true})
+	if err != nil {
+		t.Fatalf("memory.Open: %v", err)
+	}
+	if _, err := mem.AddUser("lang", "Prefer Go"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	m := newTestModel(t)
+	m.deps.Memory = mem
+	m.mode = modeBusy
+	if got := classifyBusyInput("/memory reset --confirm"); got != busyInputReject {
+		t.Fatalf("busy disposition = %v, want reject", got)
+	}
+
+	next, _ := m.cmdMemory("reset --confirm")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineError, "busy:") {
+		t.Fatalf("missing busy error: %#v", mm.lines)
+	}
+	active, err := mem.ListActive()
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(active) != 1 || active[0].Claim != "Prefer Go" {
+		t.Fatalf("busy reset mutated memory: %+v", active)
+	}
+}
+
+func TestParseMemoryUpdate(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		input     string
+		wantID    string
+		wantClaim string
+	}{
+		{input: "mem_123 corrected claim", wantID: "mem_123", wantClaim: "corrected claim"},
+		{input: "  key\tclaim with spaces  ", wantID: "key", wantClaim: "claim with spaces"},
+		{input: "key-only", wantID: "key-only"},
+	} {
+		id, claim := parseMemoryUpdate(tc.input)
+		if id != tc.wantID || claim != tc.wantClaim {
+			t.Fatalf("parseMemoryUpdate(%q) = (%q, %q), want (%q, %q)", tc.input, id, claim, tc.wantID, tc.wantClaim)
+		}
+	}
+}
+
 func TestResumeDoesNotRefreshSystemPrompt(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.NewThreadStore(filepath.Join(t.TempDir(), "data"))

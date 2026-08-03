@@ -206,7 +206,7 @@ checkpoint 必须是严格 JSON，并包含：
 
 | 操作 | 行为 |
 | --- | --- |
-| `resume <id> [--recover]` / `/resume <id> [--recover]` | **存储层**：读取 state、活动 checkpoint 和最近可见 transcript。**模型层**：下一请求使用活动 checkpoint + 未覆盖热 groups + 当前 tools + 新消息，不把完整账本水合进 prompt。产品承诺是任务可继续，不是全文语义等价。若活动 checkpoint 是可识别 v1，先 CAS reset 指针并保留 raw ledger；若 thread 有活动 turn 或 pending compaction，普通 resume 仍拒绝接管；精确指定 `--recover` 才会显式恢复该目标。 |
+| `resume <id> [--recover]` / `/resume <id> [--recover]` / `exec resume <id> [PROMPT] [--recover]` | **存储层**：读取 state、活动 checkpoint 和最近可见 transcript。**模型层**：下一请求使用活动 checkpoint + 未覆盖热 groups + 当前 tools + 新消息，不把完整账本水合进 prompt。产品承诺是任务可继续，不是全文语义等价。headless `exec resume` 必须给精确、不透明 ID，省略 ID 不会自动选择最近会话；它只发送调用中提供的一条新 prompt，并且只通过 `chat.OpenSession` 恢复，不解析账本文件。若活动 checkpoint 是可识别 v1，先 CAS reset 指针并保留 raw ledger；若 thread 有活动 turn 或 pending compaction，普通 resume 仍拒绝接管；精确指定 `--recover` 才会显式恢复该目标。`--output-format stream-json` 不读取或导出账本：它只在成功打开后写 session.started，工具 activity 也只在对应生命周期已经写入账本后投影，最终 result 则在 turn.committed 之后写出。 |
 | 向上滚动 | 以稳定 message page 从 event ledger 读取更早 transcript；只扩展 UI 回放缓存，不改变模型工作集。 |
 | `/new [title]` | 创建独立 thread，旧 thread 保留。 |
 | `/clear` | 与 `/new` 相同地创建并切换到新 thread，同时清空旧队列；不重写旧 thread。 |
@@ -230,4 +230,4 @@ checkpoint 必须是严格 JSON，并包含：
 
 `model.context` 的压缩策略数值设为 `0` 时采用产品默认值，并非禁用开关。例如 `keep_recent_turns: 0` 使用默认 12，`low_gain_threshold_percent: 0` 使用默认 15%，`max_low_gain_attempts: 0` 使用默认 2。窗口与输出上限必须明确配置。
 
-system prompt 在 `thread.created` 时写入并冻结；resume / compact 不会从磁盘重读项目规则。tools 与权限策略跟随**当前进程配置**。
+system prompt 在 `thread.created` 时写入并冻结；resume / compact 不会从磁盘重读项目规则。tools 与权限策略跟随**当前进程配置**。headless `exec resume` 也不会继承此前进程的 session allow/deny 决策，且没有交互 approver；需要审批的工具调用仍由当前进程的权限策略 fail closed。

@@ -28,6 +28,8 @@ const (
 	lockFile      = "write.lock"
 )
 
+var errResetGenerationChanged = errors.New("memory reset generation changed")
+
 // Store is a project-scoped memory store under <workspace>/.eino/memory/.
 type Store struct {
 	root   string // .eino/memory absolute path
@@ -146,6 +148,31 @@ func (s *Store) SetGenerateEnabled(on bool) error {
 	})
 }
 
+// Reset clears all stored memories and consolidation bookkeeping while
+// preserving the store's project identity and runtime configuration. Advancing
+// ResetGeneration fences consolidator work that started before this reset.
+func (s *Store) Reset() error {
+	return s.withFileLock(func() error {
+		meta, err := s.readMetaUnlocked()
+		if err != nil {
+			return err
+		}
+		meta.ResetGeneration++
+		meta.LastConsolidate = nil
+		meta.LastError = ""
+		meta.ClaimedThreads = nil
+		meta.ProcessedThreads = nil
+
+		if err := s.writeEntriesUnlocked(nil); err != nil {
+			return err
+		}
+		if err := s.rebuildSummaryUnlocked(); err != nil {
+			return err
+		}
+		return s.writeMetaUnlocked(meta)
+	})
+}
+
 func (s *Store) bootstrap() error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return fmt.Errorf("create memory dir: %w", err)
@@ -208,7 +235,11 @@ func (s *Store) AddCandidate(key, claim, threadID string, sourceEventIDs []strin
 	return s.add(key, claim, TrustCandidate, threadID, sourceEventIDs)
 }
 
-func (s *Store) add(key, claim string, trust Trust, threadID string, sourceEventIDs []string) (Entry, error) {
+func (s *Store) addCandidateAtGeneration(
+	generation uint64,
+	key, claim, threadID string,
+	sourceEventIDs []string,
+) (Entry, error) {
 	claim = strings.TrimSpace(claim)
 	if claim == "" {
 		return Entry{}, errors.New("memory claim is required")
@@ -216,51 +247,80 @@ func (s *Store) add(key, claim string, trust Trust, threadID string, sourceEvent
 	key = normalizeKey(key, claim)
 	var out Entry
 	err := s.withFileLock(func() error {
+		if err := s.requireGenerationUnlocked(generation); err != nil {
+			return err
+		}
+		var err error
+		out, err = s.addUnlocked(key, claim, TrustCandidate, threadID, sourceEventIDs)
+		return err
+	})
+	return out, err
+}
+
+// UpdateUser replaces an active memory selected by id or key with a
+// user-confirmed version under the same key.
+func (s *Store) UpdateUser(idOrKey, claim string) (Entry, error) {
+	idOrKey = strings.TrimSpace(idOrKey)
+	if idOrKey == "" {
+		return Entry{}, errors.New("id or key is required")
+	}
+	claim = strings.TrimSpace(claim)
+	if claim == "" {
+		return Entry{}, errors.New("memory claim is required")
+	}
+
+	var out Entry
+	err := s.withFileLock(func() error {
 		entries, err := s.loadEntriesUnlocked()
 		if err != nil {
 			return err
 		}
-		now := s.now().UTC()
-		version := 1
-		var supersedes string
 
-		if trust == TrustCandidate {
-			// Do not overwrite user-confirmed facts for the same key.
-			for _, e := range entries {
-				if e.Key == key && e.Status == StatusActive && e.Trust == TrustUser {
-					return fmt.Errorf("candidate refused: key %q has active user memory", key)
+		target := -1
+		for i := range entries {
+			if entries[i].Status == StatusActive && entries[i].ID == idOrKey {
+				target = i
+				break
+			}
+		}
+		if target < 0 {
+			for i := range entries {
+				if entries[i].Status == StatusActive && entries[i].Key == idOrKey {
+					target = i
+					break
 				}
 			}
 		}
+		if target < 0 {
+			return fmt.Errorf("memory not found: %s", idOrKey)
+		}
 
+		now := s.now().UTC()
+		key := entries[target].Key
+		supersedes := entries[target].ID
+		version := entries[target].Version + 1
 		for i := range entries {
 			e := &entries[i]
-			if e.Key != key || e.Status != StatusActive {
+			if e.Status != StatusActive || e.Key != key {
 				continue
 			}
-			// User write supersedes any active (user or candidate).
-			// Candidate write supersedes only other candidates (user blocked above).
-			if trust == TrustUser || e.Trust == TrustCandidate {
-				e.Status = StatusSuperseded
-				e.UpdatedAt = now
-				if e.Version >= version {
-					version = e.Version + 1
-				}
-				supersedes = e.ID
+			e.Status = StatusSuperseded
+			e.UpdatedAt = now
+			if e.Version >= version {
+				version = e.Version + 1
 			}
 		}
+
 		out = Entry{
-			ID:             newID(),
-			Key:            key,
-			Claim:          claim,
-			Trust:          trust,
-			Status:         StatusActive,
-			Version:        version,
-			SourceEventIDs: append([]string(nil), sourceEventIDs...),
-			SourceThreadID: threadID,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-			Supersedes:     supersedes,
+			ID:         newID(),
+			Key:        key,
+			Claim:      claim,
+			Trust:      TrustUser,
+			Status:     StatusActive,
+			Version:    version,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			Supersedes: supersedes,
 		}
 		entries = append(entries, out)
 		if err := s.writeEntriesUnlocked(entries); err != nil {
@@ -269,6 +329,83 @@ func (s *Store) add(key, claim string, trust Trust, threadID string, sourceEvent
 		return s.rebuildSummaryUnlocked()
 	})
 	return out, err
+}
+
+func (s *Store) add(key, claim string, trust Trust, threadID string, sourceEventIDs []string) (Entry, error) {
+	claim = strings.TrimSpace(claim)
+	if claim == "" {
+		return Entry{}, errors.New("memory claim is required")
+	}
+	key = normalizeKey(key, claim)
+	var out Entry
+	err := s.withFileLock(func() error {
+		var err error
+		out, err = s.addUnlocked(key, claim, trust, threadID, sourceEventIDs)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) addUnlocked(
+	key, claim string,
+	trust Trust,
+	threadID string,
+	sourceEventIDs []string,
+) (Entry, error) {
+	entries, err := s.loadEntriesUnlocked()
+	if err != nil {
+		return Entry{}, err
+	}
+	now := s.now().UTC()
+	version := 1
+	var supersedes string
+
+	if trust == TrustCandidate {
+		// Do not overwrite user-confirmed facts for the same key.
+		for _, e := range entries {
+			if e.Key == key && e.Status == StatusActive && e.Trust == TrustUser {
+				return Entry{}, fmt.Errorf("candidate refused: key %q has active user memory", key)
+			}
+		}
+	}
+
+	for i := range entries {
+		e := &entries[i]
+		if e.Key != key || e.Status != StatusActive {
+			continue
+		}
+		// User write supersedes any active (user or candidate).
+		// Candidate write supersedes only other candidates (user blocked above).
+		if trust == TrustUser || e.Trust == TrustCandidate {
+			e.Status = StatusSuperseded
+			e.UpdatedAt = now
+			if e.Version >= version {
+				version = e.Version + 1
+			}
+			supersedes = e.ID
+		}
+	}
+	out := Entry{
+		ID:             newID(),
+		Key:            key,
+		Claim:          claim,
+		Trust:          trust,
+		Status:         StatusActive,
+		Version:        version,
+		SourceEventIDs: append([]string(nil), sourceEventIDs...),
+		SourceThreadID: threadID,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Supersedes:     supersedes,
+	}
+	entries = append(entries, out)
+	if err := s.writeEntriesUnlocked(entries); err != nil {
+		return Entry{}, err
+	}
+	if err := s.rebuildSummaryUnlocked(); err != nil {
+		return Entry{}, err
+	}
+	return out, nil
 }
 
 // Delete marks an active entry deleted by id or key.
@@ -504,10 +641,21 @@ func (s *Store) Report() (StatusReport, error) {
 
 // MarkExtracted records a successful extraction so the thread is not rescanned.
 func (s *Store) MarkExtracted(threadID string) error {
+	return s.markExtracted(threadID, nil)
+}
+
+func (s *Store) markExtractedAtGeneration(generation uint64, threadID string) error {
+	return s.markExtracted(threadID, &generation)
+}
+
+func (s *Store) markExtracted(threadID string, generation *uint64) error {
 	return s.withFileLock(func() error {
 		meta, err := s.readMetaUnlocked()
 		if err != nil {
 			return err
+		}
+		if generation != nil && meta.ResetGeneration != *generation {
+			return errResetGenerationChanged
 		}
 		now := s.now().UTC()
 		meta.LastConsolidate = &now
@@ -524,10 +672,21 @@ func (s *Store) MarkExtracted(threadID string) error {
 
 // RecordExtractError stores the last failure without marking the thread processed.
 func (s *Store) RecordExtractError(extractErr error) error {
+	return s.recordExtractError(extractErr, nil)
+}
+
+func (s *Store) recordExtractErrorAtGeneration(generation uint64, extractErr error) error {
+	return s.recordExtractError(extractErr, &generation)
+}
+
+func (s *Store) recordExtractError(extractErr error, generation *uint64) error {
 	return s.withFileLock(func() error {
 		meta, err := s.readMetaUnlocked()
 		if err != nil {
 			return err
+		}
+		if generation != nil && meta.ResetGeneration != *generation {
+			return errResetGenerationChanged
 		}
 		now := s.now().UTC()
 		meta.LastConsolidate = &now
@@ -550,6 +709,30 @@ func (s *Store) IsProcessed(threadID string) (bool, error) {
 		return nil
 	})
 	return ok, err
+}
+
+func (s *Store) resetGeneration() (uint64, error) {
+	var generation uint64
+	err := s.withFileLock(func() error {
+		meta, err := s.readMetaUnlocked()
+		if err != nil {
+			return err
+		}
+		generation = meta.ResetGeneration
+		return nil
+	})
+	return generation, err
+}
+
+func (s *Store) requireGenerationUnlocked(generation uint64) error {
+	meta, err := s.readMetaUnlocked()
+	if err != nil {
+		return err
+	}
+	if meta.ResetGeneration != generation {
+		return errResetGenerationChanged
+	}
+	return nil
 }
 
 func (s *Store) rebuildSummaryUnlocked() error {

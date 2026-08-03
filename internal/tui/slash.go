@@ -51,7 +51,7 @@ func slashCatalog() []slashCommand {
 		{Name: "/title", Description: "rename the current session", NeedsArg: true},
 		{Name: "/queue", Description: "list queued follow-ups (or: clear)", NeedsArg: true},
 		{Name: "/permissions", Aliases: []string{"/policy"}, Description: "shell/apply_patch policy and session allows"},
-		{Name: "/memory", Description: "project memory (list|add|delete|accept|on|off|generate|status|rebuild)", NeedsArg: true},
+		{Name: "/memory", Description: "project memory (list|add|update|delete|accept|on|off|generate|status|rebuild|reset --confirm)", NeedsArg: true},
 		{Name: "/clear", Description: "clear screen and start a new thread (previous thread retained)"},
 		{Name: "/exit", Aliases: []string{"/quit"}, Description: "quit"},
 	}
@@ -187,7 +187,8 @@ func helpText() string {
 		"  /queue             list queued follow-ups",
 		"  /queue clear       drop all queued follow-ups",
 		"  /permissions       tool policy, workspace clamp, session allows",
-		"  /memory            project memory (list|add|delete|accept|on|off|generate|status|rebuild)",
+		"  /memory            project memory (list|add|update|delete|accept|on|off|generate|status|rebuild)",
+		"  /memory reset --confirm  clear this workspace's semantic memory; keep session threads",
 		"  /clear             clear screen and start a new thread (previous thread retained)",
 		"  /exit              quit",
 		"",

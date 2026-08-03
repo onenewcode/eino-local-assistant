@@ -27,15 +27,25 @@ type rootOptions struct {
 	configPath string
 }
 
+// commandDeps is immutable after construction. Tests create a fresh command
+// tree with a local session factory instead of mutating global runtime hooks.
+type commandDeps struct {
+	exec execCommandDeps
+}
+
 func newRootCommand() *cobra.Command {
+	return newRootCommandWithDeps(commandDeps{exec: defaultExecCommandDeps()})
+}
+
+func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	opts := &rootOptions{}
 
 	root := &cobra.Command{
 		Use:   appName + " [command]",
 		Short: "Eino local coding assistant",
-		Long:  "Eino local coding assistant — interactive TUI chat with ReAct tools and session persistence.",
+		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools.",
 		Example: fmt.Sprintf(
-			"  %[1]s\n  %[1]s chat --config config.toml\n  %[1]s chat --title \"debug flaky test\"\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
+			"  %[1]s\n  %[1]s chat --config config.toml\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
 			appName,
 		),
 		Args:          cobra.NoArgs,
@@ -51,6 +61,7 @@ func newRootCommand() *cobra.Command {
 
 	root.AddCommand(
 		newChatCommand(opts),
+		newExecCommand(opts, deps.exec),
 		newResumeCommand(opts),
 		newSessionsCommand(opts),
 		newVersionCommand(),

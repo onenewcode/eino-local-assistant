@@ -6,17 +6,17 @@
 | --- | --- |
 | 包地图与分层 | [architecture.md](./architecture.md) |
 | 会话账本、`/resume`、checkpoint、compaction | [session-persistence.md](./session-persistence.md) |
-| 本功能：`AGENTS.md`、`.eino/memory/`、`/memory` | 本文 |
+| 本功能：AGENTS 指令、`.eino/memory/`、`/memory` | 本文 |
 | 迭代记录 | [iterations/2026-07-21-persistent-memory.md](./iterations/2026-07-21-persistent-memory.md) |
 | 行业调研 | [research/persistent-memory-systems-research.md](./research/persistent-memory-systems-research.md) |
 
-`AGENTS.md` 由 **`internal/agent`**（`LoadProjectInstructions`）加载，不是独立 `internal/rules` 包；语义记忆在 **`internal/memory`**。
+`AGENTS.override.md` / `AGENTS.md` 由 **`internal/agent`**（`LoadProjectInstructions`）选择加载，不是独立 `internal/rules` 包；语义记忆在 **`internal/memory`**。
 
 ## 1. 是什么 / 不是什么
 
 **是**：
 
-1. **持久指令**：workspace 根目录 `AGENTS.md`（软规则，有界注入；见下方生命周期）
+1. **持久指令**：workspace 根目录 `AGENTS.override.md` 或 `AGENTS.md`（软规则，有界注入；见下方选择和生命周期）
 2. **显式记忆**：用户通过 `/memory add` 写入的项目偏好/事实
 3. **自动候选**：空闲 session journal 异步抽取的 *candidate*（低信任）
 
@@ -30,7 +30,7 @@
 ## 2. 三层模型
 
 ```text
-AGENTS.md          人工维护 · 团队可提交 git
+AGENTS.override.md / AGENTS.md  人工维护 · 团队文件或本地覆盖
 entries (user)     用户显式确认 · 高信任
 entries (candidate) 自动抽取 · 注入时标 unverified
 summary.md         有界派生视图 · 供 system 注入
@@ -44,7 +44,8 @@ summary.md         有界派生视图 · 供 system 注入
 
 ```text
 <workspace>/
-  AGENTS.md                 # 可选；项目指令
+  AGENTS.override.md        # 可选；有效时替代同目录 AGENTS.md
+  AGENTS.md                 # 可选；共享项目指令
   .eino/
     .gitignore              # 默认忽略 memory/
     memory/
@@ -53,7 +54,11 @@ summary.md         有界派生视图 · 供 system 注入
       summary.md            # 可重建的注入摘要
 ```
 
-记忆默认 **不提交 git**。团队共识应写在 `AGENTS.md`，不要依赖个人 candidate。
+语义记忆目录默认 **不提交 git**。团队共识应写在 `AGENTS.md`，不要依赖个人 candidate；仅本地需要的项目指令可写 `AGENTS.override.md` 并由项目自行决定是否 gitignore。
+
+同一 workspace 根目录至多选择一个指令文件，候选顺序为 `AGENTS.override.md`、`AGENTS.md`。有效候选必须在解析符号链接后指向普通文件，且内容去掉开头的 UTF-8 BOM 后不能仅含空白；目录、FIFO、空白内容等会跳过。符号链接目标不要求位于 workspace 内，因此应把链接目标也视为会发送给模型的可信项目配置。
+
+候选顺序和“同目录至多一个”对齐 Codex；Codex 固定源码也明确允许符号链接。本项目进一步把“空白 override 回退 base”定义为稳定合同，而 Codex 的公开文档与项目级源码在这个边界上仍有差异。Claude Code 则会把 `CLAUDE.local.md` 追加在 `CLAUDE.md` 后，而不是替换 base。
 
 ## 4. 配置
 
@@ -75,7 +80,7 @@ generate = true             # 空闲自动抽取
 
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
-| `rules.enabled` | true | 是否加载 `AGENTS.md` |
+| `rules.enabled` | true | 是否选择并加载 workspace 根 AGENTS 指令 |
 | `rules.max_tokens` | 8000 | 规则注入 token 估算上限 |
 | `memory.enabled` | true | 是否注入 summary / 暴露读工具 |
 | `memory.generate` | true | 是否后台自动抽取 |
@@ -93,12 +98,14 @@ generate = true             # 空闲自动抽取
 | `/memory` / `/memory list` | 列出 active 条目 |
 | `/memory add <text>` | 用户写入（高信任） |
 | `/memory add key=slug <text>` | 指定 key |
+| `/memory update <id\|key> <text>` | 纠正 active 条目；`edit` / `correct` 为别名 |
 | `/memory delete <id\|key>` | tombstone 删除 |
 | `/memory accept <id>` | candidate → user 信任 |
 | `/memory on` / `off` | 开/关注入与读工具 |
 | `/memory generate on` / `off` | 开/关自动抽取 |
 | `/memory status` | 路径、计数、上次 consolidate |
 | `/memory rebuild` | 重建 `summary.md` |
+| `/memory reset --confirm` | 清空当前项目语义记忆与抽取元数据；保留 session/thread 和开关 |
 
 ## 6. 只读工具
 
@@ -115,7 +122,7 @@ generate = true             # 空闲自动抽取
 system prompt 组装顺序：
 
 1. 用户 persona + 产品 tool policy（优先保留）
-2. `AGENTS.md` 块（≤ rules 预算）
+2. 选中的 AGENTS 指令块（≤ rules 预算）
 3. 记忆 summary 块（≤ memory 预算；candidate 标 *unverified*）
 
 超预算时：**先压 memory summary，再压 AGENTS 尾部**。
@@ -126,9 +133,9 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 
 | 时机 | 行为 |
 | --- | --- |
-| `/new`、`/clear`、新建 session | 从磁盘 recompose AGENTS + memory summary，写入 **新** thread 的 durable system |
-| **普通 turn** | 使用创建时冻结的 system；**不**每轮重读 `AGENTS.md` |
-| **只编辑磁盘上的 `AGENTS.md`** | 当前 session **不生效**（不改请求前缀 → 不砸 prompt cache） |
+| `/new`、`/clear`、新建 session | 从磁盘重新选择根目录 AGENTS 指令并组合 memory summary，写入 **新** thread 的 durable system |
+| **普通 turn** | 使用创建时冻结的 system；**不**每轮重读 AGENTS 指令 |
+| **只编辑磁盘上的 AGENTS 指令文件** | 当前 session **不生效**（不改请求前缀 → 不砸 prompt cache） |
 | **`/resume`** | 沿用该 thread **创建时** durable system；**不**用当前磁盘热更 |
 | **`/memory` 写入** | 落盘立即生效；`memory_*` 工具可见；**system 注入**等到 `/new` 或 `/clear` |
 | **`/compact`** | 只压缩对话历史；**不**重载 AGENTS/memory 进 system（与 Claude compact 重读 CLAUDE.md 不同：本仓库 ledger 无 durable system 修订事件） |
@@ -152,8 +159,24 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 | `candidate` | 自动抽取；summary 中标 unverified |
 
 - 同 `key`：**user 层 LWW**；**candidate 不得覆盖 active user**（会拒绝写入）；user 写入可 supersede candidate
+- 纠正：`/memory update` 按 id/key 原子定位 active 条目，保留原 key，写入新的 user 版本，并把旧版本标为 `superseded`；旧值立即退出 list/search/summary
 - 删除：`status=deleted` tombstone；list/search/summary 均不可见
 - `.eino` 为 sandbox **内建保护路径**，worker 不可直接改写记忆权威文件
+
+### 9.1 全量重置
+
+`/memory reset` 是高影响命令，必须在 idle 状态显式运行 `/memory reset --confirm`。不带 `--confirm` 只显示确认用法，不修改磁盘。
+
+确认后，命令会：
+
+- 清空当前 workspace 的全部语义记忆版本（包括 active、superseded 与 tombstone），并重建空 `summary.md`
+- 清空 processed/claimed thread、上次 consolidate 和错误等抽取元数据，使状态回到可重新抽取的起点
+- 保留 `/memory on|off` 与 `/memory generate on|off` 的当前值
+- 保留 session/thread journal；`/resume` 与会话审计不受影响
+
+reset 落盘后，`memory_*` 读工具立即看不到旧条目；但当前 thread 的 system prompt 是创建时的冻结快照，已经注入其中的旧 summary 不会热替换，需 `/new` 或 `/clear` 才会得到空的 system memory 层。
+
+这不是历史来源的物理擦除。由于 session journal 被保留且 processed/claimed 标记被清空，若 `memory.generate` 仍开启，符合年龄与空闲条件的旧 session 以后可能再次被抽取。需要保持空记忆时，先运行 `/memory generate off`，再执行 reset；需要删除会话来源时使用会话自己的删除/保留策略，不能用 memory reset 代替。
 
 ## 10. 安全注意
 
@@ -171,7 +194,7 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 | 自动默认 | 开（偏 Claude） | Codex 默认关 |
 | 落盘 | 项目 `.eino/memory` | Claude 项目本地；Codex 常在用户 home |
 | agent 写工具 | 无（只读） | 部分产品允许写 |
-| 规则层级 | 仅根 `AGENTS.md` | Codex/Claude 多级 |
+| 规则层级 | 仅 workspace 根 override/base 二选一 | Codex/Claude 多级 |
 
 偏离理由见迭代文档。
 
@@ -179,7 +202,7 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 
 - 无向量检索；检索为关键词/子串
 - 无全局 `~` 级记忆层
-- 无多级 `AGENTS.md` 合并
+- 目前只做 workspace 根的 override/base 二选一；尚无用户全局、祖先链或子目录 `AGENTS.md` 合并
 - 自动巩固为单阶段 extract，非 Codex 完整两阶段 git consolidate
 
-后续可演进：规则层级、全局偏好 scope、可选向量、更细费用展示。
+后续可演进：用户全局与目录级规则层级、全局偏好 scope、可选向量、更细费用展示。

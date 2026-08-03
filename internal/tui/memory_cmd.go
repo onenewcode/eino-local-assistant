@@ -12,6 +12,8 @@ import (
 // know when AGENTS.md / memory re-enter the system prefix.
 const projectContextRefreshHint = "system injection refreshes on /new or /clear"
 
+const memoryResetUsage = "usage: /memory reset --confirm"
+
 func (m *model) cmdMemory(arg string) (tea.Model, tea.Cmd) {
 	if m.deps.Memory == nil {
 		m.appendLine(lineError, "memory store is not configured")
@@ -90,6 +92,23 @@ func (m *model) cmdMemory(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSystem, fmt.Sprintf("memory saved: %s (%s); %s", e.ID, e.Key, projectContextRefreshHint))
 		m.appendLine(lineSep, "")
 		return m, nil
+	case "update", "edit", "correct":
+		idOrKey, claim := parseMemoryUpdate(rest)
+		if idOrKey == "" || claim == "" {
+			m.appendLine(lineError, "usage: /memory update <id|key> <claim>")
+			return m, nil
+		}
+		e, err := m.deps.Memory.UpdateUser(idOrKey, claim)
+		if err != nil {
+			m.appendLine(lineError, "memory update: "+err.Error())
+			return m, nil
+		}
+		m.appendLine(lineSystem, fmt.Sprintf(
+			"memory updated: %s (%s), supersedes %s; %s",
+			e.ID, e.Key, e.Supersedes, projectContextRefreshHint,
+		))
+		m.appendLine(lineSep, "")
+		return m, nil
 	case "delete":
 		if rest == "" {
 			m.appendLine(lineError, "usage: /memory delete <id|key>")
@@ -161,8 +180,20 @@ func (m *model) cmdMemory(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSystem, "memory summary rebuilt on disk; "+projectContextRefreshHint)
 		m.appendLine(lineSep, "")
 		return m, nil
+	case "reset":
+		if rest != "--confirm" {
+			m.appendLine(lineError, memoryResetUsage)
+			return m, nil
+		}
+		if err := m.deps.Memory.Reset(); err != nil {
+			m.appendLine(lineError, "memory reset: "+err.Error())
+			return m, nil
+		}
+		m.appendLine(lineSystem, "memory reset: current workspace semantic memory cleared; session threads retained; "+projectContextRefreshHint)
+		m.appendLine(lineSep, "")
+		return m, nil
 	default:
-		m.appendLine(lineError, "usage: /memory [list|add|delete|accept|on|off|generate|status|rebuild]")
+		m.appendLine(lineError, "usage: /memory [list|add|update|delete|accept|on|off|generate|status|rebuild|reset --confirm]")
 		return m, nil
 	}
 }
@@ -197,4 +228,13 @@ func parseMemoryAdd(rest string) (key, claim string) {
 		return parts[0], parts[0]
 	}
 	return "", rest
+}
+
+func parseMemoryUpdate(rest string) (idOrKey, claim string) {
+	rest = strings.TrimSpace(rest)
+	idx := strings.IndexAny(rest, " \t")
+	if idx < 0 {
+		return rest, ""
+	}
+	return rest[:idx], strings.TrimSpace(rest[idx:])
 }

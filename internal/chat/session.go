@@ -640,15 +640,18 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 
 	usageTracker := &turnUsageTracker{}
 	combinedEmit := func(event TurnEvent) {
+		emitEvent := true
 		if event.Kind == TurnEventModelUsage && event.ModelUsage != nil {
 			tracked := usageTracker.normalize(*event.ModelUsage)
 			normalized, record := s.normalizedModelUsage(turnID, tracked)
 			event.ModelUsage = &normalized
 			recorder.recordUsage(record)
 		} else {
-			recorder.record(event)
+			// Tool observations reach consumers only after their lifecycle entry
+			// has been accepted by the durable recorder.
+			emitEvent = recorder.record(event)
 		}
-		if emit != nil {
+		if emit != nil && emitEvent {
 			emit(event)
 		}
 	}
@@ -1632,14 +1635,14 @@ func newThreadTurnRecorder(repo store.ThreadRepository, threadID string, revisio
 	}
 }
 
-func (r *threadTurnRecorder) record(event TurnEvent) {
+func (r *threadTurnRecorder) record(event TurnEvent) bool {
 	if event.Kind != TurnEventToolStart && event.Kind != TurnEventToolEnd && event.Kind != TurnEventToolError {
-		return
+		return true
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.failure != nil {
-		return
+		return false
 	}
 	switch event.Kind {
 	case TurnEventToolStart:
@@ -1649,7 +1652,7 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 		}
 		if _, exists := r.toolNames[toolID]; exists {
 			r.failure = fmt.Errorf("duplicate tool call id %q", toolID)
-			return
+			return false
 		}
 		state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
 			return r.repo.ToolStarted(context.Background(), r.threadID, revision, store.ToolStarted{
@@ -1661,7 +1664,7 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 		})
 		if err != nil {
 			r.failure = err
-			return
+			return false
 		}
 		r.revision = state.Revision
 		r.lastState = state
@@ -1688,7 +1691,7 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 			})
 			if err != nil {
 				r.failure = err
-				return
+				return false
 			}
 			r.revision = state.Revision
 			r.lastState = state
@@ -1704,7 +1707,7 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 		})
 		if err != nil {
 			r.failure = err
-			return
+			return false
 		}
 		state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
 			return r.repo.ToolCompleted(context.Background(), r.threadID, revision, store.ToolCompleted{
@@ -1717,11 +1720,12 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 		})
 		if err != nil {
 			r.failure = err
-			return
+			return false
 		}
 		r.revision = state.Revision
 		r.lastState = state
 	}
+	return true
 }
 
 // recordUsage keeps usage events in the same revision sequence as tool

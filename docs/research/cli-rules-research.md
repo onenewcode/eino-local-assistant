@@ -2,7 +2,7 @@
 
 > 状态：调研结论与通用实施建议，不代表任何具体能力已经在本仓库实现。
 >
-> 调研日期：2026-07-15。产品行为、文件约定和安全模型会持续变化，实际采用前应重新核验引用资料。
+> 初始调研日期：2026-07-15；本地覆盖合同复核日期：2026-07-31。产品行为、文件约定和安全模型会持续变化，实际采用前应重新核验引用资料。
 >
 > 资料范围：官方文档 + 社区实践（Reddit / 博客）+ 多工具对比 + 开源实现思路；**不限于官方文档**。
 
@@ -118,8 +118,8 @@ Coding agent 每轮都在“新入职”。没有规则时，它会：
 
 | 工具 | 主规则文件 | 模块化规则 | 全局层 | 本地覆盖 | 加载方式 | 硬策略层 |
 | --- | --- | --- | --- | --- | --- | --- |
-| **Claude Code** | `CLAUDE.md` / `.claude/CLAUDE.md` | `.claude/rules/**/*.md`（可 path 作用域） | `~/.claude/` + 企业 managed policy | `CLAUDE.local.md` | 祖先链启动加载；子目录按需；`@import` | permissions allow/deny/ask + hooks + sandbox |
-| **Codex CLI** | `AGENTS.md` / `AGENTS.override.md` | 目录嵌套 + fallback 文件名 | `~/.codex/AGENTS.md` | override 文件 | root→cwd 合并，近者优先；有字节上限 | sandbox_mode + approval_policy + execpolicy `prefix_rule` |
+| **Claude Code** | `CLAUDE.md` / `.claude/CLAUDE.md` | `.claude/rules/**/*.md`（可 path 作用域） | `~/.claude/` + 企业 managed policy | `CLAUDE.local.md`（与同目录共享文件都加载） | 祖先链启动拼接；子目录按需；`@import` | permissions allow/deny/ask + hooks + sandbox |
+| **Codex CLI** | `AGENTS.md` / `AGENTS.override.md` | 目录嵌套 + fallback 文件名 | `~/.codex/AGENTS.md` | `AGENTS.override.md`（替代同目录普通文件） | project root→cwd，每目录至多一个候选；有字节上限 | sandbox_mode + approval_policy + execpolicy `prefix_rule` |
 | **Cursor** | 现多读 `AGENTS.md`；旧 `.cursorrules` | `.cursor/rules/*.mdc`（globs / always / agent-decided） | 用户规则 | 本地规则 | 按类型附加 | 产品内权限/模式（工具侧） |
 | **GitHub Copilot** | `.github/copilot-instructions.md` | `.github/instructions/*.instructions.md` | 组织策略 | — | 仓库级自定义指令 | 组织策略/策略控制 |
 | **Aider** | 任意 md，常 `CONVENTIONS.md` | 多文件 `--read` / conf `read:` | conf 可列路径 | — | 默认手动或 conf 自动 read | 无完整沙箱产品层；靠确认与模型 |
@@ -133,9 +133,30 @@ Coding agent 每轮都在“新入职”。没有规则时，它会：
 补充观察：
 
 - **2025–2026 的可移植共识是 `AGENTS.md`**（“README for agents”），多工具与基金会叙事都在推动它成为跨产品真相源。[1][5][6]
-- **Claude Code 原生读 `CLAUDE.md` 不读 `AGENTS.md`**；常见桥接是 `CLAUDE.md` 内 `@AGENTS.md` 或 symlink。[5][6]
+- **Claude Code 原生读 `CLAUDE.md` 不读 `AGENTS.md`**；官方建议用 `CLAUDE.md` 内 `@AGENTS.md` 或 symlink 桥接。[9]
 - **Cursor 旧 `.cursorrules` 已软废弃**，新项目应 `AGENTS.md` + 可选 `.cursor/rules`。[5]
 - Aider 的优点是极简与 cache 友好：小文件只读加载，不发明复杂 schema。[7]
+
+#### 4.1.1 本地覆盖与层级选择合同复核（2026-07-31）
+
+本次复核的决策面是：**共享项目指令与本机私有指令同时存在时，产品选择哪些文件、以什么顺序放入上下文、作用到哪棵目录，以及何时重新读取。**仅讨论 Codex CLI 与 Claude Code 已公开的文件合同；不讨论 auto memory、权限执行、模型内部冲突消解，也不据此推断任何私有实现。
+
+| 维度 | Codex CLI | Claude Code |
+| --- | --- | --- |
+| 全局 / 用户层 | `$CODEX_HOME`（默认 `~/.codex`）先尝试 `AGENTS.override.md`，否则 `AGENTS.md`；取第一个非空文件 [8][19] | managed policy → `~/.claude/CLAUDE.md` → project → local，官方表按“宽到窄”列出加载顺序 [9] |
+| 项目同目录选择 | 按 `AGENTS.override.md` → `AGENTS.md` → 配置的 fallback 名称检查，**每目录至多选择一个**；override 不是在同目录 base 之后追加；固定源码明确允许符号链接 [8][19] | `CLAUDE.md` 与 `CLAUDE.local.md` 都会被发现并拼接；同目录中 local 排在 base 后，不会替换 base [9] |
+| 跨目录顺序 | 从 project root（通常 Git root）到启动 cwd；越近 cwd 的文件越晚进入 prompt。找不到 root 时只检查 cwd，并在 cwd 停止，不向下预读 [8][19] | 从文件系统根到启动 cwd 拼接祖先文件；越近 cwd 的内容越晚。cwd 下的文件在 Claude 读取该子目录文件时才惰性加载 [9] |
+| 加载 / 刷新时机 | 用户文档合同是每次命令或 TUI session 启动时构建；同路径文件变更后应重启。固定提交源码还显示：普通 turn 复用创建时快照，而 turn 的环境 / cwd 选择变化会刷新，这是实现观察而非稳定文档承诺 [8][19] | 每个 conversation 启动加载祖先链，子目录按读取触发；`/compact` 后重新读取 project-root 文件，嵌套文件等下次访问再加载。`InstructionsLoaded` hook 可观察 `session_start`、`nested_traversal`、`include`、`compact` 等原因 [9][21] |
+| worktree 边界 | Codex-managed worktree 会自动复制被忽略的 `AGENTS.override.md`，无需列入 `.worktreeinclude` [20] | 被 gitignore 的 `CLAUDE.local.md` 只存在于创建它的 worktree；要跨 worktree 共享，官方建议从 home 目录 import [9] |
+
+这里的“后置 / 更具体”只是**上下文顺序**，不是硬覆盖算法。Claude Code 明确警告：矛盾指令可能被模型任意选择；Codex 文档所说“closer files override”也没有把自然语言冲突提升为客户端强制策略。[8][9]
+
+证据仍有四处边界：
+
+1. Codex 文档同时写了“按候选顺序、每目录一个”和“跳过空文件”；当前项目级源码先选第一个存在的候选，再忽略空内容，而全局加载器会对空 override 继续尝试 base。公开测试没有明确锁定“项目目录中空 override + 非空 base”的长期合同，因此不应依赖该边界。[8][19]
+2. Codex 用户文档以“一次 run / TUI session 一次”为刷新合同；当前源码对 turn 环境选择变化有额外刷新路径。二者并非必然冲突，但后者尚未成为同等清晰的用户承诺。[8][19]
+3. Claude 文档允许 project instructions 放在 `./CLAUDE.md` 或 `./.claude/CLAUDE.md`，但未明确说明两者同时存在时是否都加载及其相对顺序；可观测时应以 `/context` 或 `InstructionsLoaded` 为准。[9][21]
+4. Claude 文档说明启动、惰性加载与 compact 重载，但未承诺已加载文件在同一会话内被编辑后立即热刷新；Codex 则明确建议遇到陈旧内容时重启。[8][9]
 
 ### 4.2 软规则内容“该写什么”
 
@@ -182,8 +203,8 @@ Managed / 企业策略
 
 | 产品 | 合并语义（实践中） |
 | --- | --- |
-| Codex | 发现链合并；更靠近 cwd 的内容优先/覆盖；有 `project_doc_max_bytes` 一类上限 [8] |
-| Claude Code | 多文件拼接进上下文；子目录 lazy；path rules 触碰相关文件时加载；local 追加 [9] |
+| Codex | 每目录从 override / base / fallback 中选一个，再合并发现链；更靠近 cwd 的内容后置；有 `project_doc_max_bytes` 上限 [8][19] |
+| Claude Code | 多文件拼接进上下文；同目录 local 在 base 后；子目录 lazy；path rules 触碰相关文件时加载 [9][21] |
 | agents.md 叙事 | nested **nearest wins** [1][5] |
 | Cline / Continue | 工作区覆盖全局；globs 决定是否进入本轮 |
 
@@ -648,8 +669,8 @@ Immutable 预算
 5. 生态对比综述，如 [AGENTS.md vs CLAUDE.md vs Cursor rules (2026)](https://codersera.com/blog/agents-md-vs-claude-md-vs-cursor-rules-comparison-2026/)。  
 6. Builder.io / 多工具实践：以 AGENTS.md 为真相源、薄适配 Claude/Cursor 的迁移路径。  
 7. Aider，[Conventions](https://aider.chat/docs/usage/conventions.html)（`CONVENTIONS.md` / `--read` / conf）。  
-8. OpenAI Codex，[AGENTS.md guide](https://developers.openai.com/codex/guides/agents-md)、[local config](https://developers.openai.com/codex/local-config)。  
-9. Claude Code，[Memory / CLAUDE.md hierarchy](https://code.claude.com/docs/en/memory)。  
+8. OpenAI Codex，[Custom instructions with AGENTS.md](https://developers.openai.com/codex/agent-configuration/agents-md)、[Project instructions discovery](https://developers.openai.com/codex/config-file/config-advanced#project-instructions-discovery)（访问：2026-07-31）。
+9. Anthropic Claude Code，[Memory and project instructions](https://code.claude.com/docs/en/memory)（访问：2026-07-31）。
 10. OpenAI Codex，[Agent approvals & security](https://developers.openai.com/codex/agent-approvals-security)、[Sandboxing](https://developers.openai.com/codex/sandboxing)、[Exec policy / rules](https://developers.openai.com/codex/exec-policy/)。  
 11. Claude Code permissions / hooks 文档与社区整理（allow/deny/ask、PreToolUse、permission modes）。  
 12. Open Interpreter，[Safety](https://docs.openinterpreter.com/safety/safe-mode)、[Isolation](https://docs.openinterpreter.com/safety/isolation)。  
@@ -659,6 +680,9 @@ Immutable 预算
 16. Continue，[Rules](https://docs.continue.dev/customize/deep-dives/rules)。  
 17. OpenHands，Skills / repo `AGENTS.md` 文档。  
 18. 本仓库代码现状：`internal/tools/command.go`（`sh -c`、timeout、输出上限）、`internal/config/config.go`（`system_prompt`）、`internal/contextbuild`（immutable 预算）、`AGENTS.md`（开发约束）。
+19. OpenAI Codex 公开源码，提交 [`f0c30e5`](https://github.com/openai/codex/commit/f0c30e528a54bdf0fa9a4d52ff74b34383434811)：[`agents_md.rs`](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/core/src/agents_md.rs#L83-L247)、[`codex-home instructions`](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/codex-home/src/instructions/mod.rs#L24-L66)、[`AgentsMdManager`](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/core/src/agents_md_manager.rs#L10-L49)、[创建时快照测试](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/core/tests/suite/agents_md.rs#L523-L634) 与 [cwd 变化刷新测试](https://github.com/openai/codex/blob/f0c30e528a54bdf0fa9a4d52ff74b34383434811/codex-rs/core/tests/suite/model_visible_layout.rs#L263-L392)（访问：2026-07-31）。
+20. OpenAI Codex，[Worktrees / Copy ignored local files](https://developers.openai.com/codex/environments/git-worktrees#copy-ignored-local-files-into-managed-worktrees)（访问：2026-07-31）。
+21. Anthropic Claude Code，[Hooks / `InstructionsLoaded`](https://code.claude.com/docs/en/hooks#instructionsloaded)（访问：2026-07-31）。
 
 ---
 

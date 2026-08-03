@@ -3,40 +3,52 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "调研主流 CLI coding agent 如何做命令权限与审批（Codex / Claude Code 等），写到 docs/research/",
-      "expected_output": "Industry-only research note under docs/research/, multi-source, no local product-code audit, no repo migration plan",
+      "prompt": "调研已上线多 Agent 应用如何处理用户在长任务中改变目标，并写到 docs/research/。",
+      "expected_output": "A direction-level industry note grounded in multiple deployed applications, with facts, synthesis, and unknowns separated.",
       "files": [],
       "expectations": [
-        "Uses external primary sources (vendor docs / mature agents / independent sources)",
-        "Does not read or cite this repo's internal/ or cmd/ product implementation as research evidence",
+        "Frames user-intent change during long-running multi-agent work as the research direction",
+        "Uses multiple independent deployed applications rather than a preset product list",
+        "Does not make frameworks, SDKs, or APIs the research subject",
+        "Marks undocumented cancellation, routing, and context behavior as evidence gaps",
         "Writes docs/research/* and not docs/issues/*",
-        "Includes research date and re-verify caveat",
-        "Compares mechanisms and tradeoffs, not marketing blurbs",
-        "Does not end with 'how this repository should change' unless the user asked for local mapping"
+        "Does not inspect local product code or propose a repository migration"
       ]
     },
     {
       "id": 2,
-      "prompt": "research how mature agents decide tool-call continuation vs termination",
-      "expected_output": "Mechanistic industry note on provider stop reasons vs agent-loop budgets, with sources",
+      "prompt": "research how mainstream AI applications let a user interrupt or refine a long-running task",
+      "expected_output": "A comparative note on user-visible interruption/refinement behavior and its stated limits.",
       "files": [],
       "expectations": [
-        "Separates provider-response layer from agent-loop layer",
-        "Covers at least two mature systems or APIs",
-        "Marks inference vs documented behavior",
-        "Avoids local codebase exploration for design answers"
+        "Starts from actual deployed applications and official product or engineering evidence",
+        "Separates user-visible controls from undisclosed internal worker-cancellation semantics",
+        "Compares concrete mechanisms and tradeoffs instead of a feature list",
+        "Does not substitute API documentation for product behavior"
       ]
     },
     {
       "id": 3,
-      "prompt": "对比一下上下文压缩/compaction 的业界做法",
-      "expected_output": "Scoped comparative research on compaction strategies with applicability boundaries",
+      "prompt": "对比已上线智能应用处理长对话上下文、摘要和任务交接的业界做法",
+      "expected_output": "A scoped research note that contrasts application-level context practices and their boundaries.",
       "files": [],
       "expectations": [
-        "Defines scope and out-of-scope",
-        "Shows where serious systems converge or diverge",
-        "Lists pitfalls and open questions",
-        "Remains industry-focused rather than a local implementation plan"
+        "Defines scope and out-of-scope boundaries",
+        "Uses cases with different context-transfer tradeoffs, not only products that converge",
+        "Distinguishes documented behavior from a proposed abstract model",
+        "Lists evidence gaps and avoids a local implementation plan"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "以某个我指定的助手为起点，调研这个方向的主流产品实践",
+      "expected_output": "A broad direction-level study that treats the named assistant as one relevant case rather than the whole landscape.",
+      "files": [],
+      "expectations": [
+        "Uses the named product only when relevant and still finds independent comparison cases",
+        "Explains why each selected application is evidence for the direction",
+        "Does not turn the task into an API, SDK, or framework survey",
+        "Labels vendor self-reports and unverified internal claims"
       ]
     }
   ]

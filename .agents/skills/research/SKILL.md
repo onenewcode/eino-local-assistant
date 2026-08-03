@@ -1,153 +1,143 @@
 ---
 name: research
 description: >
-  Industry research for coding agents and related systems. Use when the user asks
-  to research, survey, compare, or investigate industry practice; mentions Codex,
-  Claude Code,Grok Build , Cursor, Aider, OpenHands, Continue, or similar CLI/IDE agents;
-  wants vendor/API behavior on tools, context, permissions, sessions, compaction,
-  or termination; or wants a writeup under docs/research/. Prefer this skill over
-  reading local product code for design inspiration. Research external systems
-  only — do not audit or map this repository's implementation.
+  Research a user-specified industry direction in deployed AI applications and
+  agentic systems. Use when the user asks to research, survey, compare, or
+  investigate current industry practice, product behavior, or engineering
+  tradeoffs. Treat the direction as the unit of research: search broadly across
+  relevant real applications, not a preselected vendor list, framework, SDK, or
+  API. Research external systems only; do not audit or map this repository's
+  implementation.
 ---
 
 # research
 
-Produce high-signal **industry** research: how mature products and APIs actually
-do a thing, what tradeoffs they make, and which patterns are efficient/reasonable.
+Produce high-signal industry research about how deployed applications handle a
+specific problem. The research should reveal mechanisms, tradeoffs, boundaries,
+and evidence gaps -- not create a product tour or a local implementation plan.
 
-This is not a local codebase audit, not an issue writeup, and not a generic
-"how to research" tutorial.
+## Scope and boundaries
 
-## Hard boundary
+- Treat the user's question as an **industry direction**. Examples: long-running
+  task interruption, multi-agent user routing, context transfer, approval UX,
+  or agent reliability.
+- Select evidence from relevant, publicly deployed applications and their public
+  engineering material. Do not start from a canned list of companies or tools.
+- If the user names a product, use it as one lead when relevant; do not let it
+  define the entire landscape or replace comparison with other applications.
+- Do not make frameworks, SDKs, APIs, or source-code interfaces the subject of
+  a direction-level study. Use them only when the user explicitly asks about
+  that interface itself.
+- When an application does not disclose an internal mechanism, say so. Do not
+  fill the gap with API behavior, UI speculation, or an invented architecture.
+- Stay outside this repository's product code. Read local `docs/research/*`
+  only for an existing note's scope or style; do not read `internal/`, `cmd/`,
+  tests, or application packages as industry evidence.
+- Write research only under `docs/research/<topic>-research.md`. Do not create
+  issue documents or turn the note into a local migration plan.
 
-Stay outside this repo's product code while researching.
+## Evidence strategy
 
-- **Do research**: vendor docs, official blogs, public specs, release notes,
-  reputable engineering posts, and **other** open-source implementations.
-- **Do not open** local product paths for "how we do it today"
-  (`internal/`, `cmd/`, app packages, tests of product behavior).
-- **Local writes only**: `docs/research/<topic>-research.md`.
-- **Optional local read**: existing `docs/research/*` only for tone/structure,
-  never as evidence of industry practice.
-- **Do not** end with "how this repo should change" or "minimal local MVP".
-  Implementation mapping is a later, separate step if the user asks.
+Search broadly before writing. Choose sources because they illuminate the
+question, not because they are familiar.
 
-If the user explicitly asks to compare industry findings to this repo, finish the
-industry research first, then ask before touching product code.
+1. Define the decision surface in one sentence and state 2-4 scope boundaries.
+2. Find multiple independent deployed applications relevant to that surface.
+   Prefer public engineering articles, product documentation describing observed
+   behavior, release notes, and recorded product interactions. Aim for at least
+   three independent sources when the market supports it; disclose a narrower
+   evidence base when it does not.
+3. Prefer primary sources for a product's own behavior. Use independent sources
+   to challenge marketing claims, establish adoption context, or surface a
+   disagreement -- never to invent private internals.
+4. Look for concrete control points: what triggers a behavior, who owns a user
+   interaction, what information moves, what can be interrupted, what remains
+   persistent, and what the product explicitly does not promise.
+5. Check whether evidence describes an actual shipped behavior, a preview, an
+   experiment, a roadmap, or a generic recommendation. Label it accordingly.
+
+For a broad direction, source selection should normally span different product
+categories or vendors. A single product's blog can be a useful case study, but
+it cannot establish an industry norm by itself.
+
+## Reasoning discipline
+
+Separate every important statement into one of these classes:
+
+- **Documented fact**: a source directly states or demonstrates the behavior.
+- **Cross-product synthesis**: a reasoned pattern supported by multiple facts.
+- **Evidence gap**: products do not disclose enough to make the claim.
+
+Do not equate a product's UI with its internal consistency, cancellation,
+routing, or security semantics. Do not call a pattern "standard" merely because
+two products use related vocabulary. When applications diverge, explain the
+applicability boundary instead of forcing a consensus.
+
+If the user asks for a design question, describe a reusable abstract model only
+after presenting the evidence. Mark it as synthesis, keep it product-neutral,
+and do not map it to this repository unless the user separately requests that.
 
 ## Workflow
 
-1. **Frame the question**
-   - One concrete decision surface (e.g. tool-call termination, command
-     permissions, context compaction).
-   - In scope / out of scope in 2–4 bullets.
-   - Prefer mechanisms and failure modes over product marketing.
-
-2. **Search widely (no memory-only conclusions)**
-   Cover at least:
-   - Mature coding agents: Codex CLI, Claude Code,Grok Build and 1–2 peers when relevant
-     (Cursor, Aider, OpenHands, Continue, etc.)
-   - Provider/API semantics when the topic depends on them (OpenAI, Anthropic,
-     others as needed)
-   - At least one additional independent source class: OSS implementation,
-     engineering post, or formal docs/spec
-
-   Prefer primary sources. Note the research date; products drift.
-
-3. **Cross-check claims**
-   - Separate observed behavior / documented API from inference.
-   - When sources disagree, show the disagreement instead of forcing a false
-     consensus.
-   - Mark weak or single-source claims.
-
-4. **Synthesize for reuse**
-   Focus on:
-   - Dominant industry patterns
-   - Efficient/reasonable defaults and why they work
-   - Tradeoffs and applicability boundaries
-   - Common pitfalls and anti-patterns
-
-   Avoid empty landscape tours with no decision value.
-
+1. **Frame the direction**
+   - Name the concrete decision surface.
+   - State in scope and out of scope.
+   - Identify terms that must not be conflated.
+2. **Build the source set**
+   - Search for relevant live applications rather than familiar products.
+   - Include cases that converge and cases that make different tradeoffs.
+   - Record publication/update and access dates.
+3. **Extract mechanisms**
+   - Capture input, control flow, state/context movement, user-visible behavior,
+     failure handling, and stated limitations.
+   - Keep each claim traceable to a source.
+4. **Cross-check and classify**
+   - Mark single-source claims and vendor self-reports.
+   - Separate facts, synthesis, and unknowns.
 5. **Write the note**
-   Path: `docs/research/<topic>-research.md`  
-   Do **not** put research under `docs/issues/`.
+   - Lead with conclusions, then evidence, synthesis, pitfalls, and open
+     questions.
+   - Prefer short case cards and narrow tables over dense landscape matrices.
+   - Include links and a research date for every source set.
+6. **Validate before handoff**
+   - Check that no preselected product roster, framework, SDK, or API became the
+     de facto research subject.
+   - Check that the note contains no local implementation mapping and does not
+     claim undisclosed internals as fact.
 
-## Output template
+## Output shape
 
-Use this structure unless the topic truly needs a tighter shape:
+Use this structure unless the direction calls for a tighter one:
 
 ```markdown
-# <Topic>: industry practice
+# <Direction>: industry practice
 
 > Status: research note, not an implementation plan.
 >
-> Research date: YYYY-MM-DD. Re-verify before adopting; vendor behavior changes.
+> Research date: YYYY-MM-DD. Re-verify before adopting; products change.
 >
 > Scope: ...
 > Out of scope: ...
 
-## 1. Summary
-- 3–6 bullets: main patterns, key tradeoffs, sharp edges
+## 1. Conclusions
 
-## 2. Problem boundary
-- Terms, layers, and what is often confused
+## 2. Evidence from deployed applications
 
-## 3. Industry mechanisms
-- Compare mature systems/APIs by mechanism, not brand slogans
-- Use tables or short subsections when helpful
+## 3. Mechanisms and tradeoffs
 
-## 4. Efficient / reasonable patterns
-- What good systems converge on
-- When a pattern fits vs when it does not
+## 4. Cross-product synthesis
 
-## 5. Pitfalls
-- Failure modes seen in real products/APIs
-
-## 6. Open questions
-- What remains uncertain or needs re-check
+## 5. Pitfalls and evidence gaps
 
 ## References
-- Dated links / sources
 ```
 
 Writing bar:
-- Chinese is fine when the user writes in Chinese; keep terms precise.
-- Every important claim should be traceable to a source or explicitly marked as
-  inference.
-- Prefer concrete mechanics (`tool_choice`, `max_turns`, stop reasons, approval
-  gates) over vague advice ("be careful with context").
 
-## Quality bar (reasonable research)
-
-A good note is reasonable when it is:
-
-- **Scoped**: one decision surface, explicit non-goals
-- **Multi-source**: not a single blog paraphrased
-- **Mechanistic**: explains control points and runtime behavior
-- **Comparative**: shows where serious systems converge or diverge
-- **Actionable later**: a reader could design from it without reading this repo
-- **Non-prescriptive to this repo**: no local migration plan unless requested
-
-Reject these failure modes:
-
-- Reading local `internal/`/`cmd/` to reverse-engineer "the answer"
-- Turning research into an issue, rewrite plan, or PR outline
-- Tutorial filler ("what is an agent?")
-- Undated vendor claims with no source
-- Fake certainty where docs are ambiguous
-
-## Quick triggers
-
-Use this skill for prompts like:
-
-- "调研一下 Codex/Claude Code 怎么做 X"
-- "research industry approaches to Y"
-- "对比主流 CLI agent 的权限/会话/压缩/终止"
-- "写一份 docs/research/..."
-
-Do not use it for:
-
-- Debugging this repo from local code
-- Writing `docs/issues/*`
-- Implementing a feature in-tree
+- Write in the user's language when appropriate; keep terms precise.
+- Cite every material factual claim and attach access dates.
+- Use applications as evidence, not as a substitute for reasoning.
+- State what remains unknown rather than using a framework/API as a proxy for
+  unobserved product behavior.
+- Do not end with "how this repository should change" unless the user asked for
+  a separate local design step.
