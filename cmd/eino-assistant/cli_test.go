@@ -106,26 +106,24 @@ func TestResumeRequiresID(t *testing.T) {
 	}
 }
 
-func TestExecResumeRequiresExplicitIDAndDocumentsRecovery(t *testing.T) {
+func TestExecResumeRequiresExplicitIDOrLastAndDocumentsRecovery(t *testing.T) {
 	t.Parallel()
 	_, _, err := executeForTest("exec", "resume")
 	if err == nil || !strings.Contains(err.Error(), "session id is required") {
-		t.Fatalf("error=%v, want explicit session-id error", err)
+		t.Fatalf("error=%v, want explicit session-id-or-last error", err)
 	}
 
 	stdout, _, err := executeForTest("exec", "resume", "--help")
 	if err != nil {
 		t.Fatalf("exec resume --help: %v", err)
 	}
-	for _, want := range []string{"--recover", "never chooses a most-recent session", "[PROMPT]"} {
+	for _, want := range []string{"--recover", "--last", "--ephemeral", "-m", "--model", "-o", "--output-last-message", "stable identity", "storage.data_dir", "temporary snapshot", "[PROMPT]"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("headless resume help missing %q:\n%s", want, stdout)
 		}
 	}
-	for _, forbidden := range []string{"--last", "--ephemeral"} {
-		if strings.Contains(stdout, forbidden) {
-			t.Fatalf("headless resume help unexpectedly exposes %q:\n%s", forbidden, stdout)
-		}
+	if !strings.Contains(stdout, "--json") || !strings.Contains(stdout, "stream-json") {
+		t.Fatalf("exec resume help omitted JSONL alias documentation:\n%s", stdout)
 	}
 }
 

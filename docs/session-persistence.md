@@ -20,6 +20,10 @@
 7. `/clear` 创建并切换到新 session，不重写当前 session；旧队列不��跨 session 执行。
 8. 自主复杂任务将图、proof 接受状态和中断状态写为 `task.state.updated`；`/resume` 恢复该投影，但恢复时仍为 `working` 的节点先转为 `needs_replan`，不会自动重放操作。普通后续输入延续原始需求；只有显式以当前用户原文替换 `user-request` 才改变任务范围并使相关 proof 失效。
 
+fresh `exec --ephemeral` 使用同一个 v2 `ThreadStore` API，但根目录是本次进程创建的空临时目录，runtime 关闭时整体删除。`exec resume <id> --ephemeral` 和 `exec resume --last --ephemeral` 则在 durable source thread 锁下复制选定 session 的 authoritative journal、materialized state/meta、checkpoints 与 artifacts 到该临时根目录，再由临时 store 承担整个 resumed turn；source session 不接收 turn、journal、state、checkpoint 或 artifact 写入，source `locks/` 也不复制。ephemeral `--last` 使用不修复 durable projections 的只读 session 列表；普通 durable `--last` 仍使用既有 `ListThreads` 路径。该能力只保证 session ledger 的本次运行生命周期，不宣称 fork 语义；工具已经造成的工作区、网络或其他外部副作用不会回滚，项目级 semantic memory 也不会被清除。
+
+Headless `exec --output-schema FILE` 在打开/创建 session 前读取并编译本地 JSON Schema；文件不存在、不可读、JSON 无效或 schema 无效都是 input error，不会调用模型。有效 schema 只用于最终 assistant Content：内容必须是 JSON 实例且匹配 schema，校验发生在 `turn.committed` 前。失败会沿用 turn failed lifecycle，不写入 assistant message，但已记录的 provider usage 保留；`--output-last-message` 也只在校验成功并提交后写入。该能力是本地最终响应校验，不是 provider-enforced structured output，不会把 `response_format` 注入 ReAct loop；相对 `$ref` 按 schema 文件所在路径解析。
+
 ## 目录布局
 
 默认根目录为 `~/.eino-assistant`，也可用 `storage.data_dir` 覆盖：
@@ -206,7 +210,7 @@ checkpoint 必须是严格 JSON，并包含：
 
 | 操作 | 行为 |
 | --- | --- |
-| `resume <id> [--recover]` / `/resume <id> [--recover]` / `exec resume <id> [PROMPT] [--recover]` | **存储层**：读取 state、活动 checkpoint 和最近可见 transcript。**模型层**：下一请求使用活动 checkpoint + 未覆盖热 groups + 当前 tools + 新消息，不把完整账本水合进 prompt。产品承诺是任务可继续，不是全文语义等价。headless `exec resume` 必须给精确、不透明 ID，省略 ID 不会自动选择最近会话；它只发送调用中提供的一条新 prompt，并且只通过 `chat.OpenSession` 恢复，不解析账本文件。若活动 checkpoint 是可识别 v1，先 CAS reset 指针并保留 raw ledger；若 thread 有活动 turn 或 pending compaction，普通 resume 仍拒绝接管；精确指定 `--recover` 才会显式恢复该目标。`--output-format stream-json` 不读取或导出账本：它只在成功打开后写 session.started，工具 activity 也只在对应生命周期已经写入账本后投影，最终 result 则在 turn.committed 之后写出。 |
+| `resume <id> [--recover]` / `/resume <id> [--recover]` / `exec resume <id> [PROMPT] [--recover]` / `exec resume --last [PROMPT] [--recover]` | **存储层**：读取 state、活动 checkpoint 和最近可见 transcript。**模型层**：下一请求使用活动 checkpoint + 未覆盖热 groups + 当前 tools + 新消息，不把完整账本水合进 prompt。产品承诺是任务可继续，不是全文语义等价。headless `exec resume` 必须给精确、不透明 ID，除非显式使用 `--last`；`--ephemeral` 会把选定 source session 快照到临时 ledger，后续只由该临时 ledger 接收 turn lifecycle 写入。它只发送调用中提供的一条新 prompt，并且只通过 `chat.OpenSession` 恢复，不解析账本文件。若活动 checkpoint 是可识别 v1，先 CAS reset 指针并保留 raw ledger；若 thread 有活动 turn 或 pending compaction，普通 resume 仍拒绝接管；精确指定 `--recover` 才会显式恢复该目标，而且 ephemeral 恢复只写临时 ledger。`--output-format stream-json` 不读取或导出账本：它只在成功打开后写 session.started，工具 activity 也只在对应生命周期已经写入账本后投影，最终 result 则在 turn.committed 之后写出。 |
 | 向上滚动 | 以稳定 message page 从 event ledger 读取更早 transcript；只扩展 UI 回放缓存，不改变模型工作集。 |
 | `/new [title]` | 创建独立 thread，旧 thread 保留。 |
 | `/clear` | 与 `/new` 相同地创建并切换到新 thread，同时清空旧队列；不重写旧 thread。 |

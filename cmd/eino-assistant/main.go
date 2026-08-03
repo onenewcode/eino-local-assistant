@@ -1,11 +1,29 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
 	"eino-local-assistant/internal/tools"
 )
+
+const (
+	exitCodeSuccess = 0
+	exitCodeFailure = 1
+	exitCodeSIGTERM = 143
+)
+
+func exitCodeForError(err error) int {
+	if err == nil {
+		return exitCodeSuccess
+	}
+	var sigtermErr *execSIGTERMError
+	if errors.As(err, &sigtermErr) {
+		return exitCodeSIGTERM
+	}
+	return exitCodeFailure
+}
 
 func main() {
 	// The parent tool runner starts this private one-shot worker inside the
@@ -20,6 +38,6 @@ func main() {
 	}
 	if err := execute(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		os.Exit(exitCodeForError(err))
 	}
 }

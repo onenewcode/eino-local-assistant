@@ -1,14 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,11 +28,21 @@ import (
 )
 
 type fakeExecSession struct {
-	prompt string
-	chunks []string
-	err    error
-	id     string
-	usage  *chat.UsageSummary
+	prompt         string
+	chunks         []string
+	err            error
+	id             string
+	usage          *chat.UsageSummary
+	finalValidator func(string) error
+}
+
+type fakeExecThreadLister struct {
+	threads []store.ThreadMeta
+	err     error
+}
+
+func (lister fakeExecThreadLister) ListThreads(context.Context) ([]store.ThreadMeta, error) {
+	return lister.threads, lister.err
 }
 
 func (s *fakeExecSession) ID() string {
@@ -42,10 +59,21 @@ func (s *fakeExecSession) execUsageSummary() (chat.UsageSummary, bool) {
 	return *s.usage, true
 }
 
+func (s *fakeExecSession) SetFinalResponseValidator(validator func(string) error) {
+	s.finalValidator = validator
+}
+
 func (s *fakeExecSession) Ask(_ context.Context, prompt string, onChunk func(string) error) error {
 	s.prompt = prompt
+	var response strings.Builder
 	for _, chunk := range s.chunks {
+		response.WriteString(chunk)
 		if err := onChunk(chunk); err != nil {
+			return err
+		}
+	}
+	if s.finalValidator != nil {
+		if err := s.finalValidator(response.String()); err != nil {
 			return err
 		}
 	}
@@ -71,6 +99,16 @@ type failingExecWriter struct {
 func (w *failingExecWriter) Write([]byte) (int, error) {
 	w.writes++
 	return 0, w.err
+}
+
+type errorExecCloser struct {
+	err   error
+	calls int
+}
+
+func (c *errorExecCloser) Close() error {
+	c.calls++
+	return c.err
 }
 
 type failingAfterExecWriter struct {
@@ -143,6 +181,14 @@ func (s *blockingEventExecSession) AskWithEvents(ctx context.Context, prompt str
 	return ctx.Err()
 }
 
+type blockingExecSession struct{ fakeExecSession }
+
+func (s *blockingExecSession) Ask(ctx context.Context, prompt string, _ func(string) error) error {
+	s.prompt = prompt
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 type commitCheckingExecWriter struct {
 	bytes.Buffer
 	check    func() error
@@ -173,6 +219,138 @@ func executeExecWithWritersForTest(ctx context.Context, input io.Reader, deps ex
 	root.SetErr(stderr)
 	root.SetArgs(args)
 	return root.Execute()
+}
+
+func TestExecExitCodeForError(t *testing.T) {
+	if got := exitCodeForError(nil); got != exitCodeSuccess {
+		t.Fatalf("nil error exit code=%d, want %d", got, exitCodeSuccess)
+	}
+	if got := exitCodeForError(errors.New("ordinary failure")); got != exitCodeFailure {
+		t.Fatalf("ordinary failure exit code=%d, want %d", got, exitCodeFailure)
+	}
+
+	sigtermErr := markExecSIGTERMCancellation(context.Canceled, syscall.SIGTERM)
+	if sigtermErr == nil || !errors.Is(sigtermErr, context.Canceled) {
+		t.Fatalf("SIGTERM error=%v, want wrapped context cancellation", sigtermErr)
+	}
+	if got := exitCodeForError(sigtermErr); got != exitCodeSIGTERM {
+		t.Fatalf("SIGTERM exit code=%d, want %d", got, exitCodeSIGTERM)
+	}
+	if got := exitCodeForError(markExecSIGTERMCancellation(context.Canceled, syscall.SIGINT)); got != exitCodeFailure {
+		t.Fatalf("SIGINT exit code=%d, want ordinary failure %d", got, exitCodeFailure)
+	}
+}
+
+func TestExecSIGTERMExitCode(t *testing.T) {
+	if os.Getenv("EINO_EXEC_EXIT_CODE_HELPER") == "1" {
+		format := execOutputFormat(os.Getenv("EINO_EXEC_EXIT_CODE_FORMAT"))
+		if format == "" {
+			format = execOutputFormatText
+		}
+		deps := execCommandDeps{newSession: func(context.Context, string) (execSession, io.Closer, error) {
+			if _, err := fmt.Fprintln(os.Stdout, "ready"); err != nil {
+				os.Exit(exitCodeFailure)
+			}
+			return &blockingExecSession{}, nil, nil
+		}}
+		stdout := io.Writer(io.Discard)
+		if format == execOutputFormatStreamJSON {
+			stdout = os.Stdout
+		}
+		err := runExec(context.Background(), []string{"wait for SIGTERM"}, strings.NewReader(""), stdout, io.Discard, "", format, deps.newSession)
+		os.Exit(exitCodeForError(err))
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("SIGTERM exit status is a Unix process contract")
+	}
+
+	for _, format := range []execOutputFormat{execOutputFormatText, execOutputFormatStreamJSON} {
+		format := format
+		t.Run(string(format), func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestExecSIGTERMExitCode$")
+			cmd.Env = append(os.Environ(), "EINO_EXEC_EXIT_CODE_HELPER=1", "EINO_EXEC_EXIT_CODE_FORMAT="+string(format))
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatalf("stdout pipe: %v", err)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start helper: %v", err)
+			}
+			reader := bufio.NewReader(stdout)
+			ready, err := reader.ReadString('\n')
+			if err != nil || strings.TrimSpace(ready) != "ready" {
+				t.Fatalf("helper readiness=%q err=%v stderr=%q", ready, err, stderr.String())
+			}
+			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatalf("send SIGTERM: %v", err)
+			}
+
+			tail := make(chan []byte, 1)
+			go func() {
+				output, _ := io.ReadAll(reader)
+				tail <- output
+			}()
+			wait := make(chan error, 1)
+			go func() { wait <- cmd.Wait() }()
+			select {
+			case err := <-wait:
+				output := <-tail
+				exitErr, ok := err.(*exec.ExitError)
+				if !ok {
+					t.Fatalf("helper error=%v, want exit code %d", err, exitCodeSIGTERM)
+				}
+				if got := exitErr.ExitCode(); got != exitCodeSIGTERM {
+					t.Fatalf("helper exit code=%d, want %d (stderr=%q)", got, exitCodeSIGTERM, stderr.String())
+				}
+				if format == execOutputFormatStreamJSON {
+					if strings.Contains(string(output), "exit_code") {
+						t.Fatalf("stream output exposed OS exit code: %s", output)
+					}
+					records := decodeExecStream(t, string(output))
+					result := decodeExecStreamResult(t, records[len(records)-1])
+					if result.Status != execStatusCancelled {
+						t.Fatalf("stream status=%q, want cancelled", result.Status)
+					}
+				}
+			case <-time.After(3 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("SIGTERM helper did not exit")
+			}
+		})
+	}
+}
+
+func TestExecMachineOutputKeepsOSExitCodeOutOfBusinessJSON(t *testing.T) {
+	for _, format := range []execOutputFormat{execOutputFormatJSON, execOutputFormatStreamJSON} {
+		format := format
+		t.Run(string(format), func(t *testing.T) {
+			stdout, _, err := executeExecForTest(
+				strings.NewReader(""),
+				recordingExecDeps(&fakeExecSession{err: context.Canceled}, new(bool)),
+				"exec", "--output-format", string(format), "cancel",
+			)
+			if err == nil {
+				t.Fatal("expected cancelled execution error")
+			}
+			if strings.Contains(stdout, "exit_code") || strings.Contains(stdout, "143") {
+				t.Fatalf("machine output exposed OS exit code: %s", stdout)
+			}
+			if format == execOutputFormatJSON {
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Status != execStatusCancelled {
+					t.Fatalf("JSON status=%q, want cancelled", envelope.Status)
+				}
+				return
+			}
+			records := decodeExecStream(t, stdout)
+			result := decodeExecStreamResult(t, records[len(records)-1])
+			if result.Status != execStatusCancelled {
+				t.Fatalf("stream status=%q, want cancelled", result.Status)
+			}
+		})
+	}
 }
 
 func decodeExecJSON(t *testing.T, stdout string) (execJSONEnvelope, map[string]json.RawMessage) {
@@ -274,6 +452,10 @@ func decodeExecStreamResult(t *testing.T, record map[string]json.RawMessage) exe
 	return result
 }
 
+func expectedExecStreamCapabilities() []string {
+	return []string{"session_started_v1", "activity_v1", "terminal_result_v1", "usage_v1"}
+}
+
 func recordingExecDeps(session execSession, called *bool) execCommandDeps {
 	return execCommandDeps{newSession: func(_ context.Context, _ string) (execSession, io.Closer, error) {
 		*called = true
@@ -301,6 +483,760 @@ func TestExecPromptArgument(t *testing.T) {
 				t.Fatalf("stdout=%q stderr=%q", stdout, stderr)
 			}
 		})
+	}
+}
+
+func TestExecEphemeralFreshOutputOmitsSessionIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		format execOutputFormat
+	}{
+		{name: "text", format: execOutputFormatText},
+		{name: "json", format: execOutputFormatJSON},
+		{name: "stream-json", format: execOutputFormatStreamJSON},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{id: "ephemeral-session-secret", chunks: []string{"final reply"}}
+			newCalls := 0
+			ephemeralCalls := 0
+			deps := execCommandDeps{
+				newSession: func(context.Context, string) (execSession, io.Closer, error) {
+					newCalls++
+					return nil, nil, errors.New("durable factory must not run")
+				},
+				newEphemeralSession: func(context.Context, string) (execSession, io.Closer, error) {
+					ephemeralCalls++
+					return session, nil, nil
+				},
+			}
+			args := []string{"exec", "--ephemeral"}
+			if tc.format != execOutputFormatText {
+				args = append(args, "--output-format", string(tc.format))
+			}
+			args = append(args, "say hi")
+
+			stdout, stderr, err := executeExecForTest(strings.NewReader(""), deps, args...)
+			if err != nil {
+				t.Fatalf("exec --ephemeral: %v", err)
+			}
+			if newCalls != 0 || ephemeralCalls != 1 {
+				t.Fatalf("durable calls=%d ephemeral calls=%d", newCalls, ephemeralCalls)
+			}
+			if stderr != "" || strings.Contains(stdout, session.ID()) {
+				t.Fatalf("ephemeral output leaked session identity: stdout=%q stderr=%q", stdout, stderr)
+			}
+
+			switch tc.format {
+			case execOutputFormatText:
+				if stdout != "final reply\n" {
+					t.Fatalf("text stdout=%q", stdout)
+				}
+			case execOutputFormatJSON:
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Status != execStatusCompleted || envelope.Result == nil || *envelope.Result != "final reply" || envelope.Error != nil {
+					t.Fatalf("JSON envelope=%+v", envelope)
+				}
+				if envelope.Session.Persistent || envelope.Session.ID != nil {
+					t.Fatalf("JSON session=%+v", envelope.Session)
+				}
+			case execOutputFormatStreamJSON:
+				records := decodeExecStream(t, stdout)
+				if len(records) != 2 || eventName(t, records[0]) != execStreamEventSessionStarted || eventName(t, records[1]) != execStreamEventResult {
+					t.Fatalf("stream records=%s", stdout)
+				}
+				var started struct {
+					Session      execJSONSession `json:"session"`
+					Capabilities []string        `json:"capabilities"`
+				}
+				if err := json.Unmarshal(mustMarshal(t, records[0]), &started); err != nil {
+					t.Fatalf("decode session.started: %v", err)
+				}
+				result := decodeExecStreamResult(t, records[1])
+				if started.Session.Persistent || started.Session.ID != nil || result.Session.Persistent || result.Session.ID != nil {
+					t.Fatalf("stream session.started=%+v result=%+v", started.Session, result.Session)
+				}
+				if !reflect.DeepEqual(started.Capabilities, expectedExecStreamCapabilities()) {
+					t.Fatalf("stream capabilities=%v", started.Capabilities)
+				}
+				if _, ok := records[1]["capabilities"]; ok {
+					t.Fatalf("result repeated capabilities: %s", stdout)
+				}
+				if result.Status != execStatusCompleted || result.Result == nil || *result.Result != "final reply" {
+					t.Fatalf("stream result=%+v", result)
+				}
+			}
+		})
+	}
+}
+
+func TestExecJSONAliasUsesStreamJSONAcrossEntryPoints(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		deps func(*fakeExecSession) execCommandDeps
+	}{
+		{
+			name: "fresh",
+			args: []string{"exec", "--json", "say hi"},
+			deps: func(session *fakeExecSession) execCommandDeps {
+				return recordingExecDeps(session, new(bool))
+			},
+		},
+		{
+			name: "resume",
+			args: []string{"exec", "resume", "resume-session", "--json", "continue"},
+			deps: func(session *fakeExecSession) execCommandDeps {
+				return execCommandDeps{openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					return session, nil, nil
+				}}
+			},
+		},
+		{
+			name: "resume last",
+			args: []string{"exec", "resume", "--last", "--json", "continue"},
+			deps: func(session *fakeExecSession) execCommandDeps {
+				return execCommandDeps{
+					selectLastSession: func(context.Context, string) (string, error) { return session.ID(), nil },
+					openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+						return session, nil, nil
+					},
+				}
+			},
+		},
+		{
+			name: "ephemeral fresh",
+			args: []string{"exec", "--ephemeral", "--json", "say hi"},
+			deps: func(session *fakeExecSession) execCommandDeps {
+				return execCommandDeps{newEphemeralSession: func(context.Context, string) (execSession, io.Closer, error) {
+					return session, nil, nil
+				}}
+			},
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{id: "alias-session", chunks: []string{"final reply"}}
+			stdout, _, err := executeExecForTest(strings.NewReader(""), tc.deps(session), tc.args...)
+			if err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			records := decodeExecStream(t, stdout)
+			if len(records) < 2 || eventName(t, records[0]) != execStreamEventSessionStarted || eventName(t, records[len(records)-1]) != execStreamEventResult {
+				t.Fatalf("alias output is not stream-json lifecycle: %s", stdout)
+			}
+			result := decodeExecStreamResult(t, records[len(records)-1])
+			if result.Status != execStatusCompleted || result.Result == nil || *result.Result != "final reply" {
+				t.Fatalf("alias result=%+v", result)
+			}
+		})
+	}
+}
+
+func TestExecJSONAliasOutputFormatRules(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantStream bool
+	}{
+		{name: "explicit stream is equivalent", args: []string{"exec", "--json", "--output-format", "stream-json", "say hi"}, wantStream: true},
+		{name: "final json conflicts", args: []string{"exec", "--json", "--output-format", "json", "say hi"}},
+		{name: "text conflicts", args: []string{"exec", "--json", "--output-format", "text", "say hi"}},
+		{name: "resume final json conflicts", args: []string{"exec", "resume", "session-id", "--json", "--output-format", "json", "continue"}},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{chunks: []string{"final reply"}}
+			deps := recordingExecDeps(session, new(bool))
+			if strings.Contains(tc.name, "resume") {
+				deps = execCommandDeps{openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					return session, nil, nil
+				}}
+			}
+			stdout, _, err := executeExecForTest(strings.NewReader(""), deps, tc.args...)
+			if tc.wantStream {
+				if err != nil {
+					t.Fatalf("equivalent stream error: %v", err)
+				}
+				records := decodeExecStream(t, stdout)
+				if eventName(t, records[0]) != execStreamEventSessionStarted || eventName(t, records[len(records)-1]) != execStreamEventResult {
+					t.Fatalf("not equivalent stream output: %s", stdout)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "--json can only be combined") {
+				t.Fatalf("error=%v, want stable alias conflict", err)
+			}
+			if strings.Contains(tc.name, "final json") {
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Error == nil || envelope.Error.Code != execErrorInput || envelope.Status != execStatusFailed {
+					t.Fatalf("conflict envelope=%+v", envelope)
+				}
+			}
+		})
+	}
+}
+
+func TestExecOutputLastMessageSuccessfulFormatsAndModes(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		format     execOutputFormat
+		ephemeral  bool
+		openResume bool
+		option     string
+	}{
+		{name: "fresh ephemeral text short", args: []string{"exec"}, format: execOutputFormatText, ephemeral: true, option: "-o"},
+		{name: "fresh json long", args: []string{"exec", "--output-format", "json"}, format: execOutputFormatJSON, option: "--output-last-message"},
+		{name: "fresh stream short", args: []string{"exec", "--output-format", "stream-json"}, format: execOutputFormatStreamJSON, option: "-o"},
+		{name: "resume explicit text long", args: []string{"exec", "resume", "resume-session"}, format: execOutputFormatText, openResume: true, option: "--output-last-message"},
+		{name: "resume last json short", args: []string{"exec", "resume", "--last", "--output-format", "json"}, format: execOutputFormatJSON, openResume: true, option: "-o"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "last-message.txt")
+			session := &fakeExecSession{id: "resume-session", chunks: []string{"final ", "assistant response"}}
+			deps := execCommandDeps{}
+			if tc.openResume {
+				deps.openSession = func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					return session, nil, nil
+				}
+				deps.selectLastSession = func(context.Context, string) (string, error) { return session.ID(), nil }
+			} else if tc.ephemeral {
+				deps.newEphemeralSession = func(context.Context, string) (execSession, io.Closer, error) { return session, nil, nil }
+			} else {
+				deps.newSession = func(context.Context, string) (execSession, io.Closer, error) { return session, nil, nil }
+			}
+			args := append([]string{}, tc.args...)
+			if tc.ephemeral {
+				args = append(args, "--ephemeral")
+			}
+			args = append(args, tc.option, target, "say hi")
+			stdout, _, err := executeExecForTest(strings.NewReader(""), deps, args...)
+			if err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			content, err := os.ReadFile(target)
+			if err != nil || string(content) != "final assistant response" {
+				t.Fatalf("last message=%q, read error=%v", content, err)
+			}
+			if tc.format == execOutputFormatText && stdout != "final assistant response\n" {
+				t.Fatalf("text stdout=%q", stdout)
+			}
+			if tc.format == execOutputFormatJSON {
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Status != execStatusCompleted || envelope.Result == nil || *envelope.Result != "final assistant response" {
+					t.Fatalf("JSON envelope=%+v", envelope)
+				}
+			}
+			if tc.format == execOutputFormatStreamJSON {
+				records := decodeExecStream(t, stdout)
+				result := decodeExecStreamResult(t, records[len(records)-1])
+				if result.Status != execStatusCompleted || result.Result == nil || *result.Result != "final assistant response" {
+					t.Fatalf("stream result=%+v", result)
+				}
+			}
+		})
+	}
+}
+
+func TestExecOutputLastMessageShortAndLongConflictBeforeSessionOpen(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "fresh", args: []string{"exec", "-o", "short.txt", "--output-last-message", "long.txt", "say hi"}},
+		{name: "resume", args: []string{"exec", "resume", "session-id", "-o", "short.txt", "--output-last-message", "long.txt", "say hi"}},
+		{name: "resume last", args: []string{"exec", "resume", "--last", "-o", "short.txt", "--output-last-message", "long.txt", "say hi"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opened := false
+			session := &fakeExecSession{id: "session-id", chunks: []string{"should not run"}}
+			deps := execCommandDeps{
+				newSession: func(context.Context, string) (execSession, io.Closer, error) {
+					opened = true
+					return session, nil, nil
+				},
+				openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					opened = true
+					return session, nil, nil
+				},
+				selectLastSession: func(context.Context, string) (string, error) {
+					opened = true
+					return session.ID(), nil
+				},
+			}
+			_, _, err := executeExecForTest(strings.NewReader(""), deps, tc.args...)
+			if err == nil || !strings.Contains(err.Error(), "-o and --output-last-message cannot be used together") {
+				t.Fatalf("error=%v, want stable output-last conflict", err)
+			}
+			if opened {
+				t.Fatal("session was opened before output-last conflict was rejected")
+			}
+		})
+	}
+}
+
+func TestExecOutputLastMessageFailureDoesNotOverwrite(t *testing.T) {
+	tests := []struct {
+		name   string
+		format execOutputFormat
+	}{
+		{name: "text", format: execOutputFormatText},
+		{name: "json", format: execOutputFormatJSON},
+		{name: "stream-json", format: execOutputFormatStreamJSON},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "last-message.txt")
+			if err := os.WriteFile(target, []byte("old response"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			session := &fakeExecSession{chunks: []string{"partial"}, err: errors.New("turn failed")}
+			args := []string{"exec", "--output-last-message", target}
+			if tc.format != execOutputFormatText {
+				args = append(args, "--output-format", string(tc.format))
+			}
+			args = append(args, "say hi")
+			stdout, _, err := executeExecForTest(strings.NewReader(""), recordingExecDeps(session, new(bool)), args...)
+			if err == nil {
+				t.Fatal("expected turn failure")
+			}
+			content, readErr := os.ReadFile(target)
+			if readErr != nil || string(content) != "old response" {
+				t.Fatalf("last message=%q, read error=%v", content, readErr)
+			}
+			if tc.format == execOutputFormatJSON {
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Status != execStatusFailed {
+					t.Fatalf("JSON envelope=%+v", envelope)
+				}
+			}
+			if tc.format == execOutputFormatStreamJSON {
+				records := decodeExecStream(t, stdout)
+				result := decodeExecStreamResult(t, records[len(records)-1])
+				if result.Status != execStatusFailed {
+					t.Fatalf("stream result=%+v", result)
+				}
+			}
+		})
+	}
+}
+
+func TestExecOutputLastMessageCancellationDoesNotWrite(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "last-message.txt")
+	session := &fakeExecSession{chunks: []string{"partial"}, err: context.Canceled}
+	_, _, err := executeExecForTest(strings.NewReader(""), recordingExecDeps(session, new(bool)), "exec", "--output-last-message", target, "cancel")
+	if err == nil {
+		t.Fatal("expected cancellation")
+	}
+	if _, statErr := os.Stat(target); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("target stat error=%v, want target absent", statErr)
+	}
+}
+
+func TestExecOutputSchemaSupportsFormatsAndSessionModes(t *testing.T) {
+	schemaPath := filepath.Join(t.TempDir(), "schema.json")
+	if err := os.WriteFile(schemaPath, []byte(`{"type":"object","required":["answer"],"properties":{"answer":{"type":"string"}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		format execOutputFormat
+		args   []string
+		setup  func(*fakeExecSession) execCommandDeps
+	}{
+		{name: "fresh text", format: execOutputFormatText, args: []string{"exec"}, setup: func(s *fakeExecSession) execCommandDeps {
+			return execCommandDeps{newSession: func(context.Context, string) (execSession, io.Closer, error) { return s, nil, nil }}
+		}},
+		{name: "fresh json", format: execOutputFormatJSON, args: []string{"exec", "--output-format", "json"}, setup: func(s *fakeExecSession) execCommandDeps {
+			return execCommandDeps{newSession: func(context.Context, string) (execSession, io.Closer, error) { return s, nil, nil }}
+		}},
+		{name: "fresh stream", format: execOutputFormatStreamJSON, args: []string{"exec", "--output-format", "stream-json"}, setup: func(s *fakeExecSession) execCommandDeps {
+			return execCommandDeps{newSession: func(context.Context, string) (execSession, io.Closer, error) { return s, nil, nil }}
+		}},
+		{name: "resume explicit", format: execOutputFormatJSON, args: []string{"exec", "resume", "session-id", "--output-format", "json"}, setup: func(s *fakeExecSession) execCommandDeps {
+			return execCommandDeps{openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) { return s, nil, nil }}
+		}},
+		{name: "resume last", format: execOutputFormatJSON, args: []string{"exec", "resume", "--last", "--output-format", "json"}, setup: func(s *fakeExecSession) execCommandDeps {
+			return execCommandDeps{selectLastSession: func(context.Context, string) (string, error) { return "session-id", nil }, openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) { return s, nil, nil }}
+		}},
+		{name: "ephemeral", format: execOutputFormatStreamJSON, args: []string{"exec", "--ephemeral", "--output-format", "stream-json"}, setup: func(s *fakeExecSession) execCommandDeps {
+			return execCommandDeps{newEphemeralSession: func(context.Context, string) (execSession, io.Closer, error) { return s, nil, nil }}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{chunks: []string{`{"answer":"ok"}`}}
+			args := append([]string{}, tc.args...)
+			args = append(args, "--output-schema", schemaPath, "return JSON")
+			stdout, _, err := executeExecForTest(strings.NewReader(""), tc.setup(session), args...)
+			if err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			if session.finalValidator == nil || stdout == "" {
+				t.Fatalf("validator=%v stdout=%q", session.finalValidator != nil, stdout)
+			}
+		})
+	}
+}
+
+func TestExecOutputSchemaInputErrorsDoNotOpenSession(t *testing.T) {
+	for _, tc := range []struct {
+		format execOutputFormat
+		path   string
+	}{
+		{format: execOutputFormatText, path: filepath.Join(t.TempDir(), "missing.json")},
+		{format: execOutputFormatJSON, path: filepath.Join(t.TempDir(), "invalid.json")},
+		{format: execOutputFormatStreamJSON, path: filepath.Join(t.TempDir(), "invalid-stream.json")},
+	} {
+		path := tc.path
+		if strings.HasSuffix(path, "invalid.json") {
+			if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if strings.HasSuffix(path, "invalid-stream.json") {
+			if err := os.WriteFile(path, []byte(`{"type":"not-a-json-type"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		opened := false
+		deps := execCommandDeps{newSession: func(context.Context, string) (execSession, io.Closer, error) {
+			opened = true
+			return &fakeExecSession{chunks: []string{`{"answer":"ok"}`}}, nil, nil
+		}}
+		args := []string{"exec", "--output-schema", path}
+		if tc.format != execOutputFormatText {
+			args = append(args, "--output-format", string(tc.format))
+		}
+		args = append(args, "return JSON")
+		stdout, _, err := executeExecForTest(strings.NewReader(""), deps, args...)
+		if err == nil || opened {
+			t.Fatalf("path=%q err=%v opened=%v stdout=%q", path, err, opened, stdout)
+		}
+		if tc.format == execOutputFormatText && stdout != "" {
+			t.Fatalf("text stdout=%q", stdout)
+		}
+		if tc.format == execOutputFormatJSON {
+			envelope, _ := decodeExecJSON(t, stdout)
+			if envelope.Error == nil || envelope.Error.Code != execErrorInput {
+				t.Fatalf("JSON envelope=%+v", envelope)
+			}
+		}
+		if tc.format == execOutputFormatStreamJSON {
+			records := decodeExecStream(t, stdout)
+			result := decodeExecStreamResult(t, records[len(records)-1])
+			if result.Error == nil || result.Error.Code != execErrorInput {
+				t.Fatalf("stream result=%+v", result)
+			}
+		}
+	}
+}
+
+func TestExecOutputSchemaFailureDoesNotWriteLastMessage(t *testing.T) {
+	schemaPath := filepath.Join(t.TempDir(), "schema.json")
+	if err := os.WriteFile(schemaPath, []byte(`{"type":"object","required":["answer"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []execOutputFormat{execOutputFormatText, execOutputFormatJSON, execOutputFormatStreamJSON} {
+		t.Run(string(format), func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "last.txt")
+			if err := os.WriteFile(target, []byte("old"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			session := &fakeExecSession{chunks: []string{`{"wrong":true}`}}
+			args := []string{"exec", "--output-schema", schemaPath, "--output-last-message", target}
+			if format != execOutputFormatText {
+				args = append(args, "--output-format", string(format))
+			}
+			args = append(args, "return JSON")
+			_, _, err := executeExecForTest(strings.NewReader(""), recordingExecDeps(session, new(bool)), args...)
+			if err == nil {
+				t.Fatal("expected schema validation failure")
+			}
+			content, readErr := os.ReadFile(target)
+			if readErr != nil || string(content) != "old" {
+				t.Fatalf("last message=%q read error=%v", content, readErr)
+			}
+		})
+	}
+}
+
+func TestExecOutputLastMessageWriteFailureUsesOutputContract(t *testing.T) {
+	for _, format := range []execOutputFormat{execOutputFormatText, execOutputFormatJSON, execOutputFormatStreamJSON} {
+		t.Run(string(format), func(t *testing.T) {
+			target := t.TempDir() // directory cannot be replaced by the final rename
+			args := []string{"exec", "--output-last-message", target}
+			if format != execOutputFormatText {
+				args = append(args, "--output-format", string(format))
+			}
+			args = append(args, "say hi")
+			stdout, _, err := executeExecForTest(strings.NewReader(""), recordingExecDeps(&fakeExecSession{chunks: []string{"done"}}, new(bool)), args...)
+			if err == nil {
+				t.Fatal("expected output file error")
+			}
+			if format == execOutputFormatJSON {
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Status != execStatusFailed || envelope.Error == nil || envelope.Error.Code != execErrorRun {
+					t.Fatalf("JSON envelope=%+v", envelope)
+				}
+			}
+			if format == execOutputFormatStreamJSON {
+				records := decodeExecStream(t, stdout)
+				result := decodeExecStreamResult(t, records[len(records)-1])
+				if result.Status != execStatusFailed || result.Error == nil || result.Error.Code != execErrorRun {
+					t.Fatalf("stream result=%+v", result)
+				}
+			}
+		})
+	}
+}
+
+func TestExecResumeEphemeralKeepsResumeInputValidationBeforeOpening(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "explicit session id is required",
+			args: []string{"exec", "resume", "--ephemeral"},
+		},
+		{
+			name: "last rejects explicit id",
+			args: []string{"exec", "resume", "--ephemeral", "durable-session", "--last"},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			stdin := &unreadExecReader{}
+			openCalls := 0
+			selectorCalls := 0
+			deps := execCommandDeps{
+				openEphemeralSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					openCalls++
+					return nil, nil, errors.New("open must not run")
+				},
+				selectLastEphemeralSession: func(context.Context, string) (string, error) {
+					selectorCalls++
+					return "durable-session", nil
+				},
+			}
+			stdout, stderr, err := executeExecForTest(stdin, deps, tc.args...)
+			if err == nil || !strings.Contains(err.Error(), "session id") {
+				t.Fatalf("error=%v, want resume input validation error", err)
+			}
+			if stdin.reads != 0 || openCalls != 0 || selectorCalls != 0 || stderr != "" {
+				t.Fatalf("stdin reads=%d open=%d selector=%d stderr=%q", stdin.reads, openCalls, selectorCalls, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("text stdout=%q", stdout)
+			}
+		})
+	}
+}
+
+func TestExecResumeEphemeralDispatchesExplicitAndLastWithoutDurableHint(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		args       []string
+		selectedID string
+		recover    bool
+	}{
+		{
+			name:       "explicit id",
+			args:       []string{"exec", "resume", "--ephemeral", "--output-format", "json", "durable-session", "continue"},
+			selectedID: "durable-session",
+		},
+		{
+			name:       "last",
+			args:       []string{"exec", "resume", "--last", "--ephemeral", "--output-format", "json", "continue", "--recover"},
+			selectedID: "newest-session",
+			recover:    true,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{id: tc.selectedID, chunks: []string{"done"}}
+			openDurableCalls := 0
+			openEphemeralCalls := 0
+			selectorCalls := 0
+			var gotID string
+			var gotRecover bool
+			deps := execCommandDeps{
+				openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					openDurableCalls++
+					return nil, nil, errors.New("durable resume opener must not run")
+				},
+				selectLastSession: func(context.Context, string) (string, error) {
+					return "wrong-selector", errors.New("durable selector must not run")
+				},
+				selectLastEphemeralSession: func(context.Context, string) (string, error) {
+					selectorCalls++
+					return tc.selectedID, nil
+				},
+				openEphemeralSession: func(_ context.Context, _ string, id string, recoverInterrupted bool) (execSession, io.Closer, error) {
+					openEphemeralCalls++
+					gotID = id
+					gotRecover = recoverInterrupted
+					return session, nil, nil
+				},
+			}
+
+			stdout, stderr, err := executeExecForTest(strings.NewReader(""), deps, tc.args...)
+			if err != nil {
+				t.Fatalf("ephemeral resume: %v", err)
+			}
+			envelope, _ := decodeExecJSON(t, stdout)
+			if envelope.Status != execStatusCompleted || envelope.Result == nil || *envelope.Result != "done" {
+				t.Fatalf("JSON envelope=%+v", envelope)
+			}
+			if envelope.Session.Persistent || envelope.Session.ID != nil {
+				t.Fatalf("ephemeral session metadata=%+v", envelope.Session)
+			}
+			if stderr != "" || openDurableCalls != 0 || openEphemeralCalls != 1 || selectorCalls != boolToInt(tc.selectedID == "newest-session") || gotID != tc.selectedID || gotRecover != tc.recover {
+				t.Fatalf("stderr=%q durable=%d ephemeral=%d selector=%d id=%q recover=%v", stderr, openDurableCalls, openEphemeralCalls, selectorCalls, gotID, gotRecover)
+			}
+			if session.prompt != "continue" {
+				t.Fatalf("prompt=%q", session.prompt)
+			}
+		})
+	}
+}
+
+func TestExecModelOverrideDispatchesAcrossFreshResumeAndEphemeral(t *testing.T) {
+	const wantModel = "gpt-5.1-codex"
+	for _, tc := range []struct {
+		name string
+		args []string
+		deps func(*fakeExecSession, *string) execCommandDeps
+	}{
+		{
+			name: "fresh",
+			args: []string{"exec", "--model", wantModel, "say hi"},
+			deps: func(session *fakeExecSession, gotModel *string) execCommandDeps {
+				return execCommandDeps{newSessionWithModel: func(_ context.Context, _ string, modelName string) (execSession, io.Closer, error) {
+					*gotModel = modelName
+					return session, nil, nil
+				}}
+			},
+		},
+		{
+			name: "fresh ephemeral",
+			args: []string{"exec", "--ephemeral", "-m", wantModel, "say hi"},
+			deps: func(session *fakeExecSession, gotModel *string) execCommandDeps {
+				return execCommandDeps{newEphemeralWithModel: func(_ context.Context, _ string, modelName string) (execSession, io.Closer, error) {
+					*gotModel = modelName
+					return session, nil, nil
+				}}
+			},
+		},
+		{
+			name: "resume",
+			args: []string{"exec", "resume", "thread-id", "--model", wantModel, "continue"},
+			deps: func(session *fakeExecSession, gotModel *string) execCommandDeps {
+				return execCommandDeps{openSessionWithModel: func(_ context.Context, _ string, _ string, _ bool, modelName string) (execSession, io.Closer, error) {
+					*gotModel = modelName
+					return session, nil, nil
+				}}
+			},
+		},
+		{
+			name: "resume last",
+			args: []string{"exec", "resume", "--last", "--model", wantModel, "continue"},
+			deps: func(session *fakeExecSession, gotModel *string) execCommandDeps {
+				return execCommandDeps{
+					selectLastSession: func(context.Context, string) (string, error) { return "newest-thread", nil },
+					openSessionWithModel: func(_ context.Context, _ string, _ string, _ bool, modelName string) (execSession, io.Closer, error) {
+						*gotModel = modelName
+						return session, nil, nil
+					},
+				}
+			},
+		},
+		{
+			name: "resume ephemeral",
+			args: []string{"exec", "resume", "--ephemeral", "thread-id", "-m", wantModel, "continue"},
+			deps: func(session *fakeExecSession, gotModel *string) execCommandDeps {
+				return execCommandDeps{openEphemeralWithModel: func(_ context.Context, _ string, _ string, _ bool, modelName string) (execSession, io.Closer, error) {
+					*gotModel = modelName
+					return session, nil, nil
+				}}
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{id: "model-selection-session", chunks: []string{"done"}}
+			var gotModel string
+			if _, _, err := executeExecForTest(strings.NewReader(""), tc.deps(session, &gotModel), tc.args...); err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			if gotModel != wantModel {
+				t.Fatalf("model = %q, want %q", gotModel, wantModel)
+			}
+		})
+	}
+}
+
+func TestCommandRuntimeCloseRemovesEphemeralStore(t *testing.T) {
+	root := t.TempDir()
+	threadStore, err := store.NewThreadStore(root)
+	if err != nil {
+		t.Fatalf("NewThreadStore: %v", err)
+	}
+	if _, err := threadStore.CreateThread(context.Background(), store.ThreadMeta{ID: "ephemeral-thread"}, "system"); err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+
+	runtime := &commandRuntime{ephemeralStoreRoot: root}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ephemeral root still exists: stat error=%v", err)
+	}
+}
+
+func TestCommandRuntimeCloseReportsEphemeralStoreCleanupError(t *testing.T) {
+	err := (&commandRuntime{ephemeralStoreRoot: string([]byte{0})}).Close()
+	if err == nil || !strings.Contains(err.Error(), "remove ephemeral session store") {
+		t.Fatalf("Close() error = %v, want observable cleanup failure", err)
+	}
+}
+
+func TestEphemeralStoreCleanupErrorJoinsStartupError(t *testing.T) {
+	startupErr := errors.New("startup failed")
+	err := joinEphemeralStoreCleanupError(startupErr, string([]byte{0}))
+	if !errors.Is(err, startupErr) || !strings.Contains(err.Error(), "remove ephemeral session store") {
+		t.Fatalf("joined error = %v, want startup and cleanup failures", err)
+	}
+}
+
+func TestExecSessionCloseErrorPreservesCompletedOutput(t *testing.T) {
+	closeErr := errors.New("runtime cleanup failed")
+	closer := &errorExecCloser{err: closeErr}
+	session := &fakeExecSession{id: "close-error-session", chunks: []string{"done"}}
+	deps := execCommandDeps{newSession: func(context.Context, string) (execSession, io.Closer, error) {
+		return session, closer, nil
+	}}
+
+	stdout, stderr, err := executeExecForTest(strings.NewReader(""), deps, "exec", "say hi")
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("exec error = %v, want close error", err)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("closer calls = %d, want 1", closer.calls)
+	}
+	if stdout != "done\n" {
+		t.Fatalf("stdout = %q, want completed response", stdout)
+	}
+	if stderr != execSessionHint(session.ID()) {
+		t.Fatalf("stderr = %q, want session hint only", stderr)
 	}
 }
 
@@ -343,6 +1279,155 @@ func TestExecResumeDispatchesOpenFactoryWithExactIDAndRecovery(t *testing.T) {
 			}
 			if session.prompt != "continue" || stdout != "done\n" || stderr != execSessionHint(tc.id) {
 				t.Fatalf("prompt=%q stdout=%q stderr=%q", session.prompt, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestSelectNewestExecSessionUsesListOrderAndReportsSelectorFailures(t *testing.T) {
+	newestID, err := selectNewestExecSession(context.Background(), fakeExecThreadLister{
+		threads: []store.ThreadMeta{
+			{ID: "newest-thread"},
+			{ID: "older-thread"},
+		},
+	})
+	if err != nil || newestID != "newest-thread" {
+		t.Fatalf("newest id=%q err=%v, want first ListThreads result", newestID, err)
+	}
+
+	if _, err := selectNewestExecSession(context.Background(), fakeExecThreadLister{}); err == nil || !strings.Contains(err.Error(), "no durable sessions") {
+		t.Fatalf("empty selector error=%v, want no-candidate error", err)
+	}
+	wantErr := errors.New("metadata read failed")
+	if _, err := selectNewestExecSession(context.Background(), fakeExecThreadLister{err: wantErr}); !errors.Is(err, wantErr) {
+		t.Fatalf("list selector error=%v, want %v", err, wantErr)
+	}
+}
+
+func TestExecResumeLastDispatchesSelectorAndRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		recover bool
+	}{
+		{name: "last", args: []string{"exec", "resume", "--last", "continue"}},
+		{name: "last recover", args: []string{"exec", "resume", "--last", "continue", "--recover"}, recover: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			const selectedID = "newest-thread"
+			selectorCalls := 0
+			openCalls := 0
+			var gotID string
+			var gotRecover bool
+			session := &fakeExecSession{id: selectedID, chunks: []string{"done"}}
+			deps := execCommandDeps{
+				newSession: func(context.Context, string) (execSession, io.Closer, error) {
+					t.Fatal("new session must not be opened")
+					return nil, nil, nil
+				},
+				selectLastSession: func(_ context.Context, configPath string) (string, error) {
+					selectorCalls++
+					if configPath != "config.toml" {
+						t.Fatalf("config path=%q, want config.toml", configPath)
+					}
+					return selectedID, nil
+				},
+				openSession: func(_ context.Context, _ string, id string, recoverInterrupted bool) (execSession, io.Closer, error) {
+					openCalls++
+					gotID = id
+					gotRecover = recoverInterrupted
+					return session, nil, nil
+				},
+			}
+
+			stdout, stderr, err := executeExecForTest(strings.NewReader(""), deps, tc.args...)
+			if err != nil {
+				t.Fatalf("exec resume --last: %v", err)
+			}
+			if selectorCalls != 1 || openCalls != 1 || gotID != selectedID || gotRecover != tc.recover {
+				t.Fatalf("selector=%d open=%d id=%q recover=%v", selectorCalls, openCalls, gotID, gotRecover)
+			}
+			if session.prompt != "continue" || stdout != "done\n" || stderr != execSessionHint(selectedID) {
+				t.Fatalf("prompt=%q stdout=%q stderr=%q", session.prompt, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestExecResumeLastRejectsExplicitID(t *testing.T) {
+	selectorCalls := 0
+	openCalls := 0
+	deps := execCommandDeps{
+		selectLastSession: func(context.Context, string) (string, error) {
+			selectorCalls++
+			return "newest-thread", nil
+		},
+		openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+			openCalls++
+			return &fakeExecSession{}, nil, nil
+		},
+	}
+	stdout, stderr, err := executeExecForTest(strings.NewReader(""), deps, "exec", "resume", "explicit-thread", "--last")
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --last") {
+		t.Fatalf("error=%v, want mutually exclusive input error", err)
+	}
+	if selectorCalls != 0 || openCalls != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("selector=%d open=%d stdout=%q stderr=%q", selectorCalls, openCalls, stdout, stderr)
+	}
+}
+
+func TestExecResumeLastSelectorFailuresUseStableMachineOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		format    execOutputFormat
+		selector  execLastSessionSelector
+		wantCause error
+	}{
+		{
+			name:   "selector unavailable json",
+			format: execOutputFormatJSON,
+		},
+		{
+			name:   "no candidate stream json",
+			format: execOutputFormatStreamJSON,
+			selector: func(context.Context, string) (string, error) {
+				return "", errors.New("no durable sessions available")
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			openCalls := 0
+			deps := execCommandDeps{
+				selectLastSession: tc.selector,
+				openSession: func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+					openCalls++
+					return nil, nil, errors.New("open must not run after selector failure")
+				},
+			}
+			args := []string{"exec", "resume", "--last", "continue", "--output-format", string(tc.format)}
+			stdout, stderr, err := executeExecForTest(strings.NewReader(""), deps, args...)
+			if err == nil || !strings.Contains(err.Error(), "select") && tc.selector != nil {
+				t.Fatalf("error=%v, want selector startup error", err)
+			}
+			if openCalls != 0 || stderr != "" {
+				t.Fatalf("open=%d stderr=%q", openCalls, stderr)
+			}
+			if tc.format == execOutputFormatJSON {
+				envelope, _ := decodeExecJSON(t, stdout)
+				if envelope.Status != execStatusFailed || envelope.Error.Code != execErrorStartup || envelope.Session.Persistent || envelope.Session.ID != nil {
+					t.Fatalf("startup envelope=%+v", envelope)
+				}
+				return
+			}
+			records := decodeExecStream(t, stdout)
+			if len(records) != 1 {
+				t.Fatalf("stream records=%d, want one terminal result: %s", len(records), stdout)
+			}
+			result := decodeExecStreamResult(t, records[0])
+			if result.Status != execStatusFailed || result.Error == nil || result.Error.Code != execErrorStartup || result.Session.Persistent || result.Session.ID != nil {
+				t.Fatalf("startup result=%+v", result)
 			}
 		})
 	}
@@ -724,13 +1809,20 @@ func TestExecStreamJSONNewAndResumeHaveOrderedTerminalRecords(t *testing.T) {
 				t.Fatalf("record count=%d, want session.started plus result: %s", len(records), stdout)
 			}
 			var started struct {
-				Session execJSONSession `json:"session"`
+				Session      execJSONSession `json:"session"`
+				Capabilities []string        `json:"capabilities"`
 			}
 			if err := json.Unmarshal(mustMarshal(t, records[0]), &started); err != nil {
 				t.Fatalf("decode session.started: %v", err)
 			}
 			if eventName(t, records[0]) != execStreamEventSessionStarted || !started.Session.Persistent || started.Session.ID == nil || *started.Session.ID != session.ID() {
 				t.Fatalf("session.started=%s", mustMarshal(t, records[0]))
+			}
+			if !reflect.DeepEqual(started.Capabilities, expectedExecStreamCapabilities()) {
+				t.Fatalf("session.started capabilities=%v", started.Capabilities)
+			}
+			if _, ok := records[1]["capabilities"]; ok {
+				t.Fatalf("result repeated capabilities: %s", stdout)
 			}
 			result := decodeExecStreamResult(t, records[1])
 			if result.Status != execStatusCompleted || result.Result == nil || *result.Result != "final reply" || result.Error != nil || !result.Session.Persistent || result.Session.ID == nil || started.Session.ID == nil || *result.Session.ID != *started.Session.ID {
@@ -777,6 +1869,13 @@ func TestExecStreamJSONProjectsOnlySanitizedToolActivity(t *testing.T) {
 	if len(records) != 5 || eventName(t, records[0]) != execStreamEventSessionStarted || eventName(t, records[len(records)-1]) != execStreamEventResult {
 		t.Fatalf("unexpected records: %s", stdout)
 	}
+	var capabilities []string
+	if err := json.Unmarshal(records[0]["capabilities"], &capabilities); err != nil {
+		t.Fatalf("decode session.started capabilities: %v", err)
+	}
+	if !reflect.DeepEqual(capabilities, expectedExecStreamCapabilities()) {
+		t.Fatalf("session.started capabilities=%v", capabilities)
+	}
 	states := []string{"started", "completed", "failed"}
 	for index, state := range states {
 		var activity execStreamActivity
@@ -785,6 +1884,9 @@ func TestExecStreamJSONProjectsOnlySanitizedToolActivity(t *testing.T) {
 		}
 		if eventName(t, records[index+1]) != execStreamEventActivity || activity.Kind != "tool" || activity.State != state || len(records[index+1]) != 4 {
 			t.Fatalf("activity %d = %s", index, mustMarshal(t, records[index+1]))
+		}
+		if _, ok := records[index+1]["capabilities"]; ok {
+			t.Fatalf("activity repeated capabilities: %s", mustMarshal(t, records[index+1]))
 		}
 	}
 }
@@ -1144,6 +2246,7 @@ func TestExecRejectsInvalidOutputFormatBeforeMachineOutput(t *testing.T) {
 	for _, args := range [][]string{
 		{"exec", "--output-format", "not-a-format", "say hi"},
 		{"exec", "resume", "--output-format", "not-a-format"},
+		{"exec", "--json", "--output-format", "not-a-format", "say hi"},
 	} {
 		called := false
 		stdout, stderr, err := executeExecForTest(strings.NewReader(""), recordingExecDeps(&fakeExecSession{}, &called), args...)

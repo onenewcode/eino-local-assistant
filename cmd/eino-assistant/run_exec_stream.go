@@ -20,6 +20,17 @@ const (
 	execStreamEventResult         = "result"
 )
 
+// execStreamCapabilities is a fresh slice for each session.started record so
+// capability order is stable without exposing mutable package state.
+func execStreamCapabilities() []string {
+	return []string{
+		"session_started_v1",
+		"activity_v1",
+		"terminal_result_v1",
+		"usage_v1",
+	}
+}
+
 var errExecStreamClosed = errors.New("exec stream output is closed")
 
 // execStreamActivity is intentionally smaller than a chat TurnEvent. Tool
@@ -36,6 +47,7 @@ type execStreamRecord struct {
 	Event         string              `json:"event"`
 	Session       *execJSONSession    `json:"session,omitempty"`
 	Activity      *execStreamActivity `json:"activity,omitempty"`
+	Capabilities  []string            `json:"capabilities,omitempty"`
 }
 
 // execStreamResultRecord is deliberately a flat extension of the existing
@@ -54,12 +66,13 @@ type execStreamResultRecord struct {
 }
 
 type execStreamQueuedRecord struct {
-	event    string
-	session  *execJSONSession
-	activity *execStreamActivity
-	result   *execJSONEnvelope
-	terminal bool
-	ack      chan error
+	event        string
+	session      *execJSONSession
+	capabilities []string
+	activity     *execStreamActivity
+	result       *execJSONEnvelope
+	terminal     bool
+	ack          chan error
 }
 
 func (record execStreamQueuedRecord) marshal(sequence uint64) ([]byte, error) {
@@ -82,6 +95,7 @@ func (record execStreamQueuedRecord) marshal(sequence uint64) ([]byte, error) {
 		Event:         record.event,
 		Session:       record.session,
 		Activity:      record.activity,
+		Capabilities:  record.capabilities,
 	})
 }
 
@@ -246,7 +260,7 @@ func writeExecStreamResult(stdout io.Writer, result execJSONEnvelope) error {
 	return writer.enqueueTerminal(result)
 }
 
-func runExecStreamJSON(parent context.Context, prompt string, stdout, stderr io.Writer, session execSession, sessionInfo execJSONSession) error {
+func runExecStreamJSON(parent context.Context, prompt string, stdout, stderr io.Writer, session execSession, sessionInfo execJSONSession, outputLastMessage string) error {
 	ctx, cancelRun := context.WithCancel(parent)
 	defer cancelRun()
 	writer := newExecStreamWriter(stdout, cancelRun)
@@ -254,13 +268,14 @@ func runExecStreamJSON(parent context.Context, prompt string, stdout, stderr io.
 	// Confirm the first public record reached stdout before starting a durable
 	// turn, so a broken pipe cannot create an unobserved active turn.
 	if err := writer.enqueueAndWait(context.Background(), execStreamQueuedRecord{
-		event:   execStreamEventSessionStarted,
-		session: &sessionInfo,
+		event:        execStreamEventSessionStarted,
+		session:      &sessionInfo,
+		capabilities: execStreamCapabilities(),
 	}); err != nil {
 		return err
 	}
-	if err := writeExecSessionHint(stderr, *sessionInfo.ID); err != nil {
-		return finishExecStreamRun(writer, session, sessionInfo, "", err)
+	if err := writeExecSessionHintIfPersistent(stderr, sessionInfo); err != nil {
+		return finishExecStreamRun(writer, session, sessionInfo, "", err, outputLastMessage)
 	}
 
 	var response string
@@ -287,10 +302,13 @@ func runExecStreamJSON(parent context.Context, prompt string, stdout, stderr io.
 	} else {
 		err = session.Ask(ctx, prompt, onChunk)
 	}
-	return finishExecStreamRun(writer, session, sessionInfo, response, err)
+	return finishExecStreamRun(writer, session, sessionInfo, response, err, outputLastMessage)
 }
 
-func finishExecStreamRun(writer *execStreamWriter, session execSession, sessionInfo execJSONSession, response string, cause error) error {
+func finishExecStreamRun(writer *execStreamWriter, session execSession, sessionInfo execJSONSession, response string, cause error, outputLastMessage string) error {
+	if cause == nil {
+		cause = writeExecLastMessage(outputLastMessage, response)
+	}
 	result := execJSONEnvelope{
 		ContractVersion: execJSONContractVersion,
 		Session:         sessionInfo,

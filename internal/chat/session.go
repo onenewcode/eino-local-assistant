@@ -165,6 +165,10 @@ type SessionOptions struct {
 	// open turn under CAS. It is false by default so a normal resume cannot
 	// clobber a quiet live process in another terminal.
 	RecoverInterrupted bool
+	// FinalResponseValidator runs after the final assistant response is
+	// complete and before the turn is committed. It is intended for headless
+	// delivery contracts and is not sent to the provider.
+	FinalResponseValidator func(string) error
 }
 
 // CompactionResult is a user-facing account of one installed checkpoint.
@@ -283,7 +287,8 @@ type Session struct {
 	checkpointResetDuringOpen bool
 	// activeTaskTurnID lets an interactive cancellation revoke a completion
 	// approval only when that approval belongs to the still-uncommitted turn.
-	activeTaskTurnID string
+	activeTaskTurnID       string
+	finalResponseValidator func(string) error
 
 	// opMu makes a Session a single-writer actor even outside the TUI. The
 	// ThreadStore's revision CAS remains the cross-process safety boundary.
@@ -315,17 +320,18 @@ func NewSession(model Model, systemPrompt string, opts SessionOptions) (*Session
 	}
 
 	s := &Session{
-		model:              model,
-		transcript:         []*schema.Message{schema.SystemMessage(systemPrompt)},
-		threads:            opts.Store,
-		id:                 id,
-		title:              strings.TrimSpace(opts.Title),
-		modelName:          strings.TrimSpace(opts.ModelName),
-		pricing:            opts.Pricing,
-		contextCfg:         opts.Context.Normalize(),
-		maxLowGainAttempts: opts.MaxLowGainAttempts,
-		compactor:          opts.Compactor,
-		systemPrompt:       systemPrompt,
+		model:                  model,
+		transcript:             []*schema.Message{schema.SystemMessage(systemPrompt)},
+		threads:                opts.Store,
+		id:                     id,
+		title:                  strings.TrimSpace(opts.Title),
+		modelName:              strings.TrimSpace(opts.ModelName),
+		pricing:                opts.Pricing,
+		contextCfg:             opts.Context.Normalize(),
+		maxLowGainAttempts:     opts.MaxLowGainAttempts,
+		compactor:              opts.Compactor,
+		systemPrompt:           systemPrompt,
+		finalResponseValidator: opts.FinalResponseValidator,
 	}
 	state, err := s.threads.CreateThread(context.Background(), store.ThreadMeta{
 		ID:        id,
@@ -413,17 +419,18 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		return nil, fmt.Errorf("thread %q has no system prompt", id)
 	}
 	s := &Session{
-		model:              model,
-		transcript:         transcript,
-		threads:            st,
-		id:                 state.ID,
-		title:              state.Meta.Title,
-		modelName:          state.Meta.Model,
-		pricing:            opts.Pricing,
-		contextCfg:         opts.Context.Normalize(),
-		maxLowGainAttempts: opts.MaxLowGainAttempts,
-		compactor:          opts.Compactor,
-		systemPrompt:       state.SystemPrompt,
+		model:                  model,
+		transcript:             transcript,
+		threads:                st,
+		id:                     state.ID,
+		title:                  state.Meta.Title,
+		modelName:              state.Meta.Model,
+		pricing:                opts.Pricing,
+		contextCfg:             opts.Context.Normalize(),
+		maxLowGainAttempts:     opts.MaxLowGainAttempts,
+		compactor:              opts.Compactor,
+		systemPrompt:           state.SystemPrompt,
+		finalResponseValidator: opts.FinalResponseValidator,
 	}
 	s.applyThreadState(state)
 	bodyCount := countVisibleBodyMessages(transcript)
@@ -471,6 +478,14 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 	}
 	s.refreshLastCompactionUsage(context.Background())
 	return s, nil
+}
+
+// SetFinalResponseValidator installs a local final-response check. It is
+// called by headless command setup after opening the session and before Ask.
+func (s *Session) SetFinalResponseValidator(validator func(string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finalResponseValidator = validator
 }
 
 // ID returns the durable thread identifier.
@@ -710,6 +725,12 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			return fmt.Errorf("%w: %s", ErrTaskCompletionUnresolved, summary)
 		}
 	}
+	if err := s.validateFinalResponse(answer.Content); err != nil {
+		if terminalErr := s.terminateUncommittedTurn(recorder, false, "final response validation: "+err.Error()); terminalErr != nil {
+			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
+		}
+		return fmt.Errorf("final response validation: %w", err)
+	}
 
 	// From this point onward the final response is at its commit boundary. A
 	// later UI cancellation belongs to the next interaction rather than this
@@ -734,6 +755,16 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	// barrier checked by the TUI before it drains queued follow-up messages.
 	s.refreshAutoCompaction()
 	return nil
+}
+
+func (s *Session) validateFinalResponse(content string) error {
+	s.mu.RLock()
+	validator := s.finalResponseValidator
+	s.mu.RUnlock()
+	if validator == nil {
+		return nil
+	}
+	return validator(content)
 }
 
 // interruptActiveTaskForNewInput makes a later natural-language message the

@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"eino-local-assistant/internal/agent"
@@ -23,32 +27,129 @@ import (
 // interactive TUI and non-interactive commands. It stays private to cmd so it
 // cannot become a second application layer outside the existing packages.
 type commandRuntime struct {
-	cfg            config.Config
-	session        *chat.Session
-	sessionStore   *store.ThreadStore
-	chatModel      model.ToolCallingChatModel
-	registry       *tools.Registry
-	reactModel     *agent.ReActModel
-	memStore       *memory.Store
-	sessionOpts    chat.SessionOptions
-	composePrompt  func() (string, error)
-	approvalMode   tools.ApprovalMode
-	permissions    *tools.PermissionSet
-	sessionAllows  *tools.SessionAllowlist
-	sessionDenies  *tools.SessionDenylist
-	workspaceRoot  string
-	readOnlyRoots  []string
-	protectedPaths []string
-	sandboxRunner  *tools.SandboxRunner
-	runtimeCfg     config.RuntimeConfig
+	cfg                config.Config
+	session            *chat.Session
+	sessionStore       *store.ThreadStore
+	ephemeralStoreRoot string
+	chatModel          model.ToolCallingChatModel
+	registry           *tools.Registry
+	reactModel         *agent.ReActModel
+	memStore           *memory.Store
+	sessionOpts        chat.SessionOptions
+	composePrompt      func() (string, error)
+	approvalMode       tools.ApprovalMode
+	permissions        *tools.PermissionSet
+	sessionAllows      *tools.SessionAllowlist
+	sessionDenies      *tools.SessionDenylist
+	workspaceRoot      string
+	readOnlyRoots      []string
+	protectedPaths     []string
+	sandboxRunner      *tools.SandboxRunner
+	runtimeCfg         config.RuntimeConfig
 }
 
-// Close releases the sandbox worker copy after no more tools can run.
+type execThreadLister interface {
+	ListThreads(context.Context) ([]store.ThreadMeta, error)
+}
+
+type readOnlyExecThreadLister struct {
+	store *store.ThreadStore
+}
+
+func (lister readOnlyExecThreadLister) ListThreads(ctx context.Context) ([]store.ThreadMeta, error) {
+	return lister.store.ListThreadsReadOnly(ctx)
+}
+
+// selectLastExecSession deliberately uses only the configured durable store.
+// ListThreads owns newest ordering; no cwd/project or active-turn filtering is
+// added here, and OpenSession remains the recovery and locking boundary.
+func selectLastExecSession(ctx context.Context, configPath string) (string, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return "", fmt.Errorf("load config: %w", err)
+	}
+	dataDir, err := cfg.Storage.ResolveDataDir()
+	if err != nil {
+		return "", err
+	}
+	threadStore, err := store.NewThreadStore(dataDir)
+	if err != nil {
+		return "", fmt.Errorf("open session store: %w", err)
+	}
+	return selectNewestExecSession(ctx, threadStore)
+}
+
+func selectLastEphemeralExecSession(ctx context.Context, configPath string) (string, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return "", fmt.Errorf("load config: %w", err)
+	}
+	dataDir, err := cfg.Storage.ResolveDataDir()
+	if err != nil {
+		return "", err
+	}
+	threadStore, err := store.NewThreadStore(dataDir)
+	if err != nil {
+		return "", fmt.Errorf("open session store: %w", err)
+	}
+	return selectNewestExecSession(ctx, readOnlyExecThreadLister{store: threadStore})
+}
+
+func selectNewestExecSession(ctx context.Context, lister execThreadLister) (string, error) {
+	if lister == nil {
+		return "", errors.New("session selector is unavailable")
+	}
+	threads, err := lister.ListThreads(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list sessions: %w", err)
+	}
+	if len(threads) == 0 {
+		return "", errors.New("no durable sessions available")
+	}
+	id := strings.TrimSpace(threads[0].ID)
+	if id == "" {
+		return "", errors.New("newest durable session has no id")
+	}
+	return id, nil
+}
+
+// Close releases runtime workers and removes the fresh ephemeral ledger root.
 func (r *commandRuntime) Close() error {
-	if r == nil || r.sandboxRunner == nil {
+	if r == nil {
 		return nil
 	}
-	return r.sandboxRunner.Close()
+	var closeErrs []error
+	if r.sandboxRunner != nil {
+		if err := r.sandboxRunner.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close sandbox runner: %w", err))
+		}
+	}
+	if err := joinEphemeralStoreCleanupError(nil, r.ephemeralStoreRoot); err != nil {
+		closeErrs = append(closeErrs, err)
+	}
+	return errors.Join(closeErrs...)
+}
+
+func removeEphemeralStoreRoot(root string) error {
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	return os.RemoveAll(root)
+}
+
+func joinEphemeralStoreCleanupError(runErr error, root string) error {
+	if strings.TrimSpace(root) == "" {
+		return runErr
+	}
+	cleanupErr := removeEphemeralStoreRoot(root)
+	if cleanupErr == nil {
+		return runErr
+	}
+	cleanupErr = fmt.Errorf("remove ephemeral session store: %w", cleanupErr)
+	if runErr == nil {
+		return cleanupErr
+	}
+	return errors.Join(runErr, cleanupErr)
 }
 
 // newCommandRuntime performs the shared production wiring. An absent
@@ -62,14 +163,44 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
+	if err := applyModelOverride(&cfg, start.modelName); err != nil {
+		return nil, err
+	}
 
 	dataDir, err := cfg.Storage.ResolveDataDir()
 	if err != nil {
 		return nil, err
 	}
+	sourceDataDir := dataDir
+	sourceThreadPath := ""
+	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+		sourceThreadPath = filepath.Join(sourceDataDir, "sessions", strings.TrimSpace(start.resumeID))
+	}
+	ephemeralStoreRoot := ""
+	if start.ephemeral {
+		ephemeralStoreRoot, err = os.MkdirTemp("", "eino-assistant-ephemeral-")
+		if err != nil {
+			return nil, fmt.Errorf("create ephemeral session store: %w", err)
+		}
+		dataDir = ephemeralStoreRoot
+	}
+	defer func() {
+		if err != nil {
+			err = joinEphemeralStoreCleanupError(err, ephemeralStoreRoot)
+		}
+	}()
 	sessionStore, err := store.NewThreadStore(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("open session store: %w", err)
+	}
+	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+		sourceStore, sourceErr := store.NewThreadStore(sourceDataDir)
+		if sourceErr != nil {
+			return nil, fmt.Errorf("open durable source session store: %w", sourceErr)
+		}
+		if sourceErr = sourceStore.SnapshotThread(ctx, start.resumeID, sessionStore); sourceErr != nil {
+			return nil, fmt.Errorf("snapshot durable resume session: %w", sourceErr)
+		}
 	}
 
 	chatModel, err := provider.NewChatModel(ctx, cfg.Model)
@@ -85,11 +216,19 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
-	protectedPaths, err := effectiveSandboxProtectedPaths(
+	protectedSourceDataDir := ""
+	protectedSourceThreadPaths := []string(nil)
+	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+		protectedSourceDataDir = sourceDataDir
+		protectedSourceThreadPaths = []string{sourceThreadPath}
+	}
+	protectedPaths, err := effectiveSandboxProtectedPathsWithSourceThreadPaths(
 		workspaceRoot,
 		cfg.Sandbox.EffectiveProtectedPaths(),
 		configPath,
 		dataDir,
+		[]string{protectedSourceDataDir},
+		protectedSourceThreadPaths,
 	)
 	if err != nil {
 		return nil, err
@@ -110,7 +249,9 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	}
 	defer func() {
 		if err != nil {
-			_ = sandboxRunner.Close()
+			if closeErr := sandboxRunner.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close sandbox runner during startup: %w", closeErr))
+			}
 		}
 	}()
 
@@ -240,23 +381,39 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	}
 
 	return &commandRuntime{
-		cfg:            cfg,
-		session:        session,
-		sessionStore:   sessionStore,
-		chatModel:      chatModel,
-		registry:       registry,
-		reactModel:     reactModel,
-		memStore:       memStore,
-		sessionOpts:    sessionOpts,
-		composePrompt:  composePrompt,
-		approvalMode:   approvalMode,
-		permissions:    perms,
-		sessionAllows:  sessionAllows,
-		sessionDenies:  sessionDenies,
-		workspaceRoot:  workspaceRoot,
-		readOnlyRoots:  readOnlyRoots,
-		protectedPaths: protectedPaths,
-		sandboxRunner:  sandboxRunner,
-		runtimeCfg:     runtimeCfg,
+		cfg:                cfg,
+		session:            session,
+		sessionStore:       sessionStore,
+		ephemeralStoreRoot: ephemeralStoreRoot,
+		chatModel:          chatModel,
+		registry:           registry,
+		reactModel:         reactModel,
+		memStore:           memStore,
+		sessionOpts:        sessionOpts,
+		composePrompt:      composePrompt,
+		approvalMode:       approvalMode,
+		permissions:        perms,
+		sessionAllows:      sessionAllows,
+		sessionDenies:      sessionDenies,
+		workspaceRoot:      workspaceRoot,
+		readOnlyRoots:      readOnlyRoots,
+		protectedPaths:     protectedPaths,
+		sandboxRunner:      sandboxRunner,
+		runtimeCfg:         runtimeCfg,
 	}, nil
+}
+
+func applyModelOverride(cfg *config.Config, modelName string) error {
+	if cfg == nil {
+		return errors.New("configuration is required")
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return nil
+	}
+	cfg.Model.Name = modelName
+	if err := cfg.Model.Validate(); err != nil {
+		return fmt.Errorf("validate model override: %w", err)
+	}
+	return nil
 }

@@ -27,9 +27,11 @@ type sessionStart struct {
 	title              string
 	resumeID           string
 	recoverInterrupted bool
+	ephemeral          bool
+	modelName          string
 }
 
-func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
+func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr error) {
 	// Process lifetime: SIGTERM only. TUI handles Ctrl+C for turn interrupt vs quit.
 	processCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer stop()
@@ -43,7 +45,11 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer runtime.Close()
+	defer func() {
+		if closeErr := runtime.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("close command runtime: %w", closeErr))
+		}
+	}()
 	if start.resumeID != "" {
 		// Keep the durable create-time system prompt. Mid-session rewrites would
 		// bust provider prefix cache and diverge from freeze-until-/new-or-/clear.
@@ -148,7 +154,11 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
 // live below a workspace. The model can invoke shell from that workspace, so
 // a config with API credentials or the session ledger must not become readable
 // merely because a user chose a colocated path.
-func effectiveSandboxProtectedPaths(workspaceRoot string, configured []string, configPath, dataDir string) ([]string, error) {
+func effectiveSandboxProtectedPaths(workspaceRoot string, configured []string, configPath, dataDir string, additionalDataDirs ...string) ([]string, error) {
+	return effectiveSandboxProtectedPathsWithSourceThreadPaths(workspaceRoot, configured, configPath, dataDir, additionalDataDirs, nil)
+}
+
+func effectiveSandboxProtectedPathsWithSourceThreadPaths(workspaceRoot string, configured []string, configPath, dataDir string, sourceDataDirs, sourceThreadPaths []string) ([]string, error) {
 	canonicalWorkspace, err := tools.ResolveWorkspaceRoot(workspaceRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sandbox workspace: %w", err)
@@ -175,6 +185,41 @@ func effectiveSandboxProtectedPaths(workspaceRoot string, configured []string, c
 	paths, _, err = addWorkspaceProtectedPath(paths, workspaceRoot, resolvedDataDir, "session storage")
 	if err != nil {
 		return nil, err
+	}
+	for _, sourceDataDir := range sourceDataDirs {
+		if strings.TrimSpace(sourceDataDir) == "" {
+			continue
+		}
+		if err := rejectWorkspaceControlSymlink(workspaceRoot, sourceDataDir, "source session storage"); err != nil {
+			return nil, err
+		}
+		resolvedSourceDataDir, err := resolveExistingPath(sourceDataDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve source session storage: %w", err)
+		}
+		if tools.PathWithinWorkspace(resolvedSourceDataDir, workspaceRoot) {
+			return nil, fmt.Errorf("source session storage %q must not contain workspace %q", resolvedSourceDataDir, workspaceRoot)
+		}
+		paths, _, err = addWorkspaceProtectedPath(paths, workspaceRoot, resolvedSourceDataDir, "source session storage")
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, sourceThreadPath := range sourceThreadPaths {
+		if strings.TrimSpace(sourceThreadPath) == "" {
+			continue
+		}
+		if err := rejectWorkspaceControlSymlink(workspaceRoot, sourceThreadPath, "source session thread"); err != nil {
+			return nil, err
+		}
+		resolvedSourceThreadPath, err := resolveExistingPath(sourceThreadPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve source session thread: %w", err)
+		}
+		paths, _, err = addWorkspaceProtectedPath(paths, workspaceRoot, resolvedSourceThreadPath, "source session thread")
+		if err != nil {
+			return nil, err
+		}
 	}
 	return paths, nil
 }

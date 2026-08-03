@@ -262,6 +262,57 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 	return metas, nil
 }
 
+// ListThreadsReadOnly returns journal-derived metadata without repairing the
+// materialized state or meta projections. It is used when selecting a source
+// session that must remain byte-for-byte untouched by an ephemeral run.
+func (s *ThreadStore) ListThreadsReadOnly(ctx context.Context) ([]ThreadMeta, error) {
+	entries, err := os.ReadDir(filepath.Join(s.root, sessionsDirName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list threads: %w", err)
+	}
+
+	metas := make([]ThreadMeta, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || validateThreadID(entry.Name()) != nil {
+			continue
+		}
+		meta, loadErr := s.loadThreadMetaReadOnly(ctx, entry.Name())
+		if loadErr != nil {
+			return nil, fmt.Errorf("load thread %q metadata: %w", entry.Name(), loadErr)
+		}
+		metas = append(metas, meta)
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		if metas[i].UpdatedAt.Equal(metas[j].UpdatedAt) {
+			return metas[i].ID > metas[j].ID
+		}
+		return metas[i].UpdatedAt.After(metas[j].UpdatedAt)
+	})
+	return metas, nil
+}
+
+func (s *ThreadStore) loadThreadMetaReadOnly(ctx context.Context, id string) (ThreadMeta, error) {
+	var meta ThreadMeta
+	err := s.withReadOnlyThread(ctx, id, func(dir string, locked bool) error {
+		var state ThreadState
+		var err error
+		if locked {
+			state, _, _, err = replayJournalReadOnly(filepath.Join(dir, journalFileName), id)
+		} else {
+			state, err = stableReadThread(ctx, dir, id)
+		}
+		if err != nil {
+			return err
+		}
+		meta = state.Meta
+		return nil
+	})
+	return meta, err
+}
+
 // LoadThreadMeta loads the replayed metadata projection for one thread.
 func (s *ThreadStore) LoadThreadMeta(ctx context.Context, id string) (ThreadMeta, error) {
 	dir, unlock, err := s.lockThread(ctx, id)
@@ -584,15 +635,10 @@ func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func()
 	if _, err := os.Stat(dir); err != nil {
 		return "", nil, fmt.Errorf("thread directory: %w", err)
 	}
-	value, _ := s.locks.LoadOrStore(id, newLocalThreadLock())
-	local := value.(*localThreadLock)
-	select {
-	case local.held <- struct{}{}:
-	case <-ctx.Done():
-		return "", nil, fmt.Errorf("%w: %v", ErrThreadLocked, ctx.Err())
+	unlockLocal, err := s.holdLocalThreadLock(ctx, id)
+	if err != nil {
+		return "", nil, err
 	}
-
-	unlockLocal := func() { <-local.held }
 	if err := os.MkdirAll(filepath.Join(dir, locksDir), 0o700); err != nil {
 		unlockLocal()
 		return "", nil, fmt.Errorf("create thread locks directory: %w", err)
@@ -616,6 +662,20 @@ func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func()
 		unlockLocal()
 	}
 	return dir, unlock, nil
+}
+
+func (s *ThreadStore) holdLocalThreadLock(ctx context.Context, id string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	value, _ := s.locks.LoadOrStore(id, newLocalThreadLock())
+	local := value.(*localThreadLock)
+	select {
+	case local.held <- struct{}{}:
+		return func() { <-local.held }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: %v", ErrThreadLocked, ctx.Err())
+	}
 }
 
 func ensureThreadLayout(dir string) error {

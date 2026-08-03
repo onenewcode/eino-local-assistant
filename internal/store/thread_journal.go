@@ -121,6 +121,14 @@ func appendJournalEvent(path string, event ThreadEvent) error {
 }
 
 func replayJournal(path, id string) (ThreadState, []ThreadEvent, bool, error) {
+	return replayJournalWithRepair(path, id, true)
+}
+
+func replayJournalReadOnly(path, id string) (ThreadState, []ThreadEvent, bool, error) {
+	return replayJournalWithRepair(path, id, false)
+}
+
+func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []ThreadEvent, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ThreadState{}, nil, false, fmt.Errorf("read journal: %w", err)
@@ -182,12 +190,12 @@ func replayJournal(path, id string) (ThreadState, []ThreadEvent, bool, error) {
 		return ThreadState{}, nil, false, fmt.Errorf("%w: thread %q has no creation event", ErrJournalCorrupt, id)
 	}
 
-	if tornTail {
+	if repair && tornTail {
 		if err := truncateJournal(path, int64(validEnd)); err != nil {
 			return ThreadState{}, nil, false, err
 		}
 	}
-	if missingFinalNewline {
+	if repair && missingFinalNewline {
 		if err := appendJournalNewline(path); err != nil {
 			return ThreadState{}, nil, false, err
 		}

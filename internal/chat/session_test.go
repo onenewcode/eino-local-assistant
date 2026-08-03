@@ -628,6 +628,47 @@ func TestSessionDoesNotPersistFailedTurn(t *testing.T) {
 	})
 }
 
+func TestSessionFinalResponseValidationFailsBeforeCommitAndKeepsUsage(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{
+		{message: assistantWithProviderUsage(`{"wrong":true}`, 11, 3)},
+	}}
+	model := &scriptedModel{streams: []Stream{stream}}
+	st := newDurableThreadStore(t)
+	session, err := NewSession(model, "system instructions", SessionOptions{
+		Store: st,
+		ID:    "sess-schema-fail",
+		FinalResponseValidator: func(string) error {
+			return errors.New("required property answer is missing")
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	err = session.Ask(context.Background(), "q", nil)
+	if err == nil || !strings.Contains(err.Error(), "final response validation") {
+		t.Fatalf("Ask error = %v, want final response validation failure", err)
+	}
+	state, err := st.LoadThread(context.Background(), session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	if state.Meta.MessageCount != 1 {
+		t.Fatalf("message count = %d, want only the system message", state.Meta.MessageCount)
+	}
+	groups, err := st.LoadTurnGroups(context.Background(), session.ID())
+	if err != nil {
+		t.Fatalf("LoadTurnGroups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Committed != nil || groups[0].Failed == nil {
+		t.Fatalf("failed lifecycle = %#v", groups)
+	}
+	usage := session.UsageSummary()
+	if usage.PromptTokens != 11 || usage.CompletionTokens != 3 || usage.ModelCallCount != 1 {
+		t.Fatalf("usage = %+v, want provider usage retained", usage)
+	}
+}
+
 func TestSessionRejectsIncompleteToolCallFinalAnswer(t *testing.T) {
 	// Simulates a ReAct END that still carries tool_calls (text-then-tool_calls
 	// mis-detection). Must not commit; otherwise the next turn 400s forever.

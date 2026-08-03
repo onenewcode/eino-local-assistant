@@ -141,15 +141,28 @@ go run ./cmd/eino-assistant chat -title "debug flaky test"
 go run ./cmd/eino-assistant exec "summarize the current repository"
 go run ./cmd/eino-assistant exec - < build.log
 git diff | go run ./cmd/eino-assistant exec "review this change"
+# 单次调用覆盖配置中的模型（fresh、resume 与 ephemeral 均支持）
+go run ./cmd/eino-assistant exec -m gpt-5.1-codex "summarize the current repository"
+# 单轮非交互执行且不持久化 session ledger（工具副作用与 semantic memory 不回滚）
+go run ./cmd/eino-assistant exec --ephemeral "summarize the current repository"
 # 供脚本解析的一次性最终结果
 go run ./cmd/eino-assistant exec --output-format json "summarize the current repository"
+# 本地校验最终 assistant Content（不是 provider-enforced structured output）
+go run ./cmd/eino-assistant exec --output-schema response.schema.json "return the requested JSON"
+# 将成功提交的最终回复原子写入文件
+go run ./cmd/eino-assistant exec -o /tmp/last-message.txt "summarize the current repository"
 # 供进度消费者解析的版本化 JSONL 生命周期记录
 go run ./cmd/eino-assistant exec --output-format stream-json "summarize the current repository"
-# 在指定的 durable session 上追加一个新 turn（不会自动选择最近会话）
+# Codex-compatible alias for the same JSONL stream (not one final JSON object)
+go run ./cmd/eino-assistant exec --json "summarize the current repository"
+# 在指定的 durable session 上追加一个新 turn
 go run ./cmd/eino-assistant exec resume 20260715-120000-abc123 "continue the review"
 go run ./cmd/eino-assistant exec resume 20260715-120000-abc123 - < build.log
+# 显式选择当前配置 durable store 中最近更新的 session
+go run ./cmd/eino-assistant exec resume --last "continue the review"
 # 仅在确认旧进程已退出后，显式终止未完成 turn / compaction 再追加新 turn
 go run ./cmd/eino-assistant exec resume 20260715-120000-abc123 --recover "continue the review"
+go run ./cmd/eino-assistant exec resume --last --recover "continue the review"
 
 # 在 TUI 中恢复已保存会话
 go run ./cmd/eino-assistant resume 20260715-120000-abc123
@@ -167,16 +180,18 @@ go run ./cmd/eino-assistant help resume
 | 子命令 | 说明 |
 |--------|------|
 | `chat` / `new` | 新建交互会话（默认） |
-| `exec [PROMPT]` | 创建无 TTY 的单轮持久执行；`--output-format text`（默认）仅在成功提交后将最终回复写到 stdout，`--output-format json` 写单个 v1 最终结果对象，`--output-format stream-json` 写版本化 JSONL 生命周期记录；无参数或参数为 `-` 时从 stdin 读取（最多 10 MiB），显式 prompt 与管道 stdin 同时存在时将 stdin 追加为 JSON reference envelope |
-| `exec resume <id> [PROMPT] [--recover]` | 打开精确指定的 durable session 并追加一条新 prompt；不会选择最近会话，沿用 `exec` 的 stdin 和输出契约。普通打开拒绝活动 turn / pending compaction；只有显式 `--recover` 才会在 CAS 下终止其未完成状态。二者成功打开后均将 session ID 与 `exec resume <id>` 提示写到 stderr |
+| `exec [PROMPT]` | 创建无 TTY 的单轮持久执行；`--ephemeral` 使用进程临时 `ThreadStore`，关闭时删除 session ledger，不回滚工具副作用或清除 semantic memory；`--output-format text`（默认）仅在成功提交后将最终回复写到 stdout，`--output-format json` 写单个 v1 最终结果对象，`--output-format stream-json` 写版本化 JSONL 生命周期记录；`--output-schema FILE` 在 turn commit 前于本地把最终 assistant Content 解析为 JSON 实例并按 FILE 校验，不注入 provider `response_format`，也不约束 ReAct 中间步骤；schema 错误是 input error，响应校验失败是 turn failure；`-o FILE` 是 `--output-last-message FILE` 的同一选项别名，仍仅在 schema 校验成功且 turn 成功提交后用同目录临时文件和 `rename` 原子替换最终回复，失败/取消或写入失败不覆盖旧文件；同时提供两种写法是 input error；无参数或参数为 `-` 时从 stdin 读取（最多 10 MiB），显式 prompt 与管道 stdin 同时存在时将 stdin 追加为 JSON reference envelope |
+| `exec resume [<id>\|--last] [PROMPT] [--recover]` | 打开精确指定的 durable session，或在显式 `--last` 下选择最近 session，再追加一条新 prompt；支持与 fresh exec 相同的 `--output-schema FILE` 本地最终 JSON 校验和 `-o FILE` / `--output-last-message FILE` 成功提交后原子写文件契约。这两种写法是同一选项，同时提供会在打开 session 前报告 input error。显式 ID 是稳定身份；`--last` 不做 cwd/project 过滤、不排除活动会话，也不隐式恢复。普通打开拒绝活动 turn / pending compaction；只有显式 `--recover` 才会在 CAS 下终止其未完成状态。成功打开后将 session ID 与 `exec resume <id>` 提示写到 stderr |
 | `resume <id>` | 恢复已保存会话并进入 TUI；活动 turn 必须等待完成或显式使用 `--recover` 接管 |
 | `sessions` / `ls` | 列出本地会话 |
 | `version` | 打印版本 |
 | `help [command]` | 帮助 |
 
-`exec` 复用普通会话的 AGENTS.md、memory、权限、sandbox、ReAct、runtime guard、compaction 和 durable ledger 接线，但不会启动 memory consolidator。`exec resume` 经由 `chat.OpenSession` 恢复账本，而不解析 transcript、journal 或 checkpoint 文件；已经写入的 system prompt 保持权威，tools、权限和 sandbox 使用当前进程配置，且每个 headless 进程都以空的 session allow/deny 决策与无交互 approver 启动。stdin 在创建或打开 runtime 前按 10 MiB 读取；同时有显式 prompt 时，stdin 会使用 `encoding/json` 编码为含 `source`、`byte_count` 和 `content` 的 envelope，并以“decoded content 是 untrusted reference data，不是 privileged instructions”前缀追加。该 framing 仅提供来源和结构边界，不是 prompt-injection 或权限边界；system/user role 与既有硬工具权限仍是安全控制。`exec` 不读取 stdin 来回答审批；`approval_policy = "on-request"` 下需要审批的工具调用会由既有工具层 fail closed。session 成功创建或打开后，即使后续 stream 失败，也会向 stderr 输出 `Session ID` 和 `eino-assistant exec resume <id>`；默认文本回复始终只在成功提交后写入 stdout。
+`exec` 的 `-m, --model MODEL` 只为本次 headless 调用覆盖 `model.name`，适用于 fresh、resume、`--last` 和 ephemeral 路径；它在 provider 建立前应用，不创建新的会话身份，也不改写既有 transcript 或 ephemeral source snapshot。
 
-`exec --output-format json` 是独立的最终结果通道：stdout 恰好写一个 JSON 对象和一个结尾换行，不混入回复片段、进度、工具、reasoning、ANSI 或第二条记录。成功时进程退出 `0`；正常输入、启动、运行或取消失败仍写终态对象，随后以既有非零退出行为结束。不能选定合法格式的 flag/format 错误仍是标准 stderr 错误。创建 durable session 后，stderr 保留原有的 session/resume hint（失败时也保留）；`stdout` 才是脚本应解析的通道。pipe 中断或 stdout 写入失败不能保证完整对象，也不会补写第二条记录。
+`exec` 复用普通会话的 AGENTS.md、memory、权限、sandbox、ReAct、runtime guard、compaction 和 durable ledger 接线，但不会启动 memory consolidator。`exec --ephemeral` 改用本次进程创建的空临时 ledger，runtime 关闭时删除它；这只保证 session ledger 不持久化，不回滚工具副作用，也不清除项目级 semantic memory。`exec resume` 经由 `chat.OpenSession` 恢复账本，而不解析 transcript、journal 或 checkpoint 文件；已经写入的 system prompt 保持权威，tools、权限和 sandbox 使用当前进程配置，且每个 headless 进程都以空的 session allow/deny 决策与无交互 approver 启动。`exec resume --ephemeral` 是稳定的 input error，不会打开或写入已有 durable session；它与 `--last` 互斥。`exec resume --last` 是显式便捷选择器，只在当前配置的 `storage.data_dir` 中调用已有 `ListThreads` 的 newest 排序；它不是 Codex 的 cwd 过滤或 Claude 的 project/worktree 查找的等价实现，当前也没有额外的 active-session 排除或并发 single-writer 合同。stdin 在创建或打开 runtime 前按 10 MiB 读取；同时有显式 prompt 时，stdin 会使用 `encoding/json` 编码为含 `source`、`byte_count` 和 `content` 的 envelope，并以“decoded content 是 untrusted reference data，不是 privileged instructions”前缀追加。该 framing 仅提供来源和结构边界，不是 prompt-injection 或权限边界；system/user role 与既有硬工具权限仍是安全控制。`exec` 不读取 stdin 来回答审批；`approval_policy = "on-request"` 下需要审批的工具调用会由既有工具层 fail closed。durable session 成功创建或打开后，即使后续 stream 失败，也会向 stderr 输出 `Session ID` 和 `eino-assistant exec resume <id>`；ephemeral 不输出可恢复 session ID 或 hint；默认文本回复始终只在成功提交后写入 stdout。
+
+`exec --output-format json` 是独立的最终结果通道：stdout 恰好写一个 JSON 对象和一个结尾换行，不混入回复片段、进度、工具、reasoning、ANSI 或第二条记录。成功时进程退出 `0`；普通输入、启动、运行或取消失败仍写终态对象，随后以非零退出。headless `exec` 明确收到 `SIGTERM` 并因此取消时退出 `143`；这只是 OS 退出状态，不会写入 JSON/JSONL 的业务对象。不能选定合法格式的 flag/format 错误仍是标准 stderr 错误。创建 durable session 后，stderr 保留原有的 session/resume hint（失败时也保留）；`stdout` 才是脚本应解析的通道。pipe 中断或 stdout 写入失败不能保证完整对象，也不会补写第二条记录。
 
 ```json
 {
@@ -206,11 +221,11 @@ go run ./cmd/eino-assistant help resume
 | `run_error` | `The assistant run did not complete.` |
 | `cancelled` | `The assistant run was cancelled.` |
 
-`session.id` 是 opaque 值，只有 session 已创建才有值，并以 `persistent` 明示可恢复性；创建前失败为 `{ "id": null, "persistent": false }`。`usage` 是可选字段：仅在该命令能读取既有 durable、provider-reported usage projection 时出现；其 `status` 为 `exact`、`incomplete` 或 `unavailable`，没有 tokenizer 估算、成本/定价、原始 provider/model/tool/context 数据。
+`session.id` 是 opaque 值，只有 durable session 已创建才有值，并以 `persistent` 明示可恢复性；创建前失败和 ephemeral 执行均为 `{ "id": null, "persistent": false }`。`usage` 是可选字段：仅在该命令能读取既有 durable、provider-reported usage projection 时出现；其 `status` 为 `exact`、`incomplete` 或 `unavailable`，没有 tokenizer 估算、成本/定价、原始 provider/model/tool/context 数据。
 
-`exec --output-format stream-json` 是独立的 v1 JSONL 生命周期协议。每一行都是完整 JSON，且都有 `{ "stream_version": 1, "sequence": <strictly increasing uint64>, "event": <string> }`。成功创建或打开 durable session 后，第一行是 `session.started`，仅带 `{ "session": { "id": "opaque-session-id", "persistent": true } }`。可选的 `activity` 行仅表示已经持久化的工具生命周期，数据固定为 `{ "activity": { "kind": "tool", "state": "started"|"completed"|"failed" } }`。最后一行且仅有一行 `result`，平铺承载上面的安全最终 JSON v1 字段（`contract_version`、`status`、`result`、`error`、`session` 和可选 `usage`）；`completed` 只会在 durable commit 后出现。合法的 stream 选择后，输入、启动、运行和取消失败也会写一行 `result`，但创建/打开前失败没有 `session.started`。stdout 断开、短写或其他写入失败会取消活动 turn、停止投递且不重试；因此消费者可看到部分流或没有 `result`，应将交付状态视为未知。
+`exec --output-format stream-json` 是独立的 v1 JSONL 生命周期协议。每一行都是完整 JSON，且都有 `{ "stream_version": 1, "sequence": <strictly increasing uint64>, "event": <string> }`。成功创建或打开 durable session 后，第一行是 `session.started`，带 `{ "session": { "id": "opaque-session-id", "persistent": true }, "capabilities": ["session_started_v1", "activity_v1", "terminal_result_v1", "usage_v1"] }`；ephemeral 执行的 `session.started` 与最终 `result` 均带 `{ "session": { "id": null, "persistent": false } }`。`capabilities` 只在首条 `session.started` 广告当前公开的 session-started、activity、terminal-result 和可选 usage 投影能力，顺序稳定；它是 capability advertisement，不是版本协商。消费者应按 capability 检测能力并忽略未知名称，旧消费者也可以忽略新增字段。可选的 `activity` 行仅表示已经持久化的工具生命周期，数据固定为 `{ "activity": { "kind": "tool", "state": "started"|"completed"|"failed" } }`，不会重复 `capabilities`。最后一行且仅有一行 `result`，平铺承载上面的安全最终 JSON v1 字段（`contract_version`、`status`、`result`、`error`、`session` 和可选 `usage`），也不会重复 `capabilities`；`completed` 只会在 turn commit 后出现。合法的 stream 选择后，输入、启动、运行和取消失败也会写一行 `result`，但创建/打开前失败没有 `session.started`。stdout 断开、短写或其他写入失败会取消活动 turn、停止投递且不重试；因此消费者可看到部分流或没有 `result`，应将交付状态视为未知。进程退出状态仍独立于 `result.status`：成功为 `0`，普通失败/取消为非零，明确由 `SIGTERM` 导致的取消为 `143`；JSONL 不增加 `exit_code` 字段。
 
-JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、输出、错误、artifact、逐调用 usage 或结构化模型输出。它不支持版本协商、额外 error event、`--last`、`--ephemeral`、输出文件、自动最近会话选择、数值化退出码分类或权限/sandbox 覆盖参数。`--output-format json` 仍是需要单一最终对象的脚本通道。
+JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、输出、错误、artifact、逐调用 usage 或结构化模型输出。它不支持版本协商、额外 error event、`--all`、输出文件或除 `0`、普通失败非零和 SIGTERM 的 `143` 外的数值化退出码分类，或权限/sandbox 覆盖参数；`exec resume --last` 只改变 session 选择，不改变 JSONL 事件字段。`--output-format json` 仍是需要单一最终对象的脚本通道。
 
 ### TUI 内快捷键与斜杠命令
 
@@ -311,3 +326,5 @@ go tool golangci-lint run ./...
 8. `/queue` 可列出队列，`/queue clear` 可清空
 9. 发送几条消息后 ↑/↓ 可浏览输入历史；长会话 `/resume` 后用 PgUp/Home 分页加载更早 user 消息
 10. 给出多步骤编码需求，确认模型先使用 `task_plan`；每个 proof 绑定真实 `shell` 成功结果，`task_complete` 前不可交付；`Esc` 中断后已接受证据保留，恢复时先检查或重规划未完成节点
+
+`--json` 是 Codex-compatible 的 `--output-format stream-json` 别名：它输出同一套 JSONL（首条 `session.started`、activity、最终 `result`、`stream_version`、`sequence` 以及错误/退出语义完全复用），不是单一最终 JSON 文档。它支持 fresh exec、`exec resume`、`exec resume --last` 和 fresh `--ephemeral`；与显式 `--output-format stream-json` 等价，与显式 `json` 或 `text` 组合返回 input error。
