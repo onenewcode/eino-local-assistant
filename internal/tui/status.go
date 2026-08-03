@@ -36,10 +36,33 @@ func sessionCtxFragment(session *chat.Session) string {
 	return usage.FormatCompactContextSnapshot(sessionContextSnapshot(session))
 }
 
+// taskStatusFragment gives complex work a compact progress signal without
+// exposing the controller's internal acceptance matrix as a command surface.
+func taskStatusFragment(session *chat.Session) string {
+	status := sessionTaskStatus(session)
+	if !hasTaskStatus(status) {
+		return ""
+	}
+	switch status.State {
+	case "active":
+		if status.PlanRequired {
+			return "task:plan"
+		}
+		return fmt.Sprintf("task:%d/%d", status.DoneTasks, status.Tasks)
+	case "complete":
+		return "task:complete"
+	case "interrupted":
+		return "task:interrupted"
+	default:
+		return "task:" + status.State
+	}
+}
+
 // statusExtras are optional fragments shared by idle and busy status lines.
 type statusExtras struct {
 	cmdPolicy string
 	context   string
+	task      string
 	queued    string
 	follow    string
 }
@@ -48,6 +71,7 @@ func collectStatusExtras(session *chat.Session, queueN int, followHint bool, cmd
 	e := statusExtras{
 		context:   sessionCtxFragment(session),
 		cmdPolicy: strings.TrimSpace(cmdPolicy),
+		task:      taskStatusFragment(session),
 	}
 	if queueN > 0 {
 		e.queued = fmt.Sprintf("queued:%d", queueN)
@@ -62,7 +86,7 @@ func collectStatusExtras(session *chat.Session, queueN int, followHint bool, cmd
 // by " · " when the result is non-empty (ready to append after a base label).
 func joinStatusSuffix(e statusExtras) string {
 	var parts []string
-	for _, s := range []string{e.cmdPolicy, e.context, e.queued, e.follow} {
+	for _, s := range []string{e.cmdPolicy, e.context, e.task, e.queued, e.follow} {
 		if s != "" {
 			parts = append(parts, s)
 		}
@@ -79,6 +103,7 @@ type idleStatusParts struct {
 	title     string
 	cmdPolicy string
 	context   string
+	task      string
 	queued    string
 	follow    string
 }
@@ -104,6 +129,7 @@ func collectIdleStatus(session *chat.Session, modelName string, queueN int, foll
 	extras := collectStatusExtras(session, queueN, followHint, cmdPolicy)
 	p.cmdPolicy = extras.cmdPolicy
 	p.context = extras.context
+	p.task = extras.task
 	p.queued = extras.queued
 	p.follow = extras.follow
 	return p
@@ -124,6 +150,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 		{"model", p.model},
 		{"cmd", p.cmdPolicy},
 		{"context", p.context},
+		{"task", p.task},
 		{"queued", p.queued},
 		{"follow", p.follow},
 	}
@@ -131,7 +158,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	join := func(include map[string]bool) string {
 		parts := []string{base}
 		// Preferred display order (not drop order).
-		order := []string{"model", "id", "title", "cmd", "context", "queued", "follow"}
+		order := []string{"model", "id", "title", "cmd", "context", "task", "queued", "follow"}
 		for _, k := range order {
 			if !include[k] {
 				continue
@@ -147,13 +174,13 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 
 	include := map[string]bool{
 		"title": true, "id": true, "model": true, "cmd": true,
-		"context": true, "queued": true, "follow": true,
+		"context": true, "task": true, "queued": true, "follow": true,
 	}
 	if width <= 0 {
 		width = 80
 	}
 	// Drop priority when over width — keep cmd/ctx longer than decoration.
-	dropOrder := []string{"title", "id", "model", "cmd", "context"}
+	dropOrder := []string{"title", "id", "model", "cmd", "context", "task"}
 	out := join(include)
 	for _, key := range dropOrder {
 		if len(out) <= width {

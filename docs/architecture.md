@@ -1,186 +1,83 @@
-# 架构概览
+# 架构地图
 
-本文描述本仓库（eino-local-assistant）的包边界、数据面与控制面，便于改功能时找对位置。
+本文件只回答“改什么该去哪里”。行为细节见专题文档：
+[会话](./session-persistence.md)、[记忆](./memory.md)、[命令与沙箱](./command-policy.md)、[行业调研](./research/)。
 
-更细的专题文档：
-
-| 主题 | 文档 |
-| --- | --- |
-| 会话账本 / resume / compaction | [session-persistence.md](./session-persistence.md) |
-| 项目指令与持久记忆 | [memory.md](./memory.md) |
-| 命令硬权限 | [command-policy.md](./command-policy.md) |
-| 迭代记录 | [iterations/](./iterations/) |
-| 行业调研（非实现规格） | [research/](./research/) |
-
----
-
-## 1. 进程与入口
+## 入口与主流
 
 ```text
-cmd/eino-assistant/
-  main / CLI ──► run_tui.go
-                    │
-                    ├─ config.Load
-                    ├─ provider.NewChatModel
-                    ├─ tools.DefaultWithOptions (+ sandbox)
-                    ├─ agent.NewReActModel
-                    ├─ memory.Open
-                    ├─ chat.NewSession / OpenSession
-                    └─ tui.Run
+cmd/eino-assistant
+  -> config + provider + sandbox + tool registry
+  -> agent.ReActModel
+  -> chat.Session <-> store.ThreadStore
+  -> tui.Run
 ```
 
-TUI 是主交互面；配置、workspace、session store、memory store 在启动时接线。
+`cmd/eino-assistant/run_tui.go` 只负责接线；产品行为应归属到对应的 `internal` 包。
 
----
+## 包边界
 
-## 2. 包地图（`internal/`）
-
-| 包 | 职责 | 不负责 |
+| 位置 | 负责 | 不负责 |
 | --- | --- | --- |
-| **agent** | ReAct 循环、persona/tool policy、**加载 AGENTS.md**、拼装 system prompt 层（只收字符串层，不依赖 `memory.Store`） | 会话账本、记忆落盘 |
-| **memory** | 项目级语义记忆：store（flock）、summary、candidate 抽取、consolidator | session resume、硬权限 |
-| **chat** | 单会话生命周期、turn、与 store/compactor 协作 | 跨会话记忆 |
-| **store** | v2 thread journal / checkpoint / artifact | 语义记忆文件 |
-| **contextbuild** | prompt 规划、compaction | 工具执行 |
-| **tools** | shell / apply_patch / time / artifact / memory_* | 策略 UI |
-| **sandbox** | OS worker 边界 | 业务 prompt |
-| **config** | TOML 与校验 | 运行时状态 |
-| **tui** | 交互、斜杠命令、审批桥 | 模型协议细节 |
-| **provider** | OpenAI / Anthropic 适配 | 产品语义 |
-| **runtimeguard** | 整轮超时、工具次数 | 权限规则内容 |
-| **usage** | token/费用估算与展示辅助 | 计费账单 |
+| `internal/agent` | ReAct、system prompt、AGENTS.md、任务图与 completion controller | 自己管理账本文件或记忆落盘 |
+| `internal/chat` | turn 生命周期、流式事件、completion gate、上下文协作 | 任务业务正确性 |
+| `internal/store` | thread journal、checkpoint、artifact、resume | 项目记忆 |
+| `internal/contextbuild` | prompt 规划与 compaction | 工具执行 |
+| `internal/memory` | 项目级语义记忆与 consolidation | `/resume`、权限 |
+| `internal/tools` | shell、apply_patch、artifact、memory 只读工具 | TUI 策略展示 |
+| `internal/sandbox` | 工具的 OS 隔离边界 | prompt 规则 |
+| `internal/config` | TOML 读取、默认值与校验 | 运行时状态 |
+| `internal/tui` | 交互、slash、队列、审批桥、状态栏与只读任务进度 | 模型协议 |
+| `internal/provider` | OpenAI / Anthropic 模型适配 | 产品流程 |
+| `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
 
-### 2.1 为什么没有 `internal/rules`
+`AGENTS.md` 加载在 `agent`；不要新建或恢复 `internal/rules`。`[rules]` 只是配置名称。
 
-早期曾把 `AGENTS.md` 加载拆成独立 `internal/rules` 包。体量过薄且与「permissions 规则」撞名，已 **收进 `internal/agent`**：
+## 状态与安全边界
 
-- `project_instructions.go` — `LoadProjectInstructions` / `FormatProjectInstructionsBlock`
-- `compose_layers.go` — 把 AGENTS + memory summary 叠进 system prompt
-- `prompt.go` — persona + 内置 tool guidelines
-
-配置项仍叫 `[rules]`（产品语义：项目软指令开关），实现不在单独 rules 包。
-
----
-
-## 3. 三条「持久」面（勿混）
-
-```text
-┌─────────────────────┐
-│ 硬权限 / sandbox    │  permissions + sandbox + approval
-│ （模型绕不过）       │
-└─────────────────────┘
-
-┌─────────────────────┐
-│ 会话账本            │  store: journal / checkpoint / resume
-│ （同任务可继续）     │  见 session-persistence.md
-└─────────────────────┘
-
-┌─────────────────────┐     ┌─────────────────────┐
-│ 项目软指令          │     │ 语义记忆            │
-│ AGENTS.md           │     │ .eino/memory/       │
-│ agent 加载注入      │     │ memory 包 + /memory │
-└─────────────────────┘     └─────────────────────┘
-```
-
-| 面 | 数据位置 | 注入方式 | 典型命令 |
+| 面 | 所有者 / 位置 | 生命周期 | 关键边界 |
 | --- | --- | --- | --- |
-| 硬权限 | config + 运行时 allowlist | 不进 prompt；工具前强制 | `/permissions` |
-| 会话 | `~/.eino-assistant/sessions/` | checkpoint + 热 tail | `/resume` `/compact` |
-| 项目指令 | workspace `AGENTS.md` | durable system 冻快照 | `/new` `/clear` 重载；编辑文件 alone 不热更 |
-| 语义记忆 | workspace `.eino/memory/` | 有界 summary + 只读工具 | `/memory` 落盘；summary 注入同上边界 |
+| 硬权限 | `permissions` + `tools` + `sandbox` | 进程 / 每次工具调用 | 不依赖 AGENTS.md 或 memory 文本执行 |
+| 会话账本 | `store` + `chat` | 可 `/resume` | journal、artifact 与 checkpoint 是真相 |
+| 项目指令 | `agent` 读取 workspace `AGENTS.md` | `/new` / `/clear` 刷新 | system prefix 的软指导 |
+| 语义记忆 | `memory`，`.eino/memory/` | 跨会话 | 不等于 `/resume`；agent 只读 |
+| 复杂任务图 | `agent.TaskController` + `store` | 当前会话，可 `/resume` | `task.state.updated` 是图的恢复投影；工具/artifact 仍是证据真相 |
 
-**`/resume` ≠ 长期记忆。** 长期事实走 memory；任务续聊走 session。
+System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、可选 AGENTS.md 和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。
 
----
+## 复杂任务运行时
 
-## 4. System prompt 组装
+`task_plan`、`task_progress`、`task_complete` 只管理控制状态，没有文件或 shell 权限。
 
-```text
-ComposeWithLayers(persona, LayerOptions)
-  = persona
-  + ToolUsagePolicy          (agent/prompt.go，产品固定)
-  + Project instructions     (AGENTS.md，可选)
-  + Persistent memory block  (summary.md，可选；candidate 标 unverified)
-```
+- 当前用户原文被 controller 保留为 `user-request` root requirement；计划必须把它映射到场景。
+- proof 必须绑定精确匹配且成功的真实 `shell` 结果；图快照只保留引用和少量恢复上下文，完整证据仍在账本。
+- 未计划且实际执行的 `shell` / `apply_patch`，以及任务完成或中断后迟到且可能改动工作区的工具结果，都会开启“必须先建计划”的 gate；模型不能直接交付该改动。
+- `task_complete` 只是在当前 turn 内的暂定批准；`chat.Session` 在提交最终消息前复查 gate。取消、失败或恢复发现未提交批准、或快照后的 shell/patch 生命周期时，都会关闭交付并要求重规划。
+- 任务图不增加专用 slash 命令；状态栏显示紧凑进度，`Ctrl+T` 展开只读任务面板。
+- `Esc` / `Ctrl+C` 留下可恢复且不可交付的 `interrupted` 状态；普通后续输入沿用原始需求和未变范围的 proof。只有 `task_plan` 把当前用户原文显式写为 `user-request` 才替换范围；恢复中的 `working` 节点先转为 `needs_replan`，下一次执行时重新收集其 proof。
 
-预算：`[rules].max_tokens`（默认 8k）、`[memory].max_summary_tokens`（默认 2.5k）。  
-不可变指令过预算时优先保住 persona + tool policy（由 session/planner 侧约束）。
-
-**冻结与刷新**（prefix cache）：创建与 `/new`/`/clear` 写入 durable system；`/resume`、`/memory`、`/compact` **均不**改 system 前缀。Effective system 始终等于 ledger。详见 [memory.md §7.1](./memory.md)。
-
----
-
-## 5. 工具面
-
-Codex 子集 + 产品辅助：
-
-| 工具 | 包 |
-| --- | --- |
-| `shell` / `apply_patch` | tools + sandbox |
-| `get_current_time` | tools |
-| `read_artifact` | tools（thread 作用域） |
-| `memory_list` / `search` / `read` | tools → memory.Store（只读） |
-
-写入记忆：仅 **`/memory`** 与 **consolidator**，agent 无 `memory_write`。
-
----
-
-## 6. 依赖方向（应保持）
+## 依赖方向
 
 ```text
-cmd ──► tui, chat, agent, tools, memory, config, store, provider
-tui ──► chat, store, memory, tools
-chat ──► store, contextbuild, usage
-agent ──► usage (token 估算)；不 import memory
-tools ──► memory, sandbox, permissions
-memory ──► store (consolidator 只读 journal), usage
-cmd/tui 负责：Summary → FormatMemoryBlock → ComposeWithLayers
+cmd -> tui, chat, agent, tools, memory, config, store, provider
+tui -> chat, store, memory, tools
+chat -> store, contextbuild, usage
+agent -> chat, usage                 (不 import memory/store)
+tools -> memory, sandbox, permissions
+memory -> store, usage
 ```
 
-避免：
+避免反向依赖；尤其不要让 `agent` 持有 `memory.Store`、让 `store` 依赖 memory，或用 prompt 文本代替硬权限。
 
-- `agent` 依赖 `memory.Store`（只收已渲染的 prompt 段）
-- `memory` 依赖 `tui` / `agent` 循环
-- `store` 依赖 `memory`（会话与记忆文件分离）
-- 把硬权限写进 AGENTS.md / memory 文本当唯一执行手段
-- candidate 覆盖 user 信任条目；抽取失败 mark processed
----
+## 改动路由
 
-## 7. 配置面
-
-| 段 | 作用 |
+| 需求 | 优先位置 |
 | --- | --- |
-| `[model]` / pricing / context | 模型与压缩预算 |
-| `[assistant]` | persona |
-| `[workspace]` | 路径钳制根 |
-| `[permissions]` / `approval_policy` | 硬权限 |
-| `[sandbox]` | worker 边界；内建保护含 `.eino` |
-| `[rules]` | 是否加载 AGENTS.md、token 上限 |
-| `[memory]` | 注入 / 自动抽取 / idle 等 |
-| `[storage]` | session data_dir |
-| `[runtime]` / `[tools.*]` / `[ui]` | 轮次预算、工具限流、UI |
+| ReAct、prompt、AGENTS.md、任务控制 | `internal/agent` |
+| 会话、resume、compaction | `internal/chat` + `internal/store` |
+| 新工具或权限语义 | `internal/tools` + `sandbox` + [command-policy.md](./command-policy.md) |
+| 项目记忆 | `internal/memory` + [memory.md](./memory.md) |
+| slash、队列、状态展示 | `internal/tui` |
+| 配置字段 | `internal/config` + `config.example.toml` |
 
-样例：`config.example.toml`。
-
----
-
-## 8. 扩展指南（改哪里）
-
-| 想做的事 | 优先改 |
-| --- | --- |
-| 新 slash 命令 | `internal/tui/slash.go` + `model.go` |
-| 新工具 | `internal/tools` + registry + prompt Tool Guidelines |
-| 多级 AGENTS / 更多指令文件 | `internal/agent/project_instructions.go` |
-| 记忆 schema / 巩固策略 | `internal/memory` |
-| 会话事件 / resume 行为 | `internal/store` + `chat` + session-persistence 文档 |
-| 权限语义 | `internal/tools` permissions + command-policy 文档 |
-| 包边界或分层变化 | **先更新本文**，再改代码 |
-
----
-
-## 9. 文档与代码的关系
-
-- `docs/research/*`：行业观察，**不是**本仓库实现合同  
-- `docs/iterations/*`：某次交付的决策与验收  
-- `docs/memory.md` / `session-persistence.md` / `command-policy.md`：用户/运维可依赖的行为说明  
-- 本文：开发者地图；与实现漂移时以代码为准并回写本文
+改动包边界、持久化分层或安全边界时，同步更新本文件和对应专题文档。代码是最终真相；`docs/research/` 是参考，不是实现合同。

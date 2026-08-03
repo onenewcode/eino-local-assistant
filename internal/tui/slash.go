@@ -196,6 +196,7 @@ func helpText() string {
 		"  up/down   input history (first/last composer line); slash menu when open",
 		"  tab       complete selected slash command",
 		"  ctrl+j    newline",
+		"  ctrl+t    show/hide complex task progress when available",
 		"  pgup/pgdn scroll transcript (or review a long host-escalation command)",
 		"  home/end  jump to top / bottom of transcript",
 		"  esc       dismiss slash menu, deny approval, or interrupt turn/compaction",

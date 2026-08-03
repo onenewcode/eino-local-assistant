@@ -18,6 +18,7 @@
 5. 大型工具输出优先落为 artifact；TUI 的显示截断不能污染持久化原文。
 6. resume 默认只水合活动 checkpoint 与最近 50 个可见 turn；更早 transcript 在向上滚动时分页读取。
 7. `/clear` 创建并切换到新 session，不重写当前 session；旧队列不��跨 session 执行。
+8. 自主复杂任务将图、proof 接受状态和中断状态写为 `task.state.updated`；`/resume` 恢复该投影，但恢复时仍为 `working` 的节点先转为 `needs_replan`，不会自动重放操作。普通后续输入延续原始需求；只有显式以当前用户原文替换 `user-request` 才改变任务范围并使相关 proof 失效。
 
 ## 目录布局
 
@@ -44,7 +45,7 @@
 | 文件 | 角色 |
 | --- | --- |
 | `journal.jsonl` | 权威 append-only 事件链；恢复时优先重放它。 |
-| `state.json` | revision、活动 checkpoint、自动压缩熔断和 meta 的物化投影。 |
+| `state.json` | revision、活动 checkpoint、任务图投影、自动压缩熔断和 meta 的物化投影。 |
 | `meta.json` | 列表和 CLI 展示用投影：标题、时间、消息数、API usage、最近 context 快照和本地费用估算。 |
 | `checkpoints/*.json` | 不可变的结构化 checkpoint；有对应 journal 事件后才成为活动 checkpoint。 |
 | `artifacts/*.json` | 内容地址、大小、摘要、截断状态和 head/tail 元数据。 |
@@ -72,6 +73,7 @@ previous_hash, payload_hash, payload, hash
 | `tool.started` / `tool.completed` | 以稳定 tool call ID 保存工具参数、结束状态和 artifact 引用；同名并发调用不会混淆。 |
 | `turn.committed` | 原子写入完整可见 user/assistant 消息。 |
 | `usage.recorded` | 记录一个已完成模型调用的服务商 usage、调用类型和可用性；调用 ID 幂等，ReAct 中间调用与 compaction 调用均单独记账。 |
+| `task.state.updated` | 任务图、节点状态、accepted proof 引用和控制状态的紧凑投影；成功状态转换先持久化再发布，写入失败也不得把内存放宽为可交付。`task_complete` 要等所属 `turn.committed` 才是最终批准；恢复会比对其后的 shell/patch 生命周期。完整 tool output 仍只由 `tool.completed` / artifact 保存。 |
 | `context.compaction.started` | 在 compactor provider 调用前记录 operation ID；直到成功或失败事件到达前，该操作保持 pending，防止 crash/retry 重复计费。 |
 | `turn.cancelled` / `turn.failed` | 保留未提交 turn 的终止原因，不将其送回后续模型。 |
 | `context.compacted` | 安装一个活动 checkpoint，并记录父 checkpoint、仅本次新增的直接来源、来源 hash、token 前后值和熔断状态。 |
@@ -118,7 +120,7 @@ previous_hash, payload_hash, payload, hash
 
 ## 工具 artifact
 
-工具回调先把完整参数/结果送到 session recorder；TUI 仅在 `formatToolCard` 渲染时限制字符和行数。
+工具回调先把完整参数/结果送到 session recorder，再让任务控制器记录观察；TUI 仅在 `formatToolCard` 渲染时限制字符和行数。任务完成或中断后才到达、且可能已修改工作区的工具结果会要求创建新计划，不能复用旧 proof。
 
 默认保留上限：
 

@@ -14,6 +14,13 @@ type turnChunkMsg struct {
 	chunk  string
 }
 
+// turnReasoningMsg is display-only model reasoning (ReasoningContent).
+// It is never written to the session ledger.
+type turnReasoningMsg struct {
+	turnID int
+	chunk  string
+}
+
 type turnToolStartMsg struct {
 	turnID int
 	tool   string
@@ -41,6 +48,14 @@ type turnToolErrorMsg struct {
 type turnUsageMsg struct {
 	turnID int
 	usage  chat.ModelUsageEvent
+}
+
+// turnTaskGateMsg is a controller-owned completion rejection. It is separate
+// from model text so users can tell that the agent is continuing rather than
+// treating an earlier natural-language claim as the final delivery.
+type turnTaskGateMsg struct {
+	turnID int
+	gate   chat.TaskCompletionGate
 }
 
 type turnDoneMsg struct {
@@ -101,6 +116,8 @@ func emitFromTurnEvent(ctx context.Context, turnID int, ch chan<- tea.Msg) chat.
 		switch ev.Kind {
 		case chat.TurnEventChunk:
 			msg = turnChunkMsg{turnID: turnID, chunk: ev.Chunk}
+		case chat.TurnEventReasoning:
+			msg = turnReasoningMsg{turnID: turnID, chunk: ev.Chunk}
 		case chat.TurnEventToolStart:
 			msg = turnToolStartMsg{turnID: turnID, tool: ev.Tool, callID: ev.ToolCallID, input: ev.Input}
 		case chat.TurnEventToolEnd:
@@ -113,6 +130,11 @@ func emitFromTurnEvent(ctx context.Context, turnID int, ch chan<- tea.Msg) chat.
 			}
 			// The producer may reuse its event object after Emit returns.
 			msg = turnUsageMsg{turnID: turnID, usage: *ev.ModelUsage}
+		case chat.TurnEventTaskGate:
+			if ev.TaskGate == nil {
+				return
+			}
+			msg = turnTaskGateMsg{turnID: turnID, gate: *ev.TaskGate}
 		default:
 			return
 		}

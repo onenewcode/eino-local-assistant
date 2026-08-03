@@ -36,6 +36,9 @@ const (
 type ReActOptions struct {
 	// MaxStep bounds model and tool graph iterations in one ReAct turn.
 	MaxStep int
+	// TaskController enables the optional autonomous-task runtime. It owns
+	// controller state while chat.Session owns the durable conversation ledger.
+	TaskController *TaskController
 }
 
 // DefaultReActOptions returns the options used by NewReActModel.
@@ -46,8 +49,9 @@ func DefaultReActOptions() ReActOptions {
 // ReActModel adapts Eino's ReAct agent to the local chat.Model stream interface.
 // Tool calls are handled inside the agent; callers only see the final assistant stream.
 type ReActModel struct {
-	agent   *react.Agent
-	maxStep int
+	agent          *react.Agent
+	maxStep        int
+	taskController *TaskController
 }
 
 // NewReActModel builds a streaming chat model backed by Eino ReAct + tools.
@@ -91,7 +95,7 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 		return nil, fmt.Errorf("create ReAct agent: %w", err)
 	}
 
-	return &ReActModel{agent: ag, maxStep: opts.MaxStep}, nil
+	return &ReActModel{agent: ag, maxStep: opts.MaxStep, taskController: opts.TaskController}, nil
 }
 
 func normalizeReActOptions(opts ReActOptions) (ReActOptions, error) {
@@ -121,12 +125,22 @@ func normalizeToolArguments(_ context.Context, _ string, arguments string) (stri
 
 // Stream runs one ReAct turn and returns the final assistant message stream.
 func (m *ReActModel) Stream(ctx context.Context, messages []*schema.Message) (chat.Stream, error) {
-	stream, err := m.agent.Stream(ctx, messages)
+	options := make([]agent.AgentOption, 0, 1)
+	if m.taskController != nil {
+		// Ask() has no UI emitter, but task proof acceptance still needs the
+		// immutable shell observation from the callback.
+		options = append(options, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(nil, m.taskController))))
+	}
+	stream, err := m.agent.Stream(ctx, m.messagesWithTaskPacket(ctx, messages), options...)
 	if err != nil {
 		return nil, err
 	}
 	return stream, nil
 }
+
+// ReasoningEventsFromStreams marks ReActModel as a chat.ReasoningEventSource:
+// observeModelStreams live-emits TurnEventReasoning for every model call.
+func (m *ReActModel) ReasoningEventsFromStreams() {}
 
 // StreamWithEvents runs one ReAct turn and emits tool lifecycle events when emit is set.
 func (m *ReActModel) StreamWithEvents(ctx context.Context, messages []*schema.Message, emit chat.EventEmitter) (chat.Stream, <-chan struct{}, error) {
@@ -135,17 +149,23 @@ func (m *ReActModel) StreamWithEvents(ctx context.Context, messages []*schema.Me
 		return stream, nil, err
 	}
 	usageOption, future := react.WithMessageFuture()
-	opts := []agent.AgentOption{usageOption, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(emit)))}
+	opts := []agent.AgentOption{usageOption}
 
-	stream, err := m.agent.Stream(ctx, messages, opts...)
+	if m.taskController != nil {
+		opts = append(opts, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(emit, m.taskController))))
+	} else {
+		opts = append(opts, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(emit, nil))))
+	}
+
+	stream, err := m.agent.Stream(ctx, m.messagesWithTaskPacket(ctx, messages), opts...)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	// The agent exposes only its final stream. MessageFuture gives the tracker a
+	// The agent exposes only its final stream. MessageFuture gives the observer a
 	// copy of every model stream inside the ReAct loop, including tool-planning
-	// calls that would otherwise disappear from session accounting.
-	done := collectModelUsage(future, emit)
+	// calls that would otherwise disappear from session accounting and UI.
+	done := observeModelStreams(future, emit)
 	return &usageTrackingStream{stream: stream, done: done}, done, nil
 }
 
@@ -181,7 +201,9 @@ func (s *usageTrackingStream) waitForUsage() {
 	<-s.done
 }
 
-func collectModelUsage(future react.MessageFuture, emit chat.EventEmitter) <-chan struct{} {
+// observeModelStreams drains every MessageFuture model stream: live-emits
+// TurnEventReasoning deltas and records per-call usage when the stream ends.
+func observeModelStreams(future react.MessageFuture, emit chat.EventEmitter) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -193,13 +215,13 @@ func collectModelUsage(future react.MessageFuture, emit chat.EventEmitter) <-cha
 				return
 			}
 			callID := fmt.Sprintf("model-%d", atomic.AddUint64(&callNumber, 1))
-			collectOneModelUsage(stream, callID, emit)
+			observeOneModelStream(stream, callID, emit)
 		}
 	}()
 	return done
 }
 
-func collectOneModelUsage(stream *schema.StreamReader[*schema.Message], callID string, emit chat.EventEmitter) {
+func observeOneModelStream(stream *schema.StreamReader[*schema.Message], callID string, emit chat.EventEmitter) {
 	if stream == nil {
 		return
 	}
@@ -218,6 +240,14 @@ func collectOneModelUsage(stream *schema.StreamReader[*schema.Message], callID s
 				hasToolChunk = true
 			case schema.Assistant, "":
 				hasModelChunk = true
+				// Live-emit reasoning from every model call (including the final
+				// one). Session skips final-stream re-emit for ReasoningEventSource.
+				if emit != nil && message.ReasoningContent != "" {
+					emit(chat.TurnEvent{
+						Kind:  chat.TurnEventReasoning,
+						Chunk: message.ReasoningContent,
+					})
+				}
 			}
 		}
 		if errors.Is(err, io.EOF) {
@@ -274,7 +304,7 @@ func emitModelUsage(emit chat.EventEmitter, callID string, turn usage.Turn, avai
 	})
 }
 
-func toolEventCallback(emit chat.EventEmitter) callbacks.Handler {
+func toolEventCallback(emit chat.EventEmitter, taskController *TaskController) callbacks.Handler {
 	return react.BuildAgentCallback(nil, &cbtemplate.ToolCallbackHandler{
 		OnStart: func(ctx context.Context, info *callbacks.RunInfo, input *tool.CallbackInput) context.Context {
 			name := ""
@@ -287,12 +317,14 @@ func toolEventCallback(emit chat.EventEmitter) callbacks.Handler {
 			}
 			// Preserve the complete observation for the session recorder. Rendering
 			// is deliberately bounded later in the TUI, not at this provenance edge.
-			emit(chat.TurnEvent{
-				Kind:       chat.TurnEventToolStart,
-				Tool:       name,
-				ToolCallID: compose.GetToolCallID(ctx),
-				Input:      args,
-			})
+			if emit != nil {
+				emit(chat.TurnEvent{
+					Kind:       chat.TurnEventToolStart,
+					Tool:       name,
+					ToolCallID: compose.GetToolCallID(ctx),
+					Input:      args,
+				})
+			}
 			return ctx
 		},
 		OnEnd: func(ctx context.Context, info *callbacks.RunInfo, output *tool.CallbackOutput) context.Context {
@@ -304,12 +336,19 @@ func toolEventCallback(emit chat.EventEmitter) callbacks.Handler {
 			if output != nil {
 				response = output.Response
 			}
-			emit(chat.TurnEvent{
-				Kind:       chat.TurnEventToolEnd,
-				Tool:       name,
-				ToolCallID: compose.GetToolCallID(ctx),
-				Output:     response,
-			})
+			if emit != nil {
+				emit(chat.TurnEvent{
+					Kind:       chat.TurnEventToolEnd,
+					Tool:       name,
+					ToolCallID: compose.GetToolCallID(ctx),
+					Output:     response,
+				})
+			}
+			if taskController != nil {
+				// The durable tool-completed event is recorded synchronously by the
+				// session emitter before controller accepts it as task evidence.
+				taskController.RecordToolResult(ctx, name, compose.GetToolCallID(ctx), "", response)
+			}
 			return ctx
 		},
 		OnError: func(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
@@ -317,15 +356,82 @@ func toolEventCallback(emit chat.EventEmitter) callbacks.Handler {
 			if info != nil {
 				name = info.Name
 			}
-			emit(chat.TurnEvent{
-				Kind:       chat.TurnEventToolError,
-				Tool:       name,
-				ToolCallID: compose.GetToolCallID(ctx),
-				Err:        err,
-			})
+			if emit != nil {
+				emit(chat.TurnEvent{
+					Kind:       chat.TurnEventToolError,
+					Tool:       name,
+					ToolCallID: compose.GetToolCallID(ctx),
+					Err:        err,
+				})
+			}
+			if taskController != nil && (name == "apply_patch" || name == "shell") {
+				// A patch operation can fail after an earlier edit, and an execution
+				// error can arrive after a shell process started. Treat both as
+				// uncertain workspace mutations before accepting old proof again.
+				failure := "tool error"
+				if err != nil {
+					failure += ": " + err.Error()
+				}
+				taskController.RecordToolResult(ctx, name, compose.GetToolCallID(ctx), "", failure)
+			}
 			return ctx
 		},
 	})
+}
+
+// messagesWithTaskPacket places controller-owned task state after the durable
+// system prefix. It is deliberately ephemeral: compaction and session replay
+// never need to treat the packet as a user-authored transcript message.
+func (m *ReActModel) messagesWithTaskPacket(ctx context.Context, messages []*schema.Message) []*schema.Message {
+	if m == nil || m.taskController == nil {
+		return messages
+	}
+	packet := strings.TrimSpace(m.taskController.ExecutionPacket(ctx))
+	if packet == "" {
+		return messages
+	}
+	insertAt := 0
+	for insertAt < len(messages) && messages[insertAt] != nil && messages[insertAt].Role == schema.System {
+		insertAt++
+	}
+	withPacket := make([]*schema.Message, 0, len(messages)+1)
+	withPacket = append(withPacket, messages[:insertAt]...)
+	withPacket = append(withPacket, schema.SystemMessage(packet))
+	withPacket = append(withPacket, messages[insertAt:]...)
+	return withPacket
+}
+
+// TaskExecutionStatus, TaskCompletionGate, and InterruptTask satisfy the
+// optional chat.TaskRuntime contract without making chat depend on agent.
+func (m *ReActModel) TaskExecutionStatus(ctx context.Context) chat.TaskRunStatus {
+	if m == nil || m.taskController == nil {
+		return chat.TaskRunStatus{}
+	}
+	return m.taskController.TaskExecutionStatus(ctx)
+}
+
+func (m *ReActModel) TaskCompletionGate(ctx context.Context) chat.TaskCompletionGate {
+	if m == nil || m.taskController == nil {
+		return chat.TaskCompletionGate{}
+	}
+	return m.taskController.TaskCompletionGate(ctx)
+}
+
+func (m *ReActModel) InterruptTask(ctx context.Context, reason string) chat.TaskInterruptReceipt {
+	if m == nil || m.taskController == nil {
+		return chat.TaskInterruptReceipt{Summary: "task runtime is unavailable"}
+	}
+	return m.taskController.InterruptTask(ctx, reason)
+}
+
+// AbortTaskCompletion implements chat.TaskCompletionRevoker. It is invoked by
+// Session only when the turn that obtained completion approval cannot commit
+// its final delivery.
+func (m *ReActModel) AbortTaskCompletion(ctx context.Context, reason string) chat.TaskInterruptReceipt {
+	if m == nil || m.taskController == nil {
+		return chat.TaskInterruptReceipt{Summary: "task runtime is unavailable"}
+	}
+	return m.taskController.AbortTaskCompletion(ctx, reason)
 }
 
 // contentThenToolStreamToolCallChecker reports whether a model stream contains

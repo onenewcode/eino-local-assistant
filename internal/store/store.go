@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
@@ -71,6 +72,33 @@ type ThreadRepository interface {
 	RecordCompactionFailure(ctx context.Context, id string, expectedRevision uint64, input CompactionFailure) (ThreadState, error)
 	FinishCompaction(ctx context.Context, id string, input CompactionFailure) (ThreadState, error)
 	ResetIncompatibleCheckpoint(ctx context.Context, id string, expectedRevision uint64, input CheckpointSchemaReset) (ThreadState, error)
+}
+
+// TaskStateRepository is an optional extension for runtimes that need a
+// compact, recoverable execution-state projection alongside the normal thread
+// ledger. It is separate from ThreadRepository so existing callers and test
+// fakes do not gain an orchestration dependency.
+type TaskStateRepository interface {
+	LoadTaskState(ctx context.Context, id string) (json.RawMessage, error)
+	UpdateTaskState(ctx context.Context, id string, expectedRevision uint64, turnID string, input TaskStateUpdate) (ThreadState, error)
+}
+
+// TaskStateRecovery is the ledger metadata needed to safely restore an opaque
+// task-controller snapshot. The snapshot schema remains owned by the runtime;
+// store only reports whether tool lifecycle events appeared after it.
+type TaskStateRecovery struct {
+	Snapshot                             json.RawMessage
+	SnapshotTurnID                       string
+	SnapshotTurnCommitted                bool
+	PotentiallyMutatingToolAfterSnapshot bool
+}
+
+// TaskStateRecoveryRepository is an optional stronger recovery extension.
+// Runtimes that only need an opaque snapshot can continue using
+// TaskStateRepository unchanged.
+type TaskStateRecoveryRepository interface {
+	TaskStateRepository
+	LoadTaskStateRecovery(ctx context.Context, id string) (TaskStateRecovery, error)
 }
 
 type threadAccessContextKey struct{}

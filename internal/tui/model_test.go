@@ -95,6 +95,64 @@ func TestChunkAndToolEventsUpdateTranscript(t *testing.T) {
 	}
 }
 
+func TestReasoningEventsStreamThenFold(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{Ctx: context.Background(), Session: session})
+	m.turnID = 1
+	m.mode = modeBusy
+	m.width = 80
+	m.layout()
+
+	next, _ := m.Update(turnReasoningMsg{turnID: 1, chunk: "consider "})
+	mm := next.(*model)
+	next, _ = mm.Update(turnReasoningMsg{turnID: 1, chunk: "options"})
+	mm = next.(*model)
+	if mm.openReasoning < 0 {
+		t.Fatal("expected open reasoning block")
+	}
+	if !hasLineContaining(mm.lines, lineReasoning, "consider options") {
+		t.Fatalf("streaming reasoning missing: %#v", mm.lines)
+	}
+
+	// Content must not fold: final model calls interleave reasoning/content.
+	next, _ = mm.Update(turnChunkMsg{turnID: 1, chunk: "done"})
+	mm = next.(*model)
+	if mm.openReasoning < 0 {
+		t.Fatal("reasoning must stay open across assistant content")
+	}
+	if !hasLineContaining(mm.lines, lineAssistant, "done") {
+		t.Fatalf("assistant missing: %#v", mm.lines)
+	}
+	// Streaming indicator tracks the open index, not "last line only".
+	if !mm.reasoningIsStreaming(mm.openReasoning) {
+		t.Fatal("open reasoning should still count as streaming after content")
+	}
+
+	// Tool start folds via appendLine before the card.
+	next, _ = mm.Update(turnToolStartMsg{turnID: 1, tool: "search", callID: "c1", input: "{}"})
+	mm = next.(*model)
+	if mm.openReasoning != noOpenReasoning {
+		t.Fatal("reasoning should fold on tool start")
+	}
+	var folded *transcriptLine
+	for i := range mm.lines {
+		if mm.lines[i].kind == lineReasoning {
+			folded = &mm.lines[i]
+			break
+		}
+	}
+	if folded == nil {
+		t.Fatalf("reasoning line missing after fold: %#v", mm.lines)
+	}
+	if !folded.folded || !strings.Contains(folded.text, "thinking") {
+		t.Fatalf("expected folded summary, got %#v", *folded)
+	}
+	// Fold is lossy by design (ephemeral UI); body is not retained.
+	if strings.Contains(folded.text, "consider options") && !strings.Contains(folded.text, "chars") {
+		t.Fatalf("expected summary form, got %#v", *folded)
+	}
+}
+
 func TestTurnCompletionDrainsBufferedStreamEvents(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
 	m := newModel(Deps{Ctx: context.Background(), Session: session})

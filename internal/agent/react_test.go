@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,8 @@ import (
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/tools"
 
+	"github.com/cloudwego/eino/callbacks"
+	"github.com/cloudwego/eino/components"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -258,7 +262,7 @@ func TestCollectOneModelUsageAfterStreamError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var events []chat.TurnEvent
-			collectOneModelUsage(streamEndingWithError(tt.chunks, streamErr), "model-1", func(event chat.TurnEvent) {
+			observeOneModelStream(streamEndingWithError(tt.chunks, streamErr), "model-1", func(event chat.TurnEvent) {
 				events = append(events, event)
 			})
 
@@ -303,7 +307,7 @@ func TestCollectOneModelUsagePreservesUsageWhenChunksCannotConcat(t *testing.T) 
 		{Role: schema.Assistant, Name: "second"},
 	})
 	var events []chat.TurnEvent
-	collectOneModelUsage(stream, "model-1", func(event chat.TurnEvent) {
+	observeOneModelStream(stream, "model-1", func(event chat.TurnEvent) {
 		events = append(events, event)
 	})
 	if len(events) != 1 || events[0].ModelUsage == nil {
@@ -411,6 +415,115 @@ func TestReActModelStreamsPlainAnswersWithoutTools(t *testing.T) {
 	}
 }
 
+func TestReActTaskCallbackCreatesPlanRequiredGateAfterUnplannedPatch(t *testing.T) {
+	workspace := t.TempDir()
+	patchTool, err := tools.NewApplyPatch(tools.ApplyPatchOptions{
+		WorkspaceRoot: workspace,
+		Approval:      tools.ApprovalNever,
+	})
+	if err != nil {
+		t.Fatalf("NewApplyPatch: %v", err)
+	}
+	controller := NewTaskController()
+	fake := &scriptedToolModel{responses: []modelResponse{
+		{message: &schema.Message{
+			Role: schema.Assistant,
+			ToolCalls: []schema.ToolCall{{
+				ID:   "patch-before-plan",
+				Type: "function",
+				Function: schema.FunctionCall{
+					Name:      "apply_patch",
+					Arguments: `{"operations":[{"type":"create_file","path":"changed.txt","content":"changed\n"}]}`,
+				},
+			}},
+		}},
+		{message: schema.AssistantMessage("premature delivery", nil)},
+		{message: schema.AssistantMessage("still not planned", nil)},
+		{message: schema.AssistantMessage("still not planned", nil)},
+	}}
+	reactModel, err := NewReActModelWithOptions(context.Background(), fake, []tool.BaseTool{patchTool}, ReActOptions{
+		MaxStep:        6,
+		TaskController: controller,
+	})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions: %v", err)
+	}
+	session, err := chat.NewSession(reactModel, "system", chat.SessionOptions{Store: newTestThreadStore(t)})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	err = session.Ask(context.Background(), "edit the file", nil)
+	if !errors.Is(err, chat.ErrTaskCompletionUnresolved) {
+		t.Fatalf("Ask error = %v, want unresolved task completion", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "changed.txt")); err != nil {
+		t.Fatalf("apply_patch did not run: %v", err)
+	}
+	status := session.TaskStatus()
+	if status.State != taskRunActive || !strings.Contains(strings.Join(status.Gaps, " "), "before a task plan") {
+		t.Fatalf("task status after callback = %#v", status)
+	}
+	if len(fake.requests) < 3 || !containsTaskPacket(fake.requests[2], "Create a fresh task_plan") {
+		t.Fatalf("continuation request missing controller packet: %#v", fake.requests)
+	}
+}
+
+func TestReActTaskCallbackInvalidatesProofAfterApplyPatchError(t *testing.T) {
+	controller := NewTaskController()
+	ctx := taskTestContext(t, "task-callback-patch-error")
+	if result, err := controller.SetPlan(ctx, simpleTaskPlan()); err != nil || !result.OK {
+		t.Fatalf("SetPlan = %#v, %v", result, err)
+	}
+	if result, err := controller.StartTask(ctx, "implement"); err != nil || !result.OK {
+		t.Fatalf("StartTask = %#v, %v", result, err)
+	}
+	controller.RecordToolResult(ctx, "shell", "proof", "", `{"command":"go test ./internal/example","exit_code":0}`)
+	if result, err := controller.RecordProof(ctx, "implement", "unit", "proof"); err != nil || !result.OK {
+		t.Fatalf("RecordProof = %#v, %v", result, err)
+	}
+
+	toolEventCallback(nil, controller).OnError(ctx, &callbacks.RunInfo{
+		Component: components.ComponentOfTool,
+		Name:      "apply_patch",
+	}, errors.New("write second file: disk full"))
+	if status := controller.TaskExecutionStatus(ctx); status.DoneTasks != 0 || len(status.Gaps) == 0 {
+		t.Fatalf("apply_patch callback error must invalidate evidence: %#v", status)
+	}
+}
+
+func TestReActTaskCallbackInvalidatesProofAfterShellError(t *testing.T) {
+	controller := NewTaskController()
+	ctx := taskTestContext(t, "task-callback-shell-error")
+	if result, err := controller.SetPlan(ctx, simpleTaskPlan()); err != nil || !result.OK {
+		t.Fatalf("SetPlan = %#v, %v", result, err)
+	}
+	if result, err := controller.StartTask(ctx, "implement"); err != nil || !result.OK {
+		t.Fatalf("StartTask = %#v, %v", result, err)
+	}
+	controller.RecordToolResult(ctx, "shell", "proof", "", `{"command":"go test ./internal/example","exit_code":0}`)
+	if result, err := controller.RecordProof(ctx, "implement", "unit", "proof"); err != nil || !result.OK {
+		t.Fatalf("RecordProof = %#v, %v", result, err)
+	}
+
+	toolEventCallback(nil, controller).OnError(ctx, &callbacks.RunInfo{
+		Component: components.ComponentOfTool,
+		Name:      "shell",
+	}, errors.New("wait command: transport lost after process start"))
+	if status := controller.TaskExecutionStatus(ctx); status.DoneTasks != 0 || len(status.Gaps) == 0 {
+		t.Fatalf("shell callback error must invalidate evidence: %#v", status)
+	}
+}
+
+func containsTaskPacket(messages []*schema.Message, fragment string) bool {
+	for _, message := range messages {
+		if message != nil && message.Role == schema.System && strings.Contains(message.Content, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestContentThenToolStreamToolCallCheckerFindsLaterToolCalls(t *testing.T) {
 	// DeepSeek-style stream: text first, tool_calls later.
 	sr := schema.StreamReaderFromArray([]*schema.Message{
@@ -513,6 +626,72 @@ func TestTruncateRunes(t *testing.T) {
 	got := truncateRunes("abcdefghij", 5)
 	if !strings.HasSuffix(got, "…") || len([]rune(got)) != 5 {
 		t.Errorf("truncate long = %q", got)
+	}
+}
+
+func TestReActEmitsReasoningFromEveryModelCall(t *testing.T) {
+	timeTool, err := tools.NewGetCurrentTime(time.Now)
+	if err != nil {
+		t.Fatalf("NewGetCurrentTime: %v", err)
+	}
+	fake := &scriptedToolModel{responses: []modelResponse{
+		{
+			stream: []*schema.Message{
+				{Role: schema.Assistant, ReasoningContent: "need clock"},
+				{
+					Role: schema.Assistant,
+					ToolCalls: []schema.ToolCall{{
+						ID:   "call_time_1",
+						Type: "function",
+						Function: schema.FunctionCall{
+							Name:      "get_current_time",
+							Arguments: `{}`,
+						},
+					}},
+					ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{
+						PromptTokens: 5, CompletionTokens: 1, TotalTokens: 6,
+					}},
+				},
+			},
+		},
+		{
+			stream: []*schema.Message{
+				{Role: schema.Assistant, ReasoningContent: "format answer"},
+				{
+					Role:    schema.Assistant,
+					Content: "it is noon",
+					ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{
+						PromptTokens: 8, CompletionTokens: 2, TotalTokens: 10,
+					}},
+				},
+			},
+		},
+	}}
+
+	reactModel, err := NewReActModel(context.Background(), fake, []tool.BaseTool{timeTool})
+	if err != nil {
+		t.Fatalf("NewReActModel: %v", err)
+	}
+	session, err := chat.NewSession(reactModel, "system", chat.SessionOptions{Store: newTestThreadStore(t)})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	var reasoning []string
+	if err := session.AskWithEvents(context.Background(), "time?", nil, func(ev chat.TurnEvent) {
+		if ev.Kind == chat.TurnEventReasoning {
+			reasoning = append(reasoning, ev.Chunk)
+		}
+	}); err != nil {
+		t.Fatalf("AskWithEvents: %v", err)
+	}
+	if got, want := strings.Join(reasoning, "|"), "need clock|format answer"; got != want {
+		t.Fatalf("reasoning = %q, want %q", got, want)
+	}
+	for _, msg := range session.Transcript() {
+		if msg != nil && msg.ReasoningContent != "" {
+			t.Fatalf("committed message kept ReasoningContent: %#v", msg)
+		}
 	}
 }
 

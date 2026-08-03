@@ -146,9 +146,19 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// The task runtime stays in internal/agent, while its three orchestration
+	// tools join the normal policy-enforced workspace tool registry here.
+	taskController := agent.NewTaskController()
+	taskTools, err := agent.NewTaskTools(taskController)
+	if err != nil {
+		return fmt.Errorf("create task tools: %w", err)
+	}
+	allTools := append(registry.All(), taskTools...)
+	registry = tools.New(allTools...)
 
 	model, err := agent.NewReActModelWithOptions(processCtx, chatModel, registry.All(), agent.ReActOptions{
-		MaxStep: runtimeCfg.MaxReactSteps,
+		MaxStep:        runtimeCfg.MaxReactSteps,
+		TaskController: taskController,
 	})
 	if err != nil {
 		return err

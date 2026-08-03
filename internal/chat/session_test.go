@@ -78,6 +78,206 @@ func TestSessionAskAggregatesStreamAndCommitsCompleteTurn(t *testing.T) {
 	})
 }
 
+func TestSessionAskEmitsReasoningAndStripsOnCommit(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{
+		{message: &schema.Message{Role: schema.Assistant, ReasoningContent: "step ", Content: ""}},
+		{message: &schema.Message{Role: schema.Assistant, ReasoningContent: "one", Content: "Hello"}},
+	}}
+	model := &scriptedModel{streams: []Stream{stream}}
+	session, err := NewSession(model, "system", SessionOptions{Store: newDurableThreadStore(t)})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	var reasoning []string
+	var chunks []string
+	err = session.AskWithEvents(context.Background(), "hi", func(chunk string) error {
+		chunks = append(chunks, chunk)
+		return nil
+	}, func(ev TurnEvent) {
+		switch ev.Kind {
+		case TurnEventReasoning:
+			reasoning = append(reasoning, ev.Chunk)
+		case TurnEventChunk:
+			// also observed via onChunk
+		}
+	})
+	if err != nil {
+		t.Fatalf("AskWithEvents: %v", err)
+	}
+	if got, want := strings.Join(reasoning, ""), "step one"; got != want {
+		t.Fatalf("reasoning events = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(chunks, ""), "Hello"; got != want {
+		t.Fatalf("content = %q, want %q", got, want)
+	}
+	for _, msg := range session.Transcript() {
+		if msg != nil && msg.ReasoningContent != "" {
+			t.Fatalf("committed transcript must strip ReasoningContent: %#v", msg)
+		}
+	}
+
+	// Second turn must not re-send prior reasoning into the model prompt.
+	stream2 := &scriptedStream{events: []streamEvent{
+		{message: schema.AssistantMessage("ok", nil)},
+	}}
+	model.streams = []Stream{stream2}
+	if err := session.Ask(context.Background(), "again", nil); err != nil {
+		t.Fatalf("second Ask: %v", err)
+	}
+	if len(model.requests) < 2 {
+		t.Fatalf("expected second model request, got %d", len(model.requests))
+	}
+	for _, msg := range model.requests[1] {
+		if msg != nil && msg.ReasoningContent != "" {
+			t.Fatalf("follow-up prompt must not include ReasoningContent: %#v", msg)
+		}
+	}
+}
+
+func TestStripReasoningForStorage(t *testing.T) {
+	if got := stripReasoningForStorage(nil); got != nil {
+		t.Fatalf("nil in => %v", got)
+	}
+	plain := schema.AssistantMessage("hi", nil)
+	if got := stripReasoningForStorage(plain); got != plain {
+		t.Fatalf("no reasoning should return same pointer")
+	}
+	withRC := &schema.Message{
+		Role:             schema.Assistant,
+		Content:          "hi",
+		ReasoningContent: "think",
+		Extra: map[string]any{
+			extraKeyClaudeThinking:         "think",
+			extraKeyClaudeThinkingSign:     "sig",
+			extraKeyOpenAIReasoningContent: "think",
+			"keep-me":                      "ok",
+		},
+		AssistantGenMultiContent: []schema.MessageOutputPart{
+			{Type: schema.ChatMessagePartTypeReasoning, Reasoning: &schema.MessageOutputReasoning{Text: "step"}},
+			{Type: schema.ChatMessagePartTypeText, Text: "hi"},
+		},
+	}
+	stripped := stripReasoningForStorage(withRC)
+	if stripped == withRC {
+		t.Fatal("expected copy when stripping")
+	}
+	if stripped.ReasoningContent != "" || stripped.Content != "hi" {
+		t.Fatalf("stripped = %#v", stripped)
+	}
+	if stripped.Extra["keep-me"] != "ok" {
+		t.Fatalf("non-reasoning extra lost: %#v", stripped.Extra)
+	}
+	for _, key := range []string{extraKeyClaudeThinking, extraKeyClaudeThinkingSign, extraKeyOpenAIReasoningContent} {
+		if _, ok := stripped.Extra[key]; ok {
+			t.Fatalf("reasoning extra %q must be removed", key)
+		}
+	}
+	if len(stripped.AssistantGenMultiContent) != 1 || stripped.AssistantGenMultiContent[0].Type != schema.ChatMessagePartTypeText {
+		t.Fatalf("reasoning multi-parts not stripped: %#v", stripped.AssistantGenMultiContent)
+	}
+	if withRC.ReasoningContent != "think" || withRC.Extra[extraKeyClaudeThinking] != "think" {
+		t.Fatal("original must be unchanged")
+	}
+}
+
+func TestSessionStripsProviderExtraThinkingOnCommit(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{
+		{message: &schema.Message{
+			Role:             schema.Assistant,
+			Content:          "Hello",
+			ReasoningContent: "private",
+			Extra: map[string]any{
+				extraKeyClaudeThinking:     "private",
+				extraKeyClaudeThinkingSign: "sig-1",
+			},
+		}},
+	}}
+	model := &scriptedModel{streams: []Stream{stream}}
+	session, err := NewSession(model, "system", SessionOptions{Store: newDurableThreadStore(t)})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := session.Ask(context.Background(), "hi", nil); err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	for _, msg := range session.Transcript() {
+		if msg == nil || msg.Role != schema.Assistant {
+			continue
+		}
+		if msg.ReasoningContent != "" {
+			t.Fatalf("ReasoningContent leaked: %#v", msg)
+		}
+		if msg.Extra != nil {
+			if _, ok := msg.Extra[extraKeyClaudeThinking]; ok {
+				t.Fatalf("claude thinking extra leaked: %#v", msg.Extra)
+			}
+		}
+	}
+
+	stream2 := &scriptedStream{events: []streamEvent{
+		{message: schema.AssistantMessage("ok", nil)},
+	}}
+	model.streams = []Stream{stream2}
+	if err := session.Ask(context.Background(), "again", nil); err != nil {
+		t.Fatalf("second Ask: %v", err)
+	}
+	for _, msg := range model.requests[1] {
+		if msg == nil {
+			continue
+		}
+		if msg.ReasoningContent != "" {
+			t.Fatalf("follow-up prompt ReasoningContent: %#v", msg)
+		}
+		if msg.Extra != nil {
+			if _, ok := msg.Extra[extraKeyClaudeThinking]; ok {
+				t.Fatalf("follow-up prompt thinking extra: %#v", msg.Extra)
+			}
+		}
+	}
+}
+
+// reasoningSourceModel is EventAware and claims to emit reasoning events so
+// streamAnswer must not re-emit ReasoningContent from the final stream.
+type reasoningSourceModel struct {
+	scriptedModel
+}
+
+func (m *reasoningSourceModel) ReasoningEventsFromStreams() {}
+
+func (m *reasoningSourceModel) StreamWithEvents(ctx context.Context, messages []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error) {
+	// Simulate ReAct: emit reasoning from the sidecar, not from final Recv only.
+	if emit != nil {
+		emit(TurnEvent{Kind: TurnEventReasoning, Chunk: "from-source"})
+	}
+	stream, err := m.Stream(ctx, messages)
+	done := make(chan struct{})
+	close(done)
+	return stream, done, err
+}
+
+func TestSessionSkipsReasoningEmitWhenModelIsReasoningEventSource(t *testing.T) {
+	stream := &scriptedStream{events: []streamEvent{
+		{message: &schema.Message{Role: schema.Assistant, ReasoningContent: "from-final-stream", Content: "hi"}},
+	}}
+	model := &reasoningSourceModel{scriptedModel: scriptedModel{streams: []Stream{stream}}}
+	session, err := NewSession(model, "system", SessionOptions{Store: newDurableThreadStore(t)})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	var reasoning []string
+	if err := session.AskWithEvents(context.Background(), "hi", nil, func(ev TurnEvent) {
+		if ev.Kind == TurnEventReasoning {
+			reasoning = append(reasoning, ev.Chunk)
+		}
+	}); err != nil {
+		t.Fatalf("AskWithEvents: %v", err)
+	}
+	if got, want := strings.Join(reasoning, "|"), "from-source"; got != want {
+		t.Fatalf("reasoning = %q, want only sidecar emit %q (no final-stream duplicate)", got, want)
+	}
+}
+
 func TestSessionAskSendsPriorCompleteTurnsAsContext(t *testing.T) {
 	firstStream := &scriptedStream{events: []streamEvent{
 		{message: schema.AssistantMessage("first answer", nil)},

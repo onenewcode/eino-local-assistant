@@ -91,6 +91,9 @@ const (
 type transcriptLine struct {
 	kind lineKind
 	text string
+	// folded is set when a lineReasoning block was collapsed to a one-line summary.
+	// Display-only; never enters the session ledger.
+	folded bool
 }
 
 type lineKind int
@@ -104,6 +107,8 @@ const (
 	// lineUsage is TUI chrome only (turn token/cost footer). It is never
 	// written to the session ledger and never included in the model prompt.
 	lineUsage
+	// lineReasoning is ephemeral model reasoning summary for this process only.
+	lineReasoning
 	lineSep
 )
 
@@ -139,6 +144,9 @@ type model struct {
 	// slashItems is the live prefix-filtered command menu (empty => closed).
 	slashItems []slashCommand
 	slashSel   int
+	// taskPaneOpen exposes a compact, read-only task projection without making
+	// the controller's internal graph part of the command surface.
+	taskPaneOpen bool
 
 	mode             mode
 	turnID           int
@@ -156,8 +164,10 @@ type model struct {
 	compactAutomatic bool
 
 	streamingAssistant bool
-	err                error
-	quitting           bool
+	// openReasoning is the index of the in-flight reasoning line, or noOpenReasoning.
+	openReasoning int
+	err           error
+	quitting      bool
 
 	// pendingApproval is set while run_command waits for a human decision.
 	pendingApproval *approvalRequestMsg
@@ -380,6 +390,7 @@ func newModel(deps Deps) *model {
 		inputHist:     newInputHistory(),
 		openToolCards: make(map[string]int),
 		openToolNames: make(map[string]string),
+		openReasoning: noOpenReasoning,
 		composerReady: true,
 	}
 	// CLI resume (and any Session with a loaded transcript) must show prior turns.
@@ -433,6 +444,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clearPendingApproval(tools.ApprovalDeny)
 				if m.mode == modeBusy {
 					m.interruptTurn("interrupted")
+					m.cancelActiveTask("user interrupted the active turn")
 				}
 				return m, nil
 			}
@@ -442,6 +454,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			if m.mode == modeBusy {
 				m.interruptTurn("interrupted")
+				m.cancelActiveTask("user interrupted the active turn")
 				return m, nil
 			}
 			if m.mode == modeCompacting {
@@ -454,6 +467,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Interrupt always wins over menu dismiss while work is running.
 			if m.mode == modeBusy {
 				m.interruptTurn("interrupted")
+				m.cancelActiveTask("user interrupted the active turn")
 				return m, nil
 			}
 			if m.mode == modeCompacting {
@@ -470,6 +484,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitting = true
 				return m, tea.Quit
 			}
+		case tea.KeyCtrlT:
+			if m.toggleTaskPane() {
+				m.layout()
+				m.refreshViewport()
+			}
+			return m, nil
 		case tea.KeyTab:
 			// Complete the selected slash command; never insert a literal tab.
 			if m.slashMenuOpen() {
@@ -544,14 +564,23 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.turnID != m.turnID {
 			return m, m.nextEventCmd()
 		}
+		// Do not fold reasoning here: content and reasoning for the final
+		// model call can arrive concurrently from different goroutines.
 		m.appendAssistantChunk(msg.chunk)
+		return m, m.nextEventCmd()
+
+	case turnReasoningMsg:
+		if msg.turnID != m.turnID {
+			return m, m.nextEventCmd()
+		}
+		m.appendReasoningChunk(msg.chunk)
 		return m, m.nextEventCmd()
 
 	case turnToolStartMsg:
 		if msg.turnID != m.turnID {
 			return m, m.nextEventCmd()
 		}
-		m.streamingAssistant = false
+		// appendLine folds any open reasoning before the tool card.
 		m.currentTool = msg.tool
 		m.appendLine(lineTool, formatToolCard(msg.tool, msg.input, "run"))
 		key := toolCardKey(msg.callID, msg.tool)
@@ -600,6 +629,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.addTurnUsage(msg.usage)
 		return m, m.nextEventCmd()
 
+	case turnTaskGateMsg:
+		if msg.turnID != m.turnID {
+			return m, m.nextEventCmd()
+		}
+		summary := strings.TrimSpace(msg.gate.Summary)
+		if summary == "" {
+			summary = "controller rejected completion"
+		}
+		m.appendLine(lineSystem, "task completion check: "+summary+"; continuing")
+		return m, m.nextEventCmd()
+
 	case turnDoneMsg:
 		if msg.turnID != m.turnID {
 			return m, nil
@@ -613,6 +653,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		done := *m.pendingTurnDone
 		m.pendingTurnDone = nil
+		m.foldOpenReasoning()
 		cmd := m.finishTurn(done.err)
 		return m, cmd
 
@@ -663,7 +704,7 @@ func (m *model) View() string {
 	}
 
 	status := renderStatusBar(m.width, m.statusLabel())
-	helpTextLine := "enter send · ↑↓ history · ctrl+j newline · pgup/pgdn scroll · esc interrupt · /help"
+	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · esc interrupt · /help"
 	if m.hasPendingApproval() {
 		if approvalAllowsSession(m.pendingApproval.Request) {
 			helpTextLine = "1 once · 2 session · 3 deny · enter confirm · esc deny"
@@ -672,6 +713,8 @@ func (m *model) View() string {
 		}
 	} else if m.slashMenuOpen() {
 		helpTextLine = "↑↓ select · tab complete · enter accept · esc dismiss · ctrl+j newline"
+	} else if m.taskPaneOpen {
+		helpTextLine = "ctrl+t hide task progress · esc interrupt · /help"
 	}
 	help := helpStyle.Render(helpTextLine)
 	composer := renderComposer(m.width, m.textarea.View())
@@ -679,10 +722,14 @@ func (m *model) View() string {
 	// Transcript
 	// ────────
 	// status
+	// [task progress]
 	// [approval modal | slash menu]
 	// ╭ composer ╮
 	// help
 	parts := []string{m.viewport.View(), status}
+	if m.taskPaneOpen {
+		parts = append(parts, m.taskPaneView())
+	}
 	if m.hasPendingApproval() {
 		parts = append(parts, m.approvalModalPage().content)
 	} else if m.slashMenuOpen() {
@@ -725,6 +772,7 @@ func (m *model) statusLabel() string {
 	} else if m.streamingAssistant {
 		activity = "streaming"
 	}
+	// Open reasoning keeps the default "thinking" activity label.
 	elapsed := time.Since(m.turnStart).Round(time.Second)
 	return m.spinner.View() + " " +
 		fmt.Sprintf("Working · %s (%s · esc)%s", activity, elapsed, suffix)
@@ -770,12 +818,12 @@ func (m *model) layout() {
 		innerW = 10
 	}
 	m.textarea.SetWidth(innerW)
-	// viewport = total - composer border - status(rule+line) - help - slash/approval
-	// border +2; status rule+label +2; help +1; menu rows when open.
+	// viewport = total - composer border - status(rule+line) - help - optional
+	// task pane - slash/approval. Border +2; status rule+label +2; help +1.
 	composerHeight := m.textarea.Height() + 2
-	extra := m.slashMenuHeight()
+	extra := m.taskPaneHeight() + m.slashMenuHeight()
 	if m.hasPendingApproval() {
-		extra = m.approvalModalHeight()
+		extra = m.taskPaneHeight() + m.approvalModalHeight()
 	}
 	reserved := composerHeight + 3 + extra
 	h := max(5, m.height-reserved)
@@ -963,6 +1011,7 @@ func (m *model) cmdClear() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.deps.Session = session
+	m.closeTaskPane()
 	m.lines = nil
 	m.streamingAssistant = false
 	m.stickBottom = true
@@ -987,6 +1036,7 @@ func (m *model) cmdNew(title string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.deps.Session = session
+	m.closeTaskPane()
 	m.lines = nil
 	m.streamingAssistant = false
 	m.stickBottom = true
@@ -1127,6 +1177,7 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.deps.Session = session
+	m.closeTaskPane()
 	if m.deps.NotifyActiveSession != nil {
 		m.deps.NotifyActiveSession(session.ID())
 	}
@@ -1435,6 +1486,8 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 	m.turnStart = time.Now()
 	m.err = nil
 	m.currentTool = ""
+	m.openReasoning = noOpenReasoning
+	m.streamingAssistant = false
 	m.stickBottom = true
 	m.setBusyPlaceholder()
 
@@ -1494,6 +1547,19 @@ func (m *model) interruptTurn(reason string) {
 	_ = reason
 }
 
+// cancelActiveTask mirrors the terminal interrupt into the deterministic task
+// runtime after cancellation has been requested. It uses the process context
+// so the durable interruption can outlive the cancelled turn context.
+func (m *model) cancelActiveTask(reason string) {
+	if m.deps.Session == nil {
+		return
+	}
+	receipt := m.deps.Session.InterruptTask(m.processCtx(), reason)
+	if receipt.Applied {
+		m.appendLine(lineSystem, receipt.Summary)
+	}
+}
+
 func (m *model) finishTurn(err error) tea.Cmd {
 	if m.hasPendingApproval() {
 		m.clearPendingApproval(tools.ApprovalDeny)
@@ -1507,6 +1573,7 @@ func (m *model) finishTurn(err error) tea.Cmd {
 	m.turnDone = nil
 	m.pendingTurnDone = nil
 	m.streamingAssistant = false
+	m.openReasoning = noOpenReasoning
 	m.currentTool = ""
 	m.openToolCards = make(map[string]int)
 	m.openToolNames = make(map[string]string)
@@ -1644,6 +1711,8 @@ func toolCardKey(callID, toolName string) string {
 }
 
 func (m *model) appendLine(kind lineKind, text string) {
+	// Single place that ends open reasoning before a discrete transcript line.
+	m.foldOpenReasoning()
 	m.streamingAssistant = false
 	m.lines = append(m.lines, transcriptLine{kind: kind, text: text})
 	m.refreshViewport()
@@ -1662,6 +1731,9 @@ func (m *model) refreshViewport() {
 			// Stream the open assistant line as plain text; completed lines may use markdown.
 			streaming := m.streamingAssistant && i == len(m.lines)-1
 			b.WriteString(renderAssistant(line.text, m.viewport.Width, streaming))
+		case lineReasoning:
+			// text is body while open, or one-line summary after fold.
+			b.WriteString(renderReasoning(line.text, line.folded, m.reasoningIsStreaming(i)))
 		case lineTool:
 			b.WriteString(renderToolCard(line.text))
 		case lineError:

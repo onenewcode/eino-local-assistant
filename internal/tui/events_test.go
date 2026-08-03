@@ -61,6 +61,19 @@ func TestEmitFromTurnEventForwardsModelUsage(t *testing.T) {
 	}
 }
 
+func TestEmitFromTurnEventForwardsReasoning(t *testing.T) {
+	ch := make(chan tea.Msg, 1)
+	emit := emitFromTurnEvent(context.Background(), 9, ch)
+	emit(chat.TurnEvent{Kind: chat.TurnEventReasoning, Chunk: "ponder"})
+	got, ok := (<-ch).(turnReasoningMsg)
+	if !ok {
+		t.Fatal("reasoning should become turnReasoningMsg")
+	}
+	if got.turnID != 9 || got.chunk != "ponder" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestEmitFromTurnEventUnblocksOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

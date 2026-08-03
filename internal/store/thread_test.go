@@ -128,6 +128,53 @@ func TestThreadStoreJournalLifecycleAndCAS(t *testing.T) {
 	}
 }
 
+func TestThreadStorePersistsTaskStateAcrossJournalReplay(t *testing.T) {
+	threadStore, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	state, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "thread-task-state"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: "turn-1", Input: "implement feature"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := json.RawMessage(`{"version":1,"state":"active","tasks":["implement"]}`)
+	state, err = threadStore.UpdateTaskState(ctx, state.ID, state.Revision, "turn-1", TaskStateUpdate{Snapshot: first})
+	if err != nil {
+		t.Fatalf("UpdateTaskState in turn: %v", err)
+	}
+	state, err = threadStore.CommitTurn(ctx, state.ID, state.Revision, TurnCommit{TurnID: "turn-1", Messages: []*schema.Message{
+		schema.UserMessage("implement feature"), schema.AssistantMessage("working", nil),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := json.RawMessage(`{"version":1,"state":"interrupted","tasks":["implement"]}`)
+	state, err = threadStore.UpdateTaskState(ctx, state.ID, state.Revision, "", TaskStateUpdate{Snapshot: second})
+	if err != nil {
+		t.Fatalf("UpdateTaskState outside turn: %v", err)
+	}
+
+	restored, err := threadStore.LoadTaskState(ctx, state.ID)
+	if err != nil {
+		t.Fatalf("LoadTaskState: %v", err)
+	}
+	if got, want := string(restored), string(second); got != want {
+		t.Fatalf("restored task state = %s, want %s", got, want)
+	}
+	state, err = threadStore.LoadThread(ctx, state.ID)
+	if err != nil {
+		t.Fatalf("LoadThread replay: %v", err)
+	}
+	if got, want := string(state.TaskState), string(second); got != want {
+		t.Fatalf("replayed task state = %s, want %s", got, want)
+	}
+}
+
 func TestThreadStoreRejectsInvalidLifecycleTransitions(t *testing.T) {
 	threadStore, err := NewThreadStore(t.TempDir())
 	if err != nil {

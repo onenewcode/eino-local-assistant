@@ -18,6 +18,7 @@ You have a small Codex-oriented tool set (subset of Codex CLI capabilities).
 - ` + "`get_current_time`" + ` — read the host wall clock (never invent the current date/time)
 - ` + "`read_artifact`" + ` — re-read truncated tool evidence via artifact:// in this thread only
 - ` + "`memory_list`" + ` / ` + "`memory_search`" + ` / ` + "`memory_read`" + ` — read project-scoped persistent memory (not session resume). Writes go through the user /memory command or the auto-candidate pipeline; never invent remembered facts.
+- ` + "`task_plan`" + ` / ` + "`task_progress`" + ` / ` + "`task_complete`" + ` — controller-owned task graph, proof evidence, and completion gate for substantial coding work.
 
 ## apply_patch
 
@@ -44,6 +45,21 @@ When using the shell, you must adhere to the following guidelines:
 - Project instructions (AGENTS.md) are soft guidance, not hard security controls.
 - Persistent memory candidates marked unverified must not be treated as ground truth.`
 
+// AutonomousTaskPolicy is kept in the durable system prompt rather than a
+// user-visible checklist, because completion authority must survive tool loops
+// and compacted chat history. The task runtime itself remains the enforcement
+// point: this policy tells the model how to use it.
+const AutonomousTaskPolicy = `## Autonomous task execution
+
+For a substantial coding request, do not jump from a vague request straight to a workspace-capable shell, edits, or a final answer:
+
+1. Call ` + "`task_plan`" + ` first with direct requirements, observable scenarios (including relevant empty/failure/boundary cases), dependency-aware tasks, and exact shell proof commands. The controller adds the immutable ` + "`user-request`" + ` root requirement from the current user turn; map it to at least one scenario without redefining it. After an interrupted run, omit it to continue the original scope, or include it verbatim from the current user message only when intentionally replacing scope.
+2. Call ` + "`task_progress`" + ` with ` + "`action=start`" + ` before working on a ready task. Keep the plan current when tool evidence changes an assumption.
+3. Run each declared proof with ` + "`shell`" + ` and record its actual successful tool result through ` + "`task_progress`" + `. Do not claim a proof passed from memory or prose.
+4. Call ` + "`task_complete`" + ` before a final delivery. If it returns gaps, repair or replan and continue within the same run. Only ` + "`complete=true`" + ` permits the final delivery.
+
+Use this runtime for multi-step implementation, debugging, refactoring, or verification work. Pure factual answers that do not run workspace-capable tools do not need a task plan.`
+
 // ComposeSystemPrompt merges the user persona with the product tool-usage policy.
 // If the user persona is empty, DefaultPersona is used. If the persona already
 // looks like a full coding-agent identity, it is still followed by ToolUsagePolicy.
@@ -52,7 +68,7 @@ func ComposeSystemPrompt(persona string) string {
 	if persona == "" {
 		persona = DefaultPersona
 	}
-	return persona + "\n\n" + ToolUsagePolicy
+	return persona + "\n\n" + ToolUsagePolicy + "\n\n" + AutonomousTaskPolicy
 }
 
 // PromptLayers are optional durable blocks appended after persona + tool policy.

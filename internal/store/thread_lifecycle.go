@@ -55,6 +55,22 @@ func (t *lifecycleTracker) apply(event ThreadEvent) error {
 		// Compaction lifecycle events are independent of an agent turn. They
 		// must not make an idle thread look like it has an unfinished turn.
 		return nil
+	case EventTaskStateUpdated:
+		var payload TaskStateUpdate
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return lifecycleError(event, "decode task state update: %v", err)
+		}
+		if err := validateTaskStateUpdate(payload); err != nil {
+			return lifecycleError(event, "invalid task state update: %v", err)
+		}
+		if event.TurnID == "" {
+			// Interactive interruption can update the graph while a model turn is being
+			// cancelled. They are durable control events, not turn lifecycle
+			// transitions, so they must not steal ownership of that turn.
+			return nil
+		}
+		_, err := t.openTurn(event, event.TurnID)
+		return err
 	case EventTurnStarted:
 		var payload TurnStart
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {

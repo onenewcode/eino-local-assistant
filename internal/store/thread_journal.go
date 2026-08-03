@@ -333,6 +333,15 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 				state.Meta.LastContext = nil
 			}
 		}
+	case EventTaskStateUpdated:
+		var payload TaskStateUpdate
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode task state update: %w", err)
+		}
+		if err := validateTaskStateUpdate(payload); err != nil {
+			return fmt.Errorf("%w: invalid task state update: %v", ErrJournalCorrupt, err)
+		}
+		state.TaskState = append(state.TaskState[:0], payload.Snapshot...)
 	case EventTitleChanged:
 		var payload titleUpdatedPayload
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {

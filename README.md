@@ -5,6 +5,7 @@
 
 - **交互终端（TTY）**：Bubble Tea 全屏 TUI（圆角输入框、状态条、滚动对话、markdown/工具卡片、spinner、斜杠命令）
 - **ReAct 工具循环**（Codex 子集）：`shell`、`apply_patch`，以及产品用 `get_current_time` / `read_artifact`；调用过程在 UI 中可见
+- **复杂任务控制器**：多步骤编码任务以需求—场景—任务图—shell proof 跟踪；图的紧凑投影随会话账本恢复，模型必须经 completion gate 才能交付
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 在短生命周期 worker 中执行；默认工作区可写、网络关闭，并有总 turn / ReAct / tool-call 预算
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
@@ -21,6 +22,7 @@
 | `apply_patch` | create_file / update_file / delete_file | 默认 ask；与 shell 共用工作区沙盒边界 |
 | `get_current_time` | 真实本机时间 | 无 |
 | `read_artifact` | 当前 thread 的 artifact:// 证据 | thread 作用域 |
+| `task_plan` / `task_progress` / `task_complete` | 复杂任务的验收矩阵、proof 绑定与确定性完成门 | 无工作区权限；proof 只能引用实际 `shell` 结果 |
 
 工具的权限语言仍不是安全边界；实际文件和网络隔离由 sandbox worker 提供。详见 [docs/command-policy.md](docs/command-policy.md)。
 
@@ -164,7 +166,8 @@ go run ./cmd/eino-assistant help resume
 | PgUp / PgDn | 滚动 transcript（在底部时 stick-to-bottom；上滚后流式不强制回底）；审批宿主升级时逐页检查完整命令详情 |
 | Home / End | 跳到 transcript 顶部 / 底部（End 恢复 stick-to-bottom） |
 | 鼠标滚轮 | 滚动 transcript |
-| Esc | 中断当前轮（已排队消息保留并会自动继续） |
+| Ctrl+T | 展开 / 收起当前复杂任务的只读进度（状态、目标、范围、当前工作与 gap） |
+| Esc | 中断当前轮并保存复杂任务的 `interrupted` 状态（已排队消息保留并会自动继续） |
 | Ctrl+C | busy 时中断；idle 时退出 |
 | Ctrl+D | idle 且输入为空时退出 |
 | `/help` | 帮助 |
@@ -183,9 +186,9 @@ go run ./cmd/eino-assistant help resume
 | `/clear` | 清空屏幕并创建新会话；旧 thread、原始 turn 和 artifact 保留、可 `/resume` |
 | `/exit` | 退出 |
 
-工具调用显示为 Claude/Codex 风格卡片（`⚙ name` + 缩进 `⎿` 结果，JSON 会 pretty-print）；assistant 回复在完成后对 markdown/代码块做终端渲染（流式阶段为纯文本）。idle 状态栏显示 `provider/model` / 短 session id / API usage / `cost~` / 可选 context 快照；busy 状态栏显示当前工具名与 `queued:N`。上滚离开底部时状态栏提示 `↑ End to follow`。每轮完成后会显示该轮的 `API usage: prompt / generation / total / calls`，不会把 API 请求输入误称为用户输入。
+工具调用显示为 Claude/Codex 风格卡片（`⚙ name` + 缩进 `⎿` 结果，JSON 会 pretty-print）；assistant 回复在完成后对 markdown/代码块做终端渲染（流式阶段为纯文本）。idle 状态栏显示 `provider/model` / 短 session id / API usage / `cost~` / 可选 context 快照；复杂任务显示紧凑的 `task:n/m` 进度，`Ctrl+T` 可展开只读的状态、目标、范围、当前工作与 gap，busy 状态栏还会显示当前工具名与 `queued:N`。上滚离开底部时状态栏提示 `↑ End to follow`。每轮完成后会显示该轮的 `API usage: prompt / generation / total / calls`，不会把 API 请求输入误称为用户输入。
 
-生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/sessions`、`/queue`；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；`/compact`、`/clear`、`/new`、`/resume`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle。
+生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；`Esc` / `Ctrl+C` 中断当前 turn，`/compact`、`/clear`、`/new`、`/resume`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle。
 
 ## 会话存储与压缩
 
@@ -197,6 +200,8 @@ go run ./cmd/eino-assistant help resume
 - 结构化规划器永远保留系统指令、当前输入、完整 tool-call/result 组和最近 12 个完整 turn；过大的稳定 turn 前缀先 artifact 外置、再递归摘要。无法装下不可变指令和当前输入时会明确失败，不会静默丢弃。
 - 自动压缩：连续 `max_low_gain_attempts`（默认 2）次低收益会暂停该 session 的自动压缩；provider/schema 等硬失败立即暂停。手动 `/compact` 仍可用并可在成功后清除 pause。`/context` 会显示状态。
 - Resume 的产品承诺是**任务可继续**（模型层 = 活动 checkpoint + 热 tail + 当前 tools），不是无损长期记忆。账本里的原文供 UI 审计与 `read_artifact` 重读，默认不会按新问题自动回填进 prompt。
+- 自主任务图的紧凑投影写入 session journal，可随 `/resume` 重建；完整 turn、工具结果和 artifact 仍是证据真相。`task_complete` 要等最终消息所在 turn 提交才可交付；取消、失败、未提交恢复或快照之后的 shell/patch 都会重新关闭 gate。恢复时仍为 `working` 的节点会先转为 `needs_replan`，再次执行该节点会重收集其 proof。
+- 中断后的普通“继续”等输入沿用原始需求并保留未变范围的已接受 proof；明确替换需求范围会重规划。未计划且实际执行的 `shell` / `apply_patch`，以及任务完成或中断后才到达、且可能改动工作区的工具结果，也会要求先建新计划。
 - 详细格式与恢复协议见 [docs/session-persistence.md](docs/session-persistence.md)。
 - **跨会话语义记忆**（`AGENTS.md`、`.eino/memory/`、自动 candidate）与 resume 分离，见 [docs/memory.md](docs/memory.md)。
 
@@ -249,3 +254,4 @@ go tool golangci-lint run ./...
 7. PgUp 后流式输出不强制回底，状态栏出现 `↑ End to follow`；End / 滚回底部后 stick-to-bottom 恢复
 8. `/queue` 可列出队列，`/queue clear` 可清空
 9. 发送几条消息后 ↑/↓ 可浏览输入历史；长会话 `/resume` 后用 PgUp/Home 分页加载更早 user 消息
+10. 给出多步骤编码需求，确认模型先使用 `task_plan`；每个 proof 绑定真实 `shell` 成功结果，`task_complete` 前不可交付；`Esc` 中断后已接受证据保留，恢复时先检查或重规划未完成节点

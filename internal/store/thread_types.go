@@ -51,6 +51,10 @@ const (
 	EventTurnFailed    EventKind = "turn.failed"
 	EventTitleChanged  EventKind = "title.changed"
 	EventUsageRecorded EventKind = "usage.recorded"
+	// EventTaskStateUpdated records the latest recoverable autonomous-task
+	// controller snapshot. The immutable tool and turn events remain the source
+	// of evidence; this is the compact execution-state projection used on resume.
+	EventTaskStateUpdated EventKind = "task.state.updated"
 	// EventContextCompactionStarted records a durable operation boundary before
 	// a compactor provider call can incur usage.
 	EventContextCompactionStarted EventKind = "context.compaction.started"
@@ -96,6 +100,7 @@ type ThreadState struct {
 	LowGainStreak             uint64               `json:"low_gain_streak,omitempty"`
 	PendingCompaction         *CompactionOperation `json:"pending_compaction,omitempty"`
 	LastCompaction            *CompactionOutcome   `json:"last_compaction,omitempty"`
+	TaskState                 json.RawMessage      `json:"task_state,omitempty"`
 	CreatedAt                 time.Time            `json:"created_at"`
 	UpdatedAt                 time.Time            `json:"updated_at"`
 	Meta                      ThreadMeta           `json:"meta"`

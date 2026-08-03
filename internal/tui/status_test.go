@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"eino-local-assistant/internal/chat"
 )
 
 func TestShortSessionID(t *testing.T) {
@@ -150,5 +152,28 @@ func TestStatusLabelBusyUsesSharedSuffix(t *testing.T) {
 	}
 	if strings.Contains(line, "ctx=") {
 		t.Fatalf("busy status without measurement must omit ctx: %q", line)
+	}
+}
+
+func TestTaskStatusFragmentUsesCompactTaskState(t *testing.T) {
+	tests := []struct {
+		name   string
+		status chat.TaskRunStatus
+		want   string
+	}{
+		{name: "active progress", status: chat.TaskRunStatus{Available: true, State: "active", DoneTasks: 1, Tasks: 3}, want: "task:1/3"},
+		{name: "fresh plan", status: chat.TaskRunStatus{Available: true, State: "active", PlanRequired: true}, want: "task:plan"},
+		{name: "interrupted", status: chat.TaskRunStatus{Available: true, State: "interrupted"}, want: "task:interrupted"},
+		{name: "complete", status: chat.TaskRunStatus{Available: true, State: "complete"}, want: "task:complete"},
+		{name: "unavailable", status: chat.TaskRunStatus{}, want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &taskControlModel{status: test.status}
+			session := mustSession(t, backend, "system")
+			if got := taskStatusFragment(session); got != test.want {
+				t.Fatalf("taskStatusFragment() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

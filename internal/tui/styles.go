@@ -17,6 +17,11 @@ var (
 	assistantStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
 
+	// reasoningStyle is deliberately weaker than assistant body text.
+	reasoningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243")).
+			Italic(true)
+
 	toolStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("180"))
 
@@ -96,6 +101,33 @@ func renderSystem(text string) string {
 	return systemStyle.Render("· ") + text
 }
 
+// renderReasoning draws model reasoning summary (display-only).
+// Folded blocks are a single dim summary line; open/streaming blocks show body.
+func renderReasoning(text string, folded, streaming bool) string {
+	if folded {
+		return reasoningStyle.Render("·· " + text)
+	}
+	prefix := "thinking"
+	if streaming {
+		prefix = "thinking…"
+	}
+	body := strings.TrimRight(text, "\n")
+	if body == "" {
+		return reasoningStyle.Render(prefix)
+	}
+	lines := strings.Split(body, "\n")
+	var b strings.Builder
+	b.WriteString(reasoningStyle.Render(prefix))
+	b.WriteByte('\n')
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(reasoningStyle.Render("  " + line))
+	}
+	return b.String()
+}
+
 func renderSeparator(width int) string {
 	if width < 8 {
 		width = 8
@@ -138,6 +170,16 @@ var (
 	slashMenuCursorStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("114")).
 				Bold(true)
+
+	taskPaneTitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114")).
+				Bold(true)
+	taskPaneLabelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("245"))
+	taskPaneValueStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+	taskPaneGapStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("203"))
 )
 
 // renderSlashMenu paints the prefix-filtered command list above the composer.

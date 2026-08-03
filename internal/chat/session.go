@@ -74,6 +74,14 @@ const (
 	TurnEventToolEnd
 	TurnEventToolError
 	TurnEventModelUsage
+	// TurnEventReasoning is an ephemeral UI observation for model
+	// ReasoningContent deltas. It is never journaled and must not re-enter
+	// the model prompt (see stripReasoningForStorage).
+	TurnEventReasoning
+	// TurnEventTaskGate reports that the deterministic autonomous-task
+	// controller rejected an attempted final delivery and is continuing the
+	// same turn with a GapPacket. It is display-only and never journaled.
+	TurnEventTaskGate
 )
 
 const (
@@ -96,16 +104,21 @@ type ModelUsageEvent struct {
 
 // TurnEvent is a raw observation during Session.AskWithEvents. Tool payloads
 // intentionally remain untruncated here: the durable artifact recorder owns
-// retention caps and the TUI owns display caps.
+// retention caps and the TUI owns display caps. Reasoning events are
+// display-only: the recorder ignores them and committed messages strip
+// ReasoningContent before persistence.
 type TurnEvent struct {
 	Kind       TurnEventKind
 	Tool       string
 	ToolCallID string
 	Input      string
 	Output     string
+	// Chunk is assistant text for TurnEventChunk, or a ReasoningContent
+	// delta for TurnEventReasoning.
 	Chunk      string
 	Err        error
 	ModelUsage *ModelUsageEvent
+	TaskGate   *TaskCompletionGate
 }
 
 // EventEmitter receives progressive turn events. It may be called from a
@@ -115,6 +128,10 @@ type EventEmitter func(TurnEvent)
 // EventAwareModel optionally exposes tool/stream events for richer UIs. The
 // returned done channel closes only after every event for this request has been
 // emitted, including callbacks from background model goroutines.
+//
+// Emitting TurnEventReasoning is a separate contract: implement
+// ReasoningEventSource when every model call (including intermediate ReAct
+// steps) already surfaces ReasoningContent via the emitter.
 type EventAwareModel interface {
 	Model
 	StreamWithEvents(ctx context.Context, messages []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error)
@@ -264,6 +281,9 @@ type Session struct {
 	// OpenSession call, so UI entry points can notify once without replaying an
 	// old durable outcome on every later resume.
 	checkpointResetDuringOpen bool
+	// activeTaskTurnID lets an interactive cancellation revoke a completion
+	// approval only when that approval belongs to the still-uncommitted turn.
+	activeTaskTurnID string
 
 	// opMu makes a Session a single-writer actor even outside the TUI. The
 	// ThreadStore's revision CAS remains the cross-process safety boundary.
@@ -582,6 +602,9 @@ func (s *Session) AskWithEvents(ctx context.Context, input string, onChunk func(
 }
 
 func (s *Session) askThread(ctx context.Context, input string, onChunk func(string) error, emit EventEmitter) error {
+	if err := s.interruptActiveTaskForNewInput(); err != nil {
+		return err
+	}
 	turnID := newLocalID("turn")
 	state, err := s.threads.StartTurn(context.Background(), s.id, s.revision, store.TurnStart{
 		TurnID: turnID,
@@ -590,6 +613,17 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	if err != nil {
 		return fmt.Errorf("persist turn start: %w", err)
 	}
+	s.setActiveTaskTurn(turnID)
+	turnCommitted := false
+	defer func() {
+		if !turnCommitted {
+			// task_complete may have persisted before the model's final text and
+			// the turn commit. Do not let a cancelled or failed delivery retain
+			// that provisional approval.
+			s.abortTaskCompletionForTurn(context.Background(), turnID, "turn ended before final delivery committed")
+		}
+		s.clearActiveTaskTurn(turnID)
+	}()
 	// Keep the local CAS revision aligned even if context construction or the
 	// model fails after the durable turn.started event.
 	s.applyThreadState(state)
@@ -618,8 +652,10 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			emit(event)
 		}
 	}
-	turnCtx := store.WithThreadAccess(ctx, s.threads, s.id)
-	answer, err := s.streamAnswer(turnCtx, view, onChunk, combinedEmit)
+	turnCtx := WithTaskRequestContext(s.taskRuntimeContext(ctx), input)
+	turnCtx = WithTaskTurnContext(turnCtx, turnID)
+	turnCtx = WithTaskStateWriter(turnCtx, recorder.recordTaskState)
+	answer, err := s.streamTaskAwareAnswer(turnCtx, view, onChunk, combinedEmit)
 	if err != nil {
 		if answer != nil && !usageTracker.hasEvents() {
 			// A direct model stream can fail after it has produced an assistant
@@ -658,10 +694,27 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		}
 		return turnTerminationError(ctx, err)
 	}
+	if runtime, ok := s.model.(TaskRuntime); ok {
+		gate := runtime.TaskCompletionGate(turnCtx)
+		if gate.Active && !gate.Complete {
+			summary := strings.TrimSpace(gate.Summary)
+			if summary == "" {
+				summary = "controller rejected completion before commit"
+			}
+			if terminalErr := s.terminateUncommittedTurn(recorder, false, summary); terminalErr != nil {
+				return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
+			}
+			return fmt.Errorf("%w: %s", ErrTaskCompletionUnresolved, summary)
+		}
+	}
 
+	// From this point onward the final response is at its commit boundary. A
+	// later UI cancellation belongs to the next interaction rather than this
+	// already-finished delivery; a failed commit is still revoked by the defer.
+	s.clearActiveTaskTurn(turnID)
 	state, err = recorder.commit(store.TurnCommit{
 		TurnID:   turnID,
-		Messages: []*schema.Message{userMsg, answer},
+		Messages: []*schema.Message{userMsg, stripReasoningForStorage(answer)},
 	})
 	if err != nil {
 		if terminalErr := s.reconcileUncommittedTurn(turnID, false, "commit failed: "+err.Error()); terminalErr != nil {
@@ -669,6 +722,7 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		}
 		return fmt.Errorf("persist completed turn: %w", err)
 	}
+	turnCommitted = true
 	s.applyThreadState(state)
 	// The ledger remains authoritative. Refresh the bounded replay window rather
 	// than retaining an unbounded in-memory copy of raw turn data.
@@ -677,6 +731,36 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	// barrier checked by the TUI before it drains queued follow-up messages.
 	s.refreshAutoCompaction()
 	return nil
+}
+
+// interruptActiveTaskForNewInput makes a later natural-language message the
+// scope boundary for unfinished autonomous work. This avoids inventing a
+// second slash-command control plane: the following task_plan can either
+// rebuild the old graph or redirect it while preserving only unchanged proof.
+func (s *Session) interruptActiveTaskForNewInput() error {
+	runtime, ok := s.model.(TaskRuntime)
+	if !ok {
+		return nil
+	}
+	ctx := s.taskRuntimeContext(context.Background())
+	if runtime.TaskExecutionStatus(ctx).State == "interrupted" {
+		// An earlier Esc/Ctrl+C has already made the prior graph a replan
+		// boundary. Let this new user message reach the model so task_plan can
+		// preserve or deliberately replace its scope.
+		return nil
+	}
+	if gate := runtime.TaskCompletionGate(ctx); !gate.Active {
+		return nil
+	}
+	receipt := runtime.InterruptTask(ctx, "superseded by a new user message")
+	if receipt.Applied || !runtime.TaskCompletionGate(ctx).Active {
+		return nil
+	}
+	summary := strings.TrimSpace(receipt.Summary)
+	if summary == "" {
+		summary = "controller kept the prior task active"
+	}
+	return fmt.Errorf("interrupt active autonomous task before new input: %s", summary)
 }
 
 // terminateUncommittedTurn first uses the recorder's expected revision, then
@@ -746,11 +830,18 @@ func (s *Session) streamAnswer(ctx context.Context, view []*schema.Message, onCh
 		}()
 	}
 
+	// Models that implement ReasoningEventSource (ReAct) already emit
+	// TurnEventReasoning for every model call. Re-emitting from the final
+	// stream would duplicate the last call.
+	emitReasoningHere := !modelEmitsReasoningEvents(s.model)
 	chunks := make([]*schema.Message, 0)
 	for {
 		chunk, recvErr := stream.Recv()
 		if chunk != nil {
 			chunks = append(chunks, chunk)
+			if emitReasoningHere && chunk.ReasoningContent != "" && emit != nil {
+				emit(TurnEvent{Kind: TurnEventReasoning, Chunk: chunk.ReasoningContent})
+			}
 			if chunk.Content != "" {
 				if emit != nil {
 					emit(TurnEvent{Kind: TurnEventChunk, Chunk: chunk.Content})
@@ -1560,11 +1651,13 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 			r.failure = fmt.Errorf("duplicate tool call id %q", toolID)
 			return
 		}
-		state, err := r.repo.ToolStarted(context.Background(), r.threadID, r.revision, store.ToolStarted{
-			TurnID:     r.turnID,
-			ToolCallID: toolID,
-			ToolName:   event.Tool,
-			Input:      event.Input,
+		state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+			return r.repo.ToolStarted(context.Background(), r.threadID, revision, store.ToolStarted{
+				TurnID:     r.turnID,
+				ToolCallID: toolID,
+				ToolName:   event.Tool,
+				Input:      event.Input,
+			})
 		})
 		if err != nil {
 			r.failure = err
@@ -1588,8 +1681,10 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 			if toolID == "" {
 				toolID = r.newToolID(event.Tool)
 			}
-			state, err := r.repo.ToolStarted(context.Background(), r.threadID, r.revision, store.ToolStarted{
-				TurnID: r.turnID, ToolCallID: toolID, ToolName: event.Tool,
+			state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+				return r.repo.ToolStarted(context.Background(), r.threadID, revision, store.ToolStarted{
+					TurnID: r.turnID, ToolCallID: toolID, ToolName: event.Tool,
+				})
 			})
 			if err != nil {
 				r.failure = err
@@ -1611,12 +1706,14 @@ func (r *threadTurnRecorder) record(event TurnEvent) {
 			r.failure = err
 			return
 		}
-		state, err := r.repo.ToolCompleted(context.Background(), r.threadID, r.revision, store.ToolCompleted{
-			TurnID:     r.turnID,
-			ToolCallID: toolID,
-			ToolName:   event.Tool,
-			Output:     artifactPrompt(artifact),
-			Artifact:   &artifact,
+		state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+			return r.repo.ToolCompleted(context.Background(), r.threadID, revision, store.ToolCompleted{
+				TurnID:     r.turnID,
+				ToolCallID: toolID,
+				ToolName:   event.Tool,
+				Output:     artifactPrompt(artifact),
+				Artifact:   &artifact,
+			})
 		})
 		if err != nil {
 			r.failure = err
@@ -1651,7 +1748,9 @@ func (r *threadTurnRecorder) commit(input store.TurnCommit) (store.ThreadState, 
 	if r.failure != nil {
 		return store.ThreadState{}, r.failure
 	}
-	state, err := r.repo.CommitTurn(context.Background(), r.threadID, r.revision, input)
+	state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+		return r.repo.CommitTurn(context.Background(), r.threadID, revision, input)
+	})
 	if err == nil {
 		r.revision = state.Revision
 		r.lastState = state
@@ -1662,7 +1761,9 @@ func (r *threadTurnRecorder) commit(input store.TurnCommit) (store.ThreadState, 
 func (r *threadTurnRecorder) cancel(reason string) (store.ThreadState, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state, err := r.repo.CancelTurn(context.Background(), r.threadID, r.revision, store.TurnCancel{TurnID: r.turnID, Reason: reason})
+	state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+		return r.repo.CancelTurn(context.Background(), r.threadID, revision, store.TurnCancel{TurnID: r.turnID, Reason: reason})
+	})
 	if err == nil {
 		r.revision = state.Revision
 		r.lastState = state
@@ -1673,7 +1774,9 @@ func (r *threadTurnRecorder) cancel(reason string) (store.ThreadState, error) {
 func (r *threadTurnRecorder) fail(reason string) (store.ThreadState, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state, err := r.repo.FailTurn(context.Background(), r.threadID, r.revision, store.TurnFailure{TurnID: r.turnID, Error: reason})
+	state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+		return r.repo.FailTurn(context.Background(), r.threadID, revision, store.TurnFailure{TurnID: r.turnID, Error: reason})
+	})
 	if err == nil {
 		r.revision = state.Revision
 		r.lastState = state
@@ -1685,6 +1788,46 @@ func (r *threadTurnRecorder) err() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.failure
+}
+
+// recordTaskState keeps controller snapshots in the same revision stream as
+// tools and messages. An interactive interruption may append an out-of-band
+// task event while this recorder is active, so CAS operations rebase once on
+// that safe metadata-only conflict.
+func (r *threadTurnRecorder) recordTaskState(_ context.Context, snapshot []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != nil {
+		return r.failure
+	}
+	repository, ok := r.repo.(store.TaskStateRepository)
+	if !ok {
+		return nil
+	}
+	state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
+		return repository.UpdateTaskState(context.Background(), r.threadID, revision, r.turnID, store.TaskStateUpdate{Snapshot: snapshot})
+	})
+	if err != nil {
+		r.failure = err
+		return err
+	}
+	r.revision = state.Revision
+	r.lastState = state
+	return nil
+}
+
+func (r *threadTurnRecorder) mutateLocked(operation func(uint64) (store.ThreadState, error)) (store.ThreadState, error) {
+	state, err := operation(r.revision)
+	if !errors.Is(err, store.ErrRevisionConflict) {
+		return state, err
+	}
+	latest, loadErr := r.repo.LoadThread(context.Background(), r.threadID)
+	if loadErr != nil {
+		return store.ThreadState{}, loadErr
+	}
+	r.revision = latest.Revision
+	r.lastState = latest
+	return operation(r.revision)
 }
 
 func (r *threadTurnRecorder) state() store.ThreadState {
@@ -1797,14 +1940,19 @@ func turnGroupMessages(group store.TurnGroup) []*schema.Message {
 	base := cloneMessages(group.Committed.Messages)
 	// Committed assistants are final answers; tool pairs are rebuilt from the
 	// tool lifecycle below. Strip any residual tool_calls so a polluted commit
-	// cannot be replayed to the provider.
+	// cannot be replayed to the provider. Also re-strip display reasoning so a
+	// pre-sanitize ledger row cannot re-enter the model prompt.
 	for i, message := range base {
-		if message == nil || message.Role != schema.Assistant || len(message.ToolCalls) == 0 {
+		if message == nil || message.Role != schema.Assistant {
 			continue
 		}
-		cp := *message
-		cp.ToolCalls = nil
-		base[i] = &cp
+		cleaned := stripReasoningForStorage(message)
+		if len(cleaned.ToolCalls) > 0 {
+			cp := *cleaned
+			cp.ToolCalls = nil
+			cleaned = &cp
+		}
+		base[i] = cleaned
 	}
 	if len(group.Tools) == 0 {
 		return base
