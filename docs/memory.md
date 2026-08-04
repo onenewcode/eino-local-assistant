@@ -17,7 +17,7 @@
 
 **是**：
 
-1. **项目指令**：workspace 根目录 `AGENTS.override.md` 或 `AGENTS.md`（软规则，有界注入；见下方选择和生命周期）
+1. **项目指令**：workspace root 到 startup cwd 各层的 `AGENTS.override.md` 或 `AGENTS.md`（软规则，有界注入；见下方选择和生命周期）
 2. **用户指令**：用户 home 下 `~/.eino-assistant/AGENTS.override.md` 或 `AGENTS.md`（home scope、软规则、独立预算）
 3. **显式记忆**：用户通过 `/memory add` 写入的项目偏好/事实
 4. **自动候选**：空闲 session journal 异步抽取的 *candidate*（低信任）
@@ -62,7 +62,7 @@ summary.md         有界派生视图 · 供 system 注入
 
 语义记忆目录默认 **不提交 git**。团队共识应写在 `AGENTS.md`，不要依赖个人 candidate；仅本地需要的项目指令可写 `AGENTS.override.md` 并由项目自行决定是否 gitignore。
 
-同一 workspace 根目录至多选择一个指令文件，候选顺序为 `AGENTS.override.md`、`AGENTS.md`。有效候选必须在解析符号链接后指向普通文件，且内容去掉开头的 UTF-8 BOM 后不能仅含空白；目录、FIFO、空白内容等会跳过。符号链接目标不要求位于 workspace 内，因此应把链接目标也视为会发送给模型的可信项目配置。
+每个发现目录至多选择一个指令文件，候选顺序为 `AGENTS.override.md`、`AGENTS.md`；项目层按 workspace root 到 startup cwd 收集各层。有效候选必须在解析符号链接后指向普通文件，且内容去掉开头的 UTF-8 BOM 后不能仅含空白；目录、FIFO、空白内容等会跳过。符号链接目标不要求位于 workspace 内，因此应把链接目标也视为会发送给模型的可信项目配置。
 
 候选顺序和“同目录至多一个”对齐 Codex；Codex 固定源码也明确允许符号链接。本项目进一步把“空白 override 回退 base”定义为稳定合同，而 Codex 的公开文档与项目级源码在这个边界上仍有差异。Claude Code 则会把 `CLAUDE.local.md` 追加在 `CLAUDE.md` 后，而不是替换 base。
 
@@ -87,7 +87,7 @@ generate = true             # 空闲自动抽取
 
 | 字段 | 默认 | 含义 |
 | --- | --- | --- |
-| `rules.enabled` | true | 是否选择并加载 workspace 根 AGENTS 指令 |
+| `rules.enabled` | true | 是否选择并加载用户 home 与项目 AGENTS 指令 |
 | `rules.max_tokens` | 8000 | 规则注入 token 估算上限 |
 | `rules.global_max_tokens` | 4000 | 用户 home 指令注入 token 估算上限；独立于项目规则预算 |
 | `memory.enabled` | true | 是否注入 summary / 暴露读工具 |
@@ -114,6 +114,12 @@ generate = true             # 空闲自动抽取
 | `/memory status` | 路径、计数、上次 consolidate |
 | `/memory rebuild` | 重建 `summary.md` |
 | `/memory reset --confirm` | 清空当前项目语义记忆与抽取元数据；保留 session/thread 和开关 |
+
+### 6.1 `/rules` source metadata view
+
+TUI `/rules` 是 instruction source metadata 的只读视图，不是 reload 命令，也不监听文件变化。它展示 active session 创建时（或 `/new`、`/clear` 成功组合后）捕获的用户与项目 source path/title、各自预算、tokens、truncated，以及当前生命周期。正文不会由该命令打印，也不会因运行命令而重新读取磁盘；没有有效文件时显示 `none`。
+
+启动时直接 resume 的 session 继续使用 thread 创建时冻结的 system prompt。由于当前 session 持久化合同不保存 instruction provenance，`/rules` 会显示 source metadata unavailable，并明确说明冻结状态。TUI 内 `/resume` 也会使旧 snapshot 失效，之后只有成功的 `/new` 或 `/clear` 才重新建立可观察 snapshot。没有 runtime report callback 的嵌入调用方会得到清晰的 unavailable 提示，而不是 panic。
 
 ## 6. 只读工具
 
@@ -203,7 +209,7 @@ reset 落盘后，`memory_*` 读工具立即看不到旧条目；但当前 threa
 | 自动默认 | 开（偏 Claude） | Codex 默认关 |
 | 落盘 | 项目 `.eino/memory` | Claude 项目本地；Codex 常在用户 home |
 | agent 写工具 | 无（只读） | 部分产品允许写 |
-| 规则层级 | 仅 workspace 根 override/base 二选一 | Codex/Claude 多级 |
+| 规则层级 | 用户 home override/base + 项目 root 到 startup cwd 层级 | Codex/Claude 多级 |
 
 偏离理由见迭代文档。
 
@@ -214,4 +220,4 @@ reset 落盘后，`memory_*` 读工具立即看不到旧条目；但当前 threa
 - 用户层只做 `~/.eino-assistant` 的 override/base 二选一；项目层支持 workspace root 到 startup cwd 的祖先链；尚无子目录 lazy load、reload 命令或权限语义
 - 自动巩固为单阶段 extract，非 Codex 完整两阶段 git consolidate
 
-后续可演进：用户全局与目录级规则层级、全局偏好 scope、可选向量、更细费用展示。
+后续可演进：子目录 lazy load、显式 rules 可观测性、全局偏好 scope、可选向量、更细费用展示。

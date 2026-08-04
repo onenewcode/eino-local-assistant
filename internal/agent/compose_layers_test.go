@@ -70,3 +70,67 @@ func TestComposeWithLayersUsesProjectInstructionsStartDir(t *testing.T) {
 		t.Fatalf("project instructions are not root-first: %q", got)
 	}
 }
+
+func TestComposeWithLayersSnapshotCapturesMetadataWithoutText(t *testing.T) {
+	t.Parallel()
+	globalRoot := t.TempDir()
+	workspaceRoot := t.TempDir()
+	start := filepath.Join(workspaceRoot, "nested")
+	if err := os.Mkdir(start, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(globalRoot, agentsFile), []byte("global rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceRoot, agentsFile), []byte("root rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(start, agentsFile), []byte("nested rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, snapshot, err := ComposeWithLayersSnapshot("persona", LayerOptions{
+		WorkspaceRoot:               workspaceRoot,
+		UserInstructionsRoot:        globalRoot,
+		ProjectInstructionsStartDir: start,
+		ProjectInstructionsEnabled:  true,
+		UserInstructionsTokens:      1000,
+		ProjectInstructionsTokens:   1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Available || !snapshot.User.Available || !snapshot.User.Found {
+		t.Fatalf("snapshot user availability = %+v", snapshot.User)
+	}
+	if snapshot.User.Path != filepath.Join(globalRoot, agentsFile) || snapshot.User.Tokens == 0 {
+		t.Fatalf("user snapshot = %+v", snapshot.User)
+	}
+	if !snapshot.Project.Available || !snapshot.Project.Found || len(snapshot.Project.Sources) != 2 {
+		t.Fatalf("project snapshot = %+v", snapshot.Project)
+	}
+	if snapshot.Project.Sources[0].Title != "AGENTS.md" || snapshot.Project.Sources[1].Title != "nested/AGENTS.md" {
+		t.Fatalf("project source order = %+v", snapshot.Project.Sources)
+	}
+	if snapshot.Project.Sources[0].Tokens == 0 || snapshot.Project.Sources[1].Tokens == 0 {
+		t.Fatalf("project source tokens = %+v", snapshot.Project.Sources)
+	}
+	if strings.Contains(snapshot.User.Path+snapshot.Project.Sources[0].Title, "global rule") || !strings.Contains(prompt, "nested rule") {
+		t.Fatalf("snapshot unexpectedly carries body or prompt misses body: %+v / %q", snapshot, prompt)
+	}
+}
+
+func TestComposeWithLayersSnapshotReportsNoSources(t *testing.T) {
+	t.Parallel()
+	workspaceRoot := t.TempDir()
+	_, snapshot, err := ComposeWithLayersSnapshot("persona", LayerOptions{
+		WorkspaceRoot:              workspaceRoot,
+		ProjectInstructionsEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.Available || !snapshot.Project.Available || snapshot.Project.Found || len(snapshot.Project.Sources) != 0 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}

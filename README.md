@@ -8,7 +8,7 @@
 - **复杂任务控制器**：多步骤编码任务以需求—场景—任务图—shell proof 跟踪；图的紧凑投影随会话账本恢复，模型必须经 completion gate 才能交付
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 在短生命周期 worker 中执行；默认工作区可写、网络关闭，并有总 turn / ReAct / tool-call 预算
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`
-- **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话
+- **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话；TUI `/rules` 只查看当前 session 创建时捕获的 source metadata，不 reload 文件
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
@@ -243,6 +243,7 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 | Ctrl+D | idle 且输入为空时退出 |
 | `/help` | 帮助 |
 | `/status` | 模型 / 会话 / API usage / context 快照 / 费用估算 / ReAct、sandbox 与 runtime 护栏 |
+| `/rules` | 当前 session 捕获的用户/项目 instruction source、预算、tokens、truncated 与生命周期；只读，不 reload |
 | `/permissions` | 权限规则、sandbox 模式/后端/网络、运行时预算与本 session 决策 |
 | `/memory` | 项目持久记忆：list / add / update / delete / accept / on\|off / generate / status / reset（见 [docs/memory.md](docs/memory.md)） |
 | `/context` | 最近 API context 快照、规划输入预算、活动 checkpoint、热 turn、fallback 与自动压缩熔断状态 |
@@ -259,7 +260,7 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 
 工具调用显示为 Claude/Codex 风格卡片（`⚙ name` + 缩进 `⎿` 结果，JSON 会 pretty-print）；assistant 回复在完成后对 markdown/代码块做终端渲染（流式阶段为纯文本）。idle 状态栏显示 `provider/model` / 短 session id / API usage / `cost~` / 可选 context 快照；复杂任务显示紧凑的 `task:n/m` 进度，`Ctrl+T` 可展开只读的状态、目标、范围、当前工作与 gap，busy 状态栏还会显示当前工具名与 `queued:N`。上滚离开底部时状态栏提示 `↑ End to follow`。每轮完成后会显示该轮的 `API usage: prompt / generation / total / calls`，不会把 API 请求输入误称为用户输入。
 
-生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；`Esc` / `Ctrl+C` 中断当前 turn，`/compact`、`/clear`、`/new`、`/resume`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle。
+生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/rules`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；`Esc` / `Ctrl+C` 中断当前 turn，`/compact`、`/clear`、`/new`、`/resume`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle。
 
 ## 会话存储与压缩
 
@@ -279,6 +280,7 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 ## 项目指令与语义记忆
 
 - 用户级 `~/.eino-assistant/` 与 workspace 每层均按 `AGENTS.override.md` -> `AGENTS.md` 选择首个有效文件（两者不拼接；符号链接会跟随到普通文件；去掉 UTF-8 BOM 后仅含空白的内容会跳过）。用户块默认最多约 4k、项目块默认最多约 8k tokens 估算，预算彼此独立。
+- `/rules` 展示上述 loader 在 active session 创建、`/new` 或 `/clear` 成功时捕获的 path/title/tokens/truncated metadata；它不会重读或监听规则文件。fresh session 没有有效源时显示 `none`；resume 若没有持久化 provenance，则显示 metadata unavailable，并说明冻结的 session system prompt。
 - 项目记忆目录：`<workspace>/.eino/memory/`（默认 gitignore，不提交）。
 - `/memory add …` 写入高信任事实；`/memory update <id|key> …` 以新版本纠正旧值；空闲会话可异步抽取 *candidate*（summary 中标 unverified）。`/memory reset --confirm` 清项目语义记忆和抽取元数据，但保留 session/thread 与记忆开关。
 - 只读工具：`memory_list` / `memory_search` / `memory_read`。写入不经 agent 工具。

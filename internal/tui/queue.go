@@ -59,7 +59,7 @@ func queuedSystemLine(n int, input string) string {
 func classifyBusyInput(input string) busyInputDisposition {
 	action, arg := parseSlash(input)
 	switch action {
-	case slashHelp, slashContext, slashStatus, slashUsage, slashSessions, slashQueue, slashPermissions:
+	case slashHelp, slashContext, slashStatus, slashRules, slashSide, slashUsage, slashSessions, slashQueue, slashPermissions:
 		return busyInputExecuteImmediately
 	case slashMemory:
 		// list/status are read-only; mutations must wait for idle.

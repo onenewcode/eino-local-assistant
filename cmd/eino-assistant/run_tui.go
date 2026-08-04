@@ -115,21 +115,19 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		Runtime:       runtimeInfo,
 	}
 
-	// Deps.SystemPrompt is the full composed prompt used when TUI creates a new
-	// session (/new, /clear); keep it aligned with chat.NewSession above.
-	composedPrompt, err := runtime.composePrompt()
-	if err != nil {
-		return fmt.Errorf("compose system prompt: %w", err)
-	}
 	sessionID, err := tui.Run(processCtx, tui.Deps{
-		Session:      runtime.session,
-		Store:        runtime.sessionStore,
-		SystemPrompt: composedPrompt,
+		Session: runtime.session,
+		Store:   runtime.sessionStore,
+		// Use the session's frozen prompt for both fresh and resumed sessions.
+		// In particular, startup resume must not re-read current instruction files.
+		SystemPrompt: runtime.session.SystemPrompt(),
 		ComposeSystemPrompt: func() (string, error) {
 			return runtime.composePrompt()
 		},
-		SessionOpts: runtime.sessionOpts,
-		Status:      statusFrom(runtime.cfg.Model.Provider+"/"+runtime.cfg.Model.Name, runtime.registry, cmdMode, runtime.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+		RulesReport:             runtime.rulesReport,
+		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
+		SessionOpts:             runtime.sessionOpts,
+		Status:                  statusFrom(runtime.cfg.Model.Provider+"/"+runtime.cfg.Model.Name, runtime.registry, cmdMode, runtime.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
 		TurnOptions: runtimeguard.TurnOptions{
 			MaxToolCalls: runtime.runtimeCfg.MaxToolCalls,
 			Timeout:      time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,

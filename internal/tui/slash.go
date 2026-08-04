@@ -10,6 +10,8 @@ const (
 	slashExit
 	slashClear
 	slashStatus
+	slashRules
+	slashSide
 	slashContext
 	slashCompact
 	slashNew
@@ -41,6 +43,8 @@ func slashCatalog() []slashCommand {
 	return []slashCommand{
 		{Name: "/help", Aliases: []string{"/?"}, Description: "show this help"},
 		{Name: "/status", Description: "model, session, tokens, cost, max_step, context"},
+		{Name: "/rules", Description: "show captured instruction source metadata (no reload)"},
+		{Name: "/btw", Aliases: []string{"/side"}, Description: "ask a temporary side question without interrupting the current turn", NeedsArg: true},
 		{Name: "/usage", Description: "toggle turn usage footer (on|off|toggle)", NeedsArg: true},
 		{Name: "/context", Description: "context budget, checkpoints, and compaction status"},
 		{Name: "/compact", Description: "summarize stable turns and free context", NeedsArg: true},
@@ -144,6 +148,10 @@ func parseSlash(input string) (slashAction, string) {
 		return slashClear, arg
 	case "/status":
 		return slashStatus, arg
+	case "/rules":
+		return slashRules, arg
+	case "/btw", "/side":
+		return slashSide, arg
 	case "/usage":
 		return slashUsage, arg
 	case "/context":
@@ -176,6 +184,8 @@ func helpText() string {
 		"Commands:",
 		"  /help              show this help",
 		"  /status            model, session, tokens, cost, max_step, context",
+		"  /rules             captured instruction sources and budgets (no reload)",
+		"  /btw <question>    ask a temporary side question without interrupting the current turn (alias: /side)",
 		"  /usage [on|off]    show/toggle per-turn API usage footer (default on)",
 		"  /context           context budget, checkpoints, and compaction status",
 		"  /compact [focus]   summarize stable turns and free context",
@@ -203,7 +213,7 @@ func helpText() string {
 		"  esc       dismiss slash menu, deny approval, or interrupt turn/compaction",
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
-		"While busy, /help /context /status /usage /sessions /queue /permissions /memory status|list run immediately; /queue clear drops follow-ups.",
+		"While busy, /help /context /status /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; side questions never enter the FIFO queue.",
 		"Mutative commands (/compact /clear /new /resume /title /delete /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny). Status shows cmd=ask|auto.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"eino-local-assistant/internal/agent"
 	"eino-local-assistant/internal/config"
 )
 
@@ -34,6 +35,45 @@ func TestCaptureStartupCWDPreservesReaderError(t *testing.T) {
 	})
 	if !errors.Is(err, want) {
 		t.Fatalf("error = %v, want wrapped getcwd error", err)
+	}
+}
+
+func TestRulesReportUsesCapturedSnapshotAndResumeInvalidation(t *testing.T) {
+	calls := 0
+	runtime := &commandRuntime{
+		cfg: config.Config{},
+		composePromptSnapshot: func() (string, agent.PromptLayerSnapshot, error) {
+			calls++
+			return "frozen prompt", agent.PromptLayerSnapshot{
+				Available: true,
+				User: agent.PromptLayerBundleSnapshot{
+					Available: true,
+					Found:     true,
+					Path:      "/home/tester/.eino-assistant/AGENTS.md",
+					Tokens:    12,
+				},
+				Project: agent.PromptProjectSnapshot{
+					Available: true,
+					Found:     true,
+					Tokens:    20,
+					Sources: []agent.PromptProjectSourceSnapshot{{
+						Path:   "/workspace/AGENTS.md",
+						Title:  "AGENTS.md",
+						Tokens: 20,
+					}},
+				},
+			}, nil
+		},
+	}
+	if _, err := runtime.composeSystemPrompt(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || !strings.Contains(runtime.rulesReport(), "path=/workspace/AGENTS.md") {
+		t.Fatalf("report=%q calls=%d", runtime.rulesReport(), calls)
+	}
+	runtime.invalidateRulesSnapshot()
+	if calls != 1 || !strings.Contains(runtime.rulesReport(), "source metadata unavailable") {
+		t.Fatalf("resume report=%q calls=%d", runtime.rulesReport(), calls)
 	}
 }
 

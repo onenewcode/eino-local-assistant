@@ -81,6 +81,45 @@ type PromptLayers struct {
 	MemoryBlock string
 }
 
+// PromptLayerBundleSnapshot describes the metadata captured for one prompt
+// bundle. It intentionally excludes instruction text so it is safe to expose
+// through a read-only diagnostic command.
+type PromptLayerBundleSnapshot struct {
+	Available bool
+	Found     bool
+	Path      string
+	Tokens    int
+	Truncated bool
+}
+
+// PromptProjectSourceSnapshot describes one selected project instruction
+// source in the same root-first order used by prompt composition.
+type PromptProjectSourceSnapshot struct {
+	Path      string
+	Title     string
+	Tokens    int
+	Truncated bool
+}
+
+// PromptProjectSnapshot describes the project instruction bundle captured at
+// composition time. Sources never contain instruction text.
+type PromptProjectSnapshot struct {
+	Available                bool
+	Found                    bool
+	Tokens                   int
+	Truncated                bool
+	Sources                  []PromptProjectSourceSnapshot
+	StartDirOutsideWorkspace bool
+}
+
+// PromptLayerSnapshot is the immutable metadata view associated with one
+// composed system prompt. Callers should copy it before retaining it.
+type PromptLayerSnapshot struct {
+	Available bool
+	User      PromptLayerBundleSnapshot
+	Project   PromptProjectSnapshot
+}
+
 // ComposeFullSystemPrompt builds persona + tool policy + user instructions +
 // project instructions + memory.
 // Callers should already budget-truncate rules and memory blocks.

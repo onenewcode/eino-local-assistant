@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"eino-local-assistant/internal/chat"
@@ -60,6 +61,14 @@ type Deps struct {
 	// Mid-session /memory, /resume, and /compact do not recompose: the durable
 	// thread system prompt is frozen for prefix-cache stability.
 	ComposeSystemPrompt func() (string, error)
+	// RulesReport returns the active session's captured instruction metadata.
+	// It must be read-only: /rules never asks the callback to reload files.
+	RulesReport func() string
+	// InvalidateRulesSnapshot marks provenance unavailable after /resume.
+	InvalidateRulesSnapshot func()
+	// SideQuestion answers a temporary side question without writing the main
+	// session ledger or changing the active turn.
+	SideQuestion func(context.Context, *chat.Session, string) (string, error)
 	// SessionOpts is reused for /new and /resume so pricing/context stay consistent.
 	SessionOpts chat.SessionOptions
 	Status      StatusInfo
@@ -109,6 +118,8 @@ const (
 	lineUsage
 	// lineReasoning is ephemeral model reasoning summary for this process only.
 	lineReasoning
+	// lineSide is display-only output from /btw and /side.
+	lineSide
 	lineSep
 )
 
@@ -129,6 +140,8 @@ type model struct {
 	spinner  spinner.Model
 
 	lines []transcriptLine
+	// sideLines stay separate from the main transcript and turn stream.
+	sideLines []transcriptLine
 
 	// stickBottom auto-follows new transcript content while the user is at the bottom.
 	stickBottom bool
@@ -149,6 +162,7 @@ type model struct {
 	taskPaneOpen bool
 
 	mode             mode
+	sessionMu        sync.RWMutex
 	turnID           int
 	turnCancel       context.CancelFunc
 	turnStart        time.Time
@@ -336,6 +350,18 @@ func (m *model) processCtx() context.Context {
 		return m.deps.Ctx
 	}
 	return context.Background()
+}
+
+func (m *model) activeSession() *chat.Session {
+	m.sessionMu.RLock()
+	defer m.sessionMu.RUnlock()
+	return m.deps.Session
+}
+
+func (m *model) replaceSession(session *chat.Session) {
+	m.sessionMu.Lock()
+	m.deps.Session = session
+	m.sessionMu.Unlock()
 }
 
 func newModel(deps Deps) *model {
@@ -657,6 +683,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := m.finishTurn(done.err)
 		return m, cmd
 
+	case sideQuestionDoneMsg:
+		current := m.activeSession()
+		if msg.sessionID != "" && (current == nil || msg.sessionID != current.ID()) {
+			return m, nil
+		}
+		m.finishSideQuestion(msg)
+		return m, nil
+
 	case compactDoneMsg:
 		if msg.compactID != m.compactID {
 			return m, nil
@@ -937,6 +971,10 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSystem, m.statusReport())
 		m.appendLine(lineSep, "")
 		return m, nil
+	case slashRules:
+		return m.cmdRules(arg)
+	case slashSide:
+		return m.cmdSideQuestion(sideQuestionLabel(input), arg)
 	case slashUsage:
 		return m.cmdUsage(arg)
 	case slashContext:
@@ -971,6 +1009,69 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 	return m.startTurn(input)
 }
 
+func sideQuestionLabel(input string) string {
+	fields := strings.Fields(input)
+	if len(fields) > 0 && strings.EqualFold(fields[0], "/side") {
+		return "side"
+	}
+	return "btw"
+}
+
+func (m *model) cmdSideQuestion(label, question string) (tea.Model, tea.Cmd) {
+	label = strings.ToLower(strings.TrimSpace(label))
+	if label != "side" {
+		label = "btw"
+	}
+	question = strings.TrimSpace(question)
+	if question == "" {
+		m.appendLine(lineError, "usage: /btw <question>")
+		return m, nil
+	}
+
+	m.appendSideLine(fmt.Sprintf("[%s] question: %s", label, question))
+	callback := m.deps.SideQuestion
+	if callback == nil {
+		m.appendSideLine(fmt.Sprintf("[%s] side unavailable: callback is not configured", label))
+		return m, nil
+	}
+	if m.activeSession() == nil {
+		m.appendSideLine(fmt.Sprintf("[%s] side unavailable: session is unavailable", label))
+		return m, nil
+	}
+	ctx := m.processCtx()
+	return m, func() tea.Msg {
+		// Resolve the session when the command starts so session switches do not
+		// leave a side callback holding the session from model construction.
+		session := m.activeSession()
+		if session == nil {
+			return sideQuestionDoneMsg{label: label, unavailable: true}
+		}
+		answer, err := callback(ctx, session, question)
+		return sideQuestionDoneMsg{
+			label:     label,
+			sessionID: session.ID(),
+			answer:    answer,
+			err:       err,
+		}
+	}
+}
+
+func (m *model) finishSideQuestion(msg sideQuestionDoneMsg) {
+	label := strings.ToLower(strings.TrimSpace(msg.label))
+	if label != "side" {
+		label = "btw"
+	}
+	if msg.unavailable {
+		m.appendSideLine(fmt.Sprintf("[%s] side unavailable: session is unavailable", label))
+		return
+	}
+	if msg.err != nil {
+		m.appendSideLine(fmt.Sprintf("[%s] side error: %s", label, msg.err.Error()))
+		return
+	}
+	m.appendSideLine(fmt.Sprintf("[%s] answer: %s", label, strings.TrimSpace(msg.answer)))
+}
+
 // cmdUsage toggles or sets the display-only per-turn API usage footer.
 // This never affects the session ledger or model prompt.
 func (m *model) cmdUsage(arg string) (tea.Model, tea.Cmd) {
@@ -995,6 +1096,20 @@ func (m *model) cmdUsage(arg string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) cmdRules(arg string) (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(arg) != "" {
+		m.appendLine(lineError, "usage: /rules")
+		return m, nil
+	}
+	if m.deps.RulesReport == nil {
+		m.appendLine(lineSystem, "Rules\nsource metadata unavailable (runtime callback is not configured)")
+	} else {
+		m.appendLine(lineSystem, m.deps.RulesReport())
+	}
+	m.appendLine(lineSep, "")
+	return m, nil
+}
+
 func (m *model) cmdClear() (tea.Model, tea.Cmd) {
 	if m.mode != modeIdle {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
@@ -1010,9 +1125,10 @@ func (m *model) cmdClear() (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "clear context: "+err.Error())
 		return m, nil
 	}
-	m.deps.Session = session
+	m.replaceSession(session)
 	m.closeTaskPane()
 	m.lines = nil
+	m.sideLines = nil
 	m.streamingAssistant = false
 	m.stickBottom = true
 	m.queue = nil
@@ -1035,9 +1151,10 @@ func (m *model) cmdNew(title string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "new session: "+err.Error())
 		return m, nil
 	}
-	m.deps.Session = session
+	m.replaceSession(session)
 	m.closeTaskPane()
 	m.lines = nil
+	m.sideLines = nil
 	m.streamingAssistant = false
 	m.stickBottom = true
 	m.queue = nil
@@ -1176,7 +1293,10 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "resume: "+err.Error())
 		return m, nil
 	}
-	m.deps.Session = session
+	m.replaceSession(session)
+	if m.deps.InvalidateRulesSnapshot != nil {
+		m.deps.InvalidateRulesSnapshot()
+	}
 	m.closeTaskPane()
 	if m.deps.NotifyActiveSession != nil {
 		m.deps.NotifyActiveSession(session.ID())
@@ -1185,6 +1305,7 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	m.streamingAssistant = false
 	m.stickBottom = true
 	m.queue = nil
+	m.sideLines = nil
 	transcript := session.Transcript()
 	m.lines = seedLinesFromTranscript(transcript, resumeBanner(session.ID(), len(transcript)), session.Title())
 	m.appendLegacyCheckpointResetNotice(session)
@@ -1718,6 +1839,11 @@ func (m *model) appendLine(kind lineKind, text string) {
 	m.refreshViewport()
 }
 
+func (m *model) appendSideLine(text string) {
+	m.sideLines = append(m.sideLines, transcriptLine{kind: lineSide, text: text})
+	m.refreshViewport()
+}
+
 func (m *model) refreshViewport() {
 	var b strings.Builder
 	for i, line := range m.lines {
@@ -1744,6 +1870,12 @@ func (m *model) refreshViewport() {
 		case lineSep:
 			b.WriteString(renderSeparator(m.viewport.Width))
 		}
+	}
+	for _, line := range m.sideLines {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(renderSystem(line.text))
 	}
 	applyContent(&m.viewport, &m.stickBottom, b.String())
 }

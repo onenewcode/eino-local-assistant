@@ -46,11 +46,11 @@ AGENTS 指令加载在 `agent`：用户 home `~/.eino-assistant` 与 workspace �
 | --- | --- | --- | --- |
 | 硬权限 | `permissions` + `tools` + `sandbox` | 进程 / 每次工具调用 | 不依赖 AGENTS.md 或 memory 文本执行 |
 | 会话账本 | `store` + `chat` | 可 `/resume` | journal、artifact 与 checkpoint 是真相 |
-| 用户/项目指令 | `agent` 选择 home 与 workspace AGENTS 指令 | `/new` / `/clear` 刷新 | system prefix 的软指导；override 与 base 不拼接；用户和项目预算独立 |
+| 用户/项目指令 | `agent` 选择 home 与 workspace AGENTS 指令 | `/new` / `/clear` 刷新；`/rules` 只读观察 | system prefix 的软指导；override 与 base 不拼接；用户和项目预算独立；`/rules` 不 reload |
 | 语义记忆 | `memory`，`.eino/memory/` | 跨会话 | 不等于 `/resume`；agent 只读 |
 | 复杂任务图 | `agent.TaskController` + `store` | 当前会话，可 `/resume` | `task.state.updated` 是图的恢复投影；工具/artifact 仍是证据真相 |
 
-System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、用户 instructions、项目 AGENTS 指令和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。用户 root 在 runtime 构造时固定为 `os.UserHomeDir()/.eino-assistant`，不随 `storage.data_dir` 改变；resume 继续使用 thread 创建时冻结的 system prompt。
+System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、用户 instructions、项目 AGENTS 指令和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。用户 root 在 runtime 构造时固定为 `os.UserHomeDir()/.eino-assistant`，不随 `storage.data_dir` 改变；resume 继续使用 thread 创建时冻结的 system prompt。`agent.ComposeWithLayersSnapshot` 同步返回不含正文的 source metadata，runtime 将其保留到 active session 生命周期；TUI `/rules` 只读该 snapshot，不调用 loader。resume 若 provenance 未进入持久化账本，会明确报告 source metadata unavailable，而不是用当前磁盘内容冒充 active snapshot。
 
 ## 复杂任务运行时
 

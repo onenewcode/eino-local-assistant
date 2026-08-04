@@ -63,6 +63,15 @@ type turnDoneMsg struct {
 	err    error
 }
 
+// sideQuestionDoneMsg is display-only and never enters the main turn stream.
+type sideQuestionDoneMsg struct {
+	label       string
+	sessionID   string
+	answer      string
+	err         error
+	unavailable bool
+}
+
 // compactDoneMsg returns the outcome of a dedicated manual or automatic
 // compaction operation to the Bubble Tea state machine.
 type compactDoneMsg struct {

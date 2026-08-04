@@ -4,7 +4,7 @@
 | --- | --- |
 | 日期 | 2026-08-04 |
 | 范围 | home-scoped user instructions + project instructions composition |
-| 状态 | 实现于独立 worktree，提交前验证 |
+| 状态 | 已交付；实现与完整门槛验证通过 |
 | 研究依据 | [user-global-instructions-cross-product-research.md](../research/user-global-instructions-cross-product-research.md) |
 
 ## 1. 目标与边界
@@ -39,4 +39,5 @@ session，下一次 fresh/new/clear 才生效。用户 home 路径只是 context
 
 Focused tests cover missing files, override precedence, empty fallback, non-regular files,
 symlink provenance, read errors, Unicode budgets, independent global/project budgets,
-disabled rules, and fresh composer reload behavior.
+disabled rules, and fresh composer reload behavior. The full repository gate is run after
+integration before the implementation commit is pushed.

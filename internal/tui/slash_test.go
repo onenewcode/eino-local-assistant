@@ -18,6 +18,10 @@ func TestParseSlash(t *testing.T) {
 		{"/quit", slashExit, ""},
 		{"/clear", slashClear, ""},
 		{"/status", slashStatus, ""},
+		{"/rules", slashRules, ""},
+		{"/btw what changed?", slashSide, "what changed?"},
+		{"/side what changed?", slashSide, "what changed?"},
+		{"/BTW", slashSide, ""},
 		{"/usage", slashUsage, ""},
 		{"/usage off", slashUsage, "off"},
 		{"/context", slashContext, ""},
@@ -74,7 +78,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/usage",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/rules", "/btw", "/side", "/usage",
 		"/context", "/compact",
 		"/new", "/sessions", "/resume", "/title", "/delete", "/queue",
 		"/permissions", "/policy",
@@ -102,8 +106,9 @@ func catalogCoversToken(catalog []slashCommand, tok string) bool {
 
 func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
-		"/help": false, "/status": false, "/context": false, "/sessions": false,
+		"/help": false, "/status": false, "/rules": false, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/permissions": false,
+		"/btw":   true,
 		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/title": true,
 		"/delete": true, "/queue": true, "/memory": true,
 	}
@@ -177,14 +182,15 @@ func TestFilterSlashCommandsMatrix(t *testing.T) {
 		{"/cl", []string{"/clear"}},
 		{"/cle", []string{"/clear"}},
 		{"/clear", []string{"/clear"}},
-		{"/s", []string{"/status", "/sessions"}},
+		{"/s", []string{"/status", "/btw", "/sessions"}},
+		{"/si", []string{"/btw"}},
 		{"/st", []string{"/status"}},
 		{"/se", []string{"/sessions"}},
 		{"/stat", []string{"/status"}},
 		{"/sess", []string{"/sessions"}},
 		{"/n", []string{"/new"}},
 		{"/new", []string{"/new"}},
-		{"/r", []string{"/resume"}},
+		{"/r", []string{"/rules", "/resume"}},
 		{"/re", []string{"/resume"}},
 		{"/res", []string{"/resume"}},
 		{"/t", []string{"/title"}},

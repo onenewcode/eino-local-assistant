@@ -70,6 +70,42 @@ func TestSubmitStatus(t *testing.T) {
 	}
 }
 
+func TestSubmitRulesReportsCapturedMetadata(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: session,
+		RulesReport: func() string {
+			return "Rules\nuser source path=/home/tester/.eino-assistant/AGENTS.md\nproject source=none"
+		},
+	})
+	next, _ := m.submit("/rules")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineSystem, "project source=none") {
+		t.Fatalf("rules report missing: %#v", mm.lines)
+	}
+}
+
+func TestSubmitRulesRejectsArguments(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{Ctx: context.Background(), Session: session})
+	next, _ := m.submit("/rules now")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineError, "usage: /rules") {
+		t.Fatalf("rules arg error missing: %#v", mm.lines)
+	}
+}
+
+func TestSubmitRulesWithoutCallbackExplainsUnavailableMetadata(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{Ctx: context.Background(), Session: session})
+	next, _ := m.submit("/rules")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineSystem, "runtime callback is not configured") {
+		t.Fatalf("unavailable report missing: %#v", mm.lines)
+	}
+}
+
 func TestChunkAndToolEventsUpdateTranscript(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
 	m := newModel(Deps{Ctx: context.Background(), Session: session})

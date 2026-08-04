@@ -44,11 +44,11 @@ type Config struct {
 	Memory MemoryConfig `toml:"memory"`
 }
 
-// RulesConfig controls loading of workspace-root AGENTS.md.
+// RulesConfig controls loading of user-home and project AGENTS.md instructions.
 type RulesConfig struct {
 	// Enabled injects AGENTS.md when true. Omitted defaults to true.
 	Enabled *bool `toml:"enabled"`
-	// MaxTokens caps AGENTS.md injection. Zero uses DefaultRulesMaxTokens.
+	// MaxTokens caps project AGENTS.md injection. Zero uses DefaultRulesMaxTokens.
 	MaxTokens int `toml:"max_tokens"`
 	// GlobalMaxTokens caps user-home AGENTS injection. Zero uses
 	// DefaultGlobalRulesMaxTokens.

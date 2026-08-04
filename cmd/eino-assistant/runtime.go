@@ -27,25 +27,29 @@ import (
 // interactive TUI and non-interactive commands. It stays private to cmd so it
 // cannot become a second application layer outside the existing packages.
 type commandRuntime struct {
-	cfg                config.Config
-	session            *chat.Session
-	sessionStore       *store.ThreadStore
-	ephemeralStoreRoot string
-	chatModel          model.ToolCallingChatModel
-	registry           *tools.Registry
-	reactModel         *agent.ReActModel
-	memStore           *memory.Store
-	sessionOpts        chat.SessionOptions
-	composePrompt      func() (string, error)
-	approvalMode       tools.ApprovalMode
-	permissions        *tools.PermissionSet
-	sessionAllows      *tools.SessionAllowlist
-	sessionDenies      *tools.SessionDenylist
-	workspaceRoot      string
-	readOnlyRoots      []string
-	protectedPaths     []string
-	sandboxRunner      *tools.SandboxRunner
-	runtimeCfg         config.RuntimeConfig
+	cfg                   config.Config
+	session               *chat.Session
+	sessionStore          *store.ThreadStore
+	ephemeralStoreRoot    string
+	chatModel             model.ToolCallingChatModel
+	registry              *tools.Registry
+	reactModel            *agent.ReActModel
+	memStore              *memory.Store
+	sessionOpts           chat.SessionOptions
+	composePrompt         func() (string, error)
+	approvalMode          tools.ApprovalMode
+	permissions           *tools.PermissionSet
+	sessionAllows         *tools.SessionAllowlist
+	sessionDenies         *tools.SessionDenylist
+	workspaceRoot         string
+	readOnlyRoots         []string
+	protectedPaths        []string
+	sandboxRunner         *tools.SandboxRunner
+	runtimeCfg            config.RuntimeConfig
+	composePromptSnapshot func() (string, agent.PromptLayerSnapshot, error)
+	rulesSnapshot         agent.PromptLayerSnapshot
+	rulesSnapshotReady    bool
+	rulesSnapshotStatus   string
 }
 
 type execThreadLister interface {
@@ -198,16 +202,30 @@ func newSystemPromptComposer(
 	userInstructionsRoot string,
 	loadMemoryBlock func() (string, error),
 ) func() (string, error) {
+	compose := newSystemPromptSnapshotComposer(cfg, workspaceRoot, startupCWD, userInstructionsRoot, loadMemoryBlock)
 	return func() (string, error) {
+		prompt, _, err := compose()
+		return prompt, err
+	}
+}
+
+func newSystemPromptSnapshotComposer(
+	cfg config.Config,
+	workspaceRoot string,
+	startupCWD string,
+	userInstructionsRoot string,
+	loadMemoryBlock func() (string, error),
+) func() (string, agent.PromptLayerSnapshot, error) {
+	return func() (string, agent.PromptLayerSnapshot, error) {
 		memBlock := ""
 		if loadMemoryBlock != nil {
 			var err error
 			memBlock, err = loadMemoryBlock()
 			if err != nil {
-				return "", err
+				return "", agent.PromptLayerSnapshot{}, err
 			}
 		}
-		return agent.ComposeWithLayers(cfg.Assistant.SystemPrompt, agent.LayerOptions{
+		return agent.ComposeWithLayersSnapshot(cfg.Assistant.SystemPrompt, agent.LayerOptions{
 			WorkspaceRoot:               workspaceRoot,
 			UserInstructionsRoot:        userInstructionsRoot,
 			UserInstructionsTokens:      cfg.Rules.RulesGlobalMaxTokens(),
@@ -420,7 +438,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		Compactor:          compactor,
 		RecoverInterrupted: start.recoverInterrupted,
 	}
-	composePrompt := newSystemPromptComposer(cfg, workspaceRoot, startupCWD, userInstructionsRoot, func() (string, error) {
+	composePromptSnapshot := newSystemPromptSnapshotComposer(cfg, workspaceRoot, startupCWD, userInstructionsRoot, func() (string, error) {
 		if !memStore.UseEnabled() {
 			return "", nil
 		}
@@ -432,6 +450,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	})
 
 	var session *chat.Session
+	var initialSnapshot agent.PromptLayerSnapshot
 	if start.resumeID != "" {
 		session, err = chat.OpenSession(reactModel, sessionStore, start.resumeID, sessionOpts)
 		if err != nil {
@@ -439,37 +458,118 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		}
 	} else {
 		sessionOpts.Title = start.title
-		fullPrompt, promptErr := composePrompt()
+		fullPrompt, promptSnapshot, promptErr := composePromptSnapshot()
 		if promptErr != nil {
 			return nil, fmt.Errorf("compose system prompt: %w", promptErr)
 		}
+		initialSnapshot = promptSnapshot
 		session, err = chat.NewSession(reactModel, fullPrompt, sessionOpts)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return &commandRuntime{
-		cfg:                cfg,
-		session:            session,
-		sessionStore:       sessionStore,
-		ephemeralStoreRoot: ephemeralStoreRoot,
-		chatModel:          chatModel,
-		registry:           registry,
-		reactModel:         reactModel,
-		memStore:           memStore,
-		sessionOpts:        sessionOpts,
-		composePrompt:      composePrompt,
-		approvalMode:       approvalMode,
-		permissions:        perms,
-		sessionAllows:      sessionAllows,
-		sessionDenies:      sessionDenies,
-		workspaceRoot:      workspaceRoot,
-		readOnlyRoots:      readOnlyRoots,
-		protectedPaths:     protectedPaths,
-		sandboxRunner:      sandboxRunner,
-		runtimeCfg:         runtimeCfg,
-	}, nil
+	runtime := &commandRuntime{
+		cfg:                   cfg,
+		session:               session,
+		sessionStore:          sessionStore,
+		ephemeralStoreRoot:    ephemeralStoreRoot,
+		chatModel:             chatModel,
+		registry:              registry,
+		reactModel:            reactModel,
+		memStore:              memStore,
+		sessionOpts:           sessionOpts,
+		composePromptSnapshot: composePromptSnapshot,
+		rulesSnapshot:         initialSnapshot,
+		rulesSnapshotReady:    start.resumeID == "",
+		rulesSnapshotStatus:   initialRulesSnapshotStatus(start.resumeID == ""),
+		approvalMode:          approvalMode,
+		permissions:           perms,
+		sessionAllows:         sessionAllows,
+		sessionDenies:         sessionDenies,
+		workspaceRoot:         workspaceRoot,
+		readOnlyRoots:         readOnlyRoots,
+		protectedPaths:        protectedPaths,
+		sandboxRunner:         sandboxRunner,
+		runtimeCfg:            runtimeCfg,
+	}
+	runtime.composePrompt = runtime.composeSystemPrompt
+	return runtime, nil
+}
+
+func initialRulesSnapshotStatus(ready bool) string {
+	if ready {
+		return "active session snapshot captured"
+	}
+	return "resumed session; active system prompt is frozen"
+}
+
+// composeSystemPrompt is the only runtime path that both recomposes a prompt
+// and publishes its source metadata. /rules calls rulesReport instead, so it
+// cannot turn an observability command into a disk reload.
+func (r *commandRuntime) composeSystemPrompt() (string, error) {
+	if r == nil || r.composePromptSnapshot == nil {
+		return "", errors.New("system prompt composer is unavailable")
+	}
+	prompt, snapshot, err := r.composePromptSnapshot()
+	if err != nil {
+		return "", err
+	}
+	r.rulesSnapshot = snapshot
+	r.rulesSnapshotReady = true
+	r.rulesSnapshotStatus = "active session snapshot captured"
+	return prompt, nil
+}
+
+func (r *commandRuntime) invalidateRulesSnapshot() {
+	if r == nil {
+		return
+	}
+	r.rulesSnapshot = agent.PromptLayerSnapshot{}
+	r.rulesSnapshotReady = false
+	r.rulesSnapshotStatus = "resumed session; active system prompt is frozen"
+}
+
+func (r *commandRuntime) rulesReport() string {
+	if r == nil {
+		return "Rules\nsource metadata unavailable (runtime is unavailable)"
+	}
+	var b strings.Builder
+	b.WriteString("Rules (captured source metadata; /rules never reloads)\n")
+	status := strings.TrimSpace(r.rulesSnapshotStatus)
+	if status == "" {
+		status = "source metadata unavailable"
+	}
+	fmt.Fprintf(&b, "lifecycle=%s\n", status)
+	fmt.Fprintf(&b, "user budget_tokens=%d", r.cfg.Rules.RulesGlobalMaxTokens())
+	fmt.Fprintf(&b, "  project budget_tokens=%d\n", r.cfg.Rules.RulesMaxTokens())
+	if !r.rulesSnapshotReady {
+		b.WriteString("user source metadata unavailable\n")
+		b.WriteString("project source metadata unavailable\n")
+		b.WriteString("note=resume provenance is not persisted; active system prompt is frozen\n")
+		return strings.TrimRight(b.String(), "\n")
+	}
+	formatRulesBundleReport(&b, "user", r.rulesSnapshot.User)
+	b.WriteString("project")
+	if !r.rulesSnapshot.Project.Found {
+		b.WriteString(" source=none")
+	}
+	fmt.Fprintf(&b, " available=%v tokens=%d truncated=%v\n", r.rulesSnapshot.Project.Available, r.rulesSnapshot.Project.Tokens, r.rulesSnapshot.Project.Truncated)
+	for i, source := range r.rulesSnapshot.Project.Sources {
+		fmt.Fprintf(&b, "project source[%d] title=%s path=%s tokens=%d truncated=%v\n", i, source.Title, source.Path, source.Tokens, source.Truncated)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func formatRulesBundleReport(b *strings.Builder, name string, bundle agent.PromptLayerBundleSnapshot) {
+	b.WriteString(name)
+	if !bundle.Found {
+		b.WriteString(" source=none")
+	}
+	fmt.Fprintf(b, " available=%v tokens=%d truncated=%v\n", bundle.Available, bundle.Tokens, bundle.Truncated)
+	if bundle.Found {
+		fmt.Fprintf(b, "%s source path=%s\n", name, bundle.Path)
+	}
 }
 
 func applyModelOverride(cfg *config.Config, modelName string) error {
