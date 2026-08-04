@@ -65,11 +65,12 @@ type turnDoneMsg struct {
 
 // sideQuestionDoneMsg is display-only and never enters the main turn stream.
 type sideQuestionDoneMsg struct {
-	label       string
-	sessionID   string
-	answer      string
-	err         error
-	unavailable bool
+	label             string
+	sessionID         string
+	sessionGeneration uint64
+	answer            string
+	err               error
+	unavailable       bool
 }
 
 // compactDoneMsg returns the outcome of a dedicated manual or automatic

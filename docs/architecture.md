@@ -21,6 +21,8 @@ Headless `exec` accepts `-o FILE` as an alias for the existing `--output-last-me
 
 Headless `exec` also accepts `-m, --model MODEL` on fresh and resume paths, including `--last` and ephemeral runs. The override is applied before provider startup for the current invocation; it changes neither the session identity nor prior transcript/source-snapshot content.
 
+TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并通过 `cmd/eino-assistant` 的 `SideQuestion` callback 发起一次旁路模型请求。它是本仓库的安全子集：主 turn 不被打断，旁路问题不进入 FIFO queue，多个问题可并发。请求使用当前 active session 的 frozen system prompt 和 transcript 作为 reference-only；不调用 tools 或 subagents，不写主 ledger、`usage` 或 `journal`，不修改文件、git state、configuration 或 permissions。结果只进入 TUI 的 side-only display，错误和空回答也可见；没有 callback 的嵌入调用方显示 unavailable。它不是完整持久 fork，也不提供独立 session、ledger 或 resume；Codex/Claude 的行为只作为研究参考，不宣称完全等价。
+
 ## 包边界
 
 | 位置 | 负责 | 不负责 |
@@ -33,8 +35,8 @@ Headless `exec` also accepts `-m, --model MODEL` on fresh and resume paths, incl
 | `internal/tools` | shell、apply_patch、artifact、memory 只读工具 | TUI 策略展示 |
 | `internal/sandbox` | 工具的 OS 隔离边界 | prompt 规则 |
 | `internal/config` | TOML 读取、默认值与校验 | 运行时状态 |
-| `internal/tui` | 交互、slash、队列、审批桥、状态栏与只读任务进度 | 模型协议 |
-| `cmd/eino-assistant` headless output | `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema |
+| `internal/tui` | 交互、slash、队列、审批桥、状态栏、只读任务进度与 side-only 旁路结果展示/并发调度 | 模型协议、旁路请求的模型调用 |
+| `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema |
 | `internal/provider` | OpenAI / Anthropic 模型适配 | 产品流程 |
 | `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
 
@@ -48,6 +50,7 @@ AGENTS 指令加载在 `agent`：用户 home `~/.eino-assistant` 与 workspace �
 | 会话账本 | `store` + `chat` | 可 `/resume` | journal、artifact 与 checkpoint 是真相 |
 | 用户/项目指令 | `agent` 选择 home 与 workspace AGENTS 指令 | `/new` / `/clear` 刷新；`/rules` 只读观察 | system prefix 的软指导；override 与 base 不拼接；用户和项目预算独立；`/rules` 不 reload |
 | 语义记忆 | `memory`，`.eino/memory/` | 跨会话 | 不等于 `/resume`；agent 只读 |
+| 旁路问题 | `cmd/eino-assistant` runtime + `internal/tui` | 单次请求；结果只存在当前 TUI 展示 | 使用 frozen session context 作 reference；不打断/不排队主 turn；不进主 ledger、`usage`、`journal`；不调用 tools/subagents；不修改文件、git、config、permissions；错误/空回答可见；无 callback 时 unavailable |
 | 复杂任务图 | `agent.TaskController` + `store` | 当前会话，可 `/resume` | `task.state.updated` 是图的恢复投影；工具/artifact 仍是证据真相 |
 
 System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、用户 instructions、项目 AGENTS 指令和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。用户 root 在 runtime 构造时固定为 `os.UserHomeDir()/.eino-assistant`，不随 `storage.data_dir` 改变；resume 继续使用 thread 创建时冻结的 system prompt。`agent.ComposeWithLayersSnapshot` 同步返回不含正文的 source metadata，runtime 将其保留到 active session 生命周期；TUI `/rules` 只读该 snapshot，不调用 loader。resume 若 provenance 未进入持久化账本，会明确报告 source metadata unavailable，而不是用当前磁盘内容冒充 active snapshot。

@@ -37,8 +37,10 @@ func Run(ctx context.Context, deps Deps) (sessionID string, err error) {
 // sessionIDAtExit prefers the live model session (may have switched via /new
 // or /resume) and falls back to the deps session if the final model is missing.
 func sessionIDAtExit(final tea.Model, deps Deps) string {
-	if m, ok := final.(*model); ok && m != nil && m.deps.Session != nil {
-		return m.deps.Session.ID()
+	if m, ok := final.(*model); ok && m != nil {
+		if session := m.activeSession(); session != nil {
+			return session.ID()
+		}
 	}
 	if deps.Session != nil {
 		return deps.Session.ID()

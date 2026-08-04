@@ -161,21 +161,22 @@ type model struct {
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
 
-	mode             mode
-	sessionMu        sync.RWMutex
-	turnID           int
-	turnCancel       context.CancelFunc
-	turnStart        time.Time
-	events           chan tea.Msg
-	turnDone         chan turnDoneMsg
-	pendingTurnDone  *turnDoneMsg
-	turnUsage        usage.APIUsage
-	turnUsageSeen    bool
-	turnUsageCallIDs map[string]struct{}
-	compactID        int
-	compactCancel    context.CancelFunc
-	compactStart     time.Time
-	compactAutomatic bool
+	mode              mode
+	sessionMu         sync.RWMutex
+	sessionGeneration uint64
+	turnID            int
+	turnCancel        context.CancelFunc
+	turnStart         time.Time
+	events            chan tea.Msg
+	turnDone          chan turnDoneMsg
+	pendingTurnDone   *turnDoneMsg
+	turnUsage         usage.APIUsage
+	turnUsageSeen     bool
+	turnUsageCallIDs  map[string]struct{}
+	compactID         int
+	compactCancel     context.CancelFunc
+	compactStart      time.Time
+	compactAutomatic  bool
 
 	streamingAssistant bool
 	// openReasoning is the index of the in-flight reasoning line, or noOpenReasoning.
@@ -352,15 +353,21 @@ func (m *model) processCtx() context.Context {
 	return context.Background()
 }
 
-func (m *model) activeSession() *chat.Session {
+func (m *model) activeSessionSnapshot() (*chat.Session, uint64) {
 	m.sessionMu.RLock()
 	defer m.sessionMu.RUnlock()
-	return m.deps.Session
+	return m.deps.Session, m.sessionGeneration
+}
+
+func (m *model) activeSession() *chat.Session {
+	session, _ := m.activeSessionSnapshot()
+	return session
 }
 
 func (m *model) replaceSession(session *chat.Session) {
 	m.sessionMu.Lock()
 	m.deps.Session = session
+	m.sessionGeneration++
 	m.sessionMu.Unlock()
 }
 
@@ -408,16 +415,17 @@ func newModel(deps Deps) *model {
 	vp.MouseWheelEnabled = true
 
 	m := &model{
-		deps:          deps,
-		viewport:      vp,
-		textarea:      ta,
-		spinner:       sp,
-		stickBottom:   true,
-		inputHist:     newInputHistory(),
-		openToolCards: make(map[string]int),
-		openToolNames: make(map[string]string),
-		openReasoning: noOpenReasoning,
-		composerReady: true,
+		deps:              deps,
+		viewport:          vp,
+		textarea:          ta,
+		spinner:           sp,
+		stickBottom:       true,
+		inputHist:         newInputHistory(),
+		openToolCards:     make(map[string]int),
+		openToolNames:     make(map[string]string),
+		openReasoning:     noOpenReasoning,
+		sessionGeneration: 1,
+		composerReady:     true,
 	}
 	// CLI resume (and any Session with a loaded transcript) must show prior turns.
 	// In-TUI /resume uses the same seed helper for a single source of truth.
@@ -684,7 +692,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case sideQuestionDoneMsg:
-		current := m.activeSession()
+		current, generation := m.activeSessionSnapshot()
+		if msg.sessionGeneration != 0 && msg.sessionGeneration != generation {
+			return m, nil
+		}
 		if msg.sessionID != "" && (current == nil || msg.sessionID != current.ID()) {
 			return m, nil
 		}
@@ -777,10 +788,11 @@ func (m *model) View() string {
 func (m *model) statusLabel() string {
 	follow := !m.stickBottom && !m.viewport.AtBottom()
 	cmdPolicy := m.statusPolicyFragment()
-	extras := collectStatusExtras(m.deps.Session, len(m.queue), follow, cmdPolicy)
+	session := m.activeSession()
+	extras := collectStatusExtras(session, len(m.queue), follow, cmdPolicy)
 
 	if m.mode == modeIdle {
-		parts := collectIdleStatus(m.deps.Session, m.deps.Status.Model, len(m.queue), follow, cmdPolicy)
+		parts := collectIdleStatus(session, m.deps.Status.Model, len(m.queue), follow, cmdPolicy)
 		// Leave a little room for bar padding.
 		return formatIdleStatus(max(20, m.width-4), parts)
 	}
@@ -1034,24 +1046,29 @@ func (m *model) cmdSideQuestion(label, question string) (tea.Model, tea.Cmd) {
 		m.appendSideLine(fmt.Sprintf("[%s] side unavailable: callback is not configured", label))
 		return m, nil
 	}
-	if m.activeSession() == nil {
+	if session, _ := m.activeSessionSnapshot(); session == nil {
 		m.appendSideLine(fmt.Sprintf("[%s] side unavailable: session is unavailable", label))
 		return m, nil
 	}
 	ctx := m.processCtx()
 	return m, func() tea.Msg {
-		// Resolve the session when the command starts so session switches do not
-		// leave a side callback holding the session from model construction.
-		session := m.activeSession()
+		// Resolve the session when the command starts and carry its generation so
+		// results cannot cross a later /new or /resume boundary.
+		session, generation := m.activeSessionSnapshot()
 		if session == nil {
-			return sideQuestionDoneMsg{label: label, unavailable: true}
+			return sideQuestionDoneMsg{
+				label:             label,
+				sessionGeneration: generation,
+				unavailable:       true,
+			}
 		}
 		answer, err := callback(ctx, session, question)
 		return sideQuestionDoneMsg{
-			label:     label,
-			sessionID: session.ID(),
-			answer:    answer,
-			err:       err,
+			label:             label,
+			sessionID:         session.ID(),
+			sessionGeneration: generation,
+			answer:            answer,
+			err:               err,
 		}
 	}
 }
@@ -1069,7 +1086,12 @@ func (m *model) finishSideQuestion(msg sideQuestionDoneMsg) {
 		m.appendSideLine(fmt.Sprintf("[%s] side error: %s", label, msg.err.Error()))
 		return
 	}
-	m.appendSideLine(fmt.Sprintf("[%s] answer: %s", label, strings.TrimSpace(msg.answer)))
+	answer := strings.TrimSpace(msg.answer)
+	if answer == "" {
+		m.appendSideLine(fmt.Sprintf("[%s] side error: empty answer", label))
+		return
+	}
+	m.appendSideLine(fmt.Sprintf("[%s] answer: %s", label, answer))
 }
 
 // cmdUsage toggles or sets the display-only per-turn API usage footer.
@@ -1115,11 +1137,12 @@ func (m *model) cmdClear() (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
 		return m, nil
 	}
-	if m.deps.Session == nil {
+	current := m.activeSession()
+	if current == nil {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
 	}
-	oldID := m.deps.Session.ID()
+	oldID := current.ID()
 	session, err := m.createSession("")
 	if err != nil {
 		m.appendLine(lineError, "clear context: "+err.Error())
@@ -1171,10 +1194,11 @@ func (m *model) cmdNew(title string) (tea.Model, tea.Cmd) {
 // createSession always creates a distinct conversation. `/clear` uses this
 // rather than rewriting the active thread, so raw turns stay resumable.
 func (m *model) createSession(title string) (*chat.Session, error) {
-	if m.deps.Session == nil {
+	current := m.activeSession()
+	if current == nil {
 		return nil, errors.New("session is unavailable")
 	}
-	model := m.deps.Session.Model()
+	model := current.Model()
 	if model == nil {
 		return nil, errors.New("chat model is unavailable")
 	}
@@ -1191,7 +1215,7 @@ func (m *model) createSession(title string) (*chat.Session, error) {
 		m.deps.SystemPrompt = rebuilt
 	}
 	if system == "" {
-		system = m.deps.Session.SystemPrompt()
+		system = current.SystemPrompt()
 	}
 	opts := m.deps.SessionOpts
 	opts.Store = m.deps.Store
@@ -1226,8 +1250,8 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 	var b strings.Builder
 	b.WriteString("Sessions (most recent first):\n")
 	current := ""
-	if m.deps.Session != nil {
-		current = m.deps.Session.ID()
+	if session := m.activeSession(); session != nil {
+		current = session.ID()
 	}
 	// Cap list length for readability in the viewport.
 	const maxList = 30
@@ -1277,7 +1301,12 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "session store is not configured")
 		return m, nil
 	}
-	model := m.deps.Session.Model()
+	current := m.activeSession()
+	if current == nil {
+		m.appendLine(lineError, "session is unavailable")
+		return m, nil
+	}
+	model := current.Model()
 	if model == nil {
 		m.appendLine(lineError, "chat model is unavailable")
 		return m, nil
@@ -1350,7 +1379,12 @@ func (m *model) cmdTitle(title string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "usage: /title <text>")
 		return m, nil
 	}
-	if err := m.deps.Session.SetTitle(m.processCtx(), title); err != nil {
+	session := m.activeSession()
+	if session == nil {
+		m.appendLine(lineError, "title: session is unavailable")
+		return m, nil
+	}
+	if err := session.SetTitle(m.processCtx(), title); err != nil {
 		m.appendLine(lineError, "title: "+err.Error())
 		return m, nil
 	}
@@ -1373,7 +1407,7 @@ func (m *model) cmdDelete(id string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "session store is not configured")
 		return m, nil
 	}
-	if m.deps.Session != nil && m.deps.Session.ID() == id {
+	if session := m.activeSession(); session != nil && session.ID() == id {
 		m.appendLine(lineError, "cannot delete the active session; /new or /resume another first")
 		return m, nil
 	}
@@ -1391,12 +1425,13 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "usage: /context")
 		return m, nil
 	}
-	if m.deps.Session == nil {
+	session := m.activeSession()
+	if session == nil {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
 	}
-	status := m.deps.Session.ContextStatus()
-	cfg := m.deps.Session.ContextConfig()
+	status := session.ContextStatus()
+	cfg := session.ContextConfig()
 	if status.BudgetTokens == 0 {
 		status.BudgetTokens = cfg.UsableInputTokens()
 		status.TriggerTokens = status.BudgetTokens * cfg.AutoCompactTriggerPercent / 100
@@ -1408,7 +1443,7 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Context\n")
-	fmt.Fprintf(&b, "API snapshot: %s\n", usage.FormatContextSnapshot(sessionContextSnapshot(m.deps.Session)))
+	fmt.Fprintf(&b, "API snapshot: %s\n", usage.FormatContextSnapshot(sessionContextSnapshot(session)))
 	b.WriteString("Planner estimate (local truncation/compaction only; not API usage)\n")
 	fmt.Fprintf(&b, "budget=%s  max_output=%s  trigger=%s  target=%s\n",
 		usage.FormatTokens(status.BudgetTokens),
@@ -1476,7 +1511,7 @@ func (m *model) cmdCompact(focus string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "busy: finish or interrupt the current operation first")
 		return m, nil
 	}
-	if m.deps.Session == nil {
+	if m.activeSession() == nil {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
 	}
@@ -1518,7 +1553,13 @@ func (m *model) startCompaction(focus string, automatic bool) (tea.Model, tea.Cm
 	m.setBusyPlaceholder()
 	ctx, cancel := context.WithCancel(m.processCtx())
 	m.compactCancel = cancel
-	session := m.deps.Session
+	session := m.activeSession()
+	if session == nil {
+		m.mode = modeIdle
+		m.setIdlePlaceholder()
+		m.appendLine(lineError, "compaction: session is unavailable")
+		return m, nil
+	}
 	return m, tea.Batch(m.spinner.Tick, tickStatus(), func() tea.Msg {
 		var (
 			result chat.CompactionResult
@@ -1563,7 +1604,10 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 			// charged provider loop. The next stable turn re-evaluates the signal.
 			return m.drainQueue()
 		case msg.automatic:
-			status := m.deps.Session.ContextStatus()
+			status := chat.ContextStatus{}
+			if session := m.activeSession(); session != nil {
+				status = session.ContextStatus()
+			}
 			line := "automatic context compaction failed; active checkpoint unchanged"
 			if errors.Is(msg.err, context.Canceled) || isCanceled(msg.err) {
 				line = "automatic context compaction interrupted; active checkpoint unchanged"
@@ -1601,6 +1645,11 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 }
 
 func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
+	session := m.activeSession()
+	if session == nil {
+		m.appendLine(lineError, "session is unavailable")
+		return m, nil
+	}
 	m.turnID++
 	turnID := m.turnID
 	m.mode = modeBusy
@@ -1630,7 +1679,6 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 	m.turnUsageSeen = false
 	m.turnUsageCallIDs = make(map[string]struct{})
 
-	session := m.deps.Session
 	events := m.events
 	done := m.turnDone
 	emit := emitFromTurnEvent(ctx, turnID, events)
@@ -1672,10 +1720,11 @@ func (m *model) interruptTurn(reason string) {
 // runtime after cancellation has been requested. It uses the process context
 // so the durable interruption can outlive the cancelled turn context.
 func (m *model) cancelActiveTask(reason string) {
-	if m.deps.Session == nil {
+	session := m.activeSession()
+	if session == nil {
 		return
 	}
-	receipt := m.deps.Session.InterruptTask(m.processCtx(), reason)
+	receipt := session.InterruptTask(m.processCtx(), reason)
 	if receipt.Applied {
 		m.appendLine(lineSystem, receipt.Summary)
 	}
@@ -1719,7 +1768,7 @@ func (m *model) finishTurn(err error) tea.Cmd {
 	}
 	m.appendLine(lineSep, "")
 	m.textarea.Focus()
-	if err == nil && m.deps.Session != nil && m.deps.Session.NeedsAutoCompaction() {
+	if session := m.activeSession(); err == nil && session != nil && session.NeedsAutoCompaction() {
 		// Status bar shows mode=compacting; only a successful install is logged.
 		_, cmd := m.startCompaction("", true)
 		return cmd
@@ -1884,10 +1933,11 @@ func (m *model) refreshViewport() {
 // its oldest loaded page. The session keeps this separate from model context,
 // so scrolling cannot re-inflate the next prompt.
 func (m *model) loadOlderTranscript() {
-	if m.deps.Session == nil || m.mode != modeIdle {
+	session := m.activeSession()
+	if session == nil || m.mode != modeIdle {
 		return
 	}
-	page, _, err := m.deps.Session.LoadOlderTranscript(m.processCtx(), 100)
+	page, _, err := session.LoadOlderTranscript(m.processCtx(), 100)
 	if err != nil {
 		if !errors.Is(err, chat.ErrCompactionStale) {
 			m.appendLine(lineError, "load older transcript: "+err.Error())
@@ -1897,8 +1947,8 @@ func (m *model) loadOlderTranscript() {
 	if len(page) == 0 {
 		return
 	}
-	transcript := m.deps.Session.Transcript()
-	m.lines = seedLinesFromTranscript(transcript, resumeBanner(m.deps.Session.ID(), len(transcript)), m.deps.Session.Title())
+	transcript := session.Transcript()
+	m.lines = seedLinesFromTranscript(transcript, resumeBanner(session.ID(), len(transcript)), session.Title())
 	m.inputHist.seedFromMessages(transcript)
 	m.refreshViewport()
 	m.viewport.GotoTop()
@@ -1915,18 +1965,18 @@ func (m *model) statusReport() string {
 	title := ""
 	usageLine := ""
 	ctxLine := ""
-	if m.deps.Session != nil {
-		transcriptCount = len(m.deps.Session.Transcript())
-		if id := m.deps.Session.ID(); id != "" {
+	if session := m.activeSession(); session != nil {
+		transcriptCount = len(session.Transcript())
+		if id := session.ID(); id != "" {
 			sessionID = id
 		}
-		title = m.deps.Session.Title()
-		apiUsage := sessionAPIUsage(m.deps.Session)
+		title = session.Title()
+		apiUsage := sessionAPIUsage(session)
 		usageLine = "\n" + usage.FormatAPIUsage(apiUsage) + "  " +
 			usage.FormatCostEstimate(apiUsage.CostUSD, apiUsage.Status)
-		ctxLine = "\n" + usage.FormatContextSnapshot(sessionContextSnapshot(m.deps.Session))
-		cfg := m.deps.Session.ContextConfig()
-		contextStatus := m.deps.Session.ContextStatus()
+		ctxLine = "\n" + usage.FormatContextSnapshot(sessionContextSnapshot(session))
+		cfg := session.ContextConfig()
+		contextStatus := session.ContextStatus()
 		if budget := contextStatus.BudgetTokens; budget > 0 {
 			if contextStatus.OriginalTokens > 0 || contextStatus.CurrentTokens > 0 {
 				pct := 0

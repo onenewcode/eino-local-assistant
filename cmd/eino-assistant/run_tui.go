@@ -124,6 +124,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		ComposeSystemPrompt: func() (string, error) {
 			return runtime.composePrompt()
 		},
+		SideQuestion:            runtime.sideQuestion,
 		RulesReport:             runtime.rulesReport,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
 		SessionOpts:             runtime.sessionOpts,

@@ -27,6 +27,12 @@ type ThreadMeta struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 	Model        string    `json:"model,omitempty"`
 	MessageCount int       `json:"message_count"`
+	// ParentID, ForkBoundaryTurnID, and ForkSourceHash are populated only for
+	// source-preserving children. ForkSourceHash is the source journal hash at
+	// the boundary event.
+	ParentID           string `json:"parent_id,omitempty"`
+	ForkBoundaryTurnID string `json:"fork_boundary_turn_id,omitempty"`
+	ForkSourceHash     string `json:"fork_source_hash,omitempty"`
 
 	// Cumulative token/cost accounting, sourced only from usage.recorded events.
 	PromptTokens     int              `json:"prompt_tokens,omitempty"`
@@ -38,6 +44,17 @@ type ThreadMeta struct {
 	CostUSD          float64          `json:"cost_usd,omitempty"`
 	UsageStatus      UsageStatus      `json:"usage_status"`
 	LastContext      *ContextSnapshot `json:"last_context,omitempty"`
+}
+
+// ForkResult identifies the newly published child and the exact source prefix
+// it contains. ChildState is the journal-derived state before any later child
+// mutation.
+type ForkResult struct {
+	SourceID   string      `json:"source_id"`
+	ChildID    string      `json:"child_id"`
+	LastTurnID string      `json:"last_turn_id"`
+	SourceHash string      `json:"source_hash"`
+	ChildState ThreadState `json:"child_state"`
 }
 
 // ThreadRepository is the complete durable v2 thread API.
@@ -72,6 +89,13 @@ type ThreadRepository interface {
 	RecordCompactionFailure(ctx context.Context, id string, expectedRevision uint64, input CompactionFailure) (ThreadState, error)
 	FinishCompaction(ctx context.Context, id string, input CompactionFailure) (ThreadState, error)
 	ResetIncompatibleCheckpoint(ctx context.Context, id string, expectedRevision uint64, input CheckpointSchemaReset) (ThreadState, error)
+}
+
+// ThreadForkRepository is the optional v1 source-preserving fork extension.
+// It remains separate from ThreadRepository so existing runtime fakes do not
+// need to implement fork semantics before they consume them.
+type ThreadForkRepository interface {
+	ForkThread(ctx context.Context, sourceID, childID, lastTurnID string) (ForkResult, error)
 }
 
 // TaskStateRepository is an optional extension for runtimes that need a

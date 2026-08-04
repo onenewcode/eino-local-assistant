@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+type sideQuestionContextKey struct{}
 
 func TestSideQuestionUsageAndUnavailable(t *testing.T) {
 	m := newTestModel(t)
@@ -39,7 +42,7 @@ func TestSideQuestionCallbackUsesCurrentSession(t *testing.T) {
 	m := newTestModel(t)
 	first := m.deps.Session
 	second := mustSession(t, &staticModel{}, "second")
-	root := context.WithValue(context.Background(), "side-test", "ctx")
+	root := context.WithValue(context.Background(), sideQuestionContextKey{}, "ctx")
 	m.deps.Ctx = root
 	m.mode = modeBusy
 	m.turnID = 17
@@ -144,6 +147,73 @@ func TestSideQuestionErrorAndStaleResult(t *testing.T) {
 	}
 	if oldID == second.ID() || mm.deps.Session.ID() != second.ID() {
 		t.Fatalf("session switch was not preserved: old=%q current=%q", oldID, mm.deps.Session.ID())
+	}
+}
+
+func TestSideQuestionDropsResultAcrossNewAndResume(t *testing.T) {
+	m := newTestModel(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	m.deps.SideQuestion = func(context.Context, *chat.Session, string) (string, error) {
+		startedOnce.Do(func() { close(started) })
+		<-release
+		return "old answer", nil
+	}
+
+	_, cmd := m.submit("/btw while switching")
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	<-started
+	oldID := m.activeSession().ID()
+	if next, _ := m.submit("/new"); next.(*model).activeSession().ID() == oldID {
+		t.Fatal("/new did not switch the active session")
+	} else {
+		m = next.(*model)
+	}
+	close(release)
+	msg := <-result
+	before := len(m.sideLines)
+	next, _ := m.Update(msg)
+	m = next.(*model)
+	if len(m.sideLines) != before || hasSideLineContaining(m, "old answer") {
+		t.Fatalf("side result crossed /new boundary: %#v", m.sideLines)
+	}
+
+	// Resume the original ID twice. ID-only filtering would accept the result
+	// from the first instance after the second resume; generation filtering must
+	// still discard it.
+	next, _ = m.submit("/resume " + oldID)
+	m = next.(*model)
+	if m.activeSession().ID() != oldID {
+		t.Fatalf("resume id = %q, want %q", m.activeSession().ID(), oldID)
+	}
+	_, cmd = m.submit("/btw same id")
+	msg = cmd().(sideQuestionDoneMsg)
+	next, _ = m.submit("/resume " + oldID)
+	m = next.(*model)
+	before = len(m.sideLines)
+	next, _ = m.Update(msg)
+	m = next.(*model)
+	if len(m.sideLines) != before || hasSideLineContaining(m, "old answer") {
+		t.Fatalf("side result crossed same-ID /resume boundary: %#v", m.sideLines)
+	}
+}
+
+func TestSideQuestionEmptyAnswerIsVisibleError(t *testing.T) {
+	m := newTestModel(t)
+	m.deps.SideQuestion = func(context.Context, *chat.Session, string) (string, error) {
+		return " \t\n", nil
+	}
+
+	_, cmd := m.submit("/btw no answer")
+	next, _ := m.Update(cmd().(sideQuestionDoneMsg))
+	m = next.(*model)
+	if !hasSideLineContaining(m, "[btw] side error: empty answer") {
+		t.Fatalf("empty answer error missing: %#v", m.sideLines)
+	}
+	if hasSideLineContaining(m, "[btw] answer:") {
+		t.Fatalf("empty answer rendered as success: %#v", m.sideLines)
 	}
 }
 

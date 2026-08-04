@@ -32,7 +32,7 @@ func (m *model) toggleTaskPane() bool {
 		m.taskPaneOpen = false
 		return true
 	}
-	if !hasTaskStatus(sessionTaskStatus(m.deps.Session)) {
+	if !hasTaskStatus(sessionTaskStatus(m.activeSession())) {
 		return false
 	}
 	m.taskPaneOpen = true
@@ -57,7 +57,7 @@ func (m *model) taskPaneHeight() int {
 }
 
 func (m *model) taskPaneView() string {
-	status := sessionTaskStatus(m.deps.Session)
+	status := sessionTaskStatus(m.activeSession())
 	if !hasTaskStatus(status) {
 		return renderUnavailableTaskPane(m.width)
 	}

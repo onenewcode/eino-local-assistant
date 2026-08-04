@@ -9,6 +9,7 @@
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 在短生命周期 worker 中执行；默认工作区可写、网络关闭，并有总 turn / ReAct / tool-call 预算
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`
 - **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话；TUI `/rules` 只查看当前 session 创建时捕获的 source metadata，不 reload 文件
+- **旁路问题（安全子集）**：TUI `/btw <question>`（`/side` 别名）使用当前 frozen session context 做 reference；不打断、不排队主 turn，不写主 ledger、usage 或 journal，不调用工具/子 agent
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
@@ -244,6 +245,7 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 | `/help` | 帮助 |
 | `/status` | 模型 / 会话 / API usage / context 快照 / 费用估算 / ReAct、sandbox 与 runtime 护栏 |
 | `/rules` | 当前 session 捕获的用户/项目 instruction source、预算、tokens、truncated 与生命周期；只读，不 reload |
+| `/btw <question>` / `/side <question>` | 旁路只读问题；不打断、不排队主 turn（多个问题可并发）；结果只显示在 side-only 区域 |
 | `/permissions` | 权限规则、sandbox 模式/后端/网络、运行时预算与本 session 决策 |
 | `/memory` | 项目持久记忆：list / add / update / delete / accept / on\|off / generate / status / reset（见 [docs/memory.md](docs/memory.md)） |
 | `/context` | 最近 API context 快照、规划输入预算、活动 checkpoint、热 turn、fallback 与自动压缩熔断状态 |
@@ -260,7 +262,9 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 
 工具调用显示为 Claude/Codex 风格卡片（`⚙ name` + 缩进 `⎿` 结果，JSON 会 pretty-print）；assistant 回复在完成后对 markdown/代码块做终端渲染（流式阶段为纯文本）。idle 状态栏显示 `provider/model` / 短 session id / API usage / `cost~` / 可选 context 快照；复杂任务显示紧凑的 `task:n/m` 进度，`Ctrl+T` 可展开只读的状态、目标、范围、当前工作与 gap，busy 状态栏还会显示当前工具名与 `queued:N`。上滚离开底部时状态栏提示 `↑ End to follow`。每轮完成后会显示该轮的 `API usage: prompt / generation / total / calls`，不会把 API 请求输入误称为用户输入。
 
-生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/rules`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；`Esc` / `Ctrl+C` 中断当前 turn，`/compact`、`/clear`、`/new`、`/resume`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle。
+生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/rules`、`/btw`、`/side`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；旁路问题不进入该队列，也不打断当前 turn，多个旁路问题可以并发执行。`Esc` / `Ctrl+C` 中断当前 turn，`/compact`、`/clear`、`/new`、`/resume`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle。
+
+`/btw` / `/side` 是本仓库的安全子集，不是完整的持久 fork。请求使用命令开始时当前 active session 的 frozen system prompt 和 transcript 作为 reference-only；旧指令、历史、tool calls/results、approvals 都不作为 active instructions，只有新问题是 active input。旁路路径不调用 tools 或 subagents，不写主 session ledger、`usage`、`journal`，也不修改文件、git state、configuration 或 permissions。回答、生成错误和空回答错误都显示在独立的 side-only 区域（`[btw]` / `[side]`），空问题也会显示可见的 usage error；它们不会进入主 transcript。嵌入调用方没有提供 callback 时显示 `side unavailable`。该行为参考了 [旁路对话研究笔记](docs/research/side-conversation-cross-product-research.md)，但不宣称与 Codex 或 Claude Code 的行为完全等价。
 
 ## 会话存储与压缩
 

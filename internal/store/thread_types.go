@@ -36,6 +36,22 @@ var (
 	// ErrCompactionOperationNotPending means an identity-bound compaction was
 	// terminalized or replaced before a late result could reconcile it.
 	ErrCompactionOperationNotPending = errors.New("compaction operation is not pending")
+	// ErrForkActiveTurn means a source thread still owns an unfinished turn.
+	ErrForkActiveTurn = errors.New("thread fork source has an active turn")
+	// ErrForkPendingCompaction means a source thread has an unfinished
+	// compaction operation whose derived state is not safe to fork.
+	ErrForkPendingCompaction = errors.New("thread fork source has a pending compaction")
+	// ErrForkNoCommittedTurn means the source has no complete committed prefix.
+	ErrForkNoCommittedTurn = errors.New("thread fork source has no committed turn")
+	// ErrForkInvalidBoundary means the requested turn is not a complete commit.
+	ErrForkInvalidBoundary = errors.New("invalid thread fork boundary")
+	// ErrForkUnsupportedState means v1 cannot prove a derived state is safe to
+	// carry into the child ledger.
+	ErrForkUnsupportedState = errors.New("thread fork source has unsupported derived state")
+	// ErrForkSourceChanged means the source was not stable for the full fork.
+	ErrForkSourceChanged = errors.New("thread fork source changed during fork")
+	// ErrForkDestinationExists means the requested child ID is already present.
+	ErrForkDestinationExists = errors.New("thread fork destination already exists")
 )
 
 // EventKind is a durable journal event category.
