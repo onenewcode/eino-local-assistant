@@ -27,8 +27,31 @@ type ProjectInstructions struct {
 	// Truncated is true when the file exceeded the budget.
 	Truncated bool
 	// Found is false when no supported instruction file exists.
-	Found     bool
-	maxTokens int
+	Found bool
+	// Sources contains the selected instruction file from each discovered
+	// directory, in workspace-root-first order.
+	Sources []ProjectInstructionSource
+	// StartDirOutsideWorkspace is true when the requested start directory is
+	// outside the workspace and discovery fell back to the workspace root.
+	StartDirOutsideWorkspace bool
+	maxTokens                int
+}
+
+// ProjectInstructionSource describes one selected project instruction file.
+// Tokens is the number of tokens included in the formatted aggregate block,
+// rather than the size of the unbounded file contents.
+type ProjectInstructionSource struct {
+	// Path is the absolute path at which the candidate was discovered.
+	Path string
+	// Title is the stable workspace-relative title used in the prompt.
+	Title string
+	// Text is the normalized, untruncated instruction body.
+	Text string
+	// Tokens is the source's contribution to the aggregate formatted block.
+	Tokens int
+	// Truncated reports that the source could not be included in full. A source
+	// with zero Tokens was discovered after the aggregate budget was exhausted.
+	Truncated bool
 }
 
 // LoadProjectInstructions reads one workspace-root instruction file and caps
@@ -36,6 +59,14 @@ type ProjectInstructions struct {
 // precedence over AGENTS.md; the files are alternatives and are never
 // concatenated. Missing files return Found=false without error.
 func LoadProjectInstructions(workspaceRoot string, maxTokens int) (ProjectInstructions, error) {
+	return LoadProjectInstructionsAt(workspaceRoot, workspaceRoot, maxTokens)
+}
+
+// LoadProjectInstructionsAt reads project instruction files from workspaceRoot
+// through startDir, inclusive, and caps the aggregate formatted block by
+// maxTokens. If startDir is outside workspaceRoot, only workspaceRoot is
+// inspected and StartDirOutsideWorkspace records that compatibility fallback.
+func LoadProjectInstructionsAt(workspaceRoot, startDir string, maxTokens int) (ProjectInstructions, error) {
 	ws := strings.TrimSpace(workspaceRoot)
 	if ws == "" {
 		return ProjectInstructions{}, errors.New("workspace root is required")
@@ -44,25 +75,101 @@ func LoadProjectInstructions(workspaceRoot string, maxTokens int) (ProjectInstru
 	if err != nil {
 		return ProjectInstructions{}, err
 	}
+	abs = canonicalProjectInstructionPath(abs)
 	if maxTokens <= 0 {
 		maxTokens = 8000
 	}
-	path, text, found, err := readProjectInstructionsFile(abs)
+
+	start := strings.TrimSpace(startDir)
+	if start == "" {
+		start = abs
+	}
+	startAbs, err := filepath.Abs(start)
 	if err != nil {
 		return ProjectInstructions{}, err
 	}
-	if !found {
-		return ProjectInstructions{Found: false}, nil
+	startAbs = canonicalProjectInstructionPath(startAbs)
+
+	directories, outside := projectInstructionDirectories(abs, startAbs)
+	sources := make([]ProjectInstructionSource, 0, len(directories))
+	for _, directory := range directories {
+		path, text, found, err := readProjectInstructionsFile(directory)
+		if err != nil {
+			return ProjectInstructions{}, err
+		}
+		if !found {
+			continue
+		}
+		rel, err := filepath.Rel(abs, path)
+		if err != nil {
+			return ProjectInstructions{}, err
+		}
+		sources = append(sources, ProjectInstructionSource{
+			Path:  path,
+			Title: filepath.ToSlash(rel),
+			Text:  text,
+		})
 	}
-	block, truncated := fitProjectInstructionsBlock(path, text, maxTokens)
+	if len(sources) == 0 {
+		return ProjectInstructions{
+			Found:                    false,
+			StartDirOutsideWorkspace: outside,
+			maxTokens:                maxTokens,
+		}, nil
+	}
+
+	sources, block := fitProjectInstructionSources(sources, maxTokens)
+	first := sources[0]
+	var combined strings.Builder
+	for i, source := range sources {
+		if i > 0 {
+			combined.WriteString("\n\n")
+		}
+		combined.WriteString(source.Text)
+	}
 	return ProjectInstructions{
-		Path:      path,
-		Text:      text,
-		Tokens:    usage.EstimateText(block),
-		Truncated: truncated,
-		Found:     true,
-		maxTokens: maxTokens,
+		Path:                     first.Path,
+		Text:                     combined.String(),
+		Tokens:                   usage.EstimateText(block),
+		Truncated:                anyProjectInstructionSourceTruncated(sources),
+		Found:                    true,
+		Sources:                  sources,
+		StartDirOutsideWorkspace: outside,
+		maxTokens:                maxTokens,
 	}, nil
+}
+
+// canonicalProjectInstructionPath keeps directory containment comparisons
+// consistent when callers pass a symlinked workspace or startup directory.
+// A missing path is left cleaned so the existing missing-file behavior stays
+// non-fatal.
+func canonicalProjectInstructionPath(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return path
+}
+
+func projectInstructionDirectories(workspaceRoot, startDir string) ([]string, bool) {
+	rel, err := filepath.Rel(workspaceRoot, startDir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return []string{workspaceRoot}, true
+	}
+	if rel == "." {
+		return []string{workspaceRoot}, false
+	}
+
+	directories := []string{workspaceRoot}
+	current := workspaceRoot
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		directories = append(directories, current)
+	}
+	return directories, false
 }
 
 func readProjectInstructionsFile(workspaceRoot string) (string, string, bool, error) {
@@ -97,6 +204,20 @@ func readProjectInstructionsFile(workspaceRoot string) (string, string, bool, er
 // FormatProjectInstructionsBlock returns the system-prompt section for the
 // selected AGENTS instruction file.
 func FormatProjectInstructionsBlock(b ProjectInstructions) string {
+	if len(b.Sources) > 0 {
+		if b.maxTokens > 0 {
+			_, block := fitProjectInstructionSources(b.Sources, b.maxTokens)
+			return block
+		}
+		var sb strings.Builder
+		for _, source := range b.Sources {
+			if source.Text == "" {
+				continue
+			}
+			sb.WriteString(renderProjectInstructionsBlockWithNote(source.Title, strings.TrimSpace(source.Text), source.Truncated))
+		}
+		return sb.String()
+	}
 	if !b.Found || strings.TrimSpace(b.Text) == "" {
 		return ""
 	}
@@ -108,7 +229,11 @@ func FormatProjectInstructionsBlock(b ProjectInstructions) string {
 }
 
 func fitProjectInstructionsBlock(path, body string, maxTokens int) (string, bool) {
-	name := instructionFilename(path)
+	return fitProjectInstructionsBlockTitle(instructionFilename(path), body, maxTokens)
+}
+
+func fitProjectInstructionsBlockTitle(title, body string, maxTokens int) (string, bool) {
+	name := title
 	body = strings.TrimSpace(body)
 	full := renderProjectInstructionsBlock(name, body, false)
 	if usage.EstimateText(full) <= maxTokens {
@@ -135,6 +260,40 @@ func fitProjectInstructionsBlock(path, body string, maxTokens int) (string, bool
 
 	// A positive token budget always accommodates this one-rune marker.
 	return "…", true
+}
+
+func fitProjectInstructionSources(sources []ProjectInstructionSource, maxTokens int) ([]ProjectInstructionSource, string) {
+	if maxTokens <= 0 {
+		maxTokens = 8000
+	}
+	result := append([]ProjectInstructionSource(nil), sources...)
+	var block strings.Builder
+	used := 0
+	for i := range result {
+		if used >= maxTokens {
+			result[i].Tokens = 0
+			result[i].Truncated = true
+			continue
+		}
+		formatted, truncated := fitProjectInstructionsBlockTitle(result[i].Title, result[i].Text, maxTokens-used)
+		result[i].Tokens = usage.EstimateText(formatted)
+		result[i].Truncated = truncated
+		if result[i].Tokens == 0 {
+			continue
+		}
+		block.WriteString(formatted)
+		used += result[i].Tokens
+	}
+	return result, block.String()
+}
+
+func anyProjectInstructionSourceTruncated(sources []ProjectInstructionSource) bool {
+	for _, source := range sources {
+		if source.Truncated {
+			return true
+		}
+	}
+	return false
 }
 
 func renderTruncatedProjectInstructionsBlock(name, kept string) string {

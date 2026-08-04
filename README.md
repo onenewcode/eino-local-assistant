@@ -8,7 +8,7 @@
 - **复杂任务控制器**：多步骤编码任务以需求—场景—任务图—shell proof 跟踪；图的紧凑投影随会话账本恢复，模型必须经 completion gate 才能交付
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 在短生命周期 worker 中执行；默认工作区可写、网络关闭，并有总 turn / ReAct / tool-call 预算
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`
-- **项目软指令**：workspace 根目录从 `AGENTS.override.md` / `AGENTS.md` 中选择一个，有界注入新会话
+- **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
@@ -274,15 +274,15 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 - 自主任务图的紧凑投影写入 session journal，可随 `/resume` 重建；完整 turn、工具结果和 artifact 仍是证据真相。`task_complete` 要等最终消息所在 turn 提交才可交付；取消、失败、未提交恢复或快照之后的 shell/patch 都会重新关闭 gate。恢复时仍为 `working` 的节点会先转为 `needs_replan`，再次执行该节点会重收集其 proof。
 - 中断后的普通“继续”等输入沿用原始需求并保留未变范围的已接受 proof；明确替换需求范围会重规划。未计划且实际执行的 `shell` / `apply_patch`，以及任务完成或中断后才到达、且可能改动工作区的工具结果，也会要求先建新计划。
 - 详细格式与恢复协议见 [docs/session-persistence.md](docs/session-persistence.md)。
-- **项目软指令**与**跨会话语义记忆**彼此分离，也都与 resume 分离，见 [docs/memory.md](docs/memory.md)。
+- **用户/项目软指令**与**跨会话语义记忆**彼此分离，也都与 resume 分离，见 [docs/memory.md](docs/memory.md)。
 
 ## 项目指令与语义记忆
 
-- workspace 根按 `AGENTS.override.md` -> `AGENTS.md` 选择首个有效文件作为项目软规则（两者不拼接；符号链接会跟随到普通文件；去掉 UTF-8 BOM 后仅含空白的内容会跳过；默认最多约 8k tokens 估算）。
+- 用户级 `~/.eino-assistant/` 与 workspace 每层均按 `AGENTS.override.md` -> `AGENTS.md` 选择首个有效文件（两者不拼接；符号链接会跟随到普通文件；去掉 UTF-8 BOM 后仅含空白的内容会跳过）。用户块默认最多约 4k、项目块默认最多约 8k tokens 估算，预算彼此独立。
 - 项目记忆目录：`<workspace>/.eino/memory/`（默认 gitignore，不提交）。
 - `/memory add …` 写入高信任事实；`/memory update <id|key> …` 以新版本纠正旧值；空闲会话可异步抽取 *candidate*（summary 中标 unverified）。`/memory reset --confirm` 清项目语义记忆和抽取元数据，但保留 session/thread 与记忆开关。
 - 只读工具：`memory_list` / `memory_search` / `memory_read`。写入不经 agent 工具。
-- 配置：`[rules]`、`[memory]`（见 `config.example.toml`）。完整说明：[docs/memory.md](docs/memory.md)；包边界：[docs/architecture.md](docs/architecture.md)；迭代记录：[docs/iterations/2026-07-21-persistent-memory.md](docs/iterations/2026-07-21-persistent-memory.md)。
+- 配置：`[rules]`、`[memory]`（见 `config.example.toml`）。完整说明：[docs/memory.md](docs/memory.md)；包边界：[docs/architecture.md](docs/architecture.md)；迭代记录：[docs/iterations/2026-08-04-user-global-instructions.md](docs/iterations/2026-08-04-user-global-instructions.md)。
 
 ## Token 与费用
 

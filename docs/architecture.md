@@ -25,7 +25,7 @@ Headless `exec` also accepts `-m, --model MODEL` on fresh and resume paths, incl
 
 | 位置 | 负责 | 不负责 |
 | --- | --- | --- |
-| `internal/agent` | ReAct、system prompt、AGENTS 指令选择、任务图与 completion controller | 自己管理账本文件或记忆落盘 |
+| `internal/agent` | ReAct、system prompt、用户/项目 AGENTS 指令选择、任务图与 completion controller | 自己管理账本文件或记忆落盘 |
 | `internal/chat` | turn 生命周期、流式事件、completion gate、上下文协作 | 任务业务正确性 |
 | `internal/store` | thread journal、checkpoint、artifact、resume | 项目记忆 |
 | `internal/contextbuild` | prompt 规划与 compaction | 工具执行 |
@@ -38,7 +38,7 @@ Headless `exec` also accepts `-m, --model MODEL` on fresh and resume paths, incl
 | `internal/provider` | OpenAI / Anthropic 模型适配 | 产品流程 |
 | `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
 
-AGENTS 指令加载在 `agent`：workspace 根按 `AGENTS.override.md`、`AGENTS.md` 顺序选择首个有效候选；符号链接会跟随到普通文件目标，去掉 UTF-8 BOM 后仅含空白的候选会跳过。不要新建或恢复 `internal/rules`；`[rules]` 只是配置名称。
+AGENTS 指令加载在 `agent`：用户 home `~/.eino-assistant` 与 workspace 每层都按 `AGENTS.override.md`、`AGENTS.md` 顺序选择首个有效候选；符号链接会跟随到普通文件目标，去掉 UTF-8 BOM 后仅含空白的候选会跳过。用户块与项目块使用独立预算。不要新建或恢复 `internal/rules`；`[rules]` 只是配置名称。
 
 ## 状态与安全边界
 
@@ -46,11 +46,11 @@ AGENTS 指令加载在 `agent`：workspace 根按 `AGENTS.override.md`、`AGENTS
 | --- | --- | --- | --- |
 | 硬权限 | `permissions` + `tools` + `sandbox` | 进程 / 每次工具调用 | 不依赖 AGENTS.md 或 memory 文本执行 |
 | 会话账本 | `store` + `chat` | 可 `/resume` | journal、artifact 与 checkpoint 是真相 |
-| 项目指令 | `agent` 选择 workspace 根 AGENTS 指令 | `/new` / `/clear` 刷新 | system prefix 的软指导；override 与 base 不拼接 |
+| 用户/项目指令 | `agent` 选择 home 与 workspace AGENTS 指令 | `/new` / `/clear` 刷新 | system prefix 的软指导；override 与 base 不拼接；用户和项目预算独立 |
 | 语义记忆 | `memory`，`.eino/memory/` | 跨会话 | 不等于 `/resume`；agent 只读 |
 | 复杂任务图 | `agent.TaskController` + `store` | 当前会话，可 `/resume` | `task.state.updated` 是图的恢复投影；工具/artifact 仍是证据真相 |
 
-System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、可选 AGENTS 指令和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。
+System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、用户 instructions、项目 AGENTS 指令和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。用户 root 在 runtime 构造时固定为 `os.UserHomeDir()/.eino-assistant`，不随 `storage.data_dir` 改变；resume 继续使用 thread 创建时冻结的 system prompt。
 
 ## 复杂任务运行时
 

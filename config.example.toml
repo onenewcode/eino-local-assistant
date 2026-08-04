@@ -74,6 +74,8 @@ data_dir = ""
 enabled = true
 # workspace root: override, then base; symlinks allowed; blank content skipped
 # max_tokens = 8000
+# user home (~/.eino-assistant): override, then base; independent soft-context budget
+# global_max_tokens = 4000
 
 [memory]
 enabled = true              # inject summary + expose memory_* read tools

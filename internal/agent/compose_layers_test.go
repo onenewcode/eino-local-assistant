@@ -42,3 +42,31 @@ func TestComposeWithLayersEmptyMemory(t *testing.T) {
 		t.Fatalf("unexpected memory block section: %q", got)
 	}
 }
+
+func TestComposeWithLayersUsesProjectInstructionsStartDir(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	start := filepath.Join(ws, "nested")
+	if err := os.Mkdir(start, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte("root rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(start, agentsFile), []byte("nested rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ComposeWithLayers("persona", LayerOptions{
+		WorkspaceRoot:               ws,
+		ProjectInstructionsStartDir: start,
+		ProjectInstructionsEnabled:  true,
+		ProjectInstructionsTokens:   8000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Index(got, "root rule") >= strings.Index(got, "nested rule") {
+		t.Fatalf("project instructions are not root-first: %q", got)
+	}
+}

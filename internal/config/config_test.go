@@ -117,6 +117,27 @@ func TestLoadRequiresTOMLExtension(t *testing.T) {
 	}
 }
 
+func TestRulesGlobalMaxTokensDefaultsIndependently(t *testing.T) {
+	if got := (RulesConfig{}).RulesGlobalMaxTokens(); got != DefaultGlobalRulesMaxTokens {
+		t.Fatalf("default global rules budget = %d, want %d", got, DefaultGlobalRulesMaxTokens)
+	}
+	if got := (RulesConfig{GlobalMaxTokens: 37}).RulesGlobalMaxTokens(); got != 37 {
+		t.Fatalf("configured global rules budget = %d, want 37", got)
+	}
+	if got := (RulesConfig{MaxTokens: 19, GlobalMaxTokens: 37}).RulesMaxTokens(); got != 19 {
+		t.Fatalf("project rules budget = %d, want 19", got)
+	}
+}
+
+func TestRulesValidateGlobalMaxTokens(t *testing.T) {
+	if err := (RulesConfig{GlobalMaxTokens: -1}).Validate(); err == nil || !strings.Contains(err.Error(), "rules.global_max_tokens must be >= 0") {
+		t.Fatalf("negative global budget error = %v", err)
+	}
+	if err := (RulesConfig{GlobalMaxTokens: 100001}).Validate(); err == nil || !strings.Contains(err.Error(), "rules.global_max_tokens must be <= 100000") {
+		t.Fatalf("oversized global budget error = %v", err)
+	}
+}
+
 func TestLoadRejectsInvalidShellTimeout(t *testing.T) {
 	doc := validConfiguration + `
 [tools.shell]

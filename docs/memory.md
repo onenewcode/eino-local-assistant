@@ -8,17 +8,19 @@
 | 会话账本、`/resume`、checkpoint、compaction | [session-persistence.md](./session-persistence.md) |
 | 本功能：AGENTS 指令、`.eino/memory/`、`/memory` | 本文 |
 | 迭代记录 | [iterations/2026-07-21-persistent-memory.md](./iterations/2026-07-21-persistent-memory.md) |
+| 用户级 instructions 迭代 | [iterations/2026-08-04-user-global-instructions.md](./iterations/2026-08-04-user-global-instructions.md) |
 | 行业调研 | [research/persistent-memory-systems-research.md](./research/persistent-memory-systems-research.md) |
 
-`AGENTS.override.md` / `AGENTS.md` 由 **`internal/agent`**（`LoadProjectInstructions`）选择加载，不是独立 `internal/rules` 包；语义记忆在 **`internal/memory`**。
+用户目录 `~/.eino-assistant/` 与 workspace 的 `AGENTS.override.md` / `AGENTS.md` 均由 **`internal/agent`**（用户/项目 loader）选择加载，不是独立 `internal/rules` 包；语义记忆在 **`internal/memory`**。
 
 ## 1. 是什么 / 不是什么
 
 **是**：
 
-1. **持久指令**：workspace 根目录 `AGENTS.override.md` 或 `AGENTS.md`（软规则，有界注入；见下方选择和生命周期）
-2. **显式记忆**：用户通过 `/memory add` 写入的项目偏好/事实
-3. **自动候选**：空闲 session journal 异步抽取的 *candidate*（低信任）
+1. **项目指令**：workspace 根目录 `AGENTS.override.md` 或 `AGENTS.md`（软规则，有界注入；见下方选择和生命周期）
+2. **用户指令**：用户 home 下 `~/.eino-assistant/AGENTS.override.md` 或 `AGENTS.md`（home scope、软规则、独立预算）
+3. **显式记忆**：用户通过 `/memory add` 写入的项目偏好/事实
+4. **自动候选**：空闲 session journal 异步抽取的 *candidate*（低信任）
 
 **不是**：
 
@@ -40,9 +42,13 @@ summary.md         有界派生视图 · 供 system 注入
 
 ## 3. 目录
 
-默认相对 **workspace root**（`[workspace].root` 或进程 cwd）：
+项目目录默认相对 **workspace root**（`[workspace].root` 或进程 cwd）；用户目录固定在 home 下：
 
 ```text
+~/.eino-assistant/
+  AGENTS.override.md        # 可选；有效时替代同目录 AGENTS.md
+  AGENTS.md                 # 可选；用户级软指令
+
 <workspace>/
   AGENTS.override.md        # 可选；有效时替代同目录 AGENTS.md
   AGENTS.md                 # 可选；共享项目指令
@@ -68,6 +74,7 @@ summary.md         有界派生视图 · 供 system 注入
 [rules]
 enabled = true
 # max_tokens = 8000
+# global_max_tokens = 4000
 
 [memory]
 enabled = true              # 注入 summary + memory_* 读工具
@@ -82,6 +89,7 @@ generate = true             # 空闲自动抽取
 | --- | --- | --- |
 | `rules.enabled` | true | 是否选择并加载 workspace 根 AGENTS 指令 |
 | `rules.max_tokens` | 8000 | 规则注入 token 估算上限 |
+| `rules.global_max_tokens` | 4000 | 用户 home 指令注入 token 估算上限；独立于项目规则预算 |
 | `memory.enabled` | true | 是否注入 summary / 暴露读工具 |
 | `memory.generate` | true | 是否后台自动抽取 |
 | `memory.max_summary_tokens` | 2500 | summary 预算 |
@@ -122,10 +130,11 @@ generate = true             # 空闲自动抽取
 system prompt 组装顺序：
 
 1. 用户 persona + 产品 tool policy（优先保留）
-2. 选中的 AGENTS 指令块（≤ rules 预算）
-3. 记忆 summary 块（≤ memory 预算；candidate 标 *unverified*）
+2. 用户 home 的 AGENTS 指令块（≤ `rules.global_max_tokens`）
+3. workspace 到 startup cwd 的 AGENTS 指令块（≤ `rules.max_tokens`）
+4. 记忆 summary 块（≤ memory 预算；candidate 标 *unverified*）
 
-超预算时：**先压 memory summary，再压 AGENTS 尾部**。
+用户和项目指令预算独立计算；每一层使用 rune-safe 截断，不把用户块计入项目预算。
 
 ### 7.1 生命周期（冻快照保 prefix cache）
 
@@ -133,10 +142,10 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 
 | 时机 | 行为 |
 | --- | --- |
-| `/new`、`/clear`、新建 session | 从磁盘重新选择根目录 AGENTS 指令并组合 memory summary，写入 **新** thread 的 durable system |
+| `/new`、`/clear`、新建 session | 从磁盘重新选择 home 与项目 AGENTS 指令并组合 memory summary，写入 **新** thread 的 durable system |
 | **普通 turn** | 使用创建时冻结的 system；**不**每轮重读 AGENTS 指令 |
-| **只编辑磁盘上的 AGENTS 指令文件** | 当前 session **不生效**（不改请求前缀 → 不砸 prompt cache） |
-| **`/resume`** | 沿用该 thread **创建时** durable system；**不**用当前磁盘热更 |
+| **只编辑磁盘上的 AGENTS 指令文件** | 当前 session **不生效**；下一次 fresh/new/clear 会重读 |
+| **`/resume`** | 沿用该 thread **创建时** durable system；不重组当前 home 或项目文件 |
 | **`/memory` 写入** | 落盘立即生效；`memory_*` 工具可见；**system 注入**等到 `/new` 或 `/clear` |
 | **`/compact`** | 只压缩对话历史；**不**重载 AGENTS/memory 进 system（与 Claude compact 重读 CLAUDE.md 不同：本仓库 ledger 无 durable system 修订事件） |
 
@@ -202,7 +211,7 @@ reset 落盘后，`memory_*` 读工具立即看不到旧条目；但当前 threa
 
 - 无向量检索；检索为关键词/子串
 - 无全局 `~` 级记忆层
-- 目前只做 workspace 根的 override/base 二选一；尚无用户全局、祖先链或子目录 `AGENTS.md` 合并
+- 用户层只做 `~/.eino-assistant` 的 override/base 二选一；项目层支持 workspace root 到 startup cwd 的祖先链；尚无子目录 lazy load、reload 命令或权限语义
 - 自动巩固为单阶段 extract，非 Codex 完整两阶段 git consolidate
 
 后续可演进：用户全局与目录级规则层级、全局偏好 scope、可选向量、更细费用展示。

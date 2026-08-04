@@ -50,6 +50,9 @@ type RulesConfig struct {
 	Enabled *bool `toml:"enabled"`
 	// MaxTokens caps AGENTS.md injection. Zero uses DefaultRulesMaxTokens.
 	MaxTokens int `toml:"max_tokens"`
+	// GlobalMaxTokens caps user-home AGENTS injection. Zero uses
+	// DefaultGlobalRulesMaxTokens.
+	GlobalMaxTokens int `toml:"global_max_tokens"`
 }
 
 // MemoryConfig controls project-scoped long-term memory under .eino/memory/.
@@ -75,6 +78,8 @@ type MemoryConfig struct {
 const (
 	// DefaultRulesMaxTokens is the AGENTS.md injection budget.
 	DefaultRulesMaxTokens = 8000
+	// DefaultGlobalRulesMaxTokens is the user-home AGENTS injection budget.
+	DefaultGlobalRulesMaxTokens = 4000
 	// DefaultMemorySummaryTokens is the bounded memory summary budget.
 	DefaultMemorySummaryTokens = 2500
 	// DefaultMemoryIdleAfter is the idle threshold before auto extraction.
@@ -99,6 +104,14 @@ func (c RulesConfig) RulesMaxTokens() int {
 		return DefaultRulesMaxTokens
 	}
 	return c.MaxTokens
+}
+
+// RulesGlobalMaxTokens returns the effective user-home AGENTS budget.
+func (c RulesConfig) RulesGlobalMaxTokens() int {
+	if c.GlobalMaxTokens <= 0 {
+		return DefaultGlobalRulesMaxTokens
+	}
+	return c.GlobalMaxTokens
 }
 
 // MemoryEnabled reports whether memory use (inject + tools) is on.
@@ -562,6 +575,12 @@ func (c RulesConfig) Validate() error {
 	}
 	if c.MaxTokens > 100_000 {
 		return errors.New("rules.max_tokens must be <= 100000")
+	}
+	if c.GlobalMaxTokens < 0 {
+		return errors.New("rules.global_max_tokens must be >= 0")
+	}
+	if c.GlobalMaxTokens > 100_000 {
+		return errors.New("rules.global_max_tokens must be <= 100000")
 	}
 	return nil
 }

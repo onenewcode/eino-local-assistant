@@ -152,12 +152,87 @@ func joinEphemeralStoreCleanupError(runErr error, root string) error {
 	return errors.Join(runErr, cleanupErr)
 }
 
+// captureStartupCWD keeps project-instruction discovery anchored to the
+// process directory from runtime construction, rather than a later directory
+// lookup performed while composing a fresh TUI session.
+func captureStartupCWD(getwd func() (string, error)) (string, error) {
+	if getwd == nil {
+		return "", errors.New("startup cwd reader is unavailable")
+	}
+	cwd, err := getwd()
+	if err != nil {
+		return "", fmt.Errorf("capture startup cwd: %w", err)
+	}
+	if strings.TrimSpace(cwd) == "" {
+		return "", errors.New("capture startup cwd: empty path")
+	}
+	return cwd, nil
+}
+
+func resolveUserInstructionsRoot(homeDir func() (string, error)) (string, error) {
+	if homeDir == nil {
+		return "", errors.New("user home reader is unavailable")
+	}
+	home, err := homeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home: %w", err)
+	}
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", errors.New("resolve user home: empty path")
+	}
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("resolve user home: path %q is not absolute", home)
+	}
+	return filepath.Join(home, ".eino-assistant"), nil
+}
+
+// newSystemPromptComposer creates the prompt closure shared by fresh session
+// creation and TUI session resets. The startup directory is deliberately a
+// captured value so /new and /clear use the same hierarchy as the initial
+// session even if the process directory changes later.
+func newSystemPromptComposer(
+	cfg config.Config,
+	workspaceRoot string,
+	startupCWD string,
+	userInstructionsRoot string,
+	loadMemoryBlock func() (string, error),
+) func() (string, error) {
+	return func() (string, error) {
+		memBlock := ""
+		if loadMemoryBlock != nil {
+			var err error
+			memBlock, err = loadMemoryBlock()
+			if err != nil {
+				return "", err
+			}
+		}
+		return agent.ComposeWithLayers(cfg.Assistant.SystemPrompt, agent.LayerOptions{
+			WorkspaceRoot:               workspaceRoot,
+			UserInstructionsRoot:        userInstructionsRoot,
+			UserInstructionsTokens:      cfg.Rules.RulesGlobalMaxTokens(),
+			ProjectInstructionsStartDir: startupCWD,
+			ProjectInstructionsEnabled:  cfg.Rules.RulesEnabled(),
+			ProjectInstructionsTokens:   cfg.Rules.RulesMaxTokens(),
+			MemoryBlock:                 memBlock,
+		})
+	}
+}
+
 // newCommandRuntime performs the shared production wiring. An absent
 // approver is intentional for headless execution: the tool layer then rejects
 // on-request decisions instead of trying to consume command stdin.
 func newCommandRuntime(ctx context.Context, configPath string, start sessionStart, approver tools.Approver) (_ *commandRuntime, err error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	startupCWD, err := captureStartupCWD(os.Getwd)
+	if err != nil {
+		return nil, err
+	}
+	userInstructionsRoot, err := resolveUserInstructionsRoot(os.UserHomeDir)
+	if err != nil {
+		return nil, err
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -345,22 +420,16 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		Compactor:          compactor,
 		RecoverInterrupted: start.recoverInterrupted,
 	}
-	composePrompt := func() (string, error) {
-		memBlock := ""
-		if memStore.UseEnabled() {
-			summary, summaryErr := memStore.Summary()
-			if summaryErr != nil {
-				return "", summaryErr
-			}
-			memBlock = agent.FormatMemoryBlock(summary.Text)
+	composePrompt := newSystemPromptComposer(cfg, workspaceRoot, startupCWD, userInstructionsRoot, func() (string, error) {
+		if !memStore.UseEnabled() {
+			return "", nil
 		}
-		return agent.ComposeWithLayers(cfg.Assistant.SystemPrompt, agent.LayerOptions{
-			WorkspaceRoot:              workspaceRoot,
-			ProjectInstructionsEnabled: cfg.Rules.RulesEnabled(),
-			ProjectInstructionsTokens:  cfg.Rules.RulesMaxTokens(),
-			MemoryBlock:                memBlock,
-		})
-	}
+		summary, summaryErr := memStore.Summary()
+		if summaryErr != nil {
+			return "", summaryErr
+		}
+		return agent.FormatMemoryBlock(summary.Text), nil
+	})
 
 	var session *chat.Session
 	if start.resumeID != "" {

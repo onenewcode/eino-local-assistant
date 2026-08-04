@@ -73,18 +73,25 @@ func ComposeSystemPrompt(persona string) string {
 
 // PromptLayers are optional durable blocks appended after persona + tool policy.
 type PromptLayers struct {
+	// UserInstructionsBlock is formatted home-scoped AGENTS content (may be empty).
+	UserInstructionsBlock string
 	// RulesBlock is formatted AGENTS.md content (may be empty).
 	RulesBlock string
 	// MemoryBlock is formatted memory summary (may be empty).
 	MemoryBlock string
 }
 
-// ComposeFullSystemPrompt builds persona + tool policy + rules + memory.
+// ComposeFullSystemPrompt builds persona + tool policy + user instructions +
+// project instructions + memory.
 // Callers should already budget-truncate rules and memory blocks.
 func ComposeFullSystemPrompt(persona string, layers PromptLayers) string {
 	base := ComposeSystemPrompt(persona)
 	var b strings.Builder
 	b.WriteString(base)
+	if user := strings.TrimSpace(layers.UserInstructionsBlock); user != "" {
+		b.WriteString("\n\n")
+		b.WriteString(user)
+	}
 	if rules := strings.TrimSpace(layers.RulesBlock); rules != "" {
 		b.WriteString("\n\n")
 		b.WriteString(rules)

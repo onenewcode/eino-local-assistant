@@ -350,3 +350,239 @@ func TestLoadProjectInstructionsSkipsNonRegularOverride(t *testing.T) {
 		t.Fatalf("bundle = %+v", b)
 	}
 }
+
+func TestLoadProjectInstructionsAtRootOnlyCompatibility(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte("root instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy, err := LoadProjectInstructions(ws, 100)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructions: %v", err)
+	}
+	at, err := LoadProjectInstructionsAt(ws, ws, 100)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAt: %v", err)
+	}
+	if legacy.Path != at.Path || legacy.Text != at.Text || legacy.Tokens != at.Tokens ||
+		legacy.Truncated != at.Truncated || legacy.Found != at.Found ||
+		FormatProjectInstructionsBlock(legacy) != FormatProjectInstructionsBlock(at) {
+		t.Fatalf("legacy=%+v at=%+v\nlegacy block=%q\nat block=%q", legacy, at,
+			FormatProjectInstructionsBlock(legacy), FormatProjectInstructionsBlock(at))
+	}
+	if len(at.Sources) != 1 || at.Sources[0].Title != agentsFile || at.StartDirOutsideWorkspace {
+		t.Fatalf("sources=%+v outside=%v", at.Sources, at.StartDirOutsideWorkspace)
+	}
+}
+
+func TestLoadProjectInstructionsAtOrdersRootToStartDirAndSelectsPerDirectory(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	middle := filepath.Join(ws, "packages", "core")
+	start := filepath.Join(middle, "cmd")
+	if err := os.MkdirAll(start, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(ws, agentsFile):               "root",
+		filepath.Join(ws, "packages", agentsFile):   "packages base",
+		filepath.Join(middle, agentsOverrideFile):   "core override",
+		filepath.Join(start, agentsOverrideFile):    "",
+		filepath.Join(start, agentsFile):            "cmd base",
+		filepath.Join(ws, "packages", "ignored.md"): "not selected",
+		filepath.Join(ws, "outside", agentsFile):    "not discovered",
+	}
+	for path, body := range files {
+		if filepath.Base(filepath.Dir(path)) == "outside" {
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b, err := LoadProjectInstructionsAt(ws, start, 8000)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAt: %v", err)
+	}
+	if got, want := len(b.Sources), 4; got != want {
+		t.Fatalf("source count=%d, want %d: %+v", got, want, b.Sources)
+	}
+	wantTitles := []string{agentsFile, "packages/AGENTS.md", "packages/core/AGENTS.override.md", "packages/core/cmd/AGENTS.md"}
+	wantTexts := []string{"root", "packages base", "core override", "cmd base"}
+	for i, source := range b.Sources {
+		if source.Title != wantTitles[i] || source.Text != wantTexts[i] || source.Tokens <= 0 {
+			t.Errorf("source[%d]=%+v, want title=%q text=%q and positive tokens", i, source, wantTitles[i], wantTexts[i])
+		}
+	}
+	block := FormatProjectInstructionsBlock(b)
+	previous := -1
+	for _, want := range wantTexts {
+		at := strings.Index(block, want)
+		if at <= previous {
+			t.Fatalf("block order for %q is invalid: %q", want, block)
+		}
+		previous = at
+	}
+	if strings.Contains(block, "not discovered") || strings.Contains(block, "not selected") {
+		t.Fatalf("unexpected content in block: %q", block)
+	}
+}
+
+func TestLoadProjectInstructionsAtOutsideStartFallsBackToRoot(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	outside := t.TempDir()
+	inside := filepath.Join(ws, "nested")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte("root only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inside, agentsFile), []byte("must not load"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := LoadProjectInstructionsAt(ws, outside, 100)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAt: %v", err)
+	}
+	if !b.StartDirOutsideWorkspace || len(b.Sources) != 1 || b.Sources[0].Text != "root only" {
+		t.Fatalf("bundle=%+v", b)
+	}
+	if strings.Contains(FormatProjectInstructionsBlock(b), "must not load") {
+		t.Fatal("outside start fallback discovered a descendant")
+	}
+}
+
+func TestLoadProjectInstructionsAtCanonicalizesSymlinkedStartDir(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte("root only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, agentsFile), []byte("linked outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start := filepath.Join(ws, "linked-start")
+	if err := os.Symlink(outside, start); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("create symlink: %v", err)
+		}
+		t.Fatal(err)
+	}
+
+	b, err := LoadProjectInstructionsAt(ws, start, 100)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAt: %v", err)
+	}
+	if !b.StartDirOutsideWorkspace || len(b.Sources) != 1 || b.Sources[0].Text != "root only" {
+		t.Fatalf("bundle=%+v", b)
+	}
+}
+
+func TestLoadProjectInstructionsAtAllowsSymlinkAndSkipsNonRegular(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	child := filepath.Join(ws, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "linked-agents.md")
+	if err := os.WriteFile(target, []byte("linked instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(child, agentsOverrideFile)); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("create symlink: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(ws, agentsOverrideFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte("root base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := LoadProjectInstructionsAt(ws, child, 100)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAt: %v", err)
+	}
+	if len(b.Sources) != 2 || b.Sources[0].Text != "root base" || b.Sources[1].Text != "linked instructions" {
+		t.Fatalf("sources=%+v", b.Sources)
+	}
+	canonicalChild, err := filepath.EvalSymlinks(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Sources[1].Path != filepath.Join(canonicalChild, agentsOverrideFile) {
+		t.Fatalf("symlink provenance path=%q", b.Sources[1].Path)
+	}
+}
+
+func TestLoadProjectInstructionsAtAggregatesBudgetRootFirst(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	child := filepath.Join(ws, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte(strings.Repeat("root rule ", 40)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, agentsFile), []byte("child rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootFull := renderProjectInstructionsBlock(agentsFile, strings.Repeat("root rule ", 40), false)
+	maxTokens := usage.EstimateText(rootFull[:len(rootFull)/2])
+	if maxTokens >= usage.EstimateText(rootFull) {
+		maxTokens = usage.EstimateText(rootFull) - 1
+	}
+	if maxTokens <= usage.EstimateText(renderTruncatedProjectInstructionsBlock(agentsFile, "")) {
+		maxTokens = usage.EstimateText(renderTruncatedProjectInstructionsBlock(agentsFile, "")) + 5
+	}
+
+	b, err := LoadProjectInstructionsAt(ws, child, maxTokens)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAt: %v", err)
+	}
+	block := FormatProjectInstructionsBlock(b)
+	if usage.EstimateText(block) > maxTokens || b.Tokens != usage.EstimateText(block) {
+		t.Fatalf("block tokens=%d bundle tokens=%d max=%d", usage.EstimateText(block), b.Tokens, maxTokens)
+	}
+	if len(b.Sources) != 2 || !b.Sources[0].Truncated || b.Sources[0].Tokens <= 0 {
+		t.Fatalf("sources=%+v", b.Sources)
+	}
+	if b.Sources[1].Tokens != 0 || !b.Sources[1].Truncated || strings.Contains(block, "child rule") {
+		t.Fatalf("expected root-first exhaustion, sources=%+v block=%q", b.Sources, block)
+	}
+}
+
+func TestLoadProjectInstructionsAtReadErrorsFailFast(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based read error is not portable on Windows")
+	}
+	ws := t.TempDir()
+	path := filepath.Join(ws, agentsFile)
+	if err := os.WriteFile(path, []byte("private instructions"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	_, err := LoadProjectInstructionsAt(ws, ws, 100)
+	if err == nil {
+		t.Skip("test process can read mode-000 files")
+	}
+	if !strings.Contains(err.Error(), "read AGENTS.md") {
+		t.Fatalf("error=%v, want read failure", err)
+	}
+}
