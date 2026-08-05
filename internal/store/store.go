@@ -47,8 +47,8 @@ type ThreadMeta struct {
 }
 
 // ForkResult identifies the newly published child and the exact source prefix
-// it contains. ChildState is the journal-derived state before any later child
-// mutation.
+// it contains. LastTurnID is empty for a child forked before the first turn.
+// ChildState is the journal-derived state before any later child mutation.
 type ForkResult struct {
 	SourceID   string      `json:"source_id"`
 	ChildID    string      `json:"child_id"`
@@ -96,6 +96,14 @@ type ThreadRepository interface {
 // need to implement fork semantics before they consume them.
 type ThreadForkRepository interface {
 	ForkThread(ctx context.Context, sourceID, childID, lastTurnID string) (ForkResult, error)
+}
+
+// ThreadForkBeforeFirstRepository is the optional source-preserving fork
+// extension for publishing a child with an empty committed prefix. It remains
+// separate so callers can opt into the explicit before-first boundary without
+// treating ForkThread's empty lastTurnID as a sentinel.
+type ThreadForkBeforeFirstRepository interface {
+	ForkThreadBeforeFirstTurn(ctx context.Context, sourceID, childID string) (ForkResult, error)
 }
 
 // TaskStateRepository is an optional extension for runtimes that need a

@@ -158,6 +158,13 @@ func TestSlashMenuTabCompleteNeedsArgClasses(t *testing.T) {
 		t.Fatalf("tab /resume = %q", mm.textarea.Value())
 	}
 
+	setComposer(mm, "/fo")
+	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyTab})
+	mm = next.(*model)
+	if mm.textarea.Value() != "/fork" {
+		t.Fatalf("tab /fork = %q", mm.textarea.Value())
+	}
+
 	setComposer(mm, "/h")
 	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyTab})
 	mm = next.(*model)

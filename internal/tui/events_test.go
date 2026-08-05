@@ -14,7 +14,7 @@ import (
 
 func TestEmitFromTurnEventPreservesRawToolPayload(t *testing.T) {
 	ch := make(chan tea.Msg, 2)
-	emit := emitFromTurnEvent(context.Background(), 17, ch)
+	emit := emitFromTurnEvent(context.Background(), 17, 23, ch)
 
 	input := strings.Repeat("i", toolBodyMaxRunes+200)
 	output := strings.Repeat("o", toolBodyMaxRunes+200)
@@ -25,12 +25,18 @@ func TestEmitFromTurnEventPreservesRawToolPayload(t *testing.T) {
 	if !ok {
 		t.Fatal("first event should be a tool-start message")
 	}
+	if start.sessionGeneration != 23 {
+		t.Fatalf("tool-start generation = %d, want 23", start.sessionGeneration)
+	}
 	if start.input != input {
 		t.Fatalf("tool input was truncated: got %d want %d runes", len([]rune(start.input)), len([]rune(input)))
 	}
 	end, ok := (<-ch).(turnToolEndMsg)
 	if !ok {
 		t.Fatal("second event should be a tool-end message")
+	}
+	if end.sessionGeneration != 23 {
+		t.Fatalf("tool-end generation = %d, want 23", end.sessionGeneration)
 	}
 	if end.output != output {
 		t.Fatalf("tool output was truncated: got %d want %d runes", len([]rune(end.output)), len([]rune(output)))
@@ -39,7 +45,7 @@ func TestEmitFromTurnEventPreservesRawToolPayload(t *testing.T) {
 
 func TestEmitFromTurnEventForwardsModelUsage(t *testing.T) {
 	ch := make(chan tea.Msg, 1)
-	emit := emitFromTurnEvent(context.Background(), 17, ch)
+	emit := emitFromTurnEvent(context.Background(), 17, 23, ch)
 	emit(chat.TurnEvent{
 		Kind: chat.TurnEventModelUsage,
 		ModelUsage: &chat.ModelUsageEvent{
@@ -56,20 +62,20 @@ func TestEmitFromTurnEventForwardsModelUsage(t *testing.T) {
 	if !ok {
 		t.Fatal("model usage should become a turnUsageMsg")
 	}
-	if got.turnID != 17 || got.usage.CallID != "call-1" || got.usage.Usage.TotalTokens != 12 || got.usage.Usage.CachedTokens != 4 {
+	if got.turnID != 17 || got.sessionGeneration != 23 || got.usage.CallID != "call-1" || got.usage.Usage.TotalTokens != 12 || got.usage.Usage.CachedTokens != 4 {
 		t.Fatalf("usage msg=%+v", got)
 	}
 }
 
 func TestEmitFromTurnEventForwardsReasoning(t *testing.T) {
 	ch := make(chan tea.Msg, 1)
-	emit := emitFromTurnEvent(context.Background(), 9, ch)
+	emit := emitFromTurnEvent(context.Background(), 9, 23, ch)
 	emit(chat.TurnEvent{Kind: chat.TurnEventReasoning, Chunk: "ponder"})
 	got, ok := (<-ch).(turnReasoningMsg)
 	if !ok {
 		t.Fatal("reasoning should become turnReasoningMsg")
 	}
-	if got.turnID != 9 || got.chunk != "ponder" {
+	if got.turnID != 9 || got.sessionGeneration != 23 || got.chunk != "ponder" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -78,7 +84,7 @@ func TestEmitFromTurnEventUnblocksOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := make(chan tea.Msg)
-	emit := emitFromTurnEvent(ctx, 17, ch)
+	emit := emitFromTurnEvent(ctx, 17, 23, ch)
 	done := make(chan struct{})
 	go func() {
 		emit(chat.TurnEvent{Kind: chat.TurnEventChunk, Chunk: "blocked"})

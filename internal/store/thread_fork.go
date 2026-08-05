@@ -32,12 +32,31 @@ type forkCommitBoundary struct {
 	turnID string
 }
 
-var _ ThreadForkRepository = (*ThreadStore)(nil)
+type forkBoundary struct {
+	beforeFirst bool
+	lastTurnID  string
+}
+
+var (
+	_ ThreadForkRepository            = (*ThreadStore)(nil)
+	_ ThreadForkBeforeFirstRepository = (*ThreadStore)(nil)
+)
 
 // ForkThread publishes a child ledger containing a complete committed prefix
 // of sourceID. The source ledger is only read, and the child journal is rebuilt
 // so none of the source envelope hashes or sequence numbers are reused.
 func (s *ThreadStore) ForkThread(ctx context.Context, sourceID, childID, lastTurnID string) (ForkResult, error) {
+	return s.forkThread(ctx, sourceID, childID, forkBoundary{lastTurnID: lastTurnID})
+}
+
+// ForkThreadBeforeFirstTurn publishes a child ledger before sourceID's first
+// turn. The child contains only a rebuilt thread.created event, while retaining
+// the source parent, source hash, current title, and system prompt.
+func (s *ThreadStore) ForkThreadBeforeFirstTurn(ctx context.Context, sourceID, childID string) (ForkResult, error) {
+	return s.forkThread(ctx, sourceID, childID, forkBoundary{beforeFirst: true})
+}
+
+func (s *ThreadStore) forkThread(ctx context.Context, sourceID, childID string, boundary forkBoundary) (ForkResult, error) {
 	if s == nil {
 		return ForkResult{}, errors.New("thread store is required")
 	}
@@ -46,7 +65,7 @@ func (s *ThreadStore) ForkThread(ctx context.Context, sourceID, childID, lastTur
 	}
 	sourceID = strings.TrimSpace(sourceID)
 	childID = strings.TrimSpace(childID)
-	lastTurnID = strings.TrimSpace(lastTurnID)
+	boundary.lastTurnID = strings.TrimSpace(boundary.lastTurnID)
 	if err := validateThreadID(sourceID); err != nil {
 		return ForkResult{}, err
 	}
@@ -64,7 +83,7 @@ func (s *ThreadStore) ForkThread(ctx context.Context, sourceID, childID, lastTur
 
 	var result ForkResult
 	err := s.withReadOnlyThread(ctx, sourceID, func(sourceDir string, locked bool) error {
-		source, err := s.readForkSource(ctx, sourceDir, sourceID, lastTurnID, locked)
+		source, err := s.readForkSource(ctx, sourceDir, sourceID, boundary, locked)
 		if err != nil {
 			return err
 		}
@@ -134,7 +153,7 @@ func ensureForkDestinationAbsent(root, childID string) error {
 	return nil
 }
 
-func (s *ThreadStore) readForkSource(ctx context.Context, sourceDir, sourceID, lastTurnID string, locked bool) (forkSource, error) {
+func (s *ThreadStore) readForkSource(ctx context.Context, sourceDir, sourceID string, boundary forkBoundary, locked bool) (forkSource, error) {
 	var lastErr error
 	for attempt := 0; attempt < stableReadAttempts; attempt++ {
 		if err := stableReadContextError(ctx); err != nil {
@@ -176,7 +195,7 @@ func (s *ThreadStore) readForkSource(ctx context.Context, sourceDir, sourceID, l
 		} else if tornTail {
 			return forkSource{}, fmt.Errorf("%w: torn journal tail cannot be forked", ErrJournalCorrupt)
 		} else {
-			analyzed, analyzeErr := analyzeForkSource(sourceDir, sourceID, lastTurnID, state, events)
+			analyzed, analyzeErr := analyzeForkSource(sourceDir, sourceID, boundary, state, events)
 			if analyzeErr != nil {
 				return forkSource{}, analyzeErr
 			}
@@ -270,7 +289,7 @@ func fingerprintForkSource(sourceDir string) (sourceFingerprint, bool, error) {
 	return fingerprintFromHash(hashValue), lockPresent, nil
 }
 
-func analyzeForkSource(sourceDir, sourceID, lastTurnID string, state ThreadState, events []ThreadEvent) (forkSource, error) {
+func analyzeForkSource(sourceDir, sourceID string, boundaryMode forkBoundary, state ThreadState, events []ThreadEvent) (forkSource, error) {
 	if state.ID != sourceID {
 		return forkSource{}, fmt.Errorf("%w: source state id %q does not match %q", ErrJournalCorrupt, state.ID, sourceID)
 	}
@@ -324,22 +343,29 @@ func analyzeForkSource(sourceDir, sourceID, lastTurnID string, state ThreadState
 			commits = append(commits, forkCommitBoundary{index: index, turnID: event.TurnID})
 		}
 	}
-	if len(commits) == 0 {
-		return forkSource{}, ErrForkNoCommittedTurn
-	}
-
-	boundary := commits[len(commits)-1]
-	if lastTurnID != "" {
-		found := false
-		for _, candidate := range commits {
-			if candidate.turnID == lastTurnID {
-				boundary = candidate
-				found = true
-				break
-			}
+	var boundary forkCommitBoundary
+	if boundaryMode.beforeFirst {
+		if len(events) == 0 {
+			return forkSource{}, fmt.Errorf("%w: source has no creation event", ErrJournalCorrupt)
 		}
-		if !found {
-			return forkSource{}, fmt.Errorf("%w: turn %q is not a committed boundary", ErrForkInvalidBoundary, lastTurnID)
+		boundary = forkCommitBoundary{index: 0}
+	} else {
+		if len(commits) == 0 {
+			return forkSource{}, ErrForkNoCommittedTurn
+		}
+		boundary = commits[len(commits)-1]
+		if boundaryMode.lastTurnID != "" {
+			found := false
+			for _, candidate := range commits {
+				if candidate.turnID == boundaryMode.lastTurnID {
+					boundary = candidate
+					found = true
+					break
+				}
+			}
+			if !found {
+				return forkSource{}, fmt.Errorf("%w: turn %q is not a committed boundary", ErrForkInvalidBoundary, boundaryMode.lastTurnID)
+			}
 		}
 	}
 
@@ -491,6 +517,7 @@ func rebuildForkEvents(childID string, source forkSource) ([]ThreadEvent, Thread
 				return nil, ThreadState{}, fmt.Errorf("decode fork thread.created: %w", err)
 			}
 			created.Meta.ID = childID
+			created.Meta.Title = source.state.Meta.Title
 			created.Meta.ParentID = source.state.ID
 			created.Meta.ForkBoundaryTurnID = source.boundaryTurn
 			created.Meta.ForkSourceHash = source.sourceHash

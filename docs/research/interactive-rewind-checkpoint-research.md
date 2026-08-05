@@ -14,6 +14,12 @@
 > internals, and claims about external side effects that the products do not
 > disclose.
 
+This note was rechecked against the current published OpenCode page, Gemini CLI
+`main` documentation, and Codex `main` source/schema on 2026-08-04. The latest
+observed file commits and the access result for Claude Code are recorded in
+[References](#references); re-checking a moving branch is part of the evidence
+contract.
+
 ## 1. Conclusions
 
 - **Cross-product synthesis:** "rewind" is not one operation. The evidence
@@ -23,7 +29,8 @@
 - **Documented fact:** OpenCode documents `/undo` as removing the latest user
   message and all later responses plus file changes, and `/redo` as restoring an
   undone message and file state through Git. Both require the project to be a
-  Git repository. ([OpenCode TUI](https://opencode.ai/docs/tui/))
+  Git repository. The page observed on this date was last updated on 2026-08-04.
+  ([OpenCode TUI](https://opencode.ai/docs/tui/))
 - **Documented fact:** Gemini CLI documents an opt-in checkpoint taken before
   an AI file-modification tool. The checkpoint stores a project snapshot in a
   shadow Git repository plus conversation/tool-call state; `/restore` restores
@@ -57,6 +64,10 @@ available only after `/undo`, restoring the previously undone message and file
 changes. The documentation says both operations use Git internally and require
 the project to be a Git repository. ([OpenCode TUI](https://opencode.ai/docs/tui/))
 
+The current page also states that `/undo` reverts file changes and `/redo`
+restores them, and reports `Last updated: 2026-08-04`. This is a re-observation
+of the published page, not a claim about undocumented transaction scope.
+
 The same command catalog presents `/sessions` as session listing/switching,
 which is a different control from undo/redo. The documentation therefore gives
 an explicit distinction between navigating sessions and rewinding the current
@@ -73,7 +84,8 @@ mechanism, not evidence that those other effects are reversible.
 responses, tool executions, token usage, and available reasoning summaries. It
 also documents named chat checkpoints (`/resume save`, `/resume list`, and
 `/resume resume`), which are history branch points rather than the file-change
-restore flow. ([Gemini session management](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md))
+restore flow. The same page describes `/resume` as a session browser and says
+that sessions are project-specific. ([Gemini session management](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md))
 
 Its separate Checkpointing feature is disabled by default and enabled through
 `settings.json`. Before an approved filesystem-modifying tool runs, the CLI
@@ -82,6 +94,13 @@ directory, saves conversation history and the pending tool call, and exposes
 `/restore <checkpoint_file>`. Restoring reverts project files and conversation
 history, then re-proposes the original tool call so the user can rerun, edit, or
 skip it. ([Gemini checkpointing](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md))
+
+The current document says the shadow repository is under
+`~/.gemini/history/<project_hash>`, checkpoint conversation/tool-call data is
+under `~/.gemini/tmp/<project_hash>/checkpoints`, and the old
+`--checkpointing` flag was removed in 0.11.0; configuration is now the only
+enablement path. These storage and enablement details are documented behavior,
+not evidence that the checkpoint covers non-filesystem effects.
 
 **Boundary.** The docs describe a local project snapshot and conversation/tool
 state. They do not claim that provider billing, external services, network
@@ -97,6 +116,11 @@ prompt. The selected prompt is restored in the new branch's composer for editing
 The source rejects editing previous prompts while a side conversation is active
 and restores the prompt with a visible error if branching fails. ([Codex
 backtrack source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app_backtrack.rs))
+
+The source makes this a state machine: the first `Esc` captures a base thread
+identity, the overlay highlights a user-message selection, and the selection is
+invalid if the thread changes before confirmation. This is source evidence for
+interaction and stale-selection handling, not proof of workspace restoration.
 
 The public app-server fork schema supports a new thread forked from a stored
 thread, an optional inclusive last-turn boundary, and per-fork model,
@@ -118,12 +142,16 @@ restores filesystem state. The rollback protocol explicitly does not do so.
 
 The official pages selected for this direction were
 [Interactive mode](https://code.claude.com/docs/en/interactive-mode) and
-[Common workflows](https://docs.anthropic.com/en/docs/claude-code/common-workflows).
+[Common workflows](https://code.claude.com/docs/en/common-workflows). The older
+Anthropic-hosted entry points were also attempted:
+[interactive mode](https://docs.anthropic.com/en/docs/claude-code/interactive-mode)
+and [overview](https://docs.anthropic.com/en/docs/claude-code/overview).
 
-**Access record (2026-08-04).** The interactive-mode URL timed out from the
-research environment with no response body. The Anthropic URL redirected toward
-`code.claude.com`, whose target was also unreachable. No Claude Code behavior is
-inferred from memory, command-name similarity, or another product's docs.
+**Access record (2026-08-04).** Both `code.claude.com` URLs reset the connection
+before returning a response body. The two `docs.anthropic.com` URLs returned
+HTTP 301 redirects to `code.claude.com`; following those redirects also reset
+the connection. No Claude Code behavior is inferred from memory, command-name
+similarity, redirect metadata, or another product's docs.
 
 **Evidence gap.** Rewind entry, conversation/file coupling, checkpoint storage,
 dirty-worktree handling, redo behavior, and external-side-effect guarantees all
@@ -188,12 +216,23 @@ are cheap to browse but do not imply workspace rollback.
 
 All links were accessed or attempted on 2026-08-04.
 
-1. OpenCode, [TUI command documentation](https://opencode.ai/docs/tui/) and
-   [public TUI source](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/tui.mdx).
-2. Google Gemini CLI, [checkpointing](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md).
-3. Google Gemini CLI, [session management](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md).
-4. OpenAI Codex, [TUI backtrack source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app_backtrack.rs).
-5. OpenAI Codex, [thread fork schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json).
-6. OpenAI Codex, [thread rollback schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackParams.json) and [rollback tests](https://github.com/openai/codex/blob/main/codex-rs/app-server/tests/suite/v2/thread_rollback.rs).
-7. Anthropic, [Claude Code interactive mode](https://code.claude.com/docs/en/interactive-mode) — connection timeout.
-8. Anthropic, [Claude Code common workflows](https://docs.anthropic.com/en/docs/claude-code/common-workflows) — redirected target unavailable.
+1. OpenCode, [TUI command documentation](https://opencode.ai/docs/tui/) — page
+   reported last updated 2026-08-04 — and [public TUI source](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/tui.mdx),
+   latest observed file commit `8a2cfc0` (2026-06-10).
+2. Google Gemini CLI, [checkpointing](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/checkpointing.md),
+   latest observed file commit `e09410b` (2026-04-10).
+3. Google Gemini CLI, [session management](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md),
+   latest observed file commit `93844d` (2026-06-18).
+4. OpenAI Codex, [TUI backtrack source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app_backtrack.rs),
+   latest observed file commit `7dc1856` (2026-08-01).
+5. OpenAI Codex, [thread fork schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json),
+   latest observed file commit `328e951` (2026-06-27).
+6. OpenAI Codex, [thread rollback schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackParams.json),
+   latest observed file commit `2683280` (2026-06-25), and [rollback tests](https://github.com/openai/codex/blob/main/codex-rs/app-server/tests/suite/v2/thread_rollback.rs),
+   latest observed file commit `10cc57c` (2026-07-22).
+7. Anthropic, [Claude Code interactive mode](https://code.claude.com/docs/en/interactive-mode),
+   [common workflows](https://code.claude.com/docs/en/common-workflows),
+   [legacy interactive entry](https://docs.anthropic.com/en/docs/claude-code/interactive-mode),
+   and [legacy overview entry](https://docs.anthropic.com/en/docs/claude-code/overview)
+   — no official response body was accessible on 2026-08-04; see the access
+   record above.

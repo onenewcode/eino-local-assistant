@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -230,6 +231,47 @@ func TestStaleTurnEventsAreIgnored(t *testing.T) {
 	mm := next.(*model)
 	if len(mm.lines) != before {
 		t.Fatalf("stale chunk should be ignored")
+	}
+}
+
+func TestTurnEventsRejectOldSessionGenerationWithSameTurnID(t *testing.T) {
+	m := newTestModel(t)
+	m.turnID = 7
+	oldGeneration := m.sessionGeneration
+	child := mustSession(t, &staticModel{}, "child")
+	m.replaceSession(child)
+	m.lines = []transcriptLine{{kind: lineSystem, text: "child transcript"}}
+	m.mode = modeBusy
+	m.turnUsage = usage.APIUsage{Status: store.UsageStatusExact}
+	m.turnUsageCallIDs = make(map[string]struct{})
+	beforeLines := append([]transcriptLine(nil), m.lines...)
+
+	staleMessages := []tea.Msg{
+		turnChunkMsg{turnID: 7, sessionGeneration: oldGeneration, chunk: "old chunk"},
+		turnReasoningMsg{turnID: 7, sessionGeneration: oldGeneration, chunk: "old reasoning"},
+		turnToolStartMsg{turnID: 7, sessionGeneration: oldGeneration, tool: "old-tool", callID: "old-call", input: "{}"},
+		turnToolEndMsg{turnID: 7, sessionGeneration: oldGeneration, tool: "old-tool", callID: "old-call", output: "old output"},
+		turnToolErrorMsg{turnID: 7, sessionGeneration: oldGeneration, tool: "old-tool", callID: "old-call", err: errors.New("old error")},
+		turnUsageMsg{turnID: 7, sessionGeneration: oldGeneration, usage: chat.ModelUsageEvent{CallID: "old-usage", Available: true}},
+		turnTaskGateMsg{turnID: 7, sessionGeneration: oldGeneration, gate: chat.TaskCompletionGate{Summary: "old gate"}},
+		turnDoneMsg{turnID: 7, sessionGeneration: oldGeneration, err: errors.New("old done")},
+	}
+	for _, msg := range staleMessages {
+		next, _ := m.Update(msg)
+		m = next.(*model)
+	}
+
+	if !reflect.DeepEqual(m.lines, beforeLines) {
+		t.Fatalf("old session events polluted child transcript: %#v", m.lines)
+	}
+	if m.turnUsageSeen || m.pendingTurnDone != nil || m.currentTool != "" || len(m.openToolCards) != 0 {
+		t.Fatalf("old session events changed child turn state: usage=%v pending=%#v tool=%q cards=%v", m.turnUsageSeen, m.pendingTurnDone, m.currentTool, m.openToolCards)
+	}
+
+	next, _ := m.Update(turnChunkMsg{turnID: 7, sessionGeneration: m.sessionGeneration, chunk: "child reply"})
+	m = next.(*model)
+	if !hasLineContaining(m.lines, lineAssistant, "child reply") {
+		t.Fatalf("current session event was not displayed: %#v", m.lines)
 	}
 }
 

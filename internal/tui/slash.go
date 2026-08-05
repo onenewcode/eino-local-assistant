@@ -17,12 +17,16 @@ const (
 	slashNew
 	slashSessions
 	slashResume
+	slashFork
 	slashTitle
 	slashDelete
 	slashQueue
 	slashUsage
 	slashPermissions
 	slashMemory
+	// slashBacktrack is an internal Esc action; it intentionally has no
+	// textual slash command or catalog entry.
+	slashBacktrack
 	slashUnknown
 )
 
@@ -41,7 +45,7 @@ const maxSlashMenuRows = 8
 // slashCatalog is the single source of truth for menu rows (order matches help).
 func slashCatalog() []slashCommand {
 	return []slashCommand{
-		{Name: "/help", Aliases: []string{"/?"}, Description: "show this help"},
+		{Name: "/help", Aliases: []string{"/?"}, Description: "show commands and Esc key behavior"},
 		{Name: "/status", Description: "model, session, tokens, cost, max_step, context"},
 		{Name: "/rules", Description: "show captured instruction source metadata (no reload)"},
 		{Name: "/btw", Aliases: []string{"/side"}, Description: "ask a temporary side question without interrupting the current turn", NeedsArg: true},
@@ -51,6 +55,7 @@ func slashCatalog() []slashCommand {
 		{Name: "/sessions", Description: "list saved sessions (tokens/cost)"},
 		{Name: "/new", Description: "start a new session", NeedsArg: true},
 		{Name: "/resume", Description: "resume a saved session ([--recover] after confirming prior process stopped)", NeedsArg: true},
+		{Name: "/fork", Description: "fork the current session at its latest committed turn"},
 		{Name: "/delete", Description: "delete a saved session (not the active one)", NeedsArg: true},
 		{Name: "/title", Description: "rename the current session", NeedsArg: true},
 		{Name: "/queue", Description: "list queued follow-ups (or: clear)", NeedsArg: true},
@@ -164,6 +169,8 @@ func parseSlash(input string) (slashAction, string) {
 		return slashSessions, arg
 	case "/resume":
 		return slashResume, arg
+	case "/fork":
+		return slashFork, arg
 	case "/title":
 		return slashTitle, arg
 	case "/delete":
@@ -182,7 +189,7 @@ func parseSlash(input string) (slashAction, string) {
 func helpText() string {
 	return strings.Join([]string{
 		"Commands:",
-		"  /help              show this help",
+		"  /help              show this help and key bindings (including Esc backtrack)",
 		"  /status            model, session, tokens, cost, max_step, context",
 		"  /rules             captured instruction sources and budgets (no reload)",
 		"  /btw <question>    ask a temporary side question without interrupting the current turn (alias: /side)",
@@ -192,6 +199,7 @@ func helpText() string {
 		"  /sessions          list saved sessions (tokens/cost)",
 		"  /new [title]       start a new session",
 		"  /resume <id> [--recover]  resume a saved session; explicitly recover an interrupted operation",
+		"  /fork              fork the current session at its latest committed turn (auto child ID)",
 		"  /delete <id>       delete a saved session (not the active one)",
 		"  /title <text>      rename the current session",
 		"  /queue             list queued follow-ups",
@@ -210,11 +218,12 @@ func helpText() string {
 		"  ctrl+t    show/hide complex task progress when available",
 		"  pgup/pgdn scroll transcript (or review a long host-escalation command)",
 		"  home/end  jump to top / bottom of transcript",
-		"  esc       dismiss slash menu, deny approval, or interrupt turn/compaction",
+		"  esc       idle: first arms backtrack; second opens history prompt selector",
+		"            selector Esc cancels; busy Esc interrupts turn/compaction; approval Esc denies; slash menu Esc dismisses",
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
 		"While busy, /help /context /status /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; side questions never enter the FIFO queue.",
-		"Mutative commands (/compact /clear /new /resume /title /delete /exit) cannot be queued.",
+		"Mutative commands (/compact /clear /new /resume /fork /title /delete /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny). Status shows cmd=ask|auto.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",
 		"Persistent memory is project-scoped (not /resume). See docs/memory.md.",

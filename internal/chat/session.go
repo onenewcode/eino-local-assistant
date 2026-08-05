@@ -23,6 +23,9 @@ import (
 var (
 	// ErrEmptyInput is returned before a turn is persisted or sent to the model.
 	ErrEmptyInput = errors.New("message cannot be empty")
+	// ErrForkUnsupported means the session's repository does not implement the
+	// optional source-preserving fork extension.
+	ErrForkUnsupported = errors.New("session fork is unsupported")
 	// ErrCompactionUnavailable means this session has no durable thread store or
 	// no explicitly injected no-tools compactor.
 	ErrCompactionUnavailable = errors.New("context compaction is unavailable")
@@ -478,6 +481,95 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 	}
 	s.refreshLastCompactionUsage(context.Background())
 	return s, nil
+}
+
+type sessionForkConfig struct {
+	model                  Model
+	repository             store.ThreadRepository
+	id                     string
+	systemPrompt           string
+	pricing                usage.Pricing
+	contextCfg             contextbuild.Config
+	maxLowGainAttempts     int
+	compactor              contextbuild.CheckpointCompactor
+	finalResponseValidator func(string) error
+}
+
+// Fork publishes and opens a child session from a committed source prefix.
+// The source session remains a read-only participant in this operation; the
+// store fork primitive owns the source consistency and rejection checks.
+func (s *Session) Fork(ctx context.Context, childID, lastTurnID string) (*Session, store.ForkResult, error) {
+	return s.fork(ctx, childID, func(ctx context.Context, repository store.ThreadRepository, sourceID, childID string) (store.ForkResult, error) {
+		forkRepository, ok := repository.(store.ThreadForkRepository)
+		if !ok {
+			return store.ForkResult{}, ErrForkUnsupported
+		}
+		return forkRepository.ForkThread(ctx, sourceID, childID, lastTurnID)
+	})
+}
+
+// ForkBeforeFirstTurn publishes and opens a child session with no committed
+// source turns. The explicit store extension keeps this boundary distinct from
+// Fork's empty lastTurnID, which continues to mean the latest committed turn.
+func (s *Session) ForkBeforeFirstTurn(ctx context.Context, childID string) (*Session, store.ForkResult, error) {
+	return s.fork(ctx, childID, func(ctx context.Context, repository store.ThreadRepository, sourceID, childID string) (store.ForkResult, error) {
+		forkRepository, ok := repository.(store.ThreadForkBeforeFirstRepository)
+		if !ok {
+			return store.ForkResult{}, ErrForkUnsupported
+		}
+		return forkRepository.ForkThreadBeforeFirstTurn(ctx, sourceID, childID)
+	})
+}
+
+type sessionForkFunc func(context.Context, store.ThreadRepository, string, string) (store.ForkResult, error)
+
+func (s *Session) fork(ctx context.Context, childID string, fork sessionForkFunc) (*Session, store.ForkResult, error) {
+	if s == nil {
+		return nil, store.ForkResult{}, errors.New("session is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mu.RLock()
+	forkConfig := sessionForkConfig{
+		model:                  s.model,
+		repository:             s.threads,
+		id:                     s.id,
+		systemPrompt:           s.systemPrompt,
+		pricing:                s.pricing,
+		contextCfg:             s.contextCfg,
+		maxLowGainAttempts:     s.maxLowGainAttempts,
+		compactor:              s.compactor,
+		finalResponseValidator: s.finalResponseValidator,
+	}
+	s.mu.RUnlock()
+
+	result, err := fork(ctx, forkConfig.repository, forkConfig.id, childID)
+	if err != nil {
+		// Preserve the store sentinel and concrete error for callers that need to
+		// distinguish active, pending, and other durable rejection causes.
+		return nil, store.ForkResult{}, err
+	}
+
+	child, err := OpenSession(forkConfig.model, forkConfig.repository, result.ChildID, SessionOptions{
+		Store:                  forkConfig.repository,
+		Pricing:                forkConfig.pricing,
+		Context:                forkConfig.contextCfg,
+		MaxLowGainAttempts:     forkConfig.maxLowGainAttempts,
+		Compactor:              forkConfig.compactor,
+		RecoverInterrupted:     false,
+		FinalResponseValidator: forkConfig.finalResponseValidator,
+	})
+	if err != nil {
+		// Fork publication is an external store side effect and is intentionally
+		// not rolled back when opening the in-memory child fails.
+		return nil, result, err
+	}
+	if child.SystemPrompt() != forkConfig.systemPrompt {
+		return nil, result, fmt.Errorf("forked child system prompt differs from source session")
+	}
+	return child, result, nil
 }
 
 // SetFinalResponseValidator installs a local final-response check. It is

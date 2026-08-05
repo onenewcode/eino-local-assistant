@@ -146,6 +146,151 @@ func TestThreadStoreForkThreadGeneratesIDAtCommittedHead(t *testing.T) {
 	}
 }
 
+func TestThreadStoreForkThreadInheritsCurrentTitleAtCommittedHead(t *testing.T) {
+	ctx := context.Background()
+	threadStore, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "fork-title-source", Title: "initial title"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source = appendForkTestTurn(ctx, t, threadStore, source, "turn-title", false)
+	source, err = threadStore.SetThreadTitle(ctx, source.ID, source.Revision, "current title")
+	if err != nil {
+		t.Fatalf("SetThreadTitle: %v", err)
+	}
+	sourceFilesBefore := allForkThreadFiles(t, threadStore.Root(), source.ID)
+
+	result, err := threadStore.ForkThread(ctx, source.ID, "fork-title-child", "")
+	if err != nil {
+		t.Fatalf("ForkThread: %v", err)
+	}
+	if result.ChildState.Meta.Title != "current title" {
+		t.Fatalf("fork result title = %q, want current title", result.ChildState.Meta.Title)
+	}
+	child, err := threadStore.LoadThread(ctx, result.ChildID)
+	if err != nil {
+		t.Fatalf("LoadThread child: %v", err)
+	}
+	if child.Meta.Title != "current title" {
+		t.Fatalf("child title = %q, want current title", child.Meta.Title)
+	}
+	if child.Meta.ParentID != source.ID || child.Meta.ForkBoundaryTurnID != "turn-title" || child.Meta.ForkSourceHash != result.SourceHash {
+		t.Fatalf("child provenance = %#v, result = %#v", child.Meta, result)
+	}
+	if result.LastTurnID != "turn-title" {
+		t.Fatalf("fork boundary = %q, want turn-title", result.LastTurnID)
+	}
+	if !reflect.DeepEqual(allForkThreadFiles(t, threadStore.Root(), source.ID), sourceFilesBefore) {
+		t.Fatal("fork changed source files")
+	}
+}
+
+func TestThreadStoreForkThreadBeforeFirstTurnRebuildsCreationAndReloads(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.CreateThread(ctx, ThreadMeta{ID: "fork-before-first-source", Title: "initial title"}, "system prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source = appendForkTestTurn(ctx, t, store, source, "turn-existing", true)
+	source, err = store.SetThreadTitle(ctx, source.ID, source.Revision, "current title")
+	if err != nil {
+		t.Fatalf("SetThreadTitle: %v", err)
+	}
+	sourceFilesBefore := allForkThreadFiles(t, store.Root(), source.ID)
+	sourceEvents := readForkTestEvents(t, filepath.Join(store.Root(), sessionsDirName, source.ID))
+
+	result, err := store.ForkThreadBeforeFirstTurn(ctx, source.ID, "fork-before-first-child")
+	if err != nil {
+		t.Fatalf("ForkThreadBeforeFirstTurn: %v", err)
+	}
+	if result.SourceID != source.ID || result.ChildID != "fork-before-first-child" || result.LastTurnID != "" {
+		t.Fatalf("before-first fork result = %#v", result)
+	}
+	if result.SourceHash != sourceEvents[0].Hash || result.ChildState.Meta.ForkSourceHash != result.SourceHash {
+		t.Fatalf("before-first source hash = %q, source event = %#v, child = %#v", result.SourceHash, sourceEvents[0], result.ChildState)
+	}
+	if result.ChildState.Meta.ParentID != source.ID || result.ChildState.Meta.Title != "current title" || result.ChildState.SystemPrompt != "system prompt" {
+		t.Fatalf("before-first child state = %#v", result.ChildState)
+	}
+	if result.ChildState.Meta.ForkBoundaryTurnID != "" || result.ChildState.Revision != 1 || result.ChildState.HeadSequence != 1 {
+		t.Fatalf("before-first child boundary/state = %#v", result.ChildState)
+	}
+
+	childDir := filepath.Join(store.Root(), sessionsDirName, result.ChildID)
+	childEvents := readForkTestEvents(t, childDir)
+	if len(childEvents) != 1 || childEvents[0].Kind != EventThreadCreated || childEvents[0].ThreadID != result.ChildID {
+		t.Fatalf("before-first child events = %#v", childEvents)
+	}
+	var created threadCreatedPayload
+	if err := json.Unmarshal(childEvents[0].Payload, &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Meta.ID != result.ChildID || created.Meta.ParentID != source.ID || created.Meta.Title != "current title" || created.Meta.ForkBoundaryTurnID != "" || created.Meta.ForkSourceHash != result.SourceHash || created.SystemPrompt != "system prompt" {
+		t.Fatalf("before-first thread.created payload = %#v", created)
+	}
+	if len(created.Messages) != 1 || created.Messages[0].Role != schema.System || created.Messages[0].Content != "system prompt" {
+		t.Fatalf("before-first creation messages = %#v", created.Messages)
+	}
+	if entries, err := os.ReadDir(filepath.Join(childDir, artifactsDir)); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("before-first child copied artifacts: %#v", entries)
+	}
+
+	reloadedStore, err := NewThreadStore(store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := reloadedStore.LoadThread(ctx, result.ChildID)
+	if err != nil {
+		t.Fatalf("LoadThread reloaded child: %v", err)
+	}
+	if reloaded.ID != result.ChildID || reloaded.Meta.ParentID != source.ID || reloaded.Meta.Title != "current title" || reloaded.SystemPrompt != "system prompt" || reloaded.Meta.ForkSourceHash != result.SourceHash || reloaded.Meta.ForkBoundaryTurnID != "" {
+		t.Fatalf("reloaded before-first child = %#v", reloaded)
+	}
+	groups, err := reloadedStore.LoadTurnGroups(ctx, result.ChildID)
+	if err != nil {
+		t.Fatalf("LoadTurnGroups reloaded child: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("before-first child turn groups = %#v", groups)
+	}
+	if !reflect.DeepEqual(allForkThreadFiles(t, store.Root(), source.ID), sourceFilesBefore) {
+		t.Fatal("before-first fork changed source files")
+	}
+}
+
+func TestThreadStoreForkThreadRejectsNoCommittedTurn(t *testing.T) {
+	ctx := context.Background()
+	store, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := store.CreateThread(ctx, ThreadMeta{ID: "fork-no-commit-source"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceFilesBefore := allForkThreadFiles(t, store.Root(), source.ID)
+
+	_, err = store.ForkThread(ctx, source.ID, "fork-no-commit-child", "")
+	if !errors.Is(err, ErrForkNoCommittedTurn) {
+		t.Fatalf("ForkThread error = %v, want %v", err, ErrForkNoCommittedTurn)
+	}
+	if _, statErr := os.Lstat(filepath.Join(store.Root(), sessionsDirName, "fork-no-commit-child")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("no-commit fork published child: %v", statErr)
+	}
+	if !reflect.DeepEqual(allForkThreadFiles(t, store.Root(), source.ID), sourceFilesBefore) {
+		t.Fatal("rejected no-commit fork changed source")
+	}
+}
+
 func TestThreadStoreForkThreadAcceptsReplayableJournalWithoutFinalNewline(t *testing.T) {
 	ctx := context.Background()
 	store, err := NewThreadStore(t.TempDir())

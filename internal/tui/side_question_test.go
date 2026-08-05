@@ -122,6 +122,9 @@ func TestSideQuestionErrorAndStaleResult(t *testing.T) {
 	}
 	next, _ = mm.Update(msg)
 	mm = next.(*model)
+	if mm.sideQuestions != 0 {
+		t.Fatalf("error result left pending side questions: %d", mm.sideQuestions)
+	}
 	if !hasSideLineContaining(mm, "[btw] side error: temporary failure") {
 		t.Fatalf("side error missing: %#v", mm.sideLines)
 	}
@@ -147,6 +150,148 @@ func TestSideQuestionErrorAndStaleResult(t *testing.T) {
 	}
 	if oldID == second.ID() || mm.deps.Session.ID() != second.ID() {
 		t.Fatalf("session switch was not preserved: old=%q current=%q", oldID, mm.deps.Session.ID())
+	}
+	if mm.sideQuestions != 0 {
+		t.Fatalf("stale result left pending side questions: %d", mm.sideQuestions)
+	}
+}
+
+func TestSideQuestionStaleResultDoesNotConsumeCurrentPendingRequest(t *testing.T) {
+	m := newTestModel(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.deps.SideQuestion = func(_ context.Context, _ *chat.Session, question string) (string, error) {
+		if question == "old" {
+			close(started)
+			<-release
+		}
+		return question + " answer", nil
+	}
+
+	_, oldCmd := m.submit("/btw old")
+	oldResult := make(chan tea.Msg, 1)
+	go func() { oldResult <- oldCmd() }()
+	<-started
+
+	second := mustSession(t, &staticModel{}, "second")
+	m.replaceSession(second)
+	_, newCmd := m.submit("/btw new")
+	newMsg := newCmd().(sideQuestionDoneMsg)
+	if m.sideQuestions != 2 {
+		t.Fatalf("pending side questions after session switch: %d", m.sideQuestions)
+	}
+
+	close(release)
+	oldMsg := (<-oldResult).(sideQuestionDoneMsg)
+	next, _ := m.Update(oldMsg)
+	m = next.(*model)
+	if m.sideQuestions != 1 {
+		t.Fatalf("stale result consumed current request: %d", m.sideQuestions)
+	}
+	if hasSideLineContaining(m, "old answer") {
+		t.Fatalf("stale answer was displayed: %#v", m.sideLines)
+	}
+
+	next, _ = m.Update(newMsg)
+	m = next.(*model)
+	if m.sideQuestions != 0 {
+		t.Fatalf("current result left pending side questions: %d", m.sideQuestions)
+	}
+	if !hasSideLineContaining(m, "[btw] answer: new answer") {
+		t.Fatalf("current answer missing: %#v", m.sideLines)
+	}
+}
+
+func TestSessionSwitchResetsPendingSideQuestions(t *testing.T) {
+	tests := []struct {
+		name          string
+		switchSession func(*testing.T, *model) *model
+	}{
+		{
+			name: "clear",
+			switchSession: func(_ *testing.T, m *model) *model {
+				next, _ := m.cmdClear()
+				return next.(*model)
+			},
+		},
+		{
+			name: "new",
+			switchSession: func(_ *testing.T, m *model) *model {
+				next, _ := m.cmdNew("new session")
+				return next.(*model)
+			},
+		},
+		{
+			name: "resume",
+			switchSession: func(t *testing.T, m *model) *model {
+				target, err := chat.NewSession(&staticModel{}, "target", chat.SessionOptions{
+					Store: m.activeSession().Store(),
+				})
+				if err != nil {
+					t.Fatalf("create resume target: %v", err)
+				}
+				next, _ := m.cmdResume(target.ID())
+				return next.(*model)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestModel(t)
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseOld := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseOld()
+			m.deps.SideQuestion = func(_ context.Context, _ *chat.Session, question string) (string, error) {
+				if question == "old" {
+					close(started)
+					<-release
+				}
+				return question + " answer", nil
+			}
+
+			_, oldCmd := m.submit("/btw old")
+			oldResult := make(chan tea.Msg, 1)
+			go func() { oldResult <- oldCmd() }()
+			<-started
+
+			m = tt.switchSession(t, m)
+			if m.sideQuestions != 0 || len(m.sideQuestionPending) != 0 {
+				t.Fatalf("pending side state after /%s: count=%d pending=%v", tt.name, m.sideQuestions, m.sideQuestionPending)
+			}
+
+			_, newCmd := m.submit("/btw new")
+			rawNewMsg := newCmd()
+			newMsg, ok := rawNewMsg.(sideQuestionDoneMsg)
+			if !ok {
+				t.Fatalf("new command returned %T, want sideQuestionDoneMsg", rawNewMsg)
+			}
+			if m.sideQuestions != 1 {
+				t.Fatalf("new side question count=%d, want 1", m.sideQuestions)
+			}
+
+			releaseOld()
+			oldMsg := (<-oldResult).(sideQuestionDoneMsg)
+			next, _ := m.Update(oldMsg)
+			m = next.(*model)
+			if m.sideQuestions != 1 {
+				t.Fatalf("stale side result changed current count to %d", m.sideQuestions)
+			}
+			if hasSideLineContaining(m, "old answer") {
+				t.Fatalf("stale answer was displayed: %#v", m.sideLines)
+			}
+
+			next, _ = m.Update(newMsg)
+			m = next.(*model)
+			if m.sideQuestions != 0 {
+				t.Fatalf("current side result left pending count=%d", m.sideQuestions)
+			}
+			if !hasSideLineContaining(m, "[btw] answer: new answer") {
+				t.Fatalf("current answer missing: %#v", m.sideLines)
+			}
+		})
 	}
 }
 
@@ -245,6 +390,9 @@ func TestSideQuestionRequestsRunConcurrently(t *testing.T) {
 		msg := <-results
 		next, _ := m.Update(msg)
 		m = next.(*model)
+	}
+	if m.sideQuestions != 0 {
+		t.Fatalf("concurrent side questions left pending: %d", m.sideQuestions)
 	}
 	if !hasSideLineContaining(m, "[btw] answer: answer first") || !hasSideLineContaining(m, "[side] answer: answer second") {
 		t.Fatalf("concurrent side answers missing: %#v", m.sideLines)

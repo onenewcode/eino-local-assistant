@@ -10,61 +10,70 @@ import (
 )
 
 type turnChunkMsg struct {
-	turnID int
-	chunk  string
+	turnID            int
+	sessionGeneration uint64
+	chunk             string
 }
 
 // turnReasoningMsg is display-only model reasoning (ReasoningContent).
 // It is never written to the session ledger.
 type turnReasoningMsg struct {
-	turnID int
-	chunk  string
+	turnID            int
+	sessionGeneration uint64
+	chunk             string
 }
 
 type turnToolStartMsg struct {
-	turnID int
-	tool   string
-	callID string
-	input  string
+	turnID            int
+	sessionGeneration uint64
+	tool              string
+	callID            string
+	input             string
 }
 
 type turnToolEndMsg struct {
-	turnID int
-	tool   string
-	callID string
-	output string
+	turnID            int
+	sessionGeneration uint64
+	tool              string
+	callID            string
+	output            string
 }
 
 type turnToolErrorMsg struct {
-	turnID int
-	tool   string
-	callID string
-	err    error
+	turnID            int
+	sessionGeneration uint64
+	tool              string
+	callID            string
+	err               error
 }
 
 // turnUsageMsg carries one completed provider call for the turn footer line.
 // Durable accounting stays in the session ledger; context occupancy is on the
 // global status bar (not repeated in this footer).
 type turnUsageMsg struct {
-	turnID int
-	usage  chat.ModelUsageEvent
+	turnID            int
+	sessionGeneration uint64
+	usage             chat.ModelUsageEvent
 }
 
 // turnTaskGateMsg is a controller-owned completion rejection. It is separate
 // from model text so users can tell that the agent is continuing rather than
 // treating an earlier natural-language claim as the final delivery.
 type turnTaskGateMsg struct {
-	turnID int
-	gate   chat.TaskCompletionGate
+	turnID            int
+	sessionGeneration uint64
+	gate              chat.TaskCompletionGate
 }
 
 type turnDoneMsg struct {
-	turnID int
-	err    error
+	turnID            int
+	sessionGeneration uint64
+	err               error
 }
 
 // sideQuestionDoneMsg is display-only and never enters the main turn stream.
 type sideQuestionDoneMsg struct {
+	requestID         uint64
 	label             string
 	sessionID         string
 	sessionGeneration uint64
@@ -120,31 +129,31 @@ func waitTurnEvent(events <-chan tea.Msg, done <-chan turnDoneMsg, pending *turn
 // formatToolCard applies the separate, display-only visual cap.
 // Sends preserve all events while a turn is active, but cancellation releases
 // a blocked producer so the durable turn can publish its completion signal.
-func emitFromTurnEvent(ctx context.Context, turnID int, ch chan<- tea.Msg) chat.EventEmitter {
+func emitFromTurnEvent(ctx context.Context, turnID int, sessionGeneration uint64, ch chan<- tea.Msg) chat.EventEmitter {
 	return func(ev chat.TurnEvent) {
 		var msg tea.Msg
 		switch ev.Kind {
 		case chat.TurnEventChunk:
-			msg = turnChunkMsg{turnID: turnID, chunk: ev.Chunk}
+			msg = turnChunkMsg{turnID: turnID, sessionGeneration: sessionGeneration, chunk: ev.Chunk}
 		case chat.TurnEventReasoning:
-			msg = turnReasoningMsg{turnID: turnID, chunk: ev.Chunk}
+			msg = turnReasoningMsg{turnID: turnID, sessionGeneration: sessionGeneration, chunk: ev.Chunk}
 		case chat.TurnEventToolStart:
-			msg = turnToolStartMsg{turnID: turnID, tool: ev.Tool, callID: ev.ToolCallID, input: ev.Input}
+			msg = turnToolStartMsg{turnID: turnID, sessionGeneration: sessionGeneration, tool: ev.Tool, callID: ev.ToolCallID, input: ev.Input}
 		case chat.TurnEventToolEnd:
-			msg = turnToolEndMsg{turnID: turnID, tool: ev.Tool, callID: ev.ToolCallID, output: ev.Output}
+			msg = turnToolEndMsg{turnID: turnID, sessionGeneration: sessionGeneration, tool: ev.Tool, callID: ev.ToolCallID, output: ev.Output}
 		case chat.TurnEventToolError:
-			msg = turnToolErrorMsg{turnID: turnID, tool: ev.Tool, callID: ev.ToolCallID, err: ev.Err}
+			msg = turnToolErrorMsg{turnID: turnID, sessionGeneration: sessionGeneration, tool: ev.Tool, callID: ev.ToolCallID, err: ev.Err}
 		case chat.TurnEventModelUsage:
 			if ev.ModelUsage == nil {
 				return
 			}
 			// The producer may reuse its event object after Emit returns.
-			msg = turnUsageMsg{turnID: turnID, usage: *ev.ModelUsage}
+			msg = turnUsageMsg{turnID: turnID, sessionGeneration: sessionGeneration, usage: *ev.ModelUsage}
 		case chat.TurnEventTaskGate:
 			if ev.TaskGate == nil {
 				return
 			}
-			msg = turnTaskGateMsg{turnID: turnID, gate: *ev.TaskGate}
+			msg = turnTaskGateMsg{turnID: turnID, sessionGeneration: sessionGeneration, gate: *ev.TaskGate}
 		default:
 			return
 		}

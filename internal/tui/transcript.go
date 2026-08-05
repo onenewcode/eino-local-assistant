@@ -57,3 +57,11 @@ func seedLinesFromTranscript(transcript []*schema.Message, banner, title string)
 func resumeBanner(id string, msgCount int) string {
 	return fmt.Sprintf("resumed %s (%d messages)", id, msgCount)
 }
+
+func forkBanner(childID, sourceID, lastTurnID string, msgCount int) string {
+	boundary := ""
+	if lastTurnID != "" {
+		boundary = " at " + lastTurnID
+	}
+	return fmt.Sprintf("forked %s from %s%s (%d messages)", childID, sourceID, boundary, msgCount)
+}

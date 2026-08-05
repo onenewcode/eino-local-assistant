@@ -32,6 +32,8 @@ func TestParseSlash(t *testing.T) {
 		{"/new", slashNew, ""},
 		{"/new my topic", slashNew, "my topic"},
 		{"/resume 20260715-120000-abc123", slashResume, "20260715-120000-abc123"},
+		{"/fork", slashFork, ""},
+		{"/fork unexpected-argument", slashFork, "unexpected-argument"},
 		{"/title Hello World", slashTitle, "Hello World"},
 		{"/delete 20260715-120000-abc123", slashDelete, "20260715-120000-abc123"},
 		{"/queue", slashQueue, ""},
@@ -80,7 +82,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 	tokens := []string{
 		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/rules", "/btw", "/side", "/usage",
 		"/context", "/compact",
-		"/new", "/sessions", "/resume", "/title", "/delete", "/queue",
+		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue",
 		"/permissions", "/policy",
 	}
 	for _, tok := range tokens {
@@ -109,7 +111,7 @@ func TestSlashCatalogNeedsArg(t *testing.T) {
 		"/help": false, "/status": false, "/rules": false, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/permissions": false,
 		"/btw":   true,
-		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/title": true,
+		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
 		"/delete": true, "/queue": true, "/memory": true,
 	}
 	for _, cmd := range slashCatalog() {
@@ -193,6 +195,9 @@ func TestFilterSlashCommandsMatrix(t *testing.T) {
 		{"/r", []string{"/rules", "/resume"}},
 		{"/re", []string{"/resume"}},
 		{"/res", []string{"/resume"}},
+		{"/f", []string{"/fork"}},
+		{"/fo", []string{"/fork"}},
+		{"/fork", []string{"/fork"}},
 		{"/t", []string{"/title"}},
 		{"/ti", []string{"/title"}},
 		{"/d", []string{"/delete"}},
@@ -238,6 +243,9 @@ func TestCompleteSlashCommand(t *testing.T) {
 	}
 	if got := completeSlashCommand(slashCommand{Name: "/new", NeedsArg: true}); got != "/new " {
 		t.Fatalf("arg complete = %q", got)
+	}
+	if got := completeSlashCommand(slashCommand{Name: "/fork"}); got != "/fork" {
+		t.Fatalf("fork complete = %q", got)
 	}
 }
 

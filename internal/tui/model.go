@@ -161,6 +161,16 @@ type model struct {
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
 
+	// backtrackState is a pending source-preserving fork selection. It is kept
+	// separate from the durable session until the user confirms a prompt.
+	backtrackState      backtrackState
+	backtrackGeneration uint64
+	// sideQuestions is kept as a cheap count for UI gating. The set gives each
+	// callback an identity so a late result can only reconcile its own request.
+	sideQuestions       int
+	sideQuestionPending map[uint64]struct{}
+	sideQuestionNextID  uint64
+
 	mode              mode
 	sessionMu         sync.RWMutex
 	sessionGeneration uint64
@@ -191,6 +201,220 @@ type model struct {
 	// composerReady is set by newModel once textarea/viewport are constructed.
 	// Approval layout must not run against a zero-value model (unit tests).
 	composerReady bool
+}
+
+func (m *model) clearBacktrack() {
+	m.backtrackState = backtrackState{mode: backtrackInactive}
+	m.backtrackGeneration = 0
+}
+
+func (m *model) refreshBacktrackChrome() {
+	m.layout()
+	m.refreshViewport()
+}
+
+func (m *model) backtrackStatus() string {
+	switch m.backtrackState.mode {
+	case backtrackArmed:
+		return "backtrack: armed"
+	case backtrackSelecting:
+		return "backtrack: selecting"
+	default:
+		return ""
+	}
+}
+
+func (m *model) rejectBacktrack(message string) {
+	m.clearBacktrack()
+	m.refreshBacktrackChrome()
+	m.appendLine(lineError, message)
+}
+
+func (m *model) armBacktrack() {
+	m.clearBacktrack()
+	m.backtrackState.mode = backtrackArmed
+	m.refreshBacktrackChrome()
+}
+
+func (m *model) openBacktrack() {
+	if m.mode != modeIdle {
+		m.rejectBacktrack("busy: finish or interrupt the current operation first")
+		return
+	}
+	if m.hasPendingApproval() {
+		m.rejectBacktrack("busy: resolve the pending approval first")
+		return
+	}
+	if m.sideQuestions > 0 {
+		m.rejectBacktrack("busy: wait for the side question to finish first")
+		return
+	}
+	source, generation := m.activeSessionSnapshot()
+	if source == nil {
+		m.rejectBacktrack("backtrack: session is unavailable")
+		return
+	}
+	repository := m.deps.Store
+	if repository == nil {
+		repository = source.Store()
+	}
+	if repository == nil {
+		m.rejectBacktrack("backtrack: session store is unavailable")
+		return
+	}
+	groups, err := repository.LoadTurnGroups(m.processCtx(), source.ID())
+	if err != nil {
+		m.rejectBacktrack("backtrack: load turn groups: " + err.Error())
+		return
+	}
+	prompts := buildBacktrackPrompts(groups)
+	if len(prompts) == 0 {
+		m.rejectBacktrack("backtrack: no earlier committed prompt is available")
+		return
+	}
+	state := newBacktrackState(prompts)
+	state.mode = backtrackSelecting
+	m.backtrackState = state
+	m.backtrackGeneration = generation
+	// The backtrack selector owns the rows above the composer.
+	m.clearSlashMenu()
+	m.refreshBacktrackChrome()
+}
+
+func (m *model) handleBacktrackKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.backtrackState.mode != backtrackSelecting {
+		return m, nil
+	}
+	switch {
+	case msg.Type == tea.KeyEsc:
+		m.clearBacktrack()
+		m.refreshBacktrackChrome()
+		return m, nil
+	case msg.Type == tea.KeyUp || backtrackKeyRune(msg, 'k'):
+		m.backtrackState = moveBacktrackSelection(m.backtrackState, -1)
+		m.refreshBacktrackChrome()
+		return m, nil
+	case msg.Type == tea.KeyDown || backtrackKeyRune(msg, 'j'):
+		m.backtrackState = moveBacktrackSelection(m.backtrackState, 1)
+		m.refreshBacktrackChrome()
+		return m, nil
+	case msg.Type == tea.KeyEnter:
+		return m.submitBacktrack()
+	default:
+		return m, nil
+	}
+}
+
+func backtrackKeyRune(msg tea.KeyMsg, want rune) bool {
+	return msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == want
+}
+
+func (m *model) submitBacktrack() (tea.Model, tea.Cmd) {
+	selected, ok := selectedBacktrackPrompt(m.backtrackState)
+	if !ok {
+		m.rejectBacktrack("backtrack: no prompt is selected")
+		return m, nil
+	}
+	// Keep the prompt in the composer when the durable fork or child open fails.
+	setSelectedPrompt := func() {
+		m.textarea.SetValue(selected.Text)
+		m.textarea.CursorEnd()
+		m.clearSlashMenu()
+		m.syncComposerHeight()
+		m.refreshBacktrackChrome()
+	}
+	if m.mode != modeIdle {
+		setSelectedPrompt()
+		m.rejectBacktrack("busy: finish or interrupt the current operation first")
+		return m, nil
+	}
+	if m.hasPendingApproval() {
+		setSelectedPrompt()
+		m.rejectBacktrack("busy: resolve the pending approval first")
+		return m, nil
+	}
+	if m.sideQuestions > 0 {
+		setSelectedPrompt()
+		m.rejectBacktrack("busy: wait for the side question to finish first")
+		return m, nil
+	}
+	source, generation := m.activeSessionSnapshot()
+	if source == nil {
+		setSelectedPrompt()
+		m.rejectBacktrack("backtrack: session is unavailable")
+		return m, nil
+	}
+	if generation != m.backtrackGeneration {
+		setSelectedPrompt()
+		m.rejectBacktrack("backtrack: active session changed; choose a prompt again")
+		return m, nil
+	}
+	var child *chat.Session
+	var result store.ForkResult
+	var err error
+	if selected.BeforeFirst {
+		child, result, err = source.ForkBeforeFirstTurn(m.processCtx(), "")
+	} else {
+		child, result, err = source.Fork(m.processCtx(), "", selected.BoundaryTurnID)
+	}
+	if err != nil {
+		setSelectedPrompt()
+		m.rejectBacktrack("backtrack: " + err.Error())
+		return m, nil
+	}
+	if child == nil {
+		setSelectedPrompt()
+		m.rejectBacktrack("backtrack: child session is unavailable")
+		return m, nil
+	}
+	childID := child.ID()
+	if childID == "" {
+		childID = result.ChildID
+	}
+	if childID == "" {
+		setSelectedPrompt()
+		m.rejectBacktrack("backtrack: child session has no ID")
+		return m, nil
+	}
+	m.activateForkChild(source, child, result)
+	setSelectedPrompt()
+	return m, nil
+}
+
+func (m *model) beginSideQuestion() uint64 {
+	m.sideQuestionNextID++
+	if m.sideQuestionNextID == 0 {
+		// Keep zero reserved for hand-built legacy messages.
+		m.sideQuestionNextID++
+	}
+	if m.sideQuestionPending == nil {
+		m.sideQuestionPending = make(map[uint64]struct{})
+	}
+	requestID := m.sideQuestionNextID
+	m.sideQuestionPending[requestID] = struct{}{}
+	m.sideQuestions++
+	return requestID
+}
+
+// discardSideQuestion reconciles one callback result at most once. Runtime
+// messages always carry a request ID; the zero-ID fallback keeps hand-built
+// test messages compatible with the old counter-only representation.
+func (m *model) discardSideQuestion(requestID uint64) bool {
+	if requestID == 0 {
+		if m.sideQuestions == 0 {
+			return false
+		}
+		m.sideQuestions--
+		return true
+	}
+	if _, ok := m.sideQuestionPending[requestID]; !ok {
+		return false
+	}
+	delete(m.sideQuestionPending, requestID)
+	if m.sideQuestions > 0 {
+		m.sideQuestions--
+	}
+	return true
 }
 
 // tryHistoryUp handles ↑ when the cursor is on the first composer line.
@@ -369,6 +593,75 @@ func (m *model) replaceSession(session *chat.Session) {
 	m.deps.Session = session
 	m.sessionGeneration++
 	m.sessionMu.Unlock()
+	m.clearBacktrack()
+}
+
+// resetSessionTransientState clears process-local state that cannot cross a
+// durable session boundary. The caller reseeds lines and input history after
+// switching to the new session.
+func (m *model) resetSessionTransientState() {
+	if m.turnCancel != nil {
+		m.turnCancel()
+	}
+	m.turnCancel = nil
+	if m.compactCancel != nil {
+		m.compactCancel()
+	}
+	m.compactCancel = nil
+	m.compactID++
+	m.compactAutomatic = false
+	m.mode = modeIdle
+	m.events = nil
+	m.turnDone = nil
+	m.pendingTurnDone = nil
+	m.err = nil
+	m.streamingAssistant = false
+	m.currentTool = ""
+	m.openReasoning = noOpenReasoning
+	m.openToolCards = make(map[string]int)
+	m.openToolNames = make(map[string]string)
+	m.turnUsage = usage.APIUsage{}
+	m.turnUsageSeen = false
+	m.turnUsageCallIDs = nil
+	m.sideQuestions = 0
+	m.sideQuestionPending = nil
+	m.sideLines = nil
+	m.queue = nil
+	m.clearBacktrack()
+	m.clearSlashMenu()
+	m.closeTaskPane()
+	m.stickBottom = true
+	m.setIdlePlaceholder()
+	m.textarea.Focus()
+}
+
+func (m *model) activateForkChild(source, child *chat.Session, result store.ForkResult) {
+	childID := child.ID()
+	if childID == "" {
+		childID = result.ChildID
+	}
+	sourceID := ""
+	if source != nil {
+		sourceID = source.ID()
+	}
+	transcript := child.Transcript()
+	m.replaceSession(child)
+	// Invalidate the old turn identity before painting the child so late stream
+	// messages cannot populate the new transcript.
+	m.turnID++
+	m.resetSessionTransientState()
+	m.lines = seedLinesFromTranscript(transcript, forkBanner(childID, sourceID, result.LastTurnID, len(transcript)), child.Title())
+	m.inputHist.seedFromMessages(transcript)
+	m.refreshViewport()
+	if m.deps.NotifyActiveSession != nil {
+		m.deps.NotifyActiveSession(childID)
+	}
+}
+
+func (m *model) acceptsTurn(turnID int, sessionGeneration uint64) bool {
+	// Zero generation is retained for hand-built legacy test messages. Runtime
+	// turn messages always carry the non-zero generation captured at start.
+	return turnID == m.turnID && (sessionGeneration == 0 || sessionGeneration == m.sessionGeneration)
 }
 
 func newModel(deps Deps) *model {
@@ -464,6 +757,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case approvalRequestMsg:
+		if m.backtrackState.mode != backtrackInactive {
+			m.clearBacktrack()
+			m.refreshBacktrackChrome()
+		}
 		m.handleApprovalRequest(msg)
 		return m, nil
 
@@ -473,6 +770,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if m.hasPendingApproval() {
+			m.clearBacktrack()
 			// Approval modal owns keys; Ctrl+C still cancels the whole turn.
 			if msg.Type == tea.KeyCtrlC {
 				m.clearPendingApproval(tools.ApprovalDeny)
@@ -483,6 +781,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m.handleApprovalKey(msg)
+		}
+		// Busy/compacting Esc keeps its existing interrupt contract even if a
+		// stale backtrack state was left by an embedding caller.
+		if msg.Type == tea.KeyEsc && m.mode == modeBusy {
+			m.interruptTurn("interrupted")
+			m.cancelActiveTask("user interrupted the active turn")
+			return m, nil
+		}
+		if msg.Type == tea.KeyEsc && m.mode == modeCompacting {
+			m.interruptCompaction()
+			return m, nil
+		}
+		if m.backtrackState.mode == backtrackSelecting {
+			return m.handleBacktrackKey(msg)
+		}
+		if m.backtrackState.mode == backtrackArmed && msg.Type != tea.KeyEsc {
+			m.clearBacktrack()
+			m.refreshBacktrackChrome()
 		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
@@ -498,20 +814,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case tea.KeyEsc:
-			// Interrupt always wins over menu dismiss while work is running.
-			if m.mode == modeBusy {
-				m.interruptTurn("interrupted")
-				m.cancelActiveTask("user interrupted the active turn")
-				return m, nil
-			}
-			if m.mode == modeCompacting {
-				m.interruptCompaction()
-				return m, nil
-			}
 			if m.slashMenuOpen() {
 				m.clearSlashMenu()
 				return m, nil
 			}
+			if m.sideQuestions > 0 {
+				m.rejectBacktrack("busy: wait for the side question to finish first")
+				return m, nil
+			}
+			if m.backtrackState.mode == backtrackArmed {
+				m.openBacktrack()
+				return m, nil
+			}
+			m.armBacktrack()
 			return m, nil
 		case tea.KeyCtrlD:
 			if m.mode == modeIdle && strings.TrimSpace(m.textarea.Value()) == "" {
@@ -595,7 +910,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case turnChunkMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		// Do not fold reasoning here: content and reasoning for the final
@@ -604,14 +919,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.nextEventCmd()
 
 	case turnReasoningMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		m.appendReasoningChunk(msg.chunk)
 		return m, m.nextEventCmd()
 
 	case turnToolStartMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		// appendLine folds any open reasoning before the tool card.
@@ -623,7 +938,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.nextEventCmd()
 
 	case turnToolEndMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		m.streamingAssistant = false
@@ -638,7 +953,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.nextEventCmd()
 
 	case turnToolErrorMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		m.streamingAssistant = false
@@ -657,14 +972,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.nextEventCmd()
 
 	case turnUsageMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		m.addTurnUsage(msg.usage)
 		return m, m.nextEventCmd()
 
 	case turnTaskGateMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
 		summary := strings.TrimSpace(msg.gate.Summary)
@@ -675,7 +990,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.nextEventCmd()
 
 	case turnDoneMsg:
-		if msg.turnID != m.turnID {
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, nil
 		}
 		if m.pendingTurnDone == nil {
@@ -692,6 +1007,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case sideQuestionDoneMsg:
+		if !m.discardSideQuestion(msg.requestID) {
+			return m, nil
+		}
 		current, generation := m.activeSessionSnapshot()
 		if msg.sessionGeneration != 0 && msg.sessionGeneration != generation {
 			return m, nil
@@ -758,6 +1076,10 @@ func (m *model) View() string {
 		}
 	} else if m.slashMenuOpen() {
 		helpTextLine = "↑↓ select · tab complete · enter accept · esc dismiss · ctrl+j newline"
+	} else if m.backtrackState.mode == backtrackSelecting {
+		helpTextLine = "↑↓/jk select prompt · enter fork before prompt · esc cancel"
+	} else if m.backtrackState.mode == backtrackArmed {
+		helpTextLine = "esc backtrack history · edit or submit to cancel · /help"
 	} else if m.taskPaneOpen {
 		helpTextLine = "ctrl+t hide task progress · esc interrupt · /help"
 	}
@@ -779,6 +1101,8 @@ func (m *model) View() string {
 		parts = append(parts, m.approvalModalPage().content)
 	} else if m.slashMenuOpen() {
 		parts = append(parts, renderSlashMenu(m.width, m.slashItems, m.slashSel))
+	} else if m.backtrackState.mode == backtrackSelecting {
+		parts = append(parts, m.backtrackOverlayView())
 	}
 	parts = append(parts, composer, help)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
@@ -794,7 +1118,11 @@ func (m *model) statusLabel() string {
 	if m.mode == modeIdle {
 		parts := collectIdleStatus(session, m.deps.Status.Model, len(m.queue), follow, cmdPolicy)
 		// Leave a little room for bar padding.
-		return formatIdleStatus(max(20, m.width-4), parts)
+		label := formatIdleStatus(max(20, m.width-4), parts)
+		if backtrack := m.backtrackStatus(); backtrack != "" {
+			label += " · " + backtrack
+		}
+		return label
 	}
 
 	suffix := joinStatusSuffix(extras)
@@ -865,9 +1193,9 @@ func (m *model) layout() {
 	}
 	m.textarea.SetWidth(innerW)
 	// viewport = total - composer border - status(rule+line) - help - optional
-	// task pane - slash/approval. Border +2; status rule+label +2; help +1.
+	// task pane - slash/approval/backtrack. Border +2; status rule+label +2; help +1.
 	composerHeight := m.textarea.Height() + 2
-	extra := m.taskPaneHeight() + m.slashMenuHeight()
+	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
 		extra = m.taskPaneHeight() + m.approvalModalHeight()
 	}
@@ -875,6 +1203,24 @@ func (m *model) layout() {
 	h := max(5, m.height-reserved)
 	m.viewport.Width = m.width
 	m.viewport.Height = h
+}
+
+func (m *model) backtrackOverlayHeight() int {
+	if m.backtrackState.mode != backtrackSelecting {
+		return 0
+	}
+	return backtrackOverlayHeight(m.backtrackState)
+}
+
+func (m *model) backtrackOverlayView() string {
+	if m.backtrackState.mode != backtrackSelecting {
+		return ""
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	return renderBacktrackOverlay(width, m.backtrackState)
 }
 
 func (m *model) approvalModalPage() approvalModalPage {
@@ -999,6 +1345,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdSessions()
 	case slashResume:
 		return m.cmdResume(arg)
+	case slashFork:
+		return m.cmdFork(arg)
 	case slashTitle:
 		return m.cmdTitle(arg)
 	case slashDelete:
@@ -1050,6 +1398,7 @@ func (m *model) cmdSideQuestion(label, question string) (tea.Model, tea.Cmd) {
 		m.appendSideLine(fmt.Sprintf("[%s] side unavailable: session is unavailable", label))
 		return m, nil
 	}
+	requestID := m.beginSideQuestion()
 	ctx := m.processCtx()
 	return m, func() tea.Msg {
 		// Resolve the session when the command starts and carry its generation so
@@ -1057,6 +1406,7 @@ func (m *model) cmdSideQuestion(label, question string) (tea.Model, tea.Cmd) {
 		session, generation := m.activeSessionSnapshot()
 		if session == nil {
 			return sideQuestionDoneMsg{
+				requestID:         requestID,
 				label:             label,
 				sessionGeneration: generation,
 				unavailable:       true,
@@ -1064,6 +1414,7 @@ func (m *model) cmdSideQuestion(label, question string) (tea.Model, tea.Cmd) {
 		}
 		answer, err := callback(ctx, session, question)
 		return sideQuestionDoneMsg{
+			requestID:         requestID,
 			label:             label,
 			sessionID:         session.ID(),
 			sessionGeneration: generation,
@@ -1149,12 +1500,8 @@ func (m *model) cmdClear() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.replaceSession(session)
-	m.closeTaskPane()
+	m.resetSessionTransientState()
 	m.lines = nil
-	m.sideLines = nil
-	m.streamingAssistant = false
-	m.stickBottom = true
-	m.queue = nil
 	m.inputHist.clear()
 	m.appendLine(lineSystem, "context cleared; new session "+session.ID())
 	if oldID != "" {
@@ -1175,12 +1522,8 @@ func (m *model) cmdNew(title string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.replaceSession(session)
-	m.closeTaskPane()
+	m.resetSessionTransientState()
 	m.lines = nil
-	m.sideLines = nil
-	m.streamingAssistant = false
-	m.stickBottom = true
-	m.queue = nil
 	m.inputHist.clear()
 	msg := "new session " + session.ID()
 	if session.Title() != "" {
@@ -1323,23 +1666,65 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.replaceSession(session)
+	m.resetSessionTransientState()
 	if m.deps.InvalidateRulesSnapshot != nil {
 		m.deps.InvalidateRulesSnapshot()
 	}
-	m.closeTaskPane()
 	if m.deps.NotifyActiveSession != nil {
 		m.deps.NotifyActiveSession(session.ID())
 	}
 	// Resume keeps the durable thread system prompt (create-time snapshot).
-	m.streamingAssistant = false
-	m.stickBottom = true
-	m.queue = nil
-	m.sideLines = nil
 	transcript := session.Transcript()
 	m.lines = seedLinesFromTranscript(transcript, resumeBanner(session.ID(), len(transcript)), session.Title())
 	m.appendLegacyCheckpointResetNotice(session)
 	m.inputHist.seedFromMessages(transcript)
 	m.refreshViewport()
+	return m, nil
+}
+
+func (m *model) cmdFork(arg string) (tea.Model, tea.Cmd) {
+	if m.hasPendingApproval() {
+		m.appendLine(lineError, "busy: resolve the pending approval first")
+		return m, nil
+	}
+	if m.mode != modeIdle {
+		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
+		return m, nil
+	}
+	if strings.TrimSpace(arg) != "" {
+		m.appendLine(lineError, "usage: /fork")
+		return m, nil
+	}
+
+	source := m.activeSession()
+	if source == nil {
+		m.appendLine(lineError, "fork: session is unavailable")
+		return m, nil
+	}
+
+	// Empty arguments ask the durable fork primitive to select the latest
+	// complete turn and generate the child ID. The source title is carried by
+	// the child ledger; no TUI-only title mutation is needed here.
+	child, result, err := source.Fork(m.processCtx(), "", "")
+	if err != nil {
+		m.appendLine(lineError, "fork: "+err.Error())
+		return m, nil
+	}
+	if child == nil {
+		m.appendLine(lineError, "fork: child session is unavailable")
+		return m, nil
+	}
+
+	childID := child.ID()
+	if childID == "" {
+		childID = result.ChildID
+	}
+	if childID == "" {
+		m.appendLine(lineError, "fork: child session has no ID")
+		return m, nil
+	}
+
+	m.activateForkChild(source, child, result)
 	return m, nil
 }
 
@@ -1645,7 +2030,7 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 }
 
 func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
-	session := m.activeSession()
+	session, sessionGeneration := m.activeSessionSnapshot()
 	if session == nil {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
@@ -1681,7 +2066,7 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 
 	events := m.events
 	done := m.turnDone
-	emit := emitFromTurnEvent(ctx, turnID, events)
+	emit := emitFromTurnEvent(ctx, turnID, sessionGeneration, events)
 
 	go func() {
 		err := session.AskWithEvents(ctx, input, nil, emit)
@@ -1691,7 +2076,7 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 		// Completion has its own slot so a saturated display-event queue cannot
 		// strand the TUI in busy mode after cancellation.
 		close(events)
-		done <- turnDoneMsg{turnID: turnID, err: err}
+		done <- turnDoneMsg{turnID: turnID, sessionGeneration: sessionGeneration, err: err}
 	}()
 
 	return m, tea.Batch(m.spinner.Tick, tickStatus(), m.nextEventCmd())
