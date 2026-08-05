@@ -23,6 +23,15 @@ type turnReasoningMsg struct {
 	chunk             string
 }
 
+// turnSteerConsumedMsg is display-only feedback from a model-call boundary.
+// The steer text is not a user transcript line.
+type turnSteerConsumedMsg struct {
+	turnID            int
+	sessionGeneration uint64
+	sequence          uint64
+	content           string
+}
+
 type turnToolStartMsg struct {
 	turnID            int
 	sessionGeneration uint64
@@ -137,6 +146,13 @@ func emitFromTurnEvent(ctx context.Context, turnID int, sessionGeneration uint64
 			msg = turnChunkMsg{turnID: turnID, sessionGeneration: sessionGeneration, chunk: ev.Chunk}
 		case chat.TurnEventReasoning:
 			msg = turnReasoningMsg{turnID: turnID, sessionGeneration: sessionGeneration, chunk: ev.Chunk}
+		case chat.TurnEventSteerConsumed:
+			msg = turnSteerConsumedMsg{
+				turnID:            turnID,
+				sessionGeneration: sessionGeneration,
+				sequence:          ev.SteerSequence,
+				content:           ev.SteerContent,
+			}
 		case chat.TurnEventToolStart:
 			msg = turnToolStartMsg{turnID: turnID, sessionGeneration: sessionGeneration, tool: ev.Tool, callID: ev.ToolCallID, input: ev.Input}
 		case chat.TurnEventToolEnd:

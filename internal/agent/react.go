@@ -36,6 +36,13 @@ const (
 type ReActOptions struct {
 	// MaxStep bounds model and tool graph iterations in one ReAct turn.
 	MaxStep int
+	// EnableSteer opts this ReAct implementation into the explicit
+	// chat.TurnSteerModel contract. The production default is enabled so the
+	// formal runtime constructor does not leave Session.Steer unreachable.
+	EnableSteer bool
+	// DisableSteer is the explicit compatibility escape hatch for an embedding
+	// that must not expose steer. It takes precedence over EnableSteer.
+	DisableSteer bool
 	// TaskController enables the optional autonomous-task runtime. It owns
 	// controller state while chat.Session owns the durable conversation ledger.
 	TaskController *TaskController
@@ -43,7 +50,7 @@ type ReActOptions struct {
 
 // DefaultReActOptions returns the options used by NewReActModel.
 func DefaultReActOptions() ReActOptions {
-	return ReActOptions{MaxStep: DefaultMaxStep}
+	return ReActOptions{MaxStep: DefaultMaxStep, EnableSteer: true}
 }
 
 // ReActModel adapts Eino's ReAct agent to the local chat.Model stream interface.
@@ -52,6 +59,7 @@ type ReActModel struct {
 	agent          *react.Agent
 	maxStep        int
 	taskController *TaskController
+	steer          *turnSteerRegistry
 }
 
 // NewReActModel builds a streaming chat model backed by Eino ReAct + tools.
@@ -73,7 +81,11 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 		return nil, fmt.Errorf("at least one tool is required")
 	}
 
-	ag, err := react.NewAgent(ctx, &react.AgentConfig{
+	steer := (*turnSteerRegistry)(nil)
+	if opts.EnableSteer {
+		steer = newTurnSteerRegistry()
+	}
+	agentConfig := &react.AgentConfig{
 		ToolCallingModel: chatModel,
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: tools,
@@ -90,12 +102,16 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 		StreamToolCallChecker: contentThenToolStreamToolCallChecker,
 		// Model -> Tools -> Model is a few graph steps; keep headroom without unbounded loops.
 		MaxStep: opts.MaxStep,
-	})
+	}
+	if steer != nil {
+		agentConfig.MessageRewriter = steer.rewrite
+	}
+	ag, err := react.NewAgent(ctx, agentConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create ReAct agent: %w", err)
 	}
 
-	return &ReActModel{agent: ag, maxStep: opts.MaxStep, taskController: opts.TaskController}, nil
+	return &ReActModel{agent: ag, maxStep: opts.MaxStep, taskController: opts.TaskController, steer: steer}, nil
 }
 
 func normalizeReActOptions(opts ReActOptions) (ReActOptions, error) {
@@ -104,6 +120,13 @@ func normalizeReActOptions(opts ReActOptions) (ReActOptions, error) {
 	}
 	if opts.MaxStep == 0 {
 		opts.MaxStep = DefaultReActOptions().MaxStep
+	}
+	if opts.DisableSteer {
+		opts.EnableSteer = false
+	} else {
+		// A zero-value ReActOptions is used by the production runtime's explicit
+		// options literal; keep the capability reachable unless it is disabled.
+		opts.EnableSteer = true
 	}
 	return opts, nil
 }
@@ -114,6 +137,23 @@ func (m *ReActModel) MaxSteps() int {
 		return 0
 	}
 	return m.maxStep
+}
+
+// RegisterTurnSteer opts one durable turn into this model's turn-local
+// mailbox. A ReActModel only accepts registration when EnableSteer was true.
+func (m *ReActModel) RegisterTurnSteer(turnID string, mailbox chat.TurnSteerMailbox) error {
+	if m == nil || m.steer == nil {
+		return chat.ErrSteerUnsupported
+	}
+	return m.steer.register(turnID, mailbox)
+}
+
+// UnregisterTurnSteer removes the model-side lookup after a turn settles.
+func (m *ReActModel) UnregisterTurnSteer(turnID string) {
+	if m == nil || m.steer == nil {
+		return
+	}
+	m.steer.unregister(turnID)
 }
 
 func normalizeToolArguments(_ context.Context, _ string, arguments string) (string, error) {

@@ -24,7 +24,7 @@ func TestSlashMenuOpenRefilterClose(t *testing.T) {
 	}
 
 	setComposer(m, "/s")
-	if got := namesOf(m.slashItems); !equalStrings(got, []string{"/status", "/btw", "/sessions"}) {
+	if got := namesOf(m.slashItems); !equalStrings(got, []string{"/status", "/btw", "/steer", "/sessions"}) {
 		t.Fatalf("/s => %v", got)
 	}
 
@@ -326,7 +326,7 @@ func TestSlashMenuViewAndLayout(t *testing.T) {
 		t.Fatalf("viewport should shrink when menu open: closed=%d open=%d menuH=%d", closedH, openH, m.slashMenuHeight())
 	}
 	view := m.View()
-	for _, name := range []string{"/status", "/btw", "/sessions"} {
+	for _, name := range []string{"/status", "/btw", "/steer", "/sessions"} {
 		if !strings.Contains(view, name) {
 			t.Fatalf("view missing %s:\n%s", name, view)
 		}

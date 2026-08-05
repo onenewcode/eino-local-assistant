@@ -85,6 +85,9 @@ const (
 	// controller rejected an attempted final delivery and is continuing the
 	// same turn with a GapPacket. It is display-only and never journaled.
 	TurnEventTaskGate
+	// TurnEventSteerConsumed reports that a steer input crossed the model's
+	// safe-call boundary. It is display-only and never enters the ledger.
+	TurnEventSteerConsumed
 )
 
 const (
@@ -118,10 +121,14 @@ type TurnEvent struct {
 	Output     string
 	// Chunk is assistant text for TurnEventChunk, or a ReasoningContent
 	// delta for TurnEventReasoning.
-	Chunk      string
-	Err        error
-	ModelUsage *ModelUsageEvent
-	TaskGate   *TaskCompletionGate
+	Chunk string
+	// SteerSequence and SteerContent are populated for TurnEventSteerConsumed.
+	// They are copied from the mailbox after the input is atomically taken.
+	SteerSequence uint64
+	SteerContent  string
+	Err           error
+	ModelUsage    *ModelUsageEvent
+	TaskGate      *TaskCompletionGate
 }
 
 // EventEmitter receives progressive turn events. It may be called from a
@@ -291,6 +298,7 @@ type Session struct {
 	// activeTaskTurnID lets an interactive cancellation revoke a completion
 	// approval only when that approval belongs to the still-uncommitted turn.
 	activeTaskTurnID       string
+	activeSteerTurn        *activeTurnSteer
 	finalResponseValidator func(string) error
 
 	// opMu makes a Session a single-writer actor even outside the TUI. The
@@ -722,7 +730,31 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	}
 	s.setActiveTaskTurn(turnID)
 	turnCommitted := false
+	steerMailbox := newTurnSteerMailbox()
+	var steerModel TurnSteerModel
+	steerRegistered := false
+	steerClosed := false
+	var steerInputs []TurnSteerInput
+	closeSteering := func(keepConsumed bool) []TurnSteerInput {
+		s.stopSteerTurn(turnID)
+		if !steerClosed {
+			steerInputs = steerMailbox.close()
+			steerClosed = true
+			if steerRegistered {
+				steerModel.UnregisterTurnSteer(turnID)
+			}
+		}
+		if !keepConsumed {
+			// A failed/cancelled turn must not make a consumed or pending input
+			// visible to a later turn.
+			steerMailbox.discard()
+			steerInputs = nil
+		}
+		return append([]TurnSteerInput(nil), steerInputs...)
+	}
 	defer func() {
+		closeSteering(turnCommitted)
+		s.clearSteerTurn(turnID)
 		if !turnCommitted {
 			// task_complete may have persisted before the model's final text and
 			// the turn commit. Do not let a cancelled or failed delivery retain
@@ -735,9 +767,24 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	// model fails after the durable turn.started event.
 	s.applyThreadState(state)
 	recorder := newThreadTurnRecorder(s.threads, s.id, state.Revision, turnID)
+	if candidate, ok := s.model.(TurnSteerModel); ok {
+		steerModel = candidate
+		registerErr := steerModel.RegisterTurnSteer(turnID, steerMailbox)
+		if registerErr == nil {
+			steerRegistered = true
+		} else if !errors.Is(registerErr, ErrSteerUnsupported) {
+			closeSteering(false)
+			if terminalErr := s.terminateUncommittedTurn(recorder, false, "register turn steering: "+registerErr.Error()); terminalErr != nil {
+				return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
+			}
+			return fmt.Errorf("register turn steering: %w", registerErr)
+		}
+	}
+	s.activateSteerTurn(ctx, turnID, steerMailbox, steerRegistered)
 	userMsg := schema.UserMessage(input)
 	view, plan, err := s.threadPrompt(userMsg)
 	if err != nil {
+		closeSteering(false)
 		if terminalErr := s.terminateUncommittedTurn(recorder, false, "build context: "+err.Error()); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
@@ -753,7 +800,7 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			normalized, record := s.normalizedModelUsage(turnID, tracked)
 			event.ModelUsage = &normalized
 			recorder.recordUsage(record)
-		} else {
+		} else if event.Kind != TurnEventSteerConsumed {
 			// Tool observations reach consumers only after their lifecycle entry
 			// has been accepted by the durable recorder.
 			emitEvent = recorder.record(event)
@@ -762,11 +809,19 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			emit(event)
 		}
 	}
+	steerMailbox.setConsumedObserver(func(input TurnSteerInput) {
+		combinedEmit(TurnEvent{
+			Kind:          TurnEventSteerConsumed,
+			SteerSequence: input.Sequence,
+			SteerContent:  input.Content,
+		})
+	})
 	turnCtx := WithTaskRequestContext(s.taskRuntimeContext(ctx), input)
 	turnCtx = WithTaskTurnContext(turnCtx, turnID)
 	turnCtx = WithTaskStateWriter(turnCtx, recorder.recordTaskState)
 	answer, err := s.streamTaskAwareAnswer(turnCtx, view, onChunk, combinedEmit)
 	if err != nil {
+		closeSteering(false)
 		if answer != nil && !usageTracker.hasEvents() {
 			// A direct model stream can fail after it has produced an assistant
 			// chunk. Preserve reported usage, or record the started call as
@@ -782,6 +837,9 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		}
 		return turnTerminationError(ctx, err)
 	}
+	// The final model response has returned. Any input not consumed by a
+	// previous model-call boundary is now too late for this turn.
+	closeSteering(true)
 	if !usageTracker.hasEvents() {
 		// Non-ReAct models do not emit per-call events. Their completed final
 		// response is still one provider call, but never falls back to a local
@@ -790,12 +848,14 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		combinedEmit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &fallback})
 	}
 	if recorder.err() != nil {
+		closeSteering(false)
 		if terminalErr := s.terminateUncommittedTurn(recorder, false, recorder.err().Error()); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
 		return fmt.Errorf("persist tool lifecycle: %w", recorder.err())
 	}
 	if err := ctx.Err(); err != nil {
+		closeSteering(false)
 		if terminalErr := s.terminateUncommittedTurn(recorder, true, turnTerminationReason(ctx, err)); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
@@ -811,6 +871,7 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			if summary == "" {
 				summary = "controller rejected completion before commit"
 			}
+			closeSteering(false)
 			if terminalErr := s.terminateUncommittedTurn(recorder, false, summary); terminalErr != nil {
 				return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 			}
@@ -818,6 +879,7 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		}
 	}
 	if err := s.validateFinalResponse(answer.Content); err != nil {
+		closeSteering(false)
 		if terminalErr := s.terminateUncommittedTurn(recorder, false, "final response validation: "+err.Error()); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
@@ -828,9 +890,12 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	// later UI cancellation belongs to the next interaction rather than this
 	// already-finished delivery; a failed commit is still revoked by the defer.
 	s.clearActiveTaskTurn(turnID)
+	commitMessages := []*schema.Message{userMsg}
+	commitMessages = append(commitMessages, steerMessages(steerInputs)...)
+	commitMessages = append(commitMessages, stripReasoningForStorage(answer))
 	state, err = recorder.commit(store.TurnCommit{
 		TurnID:   turnID,
-		Messages: []*schema.Message{userMsg, stripReasoningForStorage(answer)},
+		Messages: commitMessages,
 	})
 	if err != nil {
 		if terminalErr := s.reconcileUncommittedTurn(turnID, false, "commit failed: "+err.Error()); terminalErr != nil {

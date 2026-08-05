@@ -30,19 +30,29 @@ TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并
 | 位置 | 负责 | 不负责 |
 | --- | --- | --- |
 | `internal/agent` | ReAct、system prompt、用户/项目 AGENTS 指令选择、任务图与 completion controller | 自己管理账本文件或记忆落盘 |
-| `internal/chat` | turn 生命周期、流式事件、completion gate、上下文协作、`Session.Fork` / `Session.ForkBeforeFirstTurn` child session 打开 | 任务业务正确性、workspace/Git 回滚 |
+| `internal/chat` | turn 生命周期、流式事件、completion gate、上下文协作、显式 steer admission/expected-ID 校验与成功 commit 结算、`Session.Fork` / `Session.ForkBeforeFirstTurn` child session 打开 | 任务业务正确性、workspace/Git 回滚 |
 | `internal/store` | thread journal、checkpoint、artifact、resume，以及可选的 V1 source-preserving `ThreadStore.ForkThread` / `ForkThreadBeforeFirstTurn` ledger primitives | 项目记忆；TUI 命令编排；workspace、git 或外部副作用回滚 |
 | `internal/contextbuild` | prompt 规划与 compaction | 工具执行 |
 | `internal/memory` | 项目级语义记忆与 consolidation | `/resume`、权限 |
 | `internal/tools` | shell、apply_patch、artifact、memory 只读工具 | TUI 策略展示 |
 | `internal/sandbox` | 工具的 OS 隔离边界 | prompt 规则 |
 | `internal/config` | TOML 读取、默认值与校验 | 运行时状态 |
-| `internal/tui` | 交互、slash、队列、审批桥、状态栏、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、旁路请求的模型调用、workspace/Git 回滚 |
+| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、状态栏、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、旁路请求的模型调用、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
 | `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema |
 | `internal/provider` | OpenAI / Anthropic 模型适配 | 产品流程 |
 | `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
 
 AGENTS 指令加载在 `agent`：用户 home `~/.eino-assistant` 与 workspace 每层都按 `AGENTS.override.md`、`AGENTS.md` 顺序选择首个有效候选；符号链接会跟随到普通文件目标，去掉 UTF-8 BOM 后仅含空白的候选会跳过。用户块与项目块使用独立预算。不要新建或恢复 `internal/rules`；`[rules]` 只是配置名称。
+
+`internal/tui` 的 follow-up queue 是当前进程、当前 session 内的非 durable FIFO，不写 session ledger。active turn busy 时，Enter 对普通 follow-up 只做 FIFO admission，不启动第二个 turn；普通 follow-up 不会隐式 steer。`/queue` 提供列表、`drop`、`edit`、`clear`、`resume`；非取消 turn error 会保留尚未启动的项目并暂停自动 drain，`/queue resume` 仅在 idle 时继续，busy 或 compacting 时 fail-closed。Esc/Ctrl+C 取消在 turn 完成清理后保持既有自动 drain；`/clear`、`/new`、`/resume`、`/fork` 等 session switch 清理 queue 与 pause 状态。
+
+busy regular turn 收到 Esc/Ctrl+C 后，TUI 先追加一次 display-only 的 `interrupt requested; waiting for turn cleanup`，表示取消已请求，但仍在等待 provider、tool 和 turn 清理完成；在该反馈出现至 `AskWithEvents` 完成期间，状态栏显示 `Stopping · waiting for turn cleanup`，并保留既有 elapsed、queue、context suffix。重复取消不会重复追加该反馈；`finishTurn` 后状态栏恢复既有 `Working`/ready 状态，再按既有结果显示 `interrupted` 或 error（如适用）。这些都只是 display-only 反馈，不改变取消传播、tool/approval 处理、FIFO 自动 drain、compaction/backtrack 分支或 durable session 语义。
+
+`/steer <text>` 是与 FIFO 分离的显式路径，只针对正在运行的 regular turn：TUI 仅在 busy 状态尝试 admission，idle、compacting、session switch 或没有可 steer 的 active turn 时拒绝；admission 失败也不会回退到 FIFO。它从当前 `chat.Session` 取得已写入 `turn.started` 的 durable turn ID，并将其作为 `expectedTurnID` 传回；`Session` 在 admission 边界校验 expected ID 仍等于 active turn ID，过期或错 session 的请求失败。成功 admission 不启动第二个 `Ask`、不进入 FIFO、不取消 turn，也不修改正在运行的 tool 或 approval；支持 receipt 的调用方同时取得 mailbox 分配的 sequence 和原文，以便把 admission 与后续消费可靠关联；旧的 `Steer(... ) error` 调用仍保持兼容。`internal/agent` 的 opt-in ReAct 只在下一次 ChatModel 调用前通过 `MessageRewriter` 消费 mailbox 输入。
+
+steer admission 本身不是消费或持久化保证：成功只表示输入进入该 regular turn 的 turn-local mailbox，TUI 立即显示 `steer admitted; awaiting next model call: <text>`，不表示模型已经看到输入。mailbox 在模型安全调用边界实际执行 `TakeTurnSteers` 后，`internal/chat` 才为每个输入发送 display-only 的 `TurnEventSteerConsumed`（带 sequence/content）；TUI 显示 `steer consumed at model boundary (#<sequence>): <text>`。该反馈事件不写 journal、不进入 `TurnCommit`，也不扩展 durable ledger 或 store schema，且不会成为 user transcript。
+
+turn 成功 commit 时，只有实际被 `TakeTurnSteers` 消费的输入才随该 `TurnCommit` 写入 session ledger；TUI 显示 `steer committed: <n> consumed input(s)`。已 admission 但在 turn 完成前未消费的 late/pending 输入不持久化，TUI 显示 `steer discarded: <n> admitted input(s) were not consumed before turn completion`。turn 失败、取消或 commit 失败时，已消费和 pending 的输入全部不持久化，TUI 显示 `steer discarded: <n> admitted input(s); turn not committed`；显式取消完成清理后，TUI 可将有 receipt 但未观察到 `TurnEventSteerConsumed` 的 steer 按 admission 顺序恢复到 composer，作为未提交 draft，不写入 input history、FIFO 或 ledger，也不自动发送。已有 composer draft 保留并与恢复文本合并；普通 queued follow-up 仍按既有规则自动 drain。这些反馈只增加 display-only 状态，不改变普通 follow-up FIFO、工具调用或 approval 的 admission、执行、取消和审批语义；这些行为也不等同于 Codex steer，也不采用 Roo 式隐式 approval。
 
 ## 状态与安全边界
 

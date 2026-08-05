@@ -345,10 +345,14 @@ func TestFinishTurnShowsUsageAfterError(t *testing.T) {
 func TestFinishTurnShowsStableRuntimeDeadlineReason(t *testing.T) {
 	m := newTestModel(t)
 	m.mode = modeBusy
+	m.queue = []string{"retry after deadline"}
 
 	m.finishTurn(runtimeguard.ErrTurnDeadlineExceeded)
 	if !hasLineContaining(m.lines, lineSystem, runtimeguard.TurnTimeoutReason) {
 		t.Fatalf("runtime deadline reason missing: %#v", m.lines)
+	}
+	if !m.queuePaused || len(m.queue) != 1 || !hasLineContaining(m.lines, lineSystem, "queue paused after turn error") {
+		t.Fatalf("runtime deadline must pause the queued follow-up: paused=%v queue=%#v lines=%#v", m.queuePaused, m.queue, m.lines)
 	}
 	if hasLineContaining(m.lines, lineError, "deadline") {
 		t.Fatalf("runtime deadline must not render as an opaque error: %#v", m.lines)

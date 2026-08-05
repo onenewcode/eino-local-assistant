@@ -80,6 +80,23 @@ func TestEmitFromTurnEventForwardsReasoning(t *testing.T) {
 	}
 }
 
+func TestEmitFromTurnEventForwardsSteerConsumption(t *testing.T) {
+	ch := make(chan tea.Msg, 1)
+	emit := emitFromTurnEvent(context.Background(), 9, 23, ch)
+	emit(chat.TurnEvent{
+		Kind:          chat.TurnEventSteerConsumed,
+		SteerSequence: 4,
+		SteerContent:  "redirect",
+	})
+	got, ok := (<-ch).(turnSteerConsumedMsg)
+	if !ok {
+		t.Fatal("steer consumption should become a turnSteerConsumedMsg")
+	}
+	if got.turnID != 9 || got.sessionGeneration != 23 || got.sequence != 4 || got.content != "redirect" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
 func TestEmitFromTurnEventUnblocksOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

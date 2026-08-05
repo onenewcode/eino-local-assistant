@@ -63,6 +63,7 @@ type statusExtras struct {
 	cmdPolicy string
 	context   string
 	task      string
+	paused    string
 	queued    string
 	follow    string
 }
@@ -86,7 +87,7 @@ func collectStatusExtras(session *chat.Session, queueN int, followHint bool, cmd
 // by " · " when the result is non-empty (ready to append after a base label).
 func joinStatusSuffix(e statusExtras) string {
 	var parts []string
-	for _, s := range []string{e.cmdPolicy, e.context, e.task, e.queued, e.follow} {
+	for _, s := range []string{e.cmdPolicy, e.context, e.task, e.paused, e.queued, e.follow} {
 		if s != "" {
 			parts = append(parts, s)
 		}
@@ -104,6 +105,7 @@ type idleStatusParts struct {
 	cmdPolicy string
 	context   string
 	task      string
+	paused    string
 	queued    string
 	follow    string
 }
@@ -130,6 +132,7 @@ func collectIdleStatus(session *chat.Session, modelName string, queueN int, foll
 	p.cmdPolicy = extras.cmdPolicy
 	p.context = extras.context
 	p.task = extras.task
+	p.paused = extras.paused
 	p.queued = extras.queued
 	p.follow = extras.follow
 	return p
@@ -151,6 +154,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 		{"cmd", p.cmdPolicy},
 		{"context", p.context},
 		{"task", p.task},
+		{"paused", p.paused},
 		{"queued", p.queued},
 		{"follow", p.follow},
 	}
@@ -158,7 +162,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	join := func(include map[string]bool) string {
 		parts := []string{base}
 		// Preferred display order (not drop order).
-		order := []string{"model", "id", "title", "cmd", "context", "task", "queued", "follow"}
+		order := []string{"model", "id", "title", "cmd", "context", "task", "paused", "queued", "follow"}
 		for _, k := range order {
 			if !include[k] {
 				continue
@@ -174,7 +178,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 
 	include := map[string]bool{
 		"title": true, "id": true, "model": true, "cmd": true,
-		"context": true, "task": true, "queued": true, "follow": true,
+		"context": true, "task": true, "paused": true, "queued": true, "follow": true,
 	}
 	if width <= 0 {
 		width = 80

@@ -422,10 +422,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	}
 	registry = tools.New(append(registry.All(), taskTools...)...)
 
-	reactModel, err := agent.NewReActModelWithOptions(ctx, chatModel, registry.All(), agent.ReActOptions{
-		MaxStep:        runtimeCfg.MaxReactSteps,
-		TaskController: taskController,
-	})
+	reactModel, err := agent.NewReActModelWithOptions(ctx, chatModel, registry.All(), runtimeReActOptions(runtimeCfg.MaxReactSteps, taskController))
 	if err != nil {
 		return nil, err
 	}
@@ -520,6 +517,14 @@ func initialRulesSnapshotStatus(ready bool) string {
 		return "active session snapshot captured"
 	}
 	return "resumed session; active system prompt is frozen"
+}
+
+func runtimeReActOptions(maxSteps int, taskController *agent.TaskController) agent.ReActOptions {
+	return agent.ReActOptions{
+		MaxStep:        maxSteps,
+		EnableSteer:    true,
+		TaskController: taskController,
+	}
 }
 
 // composeSystemPrompt is the only runtime path that both recomposes a prompt

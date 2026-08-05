@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -125,8 +126,9 @@ const (
 
 const (
 	// Start as a single-line Claude/Codex-style input; grows with content.
-	composerMinHeight = 1
-	composerMaxHeight = 8
+	composerMinHeight         = 1
+	composerMaxHeight         = 8
+	interruptRequestedMessage = "interrupt requested; waiting for turn cleanup"
 )
 
 type model struct {
@@ -152,6 +154,9 @@ type model struct {
 	openToolNames map[string]string
 	// queue holds follow-ups submitted while a turn is running (FIFO).
 	queue []string
+	// queuePaused blocks automatic FIFO promotion after a non-cancel turn error.
+	// It is process-local; /queue resume explicitly clears it.
+	queuePaused bool
 	// inputHist is shell-style Up/Down composer history for this TUI process.
 	inputHist inputHistory
 	// slashItems is the live prefix-filtered command menu (empty => closed).
@@ -175,14 +180,30 @@ type model struct {
 	sessionMu         sync.RWMutex
 	sessionGeneration uint64
 	turnID            int
-	turnCancel        context.CancelFunc
-	turnStart         time.Time
-	events            chan tea.Msg
-	turnDone          chan turnDoneMsg
-	pendingTurnDone   *turnDoneMsg
-	turnUsage         usage.APIUsage
-	turnUsageSeen     bool
-	turnUsageCallIDs  map[string]struct{}
+	// steerSession is a TUI-local compatibility seam for the optional core
+	// steering API. Production uses the active *chat.Session assertion below;
+	// tests can exercise the TUI without modifying or faking internal/chat.
+	steerSession interface {
+		ActiveTurnID() (string, bool)
+		Steer(context.Context, string, string) error
+	}
+	turnCancel             context.CancelFunc
+	interruptFeedbackShown bool
+	turnStart              time.Time
+	events                 chan tea.Msg
+	turnDone               chan turnDoneMsg
+	pendingTurnDone        *turnDoneMsg
+	turnUsage              usage.APIUsage
+	turnUsageSeen          bool
+	turnUsageCallIDs       map[string]struct{}
+	// turnSteerAdmitted counts successful /steer admissions for the active turn.
+	// turnSteerAdmissions retains only receipts from the additive API so an
+	// interrupted turn can restore unconfirmed text without guessing by content.
+	turnSteerAdmissions map[uint64]string
+	// consumed sequences are reported only after the model reaches a safe call
+	// boundary, so late inputs can be settled separately at turn completion.
+	turnSteerAdmitted int
+	turnSteerConsumed map[uint64]struct{}
 	compactID         int
 	compactCancel     context.CancelFunc
 	compactStart      time.Time
@@ -593,6 +614,7 @@ func (m *model) replaceSession(session *chat.Session) {
 	m.deps.Session = session
 	m.sessionGeneration++
 	m.sessionMu.Unlock()
+	m.interruptFeedbackShown = false
 	m.clearBacktrack()
 }
 
@@ -623,10 +645,15 @@ func (m *model) resetSessionTransientState() {
 	m.turnUsage = usage.APIUsage{}
 	m.turnUsageSeen = false
 	m.turnUsageCallIDs = nil
+	m.turnSteerAdmitted = 0
+	m.turnSteerAdmissions = nil
+	m.turnSteerConsumed = nil
+	m.interruptFeedbackShown = false
 	m.sideQuestions = 0
 	m.sideQuestionPending = nil
 	m.sideLines = nil
 	m.queue = nil
+	m.queuePaused = false
 	m.clearBacktrack()
 	m.clearSlashMenu()
 	m.closeTaskPane()
@@ -777,6 +804,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.mode == modeBusy {
 					m.interruptTurn("interrupted")
 					m.cancelActiveTask("user interrupted the active turn")
+					m.showInterruptRequested()
 				}
 				return m, nil
 			}
@@ -787,6 +815,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyEsc && m.mode == modeBusy {
 			m.interruptTurn("interrupted")
 			m.cancelActiveTask("user interrupted the active turn")
+			m.showInterruptRequested()
 			return m, nil
 		}
 		if msg.Type == tea.KeyEsc && m.mode == modeCompacting {
@@ -805,6 +834,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.mode == modeBusy {
 				m.interruptTurn("interrupted")
 				m.cancelActiveTask("user interrupted the active turn")
+				m.showInterruptRequested()
 				return m, nil
 			}
 			if m.mode == modeCompacting {
@@ -820,6 +850,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.sideQuestions > 0 {
 				m.rejectBacktrack("busy: wait for the side question to finish first")
+				return m, nil
+			}
+			if m.textarea.Value() != "" {
 				return m, nil
 			}
 			if m.backtrackState.mode == backtrackArmed {
@@ -923,6 +956,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.nextEventCmd()
 		}
 		m.appendReasoningChunk(msg.chunk)
+		return m, m.nextEventCmd()
+
+	case turnSteerConsumedMsg:
+		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
+			return m, m.nextEventCmd()
+		}
+		if m.turnSteerConsumed == nil {
+			m.turnSteerConsumed = make(map[uint64]struct{})
+		}
+		if _, seen := m.turnSteerConsumed[msg.sequence]; seen {
+			return m, m.nextEventCmd()
+		}
+		m.turnSteerConsumed[msg.sequence] = struct{}{}
+		m.appendLine(lineSystem, fmt.Sprintf("steer consumed at model boundary (#%d): %s", msg.sequence, msg.content))
 		return m, m.nextEventCmd()
 
 	case turnToolStartMsg:
@@ -1114,9 +1161,15 @@ func (m *model) statusLabel() string {
 	cmdPolicy := m.statusPolicyFragment()
 	session := m.activeSession()
 	extras := collectStatusExtras(session, len(m.queue), follow, cmdPolicy)
+	if m.queuePaused {
+		extras.paused = "queue:paused"
+	}
 
 	if m.mode == modeIdle {
 		parts := collectIdleStatus(session, m.deps.Status.Model, len(m.queue), follow, cmdPolicy)
+		if m.queuePaused {
+			parts.paused = "queue:paused"
+		}
 		// Leave a little room for bar padding.
 		label := formatIdleStatus(max(20, m.width-4), parts)
 		if backtrack := m.backtrackStatus(); backtrack != "" {
@@ -1139,6 +1192,11 @@ func (m *model) statusLabel() string {
 		}
 		return m.spinner.View() + " " +
 			fmt.Sprintf("Compacting context · %s (%s · esc)%s", kind, elapsed, suffix)
+	}
+	if m.mode == modeBusy && m.interruptFeedbackShown {
+		elapsed := time.Since(m.turnStart).Round(time.Second)
+		return m.spinner.View() + " " +
+			fmt.Sprintf("Stopping · waiting for turn cleanup (%s · esc)%s", elapsed, suffix)
 	}
 	activity := "thinking"
 	if m.currentTool != "" {
@@ -1285,11 +1343,16 @@ func (m *model) syncComposerHeight() bool {
 }
 
 func (m *model) queueWhileBusy(input string) (tea.Model, tea.Cmd) {
+	if action, arg := parseSlash(input); action == slashSteer {
+		m.textarea.Reset()
+		m.syncComposerHeight()
+		return m.cmdSteer(arg)
+	}
 	if isImmediatelyExecutableWhileBusy(input) {
 		m.textarea.Reset()
 		m.syncComposerHeight()
-		// `/queue clear` is intentionally handled here rather than put behind
-		// the active operation; queued prompts must not run before it takes effect.
+		// Queue control is intentionally handled here rather than put behind the
+		// active operation; queued prompts must not run before it takes effect.
 		return m.submit(input)
 	}
 	if !isQueueableInput(input) {
@@ -1333,6 +1396,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdRules(arg)
 	case slashSide:
 		return m.cmdSideQuestion(sideQuestionLabel(input), arg)
+	case slashSteer:
+		return m.cmdSteer(arg)
 	case slashUsage:
 		return m.cmdUsage(arg)
 	case slashContext:
@@ -1375,6 +1440,78 @@ func sideQuestionLabel(input string) string {
 		return "side"
 	}
 	return "btw"
+}
+
+// cmdSteer admits input to the currently running regular turn. The core API is
+// deliberately discovered through a local interface so this TUI remains
+// buildable while older chat.Session implementations are in use.
+func (m *model) cmdSteer(input string) (tea.Model, tea.Cmd) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		m.appendLine(lineError, "usage: /steer <text>")
+		return m, nil
+	}
+	if m.mode != modeBusy {
+		m.appendLine(lineError, "steer unavailable: a regular turn is not running")
+		return m, nil
+	}
+
+	session, generation := m.activeSessionSnapshot()
+	if session == nil {
+		m.appendLine(lineError, "steer failed: session is unavailable")
+		return m, nil
+	}
+	// A session switch is synchronous in Bubble Tea, but retain the generation
+	// guard at the admission boundary so an old UI action cannot target a new
+	// session if the embedding caller changes it concurrently.
+	current, currentGeneration := m.activeSessionSnapshot()
+	if current != session || currentGeneration != generation {
+		m.appendLine(lineError, "steer failed: active session changed")
+		return m, nil
+	}
+
+	api := m.steerSession
+	if api == nil {
+		candidate, ok := interface{}(session).(interface {
+			ActiveTurnID() (string, bool)
+			Steer(context.Context, string, string) error
+		})
+		if !ok {
+			m.appendLine(lineError, "steer failed: core steering is unsupported")
+			return m, nil
+		}
+		api = candidate
+	}
+	expectedTurnID, ok := api.ActiveTurnID()
+	if !ok || strings.TrimSpace(expectedTurnID) == "" {
+		m.appendLine(lineError, "steer failed: no active steerable turn")
+		return m, nil
+	}
+	receipt, err := m.admitSteer(api, expectedTurnID, input)
+	if err != nil {
+		m.appendLine(lineError, "steer failed: "+err.Error())
+		return m, nil
+	}
+	m.turnSteerAdmitted++
+	if receipt.Sequence != 0 && strings.TrimSpace(receipt.Content) != "" {
+		if m.turnSteerAdmissions == nil {
+			m.turnSteerAdmissions = make(map[uint64]string)
+		}
+		m.turnSteerAdmissions[receipt.Sequence] = receipt.Content
+	}
+	m.appendLine(lineSystem, "steer admitted; awaiting next model call: "+input)
+	return m, nil
+}
+
+func (m *model) admitSteer(api interface {
+	Steer(context.Context, string, string) error
+}, expectedTurnID, input string) (chat.TurnSteerReceipt, error) {
+	if receiptAPI, ok := api.(interface {
+		SteerWithReceipt(context.Context, string, string) (chat.TurnSteerReceipt, error)
+	}); ok {
+		return receiptAPI.SteerWithReceipt(m.processCtx(), expectedTurnID, input)
+	}
+	return chat.TurnSteerReceipt{}, api.Steer(m.processCtx(), expectedTurnID, input)
 }
 
 func (m *model) cmdSideQuestion(label, question string) (tea.Model, tea.Cmd) {
@@ -1906,25 +2043,102 @@ func (m *model) cmdCompact(focus string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) cmdQueue(arg string) (tea.Model, tea.Cmd) {
-	arg = strings.TrimSpace(arg)
-	if arg == "" {
-		m.appendLine(lineSystem, formatQueueList(m.queue))
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		m.appendLine(lineSystem, formatQueueList(m.queue, m.queuePaused))
 		m.appendLine(lineSep, "")
 		return m, nil
 	}
-	switch strings.ToLower(arg) {
+	switch strings.ToLower(fields[0]) {
 	case "clear":
+		if len(fields) != 1 {
+			m.appendLine(lineError, queueCommandUsage)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
 		n := len(m.queue)
 		m.queue = nil
+		m.queuePaused = false
 		if n == 0 {
-			m.appendLine(lineSystem, "queue empty")
+			m.appendLine(lineSystem, queueEmptyMessage)
 		} else {
 			m.appendLine(lineSystem, fmt.Sprintf("queue cleared (%d dropped)", n))
 		}
 		m.appendLine(lineSep, "")
 		return m, nil
+	case "drop":
+		index, parseError := parseQueueDropIndex(fields)
+		if parseError != "" {
+			m.appendLine(lineError, parseError)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		if len(m.queue) == 0 {
+			m.appendLine(lineError, queueEmptyMessage)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		if index > len(m.queue) {
+			m.appendLine(lineError, queueDropRangeError)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		var dropped string
+		m.queue, dropped, _ = dropQueuedFollowUp(m.queue, index)
+		if len(m.queue) == 0 {
+			m.queuePaused = false
+		}
+		m.appendLine(lineSystem, fmt.Sprintf("queue dropped (%d): %s", index, queuePreview(dropped)))
+		m.appendLine(lineSep, "")
+		return m, nil
+	case "resume":
+		if len(fields) != 1 {
+			m.appendLine(lineError, queueCommandUsage)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		if m.mode != modeIdle {
+			m.appendLine(lineSystem, queueResumeBusyMessage)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		m.queuePaused = false
+		if len(m.queue) == 0 {
+			m.appendLine(lineSystem, queueEmptyMessage)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		m.appendLine(lineSystem, "queue resumed; continuing queued follow-ups")
+		m.appendLine(lineSep, "")
+		return m, m.drainQueue()
+	case "edit":
+		index, newText, parseError := parseQueueEdit(arg)
+		if parseError != "" {
+			m.appendLine(lineError, parseError)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		if len(m.queue) == 0 {
+			m.appendLine(lineError, queueEmptyMessage)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		if index > len(m.queue) {
+			m.appendLine(lineError, queueEditRangeError)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		if !isQueueableInput(newText) {
+			m.appendLine(lineError, queueEditAdmissionError)
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		m.queue, _ = editQueuedFollowUp(m.queue, index, newText)
+		m.appendLine(lineSystem, fmt.Sprintf("queue edited (%d): %s", index, queuePreview(newText)))
+		m.appendLine(lineSep, "")
+		return m, nil
 	default:
-		m.appendLine(lineError, "usage: /queue | /queue clear")
+		m.appendLine(lineError, queueCommandUsage)
 		return m, nil
 	}
 }
@@ -2032,12 +2246,23 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 	session, sessionGeneration := m.activeSessionSnapshot()
 	if session == nil {
-		m.appendLine(lineError, "session is unavailable")
+		m.err = errors.New("session is unavailable")
+		m.appendLine(lineError, m.err.Error())
+		return m, nil
+	}
+	// Validate the per-turn runtime guard before publishing local busy state.
+	// drainQueue can then detect this preflight failure without losing its head.
+	m.err = nil
+	ctx, cancel, err := runtimeguard.WithTurnContext(m.processCtx(), m.deps.TurnOptions)
+	if err != nil {
+		m.err = fmt.Errorf("configure runtime guard: %w", err)
+		m.appendLine(lineError, m.err.Error())
 		return m, nil
 	}
 	m.turnID++
 	turnID := m.turnID
 	m.mode = modeBusy
+	m.interruptFeedbackShown = false
 	m.turnStart = time.Now()
 	m.err = nil
 	m.currentTool = ""
@@ -2046,15 +2271,6 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 	m.stickBottom = true
 	m.setBusyPlaceholder()
 
-	// Derive from process context so SIGTERM cancels in-flight turns, then add
-	// the configured turn deadline and tool-call budget shared by all tools.
-	ctx, cancel, err := runtimeguard.WithTurnContext(m.processCtx(), m.deps.TurnOptions)
-	if err != nil {
-		m.mode = modeIdle
-		m.setIdlePlaceholder()
-		m.err = fmt.Errorf("configure runtime guard: %w", err)
-		return m, nil
-	}
 	m.turnCancel = cancel
 	// Buffered enough for tool chatter; sends still block rather than drop.
 	m.events = make(chan tea.Msg, 256)
@@ -2063,6 +2279,9 @@ func (m *model) startTurn(input string) (tea.Model, tea.Cmd) {
 	m.turnUsage = usage.APIUsage{Status: store.UsageStatusExact}
 	m.turnUsageSeen = false
 	m.turnUsageCallIDs = make(map[string]struct{})
+	m.turnSteerAdmitted = 0
+	m.turnSteerAdmissions = make(map[uint64]string)
+	m.turnSteerConsumed = make(map[uint64]struct{})
 
 	events := m.events
 	done := m.turnDone
@@ -2115,6 +2334,14 @@ func (m *model) cancelActiveTask(reason string) {
 	}
 }
 
+func (m *model) showInterruptRequested() {
+	if m.interruptFeedbackShown {
+		return
+	}
+	m.interruptFeedbackShown = true
+	m.appendLine(lineSystem, interruptRequestedMessage)
+}
+
 func (m *model) finishTurn(err error) tea.Cmd {
 	if m.hasPendingApproval() {
 		m.clearPendingApproval(tools.ApprovalDeny)
@@ -2132,6 +2359,7 @@ func (m *model) finishTurn(err error) tea.Cmd {
 	m.currentTool = ""
 	m.openToolCards = make(map[string]int)
 	m.openToolNames = make(map[string]string)
+	m.interruptFeedbackShown = false
 	m.setIdlePlaceholder()
 
 	if err != nil {
@@ -2142,7 +2370,18 @@ func (m *model) finishTurn(err error) tea.Cmd {
 		} else {
 			m.appendLine(lineError, err.Error())
 		}
+		// Cancellation leaves an existing pause intact. An explicit resume already
+		// clears it; otherwise a later user turn cancelled by Esc/Ctrl+C must not
+		// bypass the earlier turn error's queue decision.
+		if !isCanceled(err) && len(m.queue) > 0 {
+			m.queuePaused = true
+			m.appendLine(lineSystem, queuePausedLine(len(m.queue)))
+		}
 	}
+	if isCanceled(err) {
+		m.restoreInterruptedSteers()
+	}
+	m.settleSteerFeedback(err)
 	// Turn token/cost footer is display-only chrome (lineUsage). It must never
 	// enter the session ledger or model prompt. Context stays on the status bar.
 	// Gated by ui.show_turn_usage.
@@ -2162,15 +2401,86 @@ func (m *model) finishTurn(err error) tea.Cmd {
 	return m.drainQueue()
 }
 
+func (m *model) settleSteerFeedback(err error) {
+	admitted := m.turnSteerAdmitted
+	consumed := len(m.turnSteerConsumed)
+	if admitted == 0 && consumed == 0 {
+		m.turnSteerAdmissions = nil
+		m.turnSteerConsumed = nil
+		return
+	}
+	if err != nil {
+		m.appendLine(lineSystem, fmt.Sprintf("steer discarded: %d admitted input(s); turn not committed", admitted))
+	} else {
+		m.appendLine(lineSystem, fmt.Sprintf("steer committed: %d consumed input(s)", consumed))
+		if pending := admitted - consumed; pending > 0 {
+			m.appendLine(lineSystem, fmt.Sprintf("steer discarded: %d admitted input(s) were not consumed before turn completion", pending))
+		}
+	}
+	m.turnSteerAdmitted = 0
+	m.turnSteerAdmissions = nil
+	m.turnSteerConsumed = nil
+}
+
+// restoreInterruptedSteers returns receipt-tracked admissions that never
+// reached an observed model boundary to the composer. The core deliberately
+// discards these inputs with the cancelled turn, so this is a display-only
+// recovery path rather than a second admission or a ledger write.
+func (m *model) restoreInterruptedSteers() {
+	if len(m.turnSteerAdmissions) == 0 {
+		return
+	}
+	sequences := make([]uint64, 0, len(m.turnSteerAdmissions))
+	for sequence, content := range m.turnSteerAdmissions {
+		if _, consumed := m.turnSteerConsumed[sequence]; consumed || strings.TrimSpace(content) == "" {
+			continue
+		}
+		sequences = append(sequences, sequence)
+	}
+	if len(sequences) == 0 {
+		return
+	}
+	sort.Slice(sequences, func(i, j int) bool { return sequences[i] < sequences[j] })
+	restored := make([]string, 0, len(sequences))
+	for _, sequence := range sequences {
+		restored = append(restored, m.turnSteerAdmissions[sequence])
+	}
+
+	draft := m.textarea.Value()
+	if draft != "" && !strings.HasSuffix(draft, "\n") {
+		draft += "\n"
+	}
+	draft += strings.Join(restored, "\n")
+	m.textarea.SetValue(draft)
+	m.textarea.CursorEnd()
+	m.clearSlashMenu()
+	m.syncComposerHeight()
+	m.layout()
+	m.refreshViewport()
+	m.appendLine(lineSystem, fmt.Sprintf("steer restored to composer: %d uncommitted input(s)", len(restored)))
+}
+
 // drainQueue auto-sends queued follow-ups after a turn ends.
 // Local slash commands are applied immediately; the first real turn returns its cmd.
 func (m *model) drainQueue() tea.Cmd {
+	if m.queuePaused {
+		return nil
+	}
 	for len(m.queue) > 0 {
 		next := m.queue[0]
 		m.queue = m.queue[1:]
+		m.err = nil
 		_, cmd := m.submit(next)
 		if m.mode != modeIdle {
 			return cmd
+		}
+		if m.err != nil {
+			// startTurn has already validated its guard, but keep the FIFO head if
+			// that preflight ever fails while a queued item is being promoted.
+			m.queue = append([]string{next}, m.queue...)
+			m.queuePaused = true
+			m.appendLine(lineSystem, queuePausedLine(len(m.queue)))
+			return nil
 		}
 		// Local slash consumed; continue draining.
 		if m.quitting {
@@ -2423,7 +2733,9 @@ func (m *model) statusReport() string {
 	if runtime.MaxToolCalls > 0 {
 		report += fmt.Sprintf("  max_tool_calls=%d", runtime.MaxToolCalls)
 	}
-	if n := len(m.queue); n > 0 {
+	if m.queuePaused {
+		report += fmt.Sprintf("  queue_paused=true  queued=%d  queue_resume=/queue resume", len(m.queue))
+	} else if n := len(m.queue); n > 0 {
 		report += fmt.Sprintf("  queued=%d", n)
 	}
 	return report + usageLine + ctxLine

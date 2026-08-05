@@ -8,7 +8,8 @@ import (
 func TestHelpTextDocumentsEscBacktrackAndExistingEscActions(t *testing.T) {
 	help := helpText()
 	for _, phrase := range []string{
-		"idle: first arms backtrack; second opens history prompt selector",
+		"idle with an empty composer: first arms backtrack; second opens history prompt selector",
+		"backtrack requires an empty composer",
 		"selector Esc cancels",
 		"busy Esc interrupts turn/compaction",
 		"approval Esc denies",
@@ -59,6 +60,7 @@ func TestBusyInputClassificationKeepsExistingBoundaries(t *testing.T) {
 		{input: "/status", want: busyInputExecuteImmediately},
 		{input: "/rules", want: busyInputExecuteImmediately},
 		{input: "/btw question", want: busyInputExecuteImmediately},
+		{input: "/steer change direction", want: busyInputSteer},
 		{input: "/usage off", want: busyInputExecuteImmediately},
 		{input: "/sessions", want: busyInputExecuteImmediately},
 		{input: "/queue clear", want: busyInputExecuteImmediately},

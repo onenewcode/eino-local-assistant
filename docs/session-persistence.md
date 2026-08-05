@@ -19,7 +19,7 @@
 6. resume 默认只水合活动 checkpoint 与最近 50 个可见 turn；更早 transcript 在向上滚动时分页读取。
 7. `/clear` 创建并切换到新 session，不重写当前 session；旧队列不��跨 session 执行。
 8. 自主复杂任务将图、proof 接受状态和中断状态写为 `task.state.updated`；`/resume` 恢复该投影，但恢复时仍为 `working` 的节点先转为 `needs_replan`，不会自动重放操作。普通后续输入延续原始需求；只有显式以当前用户原文替换 `user-request` 才改变任务范围并使相关 proof 失效。
-9. `ThreadStore.ForkThread` 是 `internal/store` 的 V1 source-preserving ledger primitive；`chat.Session.Fork`、TUI `/fork` 与 idle 两阶段 `Esc` backtrack 在其上提供 child session 接入。backtrack 只在已有 committed prefix 的历史 prompt 中选择边界并回填 composer，不实现 destructive rewind 或 workspace、git、外部副作用回滚。
+9. `ThreadStore.ForkThread` 是 `internal/store` 的 V1 source-preserving ledger primitive；`chat.Session.Fork`、TUI `/fork` 与 idle 两阶段 `Esc` backtrack 在其上提供 child session 接入。backtrack 的可见 committed user prompt 包括首个 prompt；首个 prompt 通过显式 `ThreadForkBeforeFirstRepository` / `ForkThreadBeforeFirstTurn` / `Session.ForkBeforeFirstTurn` 创建只含 `thread.created` 的 child，普通 `ForkThread` / `Fork` 的空 `lastTurnID` 仍表示 latest，两种语义不能混用。backtrack 不实现 destructive rewind 或 workspace、Git、外部副作用回滚。
 
 fresh `exec --ephemeral` 使用同一个 v2 `ThreadStore` API，但根目录是本次进程创建的空临时目录，runtime 关闭时整体删除。`exec resume <id> --ephemeral` 和 `exec resume --last --ephemeral` 则在 durable source thread 锁下复制选定 session 的 authoritative journal、materialized state/meta、checkpoints 与 artifacts 到该临时根目录，再由临时 store 承担整个 resumed turn；source session 不接收 turn、journal、state、checkpoint 或 artifact 写入，source `locks/` 也不复制。ephemeral `--last` 使用不修复 durable projections 的只读 session 列表；普通 durable `--last` 仍使用既有 `ListThreads` 路径。该能力只保证 session ledger 的本次运行生命周期，不宣称 fork 语义；工具已经造成的工作区、网络或其他外部副作用不会回滚，项目级 semantic memory 也不会被清除。
 
@@ -34,26 +34,27 @@ TUI `/fork` 传入空 child ID 和空边界，因此由 store 选择 source 最�
 成功调用的合同如下：
 
 - **Child identity**：`childID` 可由调用方提供，或在为空时生成新的 thread ID；它必须不同于 `sourceID`，且目标目录必须不存在。源 thread 不会被改名或替换。
-- **Committed prefix**：`lastTurnID` 为空时选择 source 中最新的 `turn.committed`；否则必须精确匹配一个完整的 committed turn。child 包含从 `thread.created` 到该 commit（含）的完整 journal 事件前缀，不能从半个 turn 或任意消息位置切开。
+- **Committed prefix and before-first boundary**：普通 `ForkThread` / `Session.Fork` 的 `lastTurnID` 为空时仍选择 source 中最新的 `turn.committed`；否则必须精确匹配一个完整的 committed turn。可见首个 committed user prompt 是合法的 backtrack target，但 TUI 对它使用显式 `ThreadForkBeforeFirstRepository` / `ForkThreadBeforeFirstTurn` / `Session.ForkBeforeFirstTurn`，child 只重建 `thread.created`。该 child 的 boundary turn 与 `ForkBoundaryTurnID` 为空，`ParentID` / `ForkSourceHash` 仍保留，且 child 没有任何 turn group。普通 empty-`lastTurnID` latest fork 与显式 before-first fork 是两个不能混用的语义；普通 fork 的 child 仍包含从 `thread.created` 到选定 commit（含）的完整 journal 事件前缀，不能从半个 turn 或任意消息位置切开。
 - **Journal rebuild**：child 不复用 source 的事件 envelope。每个 child event 生成新的 `event_id` 和 `thread_id`，`seq`、revision、`expected_revision` 从 child 重新编号，`payload_hash`、`previous_hash` 和 `hash` 重新计算。source boundary event 的原始 hash 只作为 provenance 保存，不是 child hash chain 的前置 hash。
 - **Parent provenance**：child 的 `thread.created` / `meta` 写入 `ParentID`、`ForkBoundaryTurnID` 和 `ForkSourceHash`；后者是 source 在边界事件上的 journal hash。其余前缀 payload 通过重放生成 child 的 state/meta，而不是直接把 source projection 当作 child 真相。
 - **Artifacts**：只复制边界前 `tool.completed` 事件实际引用的 content-addressed artifacts；非截断 artifact 同时复制 metadata `.json` 和原始 `.blob`，截断 artifact 不会伪造 blob。source 的 `locks/` 不复制，V1 也不复制 checkpoint 文件；child 的 checkpoint 目录保持为空。
 - **Source stability**：源 ledger 只读；已有写锁时使用共享读锁，没有写锁时用有界 fingerprint/retry 检查稳定性。源在读取或发布前发生变化会失败，不会把移动中的 source 静默分叉。child 先在 staging 目录完整重建并校验，再原子发布。
 
-V1 在发布 child 前拒绝以下状态：source 有活动 turn、pending compaction、active checkpoint 或任何 checkpoint/compaction-derived journal、文件或 usage 状态；存在 `task.state.updated` 等 task-derived state；没有完整 committed turn；`lastTurnID` 不是完整的 `turn.committed` 边界；以及 journal、payload 或 artifact 引用不一致。目标冲突、source 变化或校验失败同样不会发布部分 child，且不会修改 source。该拒绝集合是 V1 的安全边界，不是完整的 backtrack / rewind 产品语义。
+V1 在发布 child 前，无论是普通 fork 还是显式 before-first fork，都拒绝以下状态：source 有活动 turn、pending compaction、active checkpoint 或任何 checkpoint/compaction-derived journal、文件或 usage 状态；存在 `task.state.updated` 等 task-derived state；以及 journal、payload 或 artifact 引用不一致。普通 `ForkThread` 另外要求存在完整 committed turn，且 `lastTurnID` 必须是完整的 `turn.committed` 边界；显式 before-first fork 不把空 boundary 当作普通 fork 的 latest sentinel。目标冲突、source 变化或校验失败同样不会发布部分 child，且不会修改 source。该拒绝集合是 V1 的安全边界，不是完整的 backtrack / rewind 产品语义。
 
-`ForkThread` 与 `/fork` 只操作 session ledger 和 TUI session 选择：它们不恢复 source thread 的旧内容，不快照或回滚 workspace 文件、git working tree/index、进程、网络请求、项目 semantic memory 或其他外部系统状态。TUI backtrack 复用同一 primitive，在选定历史 prompt 之前创建 child，并把该 prompt 放回 composer；它不会把 prompt 预写入 child transcript。当前 V1 不提供首个 prompt，因为空 committed prefix 不能通过现有 fork 合同发布；“有了 child ledger”不等于“回到了某个历史 workspace”。
+`ForkThread` 与 `/fork` 只操作 session ledger 和 TUI session 选择：普通空 `lastTurnID` 仍选择 latest。TUI backtrack 对包括首个 prompt 在内的可见 committed user prompt 创建 child；首个 prompt 走显式 `ForkThreadBeforeFirstTurn` / `Session.ForkBeforeFirstTurn`，只产生 `thread.created`，后续 prompt 才按 committed prefix 复制。before-first child 的 `ParentID` / `ForkSourceHash` 保留，boundary 为空且没有 turn groups；source unchanged。选中的 prompt 会放回 composer，不会预写入 child transcript。“有了 child ledger”不等于“回到了某个历史 workspace”：这些路径都不快照或回滚 workspace 文件、Git working tree/index、进程、网络请求、项目 semantic memory 或其他外部系统状态。
 
 ## TUI Esc backtrack V1
 
 backtrack 是一个 idle-only、source-preserving 的历史分支入口，不是 destructive rewind。它与
-`/fork` 共用 `Session.Fork` / `ThreadStore.ForkThread` 的 ledger 合同，但提供更细的 prompt 边界：
+`/fork` 共用 `Session.Fork` / `ThreadStore.ForkThread` 的 ledger 合同，但提供更细的 prompt 边界；首个 prompt 的 boundary 由显式 `Session.ForkBeforeFirstTurn` / `ThreadStore.ForkThreadBeforeFirstTurn` 表示：
 
-1. idle 时第一次 `Esc` 进入 armed 状态；第二次 `Esc` 从 source ledger 加载历史 prompt selector。
-2. selector 只列出前面已经存在 committed turn 的历史 prompt。当前首个 prompt 被排除，因为
-   V1 fork 不支持空 committed prefix；这不是把首个 prompt 当作不可恢复的文件状态。
+1. idle 且 composer 为空时第一次 `Esc` 进入 armed 状态；第二次 `Esc` 从 source ledger 加载历史 prompt selector。backtrack requires an empty composer；普通非空草稿按 `Esc` 保持不变，既不 arm 也不打开 selector，slash menu 仍先由 `Esc` 关闭。
+2. selector 列出所有可见的 committed user prompt，包括首个 prompt。首个 prompt 是合法
+   backtrack target，不需要把普通 fork 的空 `lastTurnID` 改解释为空 prefix。
 3. `Up` / `Down` 或 `j` / `k` 移动选择，`Enter` 在选中 prompt 之前发布 source-preserving child。
-   source ledger 保持不变，child 只接收选中 prompt 之前的 committed prefix。
+   选中首个 prompt 时走显式 before-first fork，child 只含 `thread.created` 且没有 turn group；
+   选中后续 prompt 时，child 接收选中 prompt 之前的 committed prefix。source ledger 保持不变。
 4. fork 成功后切换 child，并把选中的 prompt 回填到 composer；该 prompt 不会预写入 child
    transcript，用户可以先编辑再提交。
 5. fork 失败时 source 仍保持 active，selector 关闭，选中的 prompt 保留在 composer，并显示
@@ -254,9 +255,9 @@ checkpoint 必须是严格 JSON，并包含：
 | `resume <id> [--recover]` / `/resume <id> [--recover]` / `exec resume <id> [PROMPT] [--recover]` / `exec resume --last [PROMPT] [--recover]` | **存储层**：读取 state、活动 checkpoint 和最近可见 transcript。**模型层**：下一请求使用活动 checkpoint + 未覆盖热 groups + 当前 tools + 新消息，不把完整账本水合进 prompt。产品承诺是任务可继续，不是全文语义等价。headless `exec resume` 必须给精确、不透明 ID，除非显式使用 `--last`；`--ephemeral` 会把选定 source session 快照到临时 ledger，后续只由该临时 ledger 接收 turn lifecycle 写入。它只发送调用中提供的一条新 prompt，并且只通过 `chat.OpenSession` 恢复，不解析账本文件。若活动 checkpoint 是可识别 v1，先 CAS reset 指针并保留 raw ledger；若 thread 有活动 turn 或 pending compaction，普通 resume 仍拒绝接管；精确指定 `--recover` 才会显式恢复该目标，而且 ephemeral 恢复只写临时 ledger。`--output-format stream-json` 不读取或导出账本：它只在成功打开后写 session.started，工具 activity 也只在对应生命周期已经写入账本后投影，最终 result 则在 turn.committed 之后写出。 |
 | 向上滚动 | 以稳定 message page 从 event ledger 读取更早 transcript；只扩展 UI 回放缓存，不改变模型工作集。 |
 | `/new [title]` | 创建独立 thread，旧 thread 保留。 |
-| `ThreadStore.ForkThread(...)`（内部 V1） | 在 `internal/store` 发布带新 ID 的 source-preserving child ledger：复制完整 committed event prefix、重建 journal hash/seq、记录 parent provenance 并复制前缀 artifacts；拒绝 active/pending compaction/checkpoint/task-derived 状态，不回滚 source/workspace/git/外部副作用。 |
-| `Session.Fork(...)` / `/fork` | `chat` 打开继承 source frozen system prompt 与配置的 child；TUI `/fork` 仅 idle、无参数，自动使用最新完整 committed turn；child 打开成功后才切换 active 并清理旧 queue/side/tool/task UI。 |
-| idle 两阶段 `Esc` backtrack | 加载已有 committed prefix 的历史 prompt selector；确认后在选中 prompt 前创建 child，成功后回填 composer 而不写入 child transcript；首个 prompt、busy、compacting、pending approval 和 side question in-flight 按 V1 边界拒绝。 |
+| `ThreadStore.ForkThread(...)`（内部 V1） | 在 `internal/store` 发布带新 ID 的 source-preserving child ledger：空 `lastTurnID` 选择 latest，非空值复制完整 committed event prefix，重建 journal hash/seq、记录 parent provenance 并复制前缀 artifacts；拒绝 active/pending compaction/checkpoint/task-derived 状态，不回滚 source/workspace/git/外部副作用。显式 before-first 边界由 `ForkThreadBeforeFirstTurn` 单独提供。 |
+| `Session.Fork(...)` / `/fork` | `chat` 打开继承 source frozen system prompt 与配置的 child；TUI `/fork` 仅 idle、无参数，自动使用最新完整 committed turn。`Session.ForkBeforeFirstTurn` 打开只含 `thread.created`、无 turn groups 的 child；child 打开成功后才切换 active 并清理旧 queue/side/tool/task UI。 |
+| idle 两阶段 `Esc` backtrack | 加载所有可见 committed user prompt 的历史 prompt selector，包括首个 prompt；确认后在选中 prompt 前创建 child，首个走显式 before-first 边界，后续复制 committed prefix，成功后回填 composer 而不写入 child transcript；busy、compacting、pending approval 和 side question in-flight 仍按 V1 边界拒绝。 |
 | `/clear` | 与 `/new` 相同地创建并切换到新 thread，同时清空旧队列；不重写旧 thread。 |
 | `/compact [focus]` | 创建或合并派生 checkpoint；raw turn/artifact 不删除。 |
 | `/context` | 展示预算、checkpoint、热/省略 group、planner fallback、最后 compaction outcome/reason、low-gain streak、自动暂停原因及 operation 关联的 provider usage；cache-read 仅在 provider 明确报告时显示。 |

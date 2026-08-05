@@ -2,6 +2,7 @@ package tui
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +23,7 @@ func TestParseSlash(t *testing.T) {
 		{"/btw what changed?", slashSide, "what changed?"},
 		{"/side what changed?", slashSide, "what changed?"},
 		{"/BTW", slashSide, ""},
+		{"/StEeR  change   direction  ", slashSteer, "change   direction"},
 		{"/usage", slashUsage, ""},
 		{"/usage off", slashUsage, "off"},
 		{"/context", slashContext, ""},
@@ -38,6 +40,8 @@ func TestParseSlash(t *testing.T) {
 		{"/delete 20260715-120000-abc123", slashDelete, "20260715-120000-abc123"},
 		{"/queue", slashQueue, ""},
 		{"/queue clear", slashQueue, "clear"},
+		{"/queue drop 2", slashQueue, "drop 2"},
+		{"/queue edit 2 replacement text", slashQueue, "edit 2 replacement text"},
 		{"/permissions", slashPermissions, ""},
 		{"/policy", slashPermissions, ""},
 		{"/memory", slashMemory, ""},
@@ -80,7 +84,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/rules", "/btw", "/side", "/usage",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/rules", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact",
 		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue",
 		"/permissions", "/policy",
@@ -110,7 +114,7 @@ func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
 		"/help": false, "/status": false, "/rules": false, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/permissions": false,
-		"/btw":   true,
+		"/btw": true, "/steer": true,
 		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
 		"/delete": true, "/queue": true, "/memory": true,
 	}
@@ -123,6 +127,18 @@ func TestSlashCatalogNeedsArg(t *testing.T) {
 			t.Fatalf("%s NeedsArg=%v want %v", cmd.Name, cmd.NeedsArg, need)
 		}
 	}
+}
+
+func TestSlashCatalogQueueDescriptionIncludesControls(t *testing.T) {
+	for _, cmd := range slashCatalog() {
+		if cmd.Name == "/queue" {
+			if !strings.Contains(cmd.Description, "clear/drop/edit") {
+				t.Fatalf("queue catalog description = %q", cmd.Description)
+			}
+			return
+		}
+	}
+	t.Fatal("slash catalog is missing /queue")
 }
 
 func TestSlashMenuActive(t *testing.T) {
@@ -184,9 +200,9 @@ func TestFilterSlashCommandsMatrix(t *testing.T) {
 		{"/cl", []string{"/clear"}},
 		{"/cle", []string{"/clear"}},
 		{"/clear", []string{"/clear"}},
-		{"/s", []string{"/status", "/btw", "/sessions"}},
+		{"/s", []string{"/status", "/btw", "/steer", "/sessions"}},
 		{"/si", []string{"/btw"}},
-		{"/st", []string{"/status"}},
+		{"/st", []string{"/status", "/steer"}},
 		{"/se", []string{"/sessions"}},
 		{"/stat", []string{"/status"}},
 		{"/sess", []string{"/sessions"}},

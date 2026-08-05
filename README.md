@@ -239,7 +239,7 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 | Home / End | 跳到 transcript 顶部 / 底部（End 恢复 stick-to-bottom） |
 | 鼠标滚轮 | 滚动 transcript |
 | Ctrl+T | 展开 / 收起当前复杂任务的只读进度（状态、目标、范围、当前工作与 gap） |
-| Esc | busy 时中断当前轮并保存复杂任务的 `interrupted` 状态；idle 时第一次进入 backtrack armed，第二次打开历史 prompt selector |
+| Esc | busy 时中断当前轮并保存复杂任务的 `interrupted` 状态；idle 且 composer 为空时第一次进入 backtrack armed，第二次打开历史 prompt selector；非空草稿保持不变 |
 | Ctrl+C | busy 时中断；idle 时退出 |
 | Ctrl+D | idle 且输入为空时退出 |
 | `/help` | 帮助 |
@@ -263,9 +263,9 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 
 工具调用显示为 Claude/Codex 风格卡片（`⚙ name` + 缩进 `⎿` 结果，JSON 会 pretty-print）；assistant 回复在完成后对 markdown/代码块做终端渲染（流式阶段为纯文本）。idle 状态栏显示 `provider/model` / 短 session id / API usage / `cost~` / 可选 context 快照；复杂任务显示紧凑的 `task:n/m` 进度，`Ctrl+T` 可展开只读的状态、目标、范围、当前工作与 gap，busy 状态栏还会显示当前工具名与 `queued:N`。上滚离开底部时状态栏提示 `↑ End to follow`。每轮完成后会显示该轮的 `API usage: prompt / generation / total / calls`，不会把 API 请求输入误称为用户输入。
 
-生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/rules`、`/btw`、`/side`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；旁路问题不进入该队列，也不打断当前 turn，多个旁路问题可以并发执行。busy 时 `Esc` / `Ctrl+C` 中断当前 turn；idle 时连续两次 `Esc` 进入 backtrack 选择。`/compact`、`/clear`、`/new`、`/resume`、`/fork`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle；`/fork` 也不会进入 FIFO。
+生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/rules`、`/btw`、`/side`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；旁路问题不进入该队列，也不打断当前 turn，多个旁路问题可以并发执行。busy 时 `Esc` / `Ctrl+C` 中断当前 turn；backtrack requires an empty composer，idle 且 composer 非空时 `Esc` 保持草稿且不 arm/open，composer 为空时连续两次 `Esc` 进入 backtrack 选择。`/compact`、`/clear`、`/new`、`/resume`、`/fork`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle；`/fork` 也不会进入 FIFO。
 
-Idle backtrack 展示 source 中有可见 user prompt 的 committed turn，包括首个 committed turn。确认首个 prompt 时，TUI 通过显式 before-first fork 创建空 committed prefix 的 source-preserving child；普通 `Session.Fork` 的空边界仍表示 latest，不能混用。确认选择后，TUI 在该 prompt 之前创建 child，source 保持不变，并把选中的 prompt 放回 child composer 供编辑；它不会把选中的 prompt 预写入 child transcript。fork 失败时 selector 关闭、source 仍 active、prompt 保留在 composer 并显示错误。busy、compacting、pending approval 或 side question in-flight 时拒绝 backtrack。该能力不回滚 workspace、Git、网络请求、进程、provider usage、权限、semantic memory 或其他外部副作用；它不是 destructive rewind，也不是 OpenCode/Gemini CLI 的文件恢复 checkpoint。
+Idle backtrack 展示 source 中有可见 user prompt 的 committed turn，包括首个 committed turn。backtrack requires an empty composer；idle 时普通非空草稿按 `Esc` 保持原样，既不 arm 也不打开 selector，slash menu 仍先由 `Esc` 关闭。确认首个 prompt 时，TUI 通过显式 before-first fork 创建空 committed prefix 的 source-preserving child；普通 `Session.Fork` 的空边界仍表示 latest，不能混用。确认选择后，TUI 在该 prompt 之前创建 child，source 保持不变，并把选中的 prompt 放回 child composer 供编辑；它不会把选中的 prompt 预写入 child transcript。fork 失败时 selector 关闭、source 仍 active、prompt 保留在 composer 并显示错误。busy、compacting、pending approval 或 side question in-flight 时拒绝 backtrack。该能力不回滚 workspace、Git、网络请求、进程、provider usage、权限、semantic memory 或其他外部副作用；它不是 destructive rewind，也不是 OpenCode/Gemini CLI 的文件恢复 checkpoint。
 
 `/btw` / `/side` 是本仓库的安全子集，不是完整的持久 fork。请求使用命令开始时当前 active session 的 frozen system prompt 和 transcript 作为 reference-only；旧指令、历史、tool calls/results、approvals 都不作为 active instructions，只有新问题是 active input。旁路路径不调用 tools 或 subagents，不写主 session ledger、`usage`、`journal`，也不修改文件、git state、configuration 或 permissions。回答、生成错误和空回答错误都显示在独立的 side-only 区域（`[btw]` / `[side]`），空问题也会显示可见的 usage error；它们不会进入主 transcript。嵌入调用方没有提供 callback 时显示 `side unavailable`。该行为参考了 [旁路对话研究笔记](docs/research/side-conversation-cross-product-research.md)，但不宣称与 Codex 或 Claude Code 的行为完全等价。
 
@@ -337,6 +337,6 @@ go tool golangci-lint run ./...
 9. 发送几条消息后 ↑/↓ 可浏览输入历史；长会话 `/resume` 后用 PgUp/Home 分页加载更早 user 消息
 10. 给出多步骤编码需求，确认模型先使用 `task_plan`；每个 proof 绑定真实 `shell` 成功结果，`task_complete` 前不可交付；`Esc` 中断后已接受证据保留，恢复时先检查或重规划未完成节点
 11. idle 且无参数执行 `/fork`：自动生成 child ID，child 打开成功前 source 仍 active 且 source ledger 不变；成功后切到 child，确认 source title 与 frozen system prompt 继承，旧 queue、side、tool/reasoning card、task UI 清理。busy、compacting、pending approval 或带参数时拒绝，且 busy 时保留 composer draft、不入队
-12. idle 时连续按两次 `Esc`：打开有可见 user prompt 的 committed history selector（包括首个 prompt）；确认后 source 保持不变、child 在选中 prompt 前创建，首个 prompt 走显式 before-first 空 committed prefix，prompt 回填 composer 且不预写入 child transcript；普通 `/fork` 的空边界仍表示 latest，fork 失败时恢复 prompt。busy、compacting、pending approval 和 side question in-flight 均按 V1 边界处理
+12. idle 且 composer 为空时连续按两次 `Esc`：打开有可见 user prompt 的 committed history selector（包括首个 prompt）；非空草稿按 `Esc` 保持不变且不 arm/open，slash menu 仍先关闭；确认后 source 保持不变、child 在选中 prompt 前创建，首个 prompt 走显式 before-first 空 committed prefix，prompt 回填 composer 且不预写入 child transcript；普通 `/fork` 的空边界仍表示 latest，fork 失败时恢复 prompt。busy、compacting、pending approval 和 side question in-flight 均按 V1 边界处理
 
 `--json` 是 Codex-compatible 的 `--output-format stream-json` 别名：它输出同一套 JSONL（首条 `session.started`、activity、最终 `result`、`stream_version`、`sequence` 以及错误/退出语义完全复用），不是单一最终 JSON 文档。它支持 fresh exec、`exec resume`、`exec resume --last` 和 fresh `--ephemeral`；与显式 `--output-format stream-json` 等价，与显式 `json` 或 `text` 组合返回 input error。

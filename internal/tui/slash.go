@@ -12,6 +12,7 @@ const (
 	slashStatus
 	slashRules
 	slashSide
+	slashSteer
 	slashContext
 	slashCompact
 	slashNew
@@ -49,6 +50,7 @@ func slashCatalog() []slashCommand {
 		{Name: "/status", Description: "model, session, tokens, cost, max_step, context"},
 		{Name: "/rules", Description: "show captured instruction source metadata (no reload)"},
 		{Name: "/btw", Aliases: []string{"/side"}, Description: "ask a temporary side question without interrupting the current turn", NeedsArg: true},
+		{Name: "/steer", Description: "redirect the current regular turn without starting another turn", NeedsArg: true},
 		{Name: "/usage", Description: "toggle turn usage footer (on|off|toggle)", NeedsArg: true},
 		{Name: "/context", Description: "context budget, checkpoints, and compaction status"},
 		{Name: "/compact", Description: "summarize stable turns and free context", NeedsArg: true},
@@ -58,7 +60,7 @@ func slashCatalog() []slashCommand {
 		{Name: "/fork", Description: "fork the current session at its latest committed turn"},
 		{Name: "/delete", Description: "delete a saved session (not the active one)", NeedsArg: true},
 		{Name: "/title", Description: "rename the current session", NeedsArg: true},
-		{Name: "/queue", Description: "list queued follow-ups (or: clear)", NeedsArg: true},
+		{Name: "/queue", Description: "list queued follow-ups (or: clear/drop/edit/resume)", NeedsArg: true},
 		{Name: "/permissions", Aliases: []string{"/policy"}, Description: "shell/apply_patch policy and session allows"},
 		{Name: "/memory", Description: "project memory (list|add|update|delete|accept|on|off|generate|status|rebuild|reset --confirm)", NeedsArg: true},
 		{Name: "/clear", Description: "clear screen and start a new thread (previous thread retained)"},
@@ -157,6 +159,8 @@ func parseSlash(input string) (slashAction, string) {
 		return slashRules, arg
 	case "/btw", "/side":
 		return slashSide, arg
+	case "/steer":
+		return slashSteer, arg
 	case "/usage":
 		return slashUsage, arg
 	case "/context":
@@ -193,6 +197,7 @@ func helpText() string {
 		"  /status            model, session, tokens, cost, max_step, context",
 		"  /rules             captured instruction sources and budgets (no reload)",
 		"  /btw <question>    ask a temporary side question without interrupting the current turn (alias: /side)",
+		"  /steer <text>      steer only the active regular busy turn; failures are not queued",
 		"  /usage [on|off]    show/toggle per-turn API usage footer (default on)",
 		"  /context           context budget, checkpoints, and compaction status",
 		"  /compact [focus]   summarize stable turns and free context",
@@ -204,6 +209,9 @@ func helpText() string {
 		"  /title <text>      rename the current session",
 		"  /queue             list queued follow-ups",
 		"  /queue clear       drop all queued follow-ups",
+		"  /queue drop <1-based-index>  drop one queued follow-up",
+		"  /queue edit <1-based-index> <new text>  edit one queued follow-up in place",
+		"  /queue resume      continue a queue paused after a turn error",
 		"  /permissions       tool policy, workspace clamp, session allows",
 		"  /memory            project memory (list|add|update|delete|accept|on|off|generate|status|rebuild)",
 		"  /memory reset --confirm  clear this workspace's semantic memory; keep session threads",
@@ -218,11 +226,12 @@ func helpText() string {
 		"  ctrl+t    show/hide complex task progress when available",
 		"  pgup/pgdn scroll transcript (or review a long host-escalation command)",
 		"  home/end  jump to top / bottom of transcript",
-		"  esc       idle: first arms backtrack; second opens history prompt selector",
+		"  esc       idle with an empty composer: first arms backtrack; second opens history prompt selector",
 		"            selector Esc cancels; busy Esc interrupts turn/compaction; approval Esc denies; slash menu Esc dismisses",
+		"            backtrack requires an empty composer; Esc leaves a non-empty draft unchanged",
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
-		"While busy, /help /context /status /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; side questions never enter the FIFO queue.",
+		"While busy, /steer <text> targets only the active regular turn and failed admission is never queued; /help /context /status /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; /queue resume is only available when idle; while busy/compacting, retry after the current operation finishes and the queue remains paused; side questions never enter the FIFO queue.",
 		"Mutative commands (/compact /clear /new /resume /fork /title /delete /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny). Status shows cmd=ask|auto.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",

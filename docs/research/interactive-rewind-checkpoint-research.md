@@ -111,8 +111,9 @@ feature opt-in, which is a different tradeoff from OpenCode's Git prerequisite.
 
 **Documented/source facts.** The current Codex TUI's `app_backtrack` module
 describes a two-stage interaction: the first `Esc` primes backtrack, the next
-opens a transcript overlay, and `Enter` requests a fork before the selected user
-prompt. The selected prompt is restored in the new branch's composer for editing.
+opens a transcript overlay, and `Enter` requests backtracking for the selected
+user prompt. Later prompts use a source-preserving fork before the selected
+prompt, and the selected prompt is restored in the new branch's composer for editing.
 The source rejects editing previous prompts while a side conversation is active
 and restores the prompt with a visible error if branching fails. ([Codex
 backtrack source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app_backtrack.rs))
@@ -121,6 +122,20 @@ The source makes this a state machine: the first `Esc` captures a base thread
 identity, the overlay highlights a user-message selection, and the selection is
 invalid if the thread changes before confirmation. This is source evidence for
 interaction and stale-selection handling, not proof of workspace restoration.
+
+**Documented/source fact.** In the current public Codex sources, recorded for
+this note on 2026-08-04, `backtrack_fork_before_turn_id` returns `None` for the
+first prompt. The dispatcher in `event_dispatch.rs` sends that case through
+`start_thread_with_session_start_source(..., None)`; for a later prompt it calls
+`fork_thread_at(..., before_turn_id=Some(...))`. This is a source-level
+distinction between the first-prompt and later-prompt paths. ([Codex backtrack
+source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app_backtrack.rs),
+[Codex event dispatch source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app/event_dispatch.rs))
+
+**Local persistence choice.** This repository represents the first-prompt
+boundary with a source-preserving empty child containing only `thread.created`.
+That is a local persistence-layer tradeoff; it does not claim workspace, Git, or
+external-side-effect rollback.
 
 The public app-server fork schema supports a new thread forked from a stored
 thread, an optional inclusive last-turn boundary, and per-fork model,
@@ -224,7 +239,8 @@ All links were accessed or attempted on 2026-08-04.
 3. Google Gemini CLI, [session management](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/session-management.md),
    latest observed file commit `93844d` (2026-06-18).
 4. OpenAI Codex, [TUI backtrack source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app_backtrack.rs),
-   latest observed file commit `7dc1856` (2026-08-01).
+   latest observed file commit `7dc1856` (2026-08-01), and [event dispatch source](https://github.com/openai/codex/blob/main/codex-rs/tui/src/app/event_dispatch.rs)
+   — cited for the first-prompt dispatch distinction above.
 5. OpenAI Codex, [thread fork schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/ThreadForkParams.json),
    latest observed file commit `328e951` (2026-06-27).
 6. OpenAI Codex, [thread rollback schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/json/v2/ThreadRollbackParams.json),

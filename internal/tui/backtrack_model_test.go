@@ -55,6 +55,49 @@ func TestBacktrackDoubleEscLoadsPromptsAndNavigates(t *testing.T) {
 	}
 }
 
+func TestBacktrackEscDoesNotArmWithNonEmptyComposer(t *testing.T) {
+	m := newTestModel(t)
+	draft := "ordinary draft"
+	m.textarea.SetValue(draft)
+	m.syncComposerHeight()
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(*model)
+	if cmd != nil {
+		t.Fatalf("Esc with a draft returned command: %v", cmd)
+	}
+	if m.backtrackState.mode != backtrackInactive {
+		t.Fatalf("Esc with a draft changed backtrack state: %#v", m.backtrackState)
+	}
+	if got := m.textarea.Value(); got != draft {
+		t.Fatalf("Esc with a draft changed composer: %q", got)
+	}
+}
+
+func TestBacktrackEscDoesNotOpenWhenArmedAndComposerGetsDraft(t *testing.T) {
+	m := newTestModel(t)
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(*model)
+	if m.backtrackState.mode != backtrackArmed {
+		t.Fatalf("first Esc state=%#v, want armed", m.backtrackState)
+	}
+
+	draft := "draft after arming"
+	m.textarea.SetValue(draft)
+	m.syncComposerHeight()
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(*model)
+	if cmd != nil {
+		t.Fatalf("second Esc with a draft returned command: %v", cmd)
+	}
+	if m.backtrackState.mode != backtrackArmed {
+		t.Fatalf("second Esc with a draft changed backtrack state: %#v", m.backtrackState)
+	}
+	if got := m.textarea.Value(); got != draft {
+		t.Fatalf("second Esc with a draft changed composer: %q", got)
+	}
+}
+
 func TestBacktrackForksBeforeSelectedPromptAndRefillsComposer(t *testing.T) {
 	m, source, _ := newBacktrackModel(t, 3)
 	sourceTranscript := source.Transcript()
@@ -300,7 +343,6 @@ func TestBacktrackRejectsBusyApprovalSideAndNoHistory(t *testing.T) {
 			t.Fatalf("side rejection missing: %#v", m.lines)
 		}
 	})
-
 }
 
 func TestBacktrackEscDismissesSlashMenuWithoutArming(t *testing.T) {

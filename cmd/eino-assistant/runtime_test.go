@@ -28,6 +28,16 @@ func TestCaptureStartupCWDReadsTheProcessDirectoryOnce(t *testing.T) {
 	}
 }
 
+func TestRuntimeReActOptionsEnableExplicitSteer(t *testing.T) {
+	options := runtimeReActOptions(4, nil)
+	if !options.EnableSteer {
+		t.Fatal("production ReAct options must enable explicit steer")
+	}
+	if options.MaxStep != 4 {
+		t.Fatalf("max steps = %d, want 4", options.MaxStep)
+	}
+}
+
 func TestCaptureStartupCWDPreservesReaderError(t *testing.T) {
 	want := errors.New("getcwd failed")
 	_, err := captureStartupCWD(func() (string, error) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +52,28 @@ func TestNewReActModelPreservesDefaultMaxStep(t *testing.T) {
 	}
 	if got, want := MaxStep, DefaultMaxStep; got != want {
 		t.Errorf("MaxStep = %d, want %d", got, want)
+	}
+	if model.steer == nil {
+		t.Fatal("production ReAct constructor did not opt into explicit steer")
+	}
+}
+
+func TestReActModelCanExplicitlyDisableSteer(t *testing.T) {
+	timeTool, err := tools.NewGetCurrentTime(time.Now)
+	if err != nil {
+		t.Fatalf("NewGetCurrentTime() error = %v", err)
+	}
+	model, err := NewReActModelWithOptions(context.Background(), &scriptedToolModel{}, []tool.BaseTool{timeTool}, ReActOptions{
+		DisableSteer: true,
+	})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions() error = %v", err)
+	}
+	if model.steer != nil {
+		t.Fatal("explicitly disabled ReAct steer capability was initialized")
+	}
+	if err := model.RegisterTurnSteer("turn-1", nil); !errors.Is(err, chat.ErrSteerUnsupported) {
+		t.Fatalf("RegisterTurnSteer() error = %v, want ErrSteerUnsupported", err)
 	}
 }
 
@@ -415,6 +438,91 @@ func TestReActModelStreamsPlainAnswersWithoutTools(t *testing.T) {
 	}
 }
 
+func TestReActSteerIsDeliveredOnlyAtNextModelBoundary(t *testing.T) {
+	blockingTool := &steerBlockingTool{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		args:    make(chan string, 1),
+	}
+	fake := &scriptedToolModel{responses: []modelResponse{
+		{message: &schema.Message{
+			Role: schema.Assistant,
+			ToolCalls: []schema.ToolCall{{
+				ID:   "steer-tool-call",
+				Type: "function",
+				Function: schema.FunctionCall{
+					Name:      "steer_block",
+					Arguments: `{"value":"keep"}`,
+				},
+			}},
+		}},
+		{message: schema.AssistantMessage("final answer", nil)},
+	}}
+	model, err := NewReActModelWithOptions(context.Background(), fake, []tool.BaseTool{blockingTool}, ReActOptions{
+		EnableSteer: true,
+	})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions: %v", err)
+	}
+	session, err := chat.NewSession(model, "system", chat.SessionOptions{Store: newTestThreadStore(t)})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	askDone := make(chan error, 1)
+	go func() { askDone <- session.Ask(context.Background(), "original", nil) }()
+	select {
+	case <-blockingTool.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for tool execution")
+	}
+	turnID, ok := session.ActiveTurnID()
+	if !ok {
+		t.Fatal("active ReAct turn did not expose a steer ID")
+	}
+	if err := session.Steer(context.Background(), turnID, "redirect at next decision"); err != nil {
+		t.Fatalf("Steer during tool execution: %v", err)
+	}
+	close(blockingTool.release)
+	if err := <-askDone; err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+
+	select {
+	case args := <-blockingTool.args:
+		if args != `{"value":"keep"}` {
+			t.Fatalf("tool arguments = %q, steer must not rewrite tool parameters", args)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for tool arguments")
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("underlying model calls = %d, want 2", len(fake.requests))
+	}
+	for _, message := range fake.requests[0] {
+		if message != nil && message.Role == schema.User && message.Content == "redirect at next decision" {
+			t.Fatal("steer was delivered before the tool finished")
+		}
+	}
+	foundSteer := false
+	for _, message := range fake.requests[1] {
+		if message != nil && message.Role == schema.User && message.Content == "redirect at next decision" {
+			foundSteer = true
+		}
+	}
+	if !foundSteer {
+		t.Fatalf("next model request did not contain steer: %#v", fake.requests[1])
+	}
+	steerCount := 0
+	for _, message := range session.Transcript() {
+		if message != nil && message.Role == schema.User && message.Content == "redirect at next decision" {
+			steerCount++
+		}
+	}
+	if steerCount != 1 {
+		t.Fatalf("committed steer count = %d, want exactly 1", steerCount)
+	}
+}
+
 func TestReActTaskCallbackCreatesPlanRequiredGateAfterUnplannedPatch(t *testing.T) {
 	workspace := t.TempDir()
 	patchTool, err := tools.NewApplyPatch(tools.ApplyPatchOptions{
@@ -726,6 +834,31 @@ type scriptedToolModel struct {
 	responses []modelResponse
 	calls     int
 	requests  [][]*schema.Message
+}
+
+type steerBlockingTool struct {
+	started     chan struct{}
+	startedOnce sync.Once
+	release     chan struct{}
+	args        chan string
+}
+
+func (*steerBlockingTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: "steer_block", Desc: "block until released"}, nil
+}
+
+func (t *steerBlockingTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+	t.startedOnce.Do(func() { close(t.started) })
+	select {
+	case t.args <- argumentsInJSON:
+	default:
+	}
+	select {
+	case <-t.release:
+		return "tool result", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 func (m *scriptedToolModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {

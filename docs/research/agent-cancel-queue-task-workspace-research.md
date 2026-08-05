@@ -2,7 +2,7 @@
 
 > 状态：业界调研笔记，不是实现方案，也不审计当前仓库。
 >
-> 调研日期：2026-07-17。CLI、API 与源码行为会演进；采用前应复核引用版本。
+> 调研日期：2026-07-17；2026-08-04 对 Codex、OpenCode 与 Roo Code 做 current source recheck。CLI、API 与源码行为会演进；采用前应复核引用版本。
 >
 > 范围：用户连续取消、追加输入或新建对话时，agent runtime 如何保持 turn / task 的顺序、如何传播取消，以及如何隔离和回收任务工作目录。
 >
@@ -85,6 +85,31 @@ OpenCode 公共源码（commit `3a1c6df9e24672f0761a6ced18e1315d89334baf`）的�
 - runner 在运行前校验 session 记录的 `directory`、`workspaceID` 与当前 runtime 仍相同，否则直接 interrupt，防止任务被移交 / 附着点替换后旧 runtime 继续执行。[O3]
 
 **重要限制**：同一源码也标注“单机 active drain”尚未替换为“多节点 durable ownership”，且 cancellation settlement 仍是待完成项。[O3] 因此它支持单机队列化与身份校验的价值，但不能单独证明分布式场景已经安全。
+
+### 3.4 2026-08-04 current source recheck
+
+本节只记录本次对公开来源的当前版本复核，不把旧快照的结论伪装成当前产品承诺。以下标签用于区分证据层级：**Documented fact** 是来源直接显示或明确写出的行为；**Cross-product synthesis** 是由多个产品事实归纳出的研究结论；**Evidence gap** 是当前公开材料无法证明的部分。
+
+#### Documented fact
+
+- **Codex current main**：`steer_input` 只接受 active regular turn；可选的 `expected_turn_id` 不匹配会被显式拒绝，review / compact turn 不可 steer。成功时，`UserInput` 会进入 turn-local pending input，并发出 `Steer` activity。[C5][C7]
+- **Codex handlers / feature**：handlers 先尝试 steer；只有 `NoActiveTurn` 才启动普通 regular task，其他错误会发出 error event。`Steer` feature 注释显示 Enter 已即时 steer，相关 flag 仅为兼容保留，行为恒启用。[C6][C8]
+- **OpenCode current dev**：`PromptAdmitted` 形成 durable sequence 后，分别执行按 admitted order 的 promotion steer 与 queue promotion；queue 只提取一条 FIFO 输入，再提升为 steer。[O4]
+- **OpenCode coordinator / runner**：每个 key 只有一个 active drain；`pendingWake` 合并后继唤醒，interrupt 会清除 pending wake 并等待 owner。runner 会校验 `directory` 与 `workspaceID`；当前注释仍将多节点 durable ownership 与 cancellation settlement 标为未完成。[O5][O6]
+- **Roo Code 产品文档**：FIFO queued messages 对用户可见、可编辑、可删除、不可重排；发生错误时消息保留。这是产品文档事实 / 厂商自述，不足以推出其内部 run identity。[R1]
+
+#### Cross-product synthesis（研究结论，不是本仓库实现计划）
+
+- **steer、queue、side question / fork 必须分语义**：Codex 的即时 steer、OpenCode 的 durable steer / FIFO queue 分层，以及既有 Claude Code 旁路问题与并行工作区材料，共同说明“新输入”不是单一投递动作。[C5][C6][O4][A1][A2]
+- **steer 的最小安全合同**至少需要 target run / turn identity、active / steerable 状态、显式 mismatch / rejection、单 active drain，以及 cancellation settlement。这里是跨产品研究归纳，不是任一产品公开 API 的完整规范。[C5][C6][O5][O6]
+- **不能直接把 FIFO queue 替换成 steer**：queue 保留顺序并等待后继执行，steer 则把输入注入既有活动 turn；两者在目标、时机和失败处理上不同。Roo Code 的可见 FIFO 队列也说明 queue 是独立的用户语义，而不是 steer 的 UI 别名。[C5][O4][R1]
+
+#### Evidence gap
+
+- Claude Code official interactive docs 在本环境的 2026-08-04 访问尝试超时；本次 recheck 不把记忆中的行为写成 current documented fact，仅保留既有 URL 和此前已记录的证据边界。[A5]
+- Roo Code 文档没有公开 run identity、steer target 或 cancellation settlement；可见、可编辑的 FIFO 队列不能证明其内部如何防止旧 run 迟到事件。[R1]
+- OpenCode 当前源码的注释明确保留多节点 durable ownership 与 cancellation settlement 缺口；因此不能从单机 coordinator 直接推断分布式所有权或完整取消终态已经安全。[O5][O6]
+- Codex 当前文件展示了 steer 的目标 turn、拒绝条件和 pending input 路径，但这些文件本身不能证明跨节点 ownership、所有外部工具的取消结算，或工作区回收已经由产品整体承诺。[C5][C6][C7]
 
 ## 4. 综合状态模型（推断，不是某产品 API）
 
@@ -212,7 +237,7 @@ OpenAI 的 OpenAPI 说明 `responses/{id}/cancel` 只适用于 background respon
 
 ## References
 
-访问日期均为 2026-07-17。
+既有来源访问日期为 2026-07-17；以下 current source recheck 来源于 2026-08-04。Claude Code 的当前访问尝试超时，相关 URL 仅作为 evidence gap 保留。
 
 - [A1] Claude Code, [Interactive mode](https://code.claude.com/docs/en/interactive-mode) — `Ctrl+C` / `Esc` 中断、`/btw` 旁路问题与 background controls。
 - [A2] Claude Code, [Common workflows: Run parallel sessions with worktrees](https://code.claude.com/docs/en/common-workflows) — `--worktree` 隔离并行 session。
@@ -228,3 +253,12 @@ OpenAI 的 OpenAPI 说明 `responses/{id}/cancel` 只适用于 background respon
 - [O3] OpenCode source, [`session/runner/llm.ts` at `3a1c6df`](https://github.com/anomalyco/opencode/blob/3a1c6df9e24672f0761a6ced18e1315d89334baf/packages/core/src/session/runner/llm.ts) — active drain、directory / workspace validation 与明确的分布式限制。
 - [P1] OpenAI, [`openapi.yaml` at `db3e531`](https://github.com/openai/openai-openapi/blob/db3e53198a66732cfe161339ea63bf36fc0137ad/openapi.yaml) — Responses cancel endpoint 仅用于 `background=true` response。
 - [T1] Temporal, [Cancel a Workflow - TypeScript SDK](https://docs.temporal.io/develop/typescript/workflows/cancellation) — heartbeat、取消投递时机、cleanup 与 cancelled 终态。
+- [C5] OpenAI Codex current main source, [`session/mod.rs` at `f6af2f2`](https://github.com/openai/codex/blob/f6af2f206a01d1d56559fab9f89a49ff706a186c/codex-rs/core/src/session/mod.rs) — active regular turn steering、`expected_turn_id` mismatch rejection、不可 steer turn 与 pending input 路径（accessed 2026-08-04）。
+- [C6] OpenAI Codex current main source, [`session/handlers.rs` at `8ed7a7b`](https://github.com/openai/codex/blob/8ed7a7badd51c707b22252520b0f68cdd2669790/codex-rs/core/src/session/handlers.rs) — 先尝试 steer、`NoActiveTurn` fallback 到 regular task、其他错误发 error event（accessed 2026-08-04）。
+- [C7] OpenAI Codex current main source, [`session/input_queue.rs` at `34f6f77`](https://github.com/openai/codex/blob/34f6f778d7dab9d75f341cdefe50b2933d18fbd3/codex-rs/core/src/session/input_queue.rs) — turn-local pending input 与 `Steer` activity（accessed 2026-08-04）。
+- [C8] OpenAI Codex current main source, [`features/src/lib.rs` at `937dd14`](https://github.com/openai/codex/blob/937dd1407a63684f5573cae89b292e131feb3e9e/codex-rs/features/src/lib.rs) — Enter 已即时 steer、兼容 flag 与恒启用行为的 feature 注释（accessed 2026-08-04）。
+- [O4] OpenCode current dev source, [`session/input.ts` at `14b6136`](https://github.com/anomalyco/opencode/blob/14b613678dbe0deb3f14fe4c16ffe26db1f75b4a/packages/core/src/session/input.ts) — durable `PromptAdmitted` sequence、steer promotion 与单条 FIFO queue promotion（accessed 2026-08-04）。
+- [O5] OpenCode current dev source, [`session/run-coordinator.ts` at `2f89aff`](https://github.com/anomalyco/opencode/blob/2f89aff9e3d202ec4bbca181e551438ba01f4667/packages/core/src/session/run-coordinator.ts) — per-key 单 active drain、`pendingWake` 合并与 interrupt 等待 owner（accessed 2026-08-04）。
+- [O6] OpenCode current dev source, [`session/runner/llm.ts` at `72c761e`](https://github.com/anomalyco/opencode/blob/72c761e10d93e325ee6d99cb57b1c13923fd242a/packages/core/src/session/runner/llm.ts) — directory / workspaceID 校验，以及多节点 ownership、cancellation settlement 的未完成注释（accessed 2026-08-04）。
+- [R1] Roo Code, [Message queuing](https://roocodeinc.github.io/Roo-Code/features/message-queueing) — FIFO queued messages 的可见、可编辑、可删除、不可重排与错误保留行为（accessed 2026-08-04；产品文档 / 厂商自述）。
+- [A5] Claude Code, [Interactive mode](https://code.claude.com/docs/en/interactive-mode) — 2026-08-04 current recheck 在本环境连接超时；不据此新增当前行为事实，保留为 evidence gap。

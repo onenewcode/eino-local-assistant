@@ -215,20 +215,27 @@ func TestDeleteRefusesActiveAndDeletesOther(t *testing.T) {
 
 func TestQueueListAndClear(t *testing.T) {
 	m := newTestModel(t)
+	m.queuePaused = true
 	m.queue = []string{"one", "two"}
 	next, _ := m.submit("/queue")
 	mm := next.(*model)
-	if !hasLineContaining(mm.lines, lineSystem, "Queue (2):") {
+	if !hasLineContaining(mm.lines, lineSystem, "Queue (2) [paused]:") {
 		t.Fatalf("queue list missing: %#v", mm.lines)
 	}
 	if !hasLineContaining(mm.lines, lineSystem, "1. one") {
 		t.Fatalf("queue item missing: %#v", mm.lines)
+	}
+	if !hasLineContaining(mm.lines, lineSystem, "queue edit <1-based-index> <new text>") {
+		t.Fatalf("queue edit hint missing: %#v", mm.lines)
 	}
 
 	next, _ = mm.submit("/queue clear")
 	mm = next.(*model)
 	if len(mm.queue) != 0 {
 		t.Fatalf("queue should be empty, got %#v", mm.queue)
+	}
+	if mm.queuePaused {
+		t.Fatal("queue clear must clear the pause marker")
 	}
 	if !hasLineContaining(mm.lines, lineSystem, "queue cleared") {
 		t.Fatalf("clear confirmation missing: %#v", mm.lines)
@@ -239,6 +246,7 @@ func TestQueueClearRunsImmediatelyWhileBusy(t *testing.T) {
 	m := newTestModel(t)
 	m.mode = modeBusy
 	m.turnID = 7
+	m.queuePaused = true
 	m.queue = []string{"first", "second"}
 	m.textarea.SetValue("/queue clear")
 
@@ -252,6 +260,9 @@ func TestQueueClearRunsImmediatelyWhileBusy(t *testing.T) {
 	}
 	if len(mm.queue) != 0 {
 		t.Fatalf("queued follow-ups survived immediate clear: %#v", mm.queue)
+	}
+	if mm.queuePaused {
+		t.Fatal("busy queue clear must clear the pause marker")
 	}
 	if !hasLineContaining(mm.lines, lineSystem, "queue cleared (2 dropped)") {
 		t.Fatalf("missing immediate clear confirmation: %#v", mm.lines)
@@ -278,6 +289,7 @@ func TestClearCreatesDistinctDurableSession(t *testing.T) {
 		Status:       StatusInfo{Model: "test"},
 	})
 	m.queue = []string{"must not cross sessions"}
+	m.queuePaused = true
 	next, _ := m.submit("/clear")
 	mm := next.(*model)
 	if mm.deps.Session.ID() == oldID {
@@ -285,6 +297,9 @@ func TestClearCreatesDistinctDurableSession(t *testing.T) {
 	}
 	if len(mm.queue) != 0 {
 		t.Fatalf("old queue crossed /clear: %#v", mm.queue)
+	}
+	if mm.queuePaused {
+		t.Fatal("/clear must clear the queue pause marker")
 	}
 	if !hasLineContaining(mm.lines, lineSystem, "previous session retained: "+oldID) {
 		t.Fatalf("clear did not make retention explicit: %#v", mm.lines)
@@ -706,6 +721,8 @@ func TestIsQueueableInput(t *testing.T) {
 		{"/compact preserve constraints", false},
 		{"/queue", false},
 		{"/queue clear", false},
+		{"/queue drop 2", false},
+		{"/queue edit 2 replacement", false},
 		{"/unknown", true},
 		{"/new", false},
 		{"/new title", false},
@@ -741,6 +758,8 @@ func TestBusyInputDisposition(t *testing.T) {
 		{"/sessions", busyInputExecuteImmediately},
 		{"/queue", busyInputExecuteImmediately},
 		{"/queue clear", busyInputExecuteImmediately},
+		{"/queue drop 2", busyInputExecuteImmediately},
+		{"/queue edit 2 replacement", busyInputExecuteImmediately},
 		{"/compact", busyInputReject},
 		{"/compact keep test evidence", busyInputReject},
 		{"/clear", busyInputReject},
@@ -759,6 +778,12 @@ func TestBusyInputDisposition(t *testing.T) {
 
 	if !isImmediatelyExecutableWhileBusy("/queue clear") {
 		t.Fatal("/queue clear must clear queued follow-ups immediately while busy")
+	}
+	if !isImmediatelyExecutableWhileBusy("/queue drop 2") {
+		t.Fatal("/queue drop must remove a queued follow-up immediately while busy")
+	}
+	if !isImmediatelyExecutableWhileBusy("/queue edit 2 replacement") {
+		t.Fatal("/queue edit must edit a queued follow-up immediately while busy")
 	}
 }
 

@@ -1,0 +1,278 @@
+package chat
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+
+	"github.com/cloudwego/eino/schema"
+)
+
+var (
+	// ErrNoActiveTurn means the session has no durable turn that can receive steer input.
+	ErrNoActiveTurn = errors.New("no active turn")
+	// ErrSteerTurnMismatch means expectedTurnID is not the session's active durable turn ID.
+	ErrSteerTurnMismatch = errors.New("steer turn ID mismatch")
+	// ErrSteerUnsupported means the active model did not explicitly opt into turn steering.
+	ErrSteerUnsupported = errors.New("turn steering is unsupported")
+	// ErrTurnNotSteerable means the active turn has entered its ending or cancellation boundary.
+	ErrTurnNotSteerable = errors.New("turn is not steerable")
+)
+
+// TurnSteerInput is one accepted input in a turn-local steer mailbox.
+// Sequence is assigned under the session's admission lock and is never reused.
+type TurnSteerInput struct {
+	Sequence uint64
+	Content  string
+}
+
+// TurnSteerReceipt identifies one successful steer admission. The sequence is
+// allocated by the turn-local mailbox and lets a caller associate admission
+// with a later model-boundary consumption event without comparing text.
+type TurnSteerReceipt struct {
+	Sequence uint64
+	Content  string
+}
+
+// TurnSteerMailbox is the admission side of a turn-local steer mailbox.
+// A model must consume the mailbox through TurnSteerConsumer at its declared
+// model-call safe point; enqueueing never starts another Session.Ask.
+type TurnSteerMailbox interface {
+	Enqueue(context.Context, string) error
+}
+
+// TurnSteerConsumer is implemented by mailboxes passed to opt-in models.
+// TakeTurnSteers atomically removes pending inputs and returns them in admission order.
+type TurnSteerConsumer interface {
+	TurnSteerMailbox
+	TakeTurnSteers() []TurnSteerInput
+}
+
+// TurnSteerModel is the explicit opt-in contract for models that can consume
+// steer input at a safe model-call boundary. RegisterTurnSteer binds one
+// mailbox to exactly one durable turn ID; UnregisterTurnSteer must discard the
+// model's lookup for that ID after the turn reaches a terminal boundary.
+type TurnSteerModel interface {
+	Model
+	RegisterTurnSteer(turnID string, mailbox TurnSteerMailbox) error
+	UnregisterTurnSteer(turnID string)
+}
+
+type turnSteerMailbox struct {
+	mu              sync.Mutex
+	closed          bool
+	next            uint64
+	pending         []TurnSteerInput
+	consumed        []TurnSteerInput
+	consumedObserve func(TurnSteerInput)
+}
+
+func newTurnSteerMailbox() *turnSteerMailbox {
+	return &turnSteerMailbox{}
+}
+
+func (m *turnSteerMailbox) Enqueue(ctx context.Context, input string) error {
+	_, err := m.enqueue(ctx, input)
+	return err
+}
+
+func (m *turnSteerMailbox) enqueue(ctx context.Context, input string) (TurnSteerInput, error) {
+	if strings.TrimSpace(input) == "" {
+		return TurnSteerInput{}, ErrEmptyInput
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return TurnSteerInput{}, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return TurnSteerInput{}, ErrTurnNotSteerable
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return TurnSteerInput{}, err
+		}
+	}
+	m.next++
+	accepted := TurnSteerInput{Sequence: m.next, Content: input}
+	m.pending = append(m.pending, accepted)
+	return accepted, nil
+}
+
+// setConsumedObserver binds a display-only observer for model-boundary
+// consumption. The callback is intentionally invoked after TakeTurnSteers
+// releases the mailbox mutex.
+func (m *turnSteerMailbox) setConsumedObserver(observer func(TurnSteerInput)) {
+	m.mu.Lock()
+	m.consumedObserve = observer
+	m.mu.Unlock()
+}
+
+// TakeTurnSteers is the only delivery point for a model. It is intentionally
+// destructive: a second model call cannot receive the same input again.
+func (m *turnSteerMailbox) TakeTurnSteers() []TurnSteerInput {
+	m.mu.Lock()
+	if m.closed || len(m.pending) == 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	batch := append([]TurnSteerInput(nil), m.pending...)
+	m.pending = nil
+	m.consumed = append(m.consumed, batch...)
+	observer := m.consumedObserve
+	m.mu.Unlock()
+
+	if observer != nil {
+		for _, input := range batch {
+			// Pass a value copy so the observer cannot retain mailbox-owned state.
+			observer(TurnSteerInput{Sequence: input.Sequence, Content: input.Content})
+		}
+	}
+	return batch
+}
+
+func (m *turnSteerMailbox) close() []TurnSteerInput {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.closed {
+		m.closed = true
+		// Inputs that never reached a model boundary must not leak into a later turn.
+		m.pending = nil
+	}
+	return append([]TurnSteerInput(nil), m.consumed...)
+}
+
+func (m *turnSteerMailbox) discard() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = nil
+	m.consumed = nil
+}
+
+type activeTurnSteer struct {
+	id        string
+	ctx       context.Context
+	mailbox   *turnSteerMailbox
+	supported bool
+	accepting bool
+}
+
+// ActiveTurnID returns the durable turn ID currently owned by this Session.
+// The value is generated by Session and persisted in turn.started; it is not a
+// TUI-local sequence. The bool is true only when the model explicitly opted in
+// and the turn still accepts steer input. An active but unsupported or ending
+// turn may still return its ID with false for error diagnostics.
+func (s *Session) ActiveTurnID() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.activeSteerTurn == nil || s.activeSteerTurn.id == "" {
+		return "", false
+	}
+	return s.activeSteerTurn.id, s.activeSteerTurn.supported && s.activeSteerTurn.accepting
+}
+
+// Steer admits input to the expected active durable turn. It never starts a
+// second Ask and never falls back to the ordinary FIFO queue. The opt-in model
+// consumes accepted input only at its own model-call safe point.
+func (s *Session) Steer(ctx context.Context, expectedTurnID, input string) error {
+	_, err := s.SteerWithReceipt(ctx, expectedTurnID, input)
+	return err
+}
+
+// SteerWithReceipt admits input and returns the mailbox sequence allocated for
+// it. It is an additive API: callers that only need admission can continue to
+// use Steer, while UIs can reliably reconcile an admission with consumption.
+func (s *Session) SteerWithReceipt(ctx context.Context, expectedTurnID, input string) (TurnSteerReceipt, error) {
+	if strings.TrimSpace(input) == "" {
+		return TurnSteerReceipt{}, ErrEmptyInput
+	}
+	expectedTurnID = strings.TrimSpace(expectedTurnID)
+	if expectedTurnID == "" {
+		return TurnSteerReceipt{}, fmt.Errorf("%w: expected turn ID is empty", ErrSteerTurnMismatch)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return TurnSteerReceipt{}, err
+	}
+	if s == nil {
+		return TurnSteerReceipt{}, ErrNoActiveTurn
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := s.activeSteerTurn
+	if active == nil || active.id == "" {
+		return TurnSteerReceipt{}, ErrNoActiveTurn
+	}
+	if active.id != expectedTurnID {
+		return TurnSteerReceipt{}, fmt.Errorf("%w: expected %q, active %q", ErrSteerTurnMismatch, expectedTurnID, active.id)
+	}
+	if !active.accepting || active.mailbox == nil {
+		return TurnSteerReceipt{}, ErrTurnNotSteerable
+	}
+	if active.ctx != nil && active.ctx.Err() != nil {
+		active.accepting = false
+		active.mailbox.close()
+		return TurnSteerReceipt{}, ErrTurnNotSteerable
+	}
+	if !active.supported {
+		return TurnSteerReceipt{}, ErrSteerUnsupported
+	}
+	accepted, err := active.mailbox.enqueue(ctx, input)
+	if err != nil {
+		return TurnSteerReceipt{}, err
+	}
+	return TurnSteerReceipt{Sequence: accepted.Sequence, Content: accepted.Content}, nil
+}
+
+func (s *Session) activateSteerTurn(ctx context.Context, turnID string, mailbox *turnSteerMailbox, supported bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	s.activeSteerTurn = &activeTurnSteer{
+		id:        strings.TrimSpace(turnID),
+		ctx:       ctx,
+		mailbox:   mailbox,
+		supported: supported,
+		accepting: true,
+	}
+	s.mu.Unlock()
+}
+
+func (s *Session) stopSteerTurn(turnID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeSteerTurn != nil && s.activeSteerTurn.id == strings.TrimSpace(turnID) {
+		s.activeSteerTurn.accepting = false
+	}
+}
+
+func (s *Session) clearSteerTurn(turnID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeSteerTurn != nil && s.activeSteerTurn.id == strings.TrimSpace(turnID) {
+		s.activeSteerTurn = nil
+	}
+}
+
+func steerMessages(inputs []TurnSteerInput) []*schema.Message {
+	if len(inputs) == 0 {
+		return nil
+	}
+	messages := make([]*schema.Message, 0, len(inputs))
+	for _, input := range inputs {
+		messages = append(messages, schema.UserMessage(input.Content))
+	}
+	return messages
+}

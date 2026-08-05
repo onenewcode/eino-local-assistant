@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -11,6 +12,18 @@ const maxQueue = 32
 
 // queuePreviewRunes is the max preview length for the "queued (n): …" system line.
 const queuePreviewRunes = 48
+
+const (
+	queueCommandUsage       = "usage: /queue | /queue clear | /queue drop <1-based-index> | /queue edit <1-based-index> <new text> | /queue resume"
+	queueEmptyMessage       = "queue empty"
+	queueDropIndexError     = "queue drop index must be a positive integer"
+	queueDropRangeError     = "queue drop index out of range"
+	queueEditTextError      = "queue edit text must not be empty"
+	queueEditRangeError     = "queue edit index out of range"
+	queueEditIndexError     = "queue edit index must be a positive integer"
+	queueEditAdmissionError = "queue edit rejected: new text cannot be a mutative or immediately executable slash command"
+	queueResumeBusyMessage  = "queue resume unavailable: current operation is still running; queue and pause unchanged"
+)
 
 // backtrackKeyInput is the internal representation used if a future input
 // parser routes Esc through the text classifier. Esc is a key action, not a
@@ -25,6 +38,7 @@ type busyInputDisposition int
 const (
 	busyInputEnqueue busyInputDisposition = iota
 	busyInputExecuteImmediately
+	busyInputSteer
 	busyInputReject
 )
 
@@ -67,6 +81,10 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 	switch action {
 	case slashBacktrack:
 		return busyInputReject
+	case slashSteer:
+		// Steering targets the existing regular turn directly. It is never a
+		// FIFO follow-up, including when the core rejects the admission.
+		return busyInputSteer
 	case slashHelp, slashContext, slashStatus, slashRules, slashSide, slashUsage, slashSessions, slashQueue, slashPermissions:
 		return busyInputExecuteImmediately
 	case slashMemory:
@@ -103,15 +121,79 @@ func isImmediatelyExecutableWhileBusy(input string) bool {
 	return classifyBusyInput(input) == busyInputExecuteImmediately
 }
 
-func formatQueueList(queue []string) string {
+func parseQueueDropIndex(fields []string) (int, string) {
+	if len(fields) != 2 {
+		return 0, queueCommandUsage
+	}
+	index, err := strconv.Atoi(fields[1])
+	if err != nil || index < 1 {
+		return 0, queueDropIndexError
+	}
+	return index, ""
+}
+
+func parseQueueEdit(arg string) (int, string, string) {
+	arg = strings.TrimSpace(arg)
+	fields := strings.Fields(arg)
+	if len(fields) < 2 {
+		return 0, "", queueCommandUsage
+	}
+	index, err := strconv.Atoi(fields[1])
+	if err != nil || index < 1 {
+		return 0, "", queueEditIndexError
+	}
+	if len(fields) < 3 {
+		return 0, "", queueEditTextError
+	}
+
+	// Match enqueue admission: trim only the replacement's outer whitespace;
+	// preserve internal spacing in the stored follow-up.
+	remaining := strings.TrimSpace(arg[len(fields[0]):])
+	newText := strings.TrimSpace(remaining[len(fields[1]):])
+	if newText == "" {
+		return 0, "", queueEditTextError
+	}
+	return index, newText, ""
+}
+
+func dropQueuedFollowUp(queue []string, index int) ([]string, string, bool) {
+	if index < 1 || index > len(queue) {
+		return queue, "", false
+	}
+	dropped := queue[index-1]
+	copy(queue[index-1:], queue[index:])
+	queue[len(queue)-1] = ""
+	return queue[:len(queue)-1], dropped, true
+}
+
+func editQueuedFollowUp(queue []string, index int, newText string) ([]string, bool) {
+	if index < 1 || index > len(queue) {
+		return queue, false
+	}
+	queue[index-1] = newText
+	return queue, true
+}
+
+func formatQueueList(queue []string, paused bool) string {
 	if len(queue) == 0 {
-		return "queue empty"
+		if paused {
+			return queueEmptyMessage + " (paused); use /queue resume to continue"
+		}
+		return queueEmptyMessage
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Queue (%d):\n", len(queue))
+	state := ""
+	if paused {
+		state = " [paused]"
+	}
+	fmt.Fprintf(&b, "Queue (%d)%s:\n", len(queue), state)
 	for i, item := range queue {
 		fmt.Fprintf(&b, "  %d. %s\n", i+1, queuePreview(item))
 	}
-	b.WriteString("Use /queue clear to drop all.")
+	b.WriteString("Use /queue clear to drop all, /queue drop <1-based-index> to drop one, /queue edit <1-based-index> <new text> to edit one, or /queue resume to continue.")
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func queuePausedLine(n int) string {
+	return fmt.Sprintf("queue paused after turn error; %d queued follow-ups retained; use /queue resume to continue", n)
 }
