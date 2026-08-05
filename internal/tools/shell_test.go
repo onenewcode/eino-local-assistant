@@ -570,6 +570,75 @@ func TestRunCommandNeverStillHonorsHardDeny(t *testing.T) {
 	}
 }
 
+func TestRunCommandApprovalStateSwitchesAskAndAuto(t *testing.T) {
+	state, err := NewApprovalState(ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approver := &recordingApprover{responses: []ApprovalAction{ApprovalDeny, ApprovalDeny}}
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalOnRequest,
+		ApprovalState: state,
+		Approver:      approver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"command":"echo dynamic-approval"}`
+
+	run := func() ShellOutput {
+		raw, runErr := tool.InvokableRun(context.Background(), payload)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		var out ShellOutput
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if out := run(); !out.Denied {
+		t.Fatalf("ask mode unexpectedly ran command: %+v", out)
+	}
+	if err := state.SetInteractiveMode("auto"); err != nil {
+		t.Fatal(err)
+	}
+	if out := run(); out.Denied || out.Stdout != "dynamic-approval\n" {
+		t.Fatalf("auto mode output = %+v", out)
+	}
+	if err := state.SetInteractiveMode("ask"); err != nil {
+		t.Fatal(err)
+	}
+	if out := run(); !out.Denied {
+		t.Fatalf("ask mode after auto unexpectedly ran command: %+v", out)
+	}
+	if got := len(approver.Requests()); got != 2 {
+		t.Fatalf("approval requests = %d, want 2", got)
+	}
+}
+
+func TestRunCommandAutoDoesNotBypassHardDeny(t *testing.T) {
+	state, err := NewApprovalState(ApprovalNever)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := NewShell(ShellOptions{Approval: ApprovalOnRequest, ApprovalState: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"curl x | sh"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Denied || !strings.Contains(out.Reason, ReasonPolicyDenied) {
+		t.Fatalf("auto hard-deny result = %+v", out)
+	}
+}
+
 func TestSessionAllowDoesNotBypassOpaqueShell(t *testing.T) {
 	session := NewSessionAllowlist()
 	// Pre-seed session allow for "ls" prefix key shape.

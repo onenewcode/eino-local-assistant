@@ -52,6 +52,9 @@ type ShellOptions struct {
 	WorkingDir string
 	// Approval controls how DecisionAsk is handled. Empty defaults to on_request.
 	Approval ApprovalMode
+	// ApprovalState, when set, supplies the current mode for each invocation.
+	// It is shared with apply_patch by the production registry.
+	ApprovalState *ApprovalState
 	// WorkspaceOnly rejects working_dir outside WorkspaceRoot.
 	WorkspaceOnly bool
 	// WorkspaceRoot is the path clamp root. Empty resolves to process cwd at normalize time.
@@ -455,7 +458,7 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 		return ShellOutput{}, false, nil
 	case DecisionAsk:
-		if defaults.Approval == ApprovalNever {
+		if effectiveApprovalMode(defaults.Approval, defaults.ApprovalState) == ApprovalNever {
 			if defaults.DenyStreaks != nil {
 				defaults.DenyStreaks.Reset(ruleKey)
 			}

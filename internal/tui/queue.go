@@ -85,8 +85,13 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 		// Steering targets the existing regular turn directly. It is never a
 		// FIFO follow-up, including when the core rejects the admission.
 		return busyInputSteer
-	case slashHelp, slashContext, slashStatus, slashRules, slashSide, slashUsage, slashSessions, slashQueue, slashPermissions:
+	case slashHelp, slashContext, slashStatus, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
 		return busyInputExecuteImmediately
+	case slashPermissions:
+		if strings.TrimSpace(arg) == "" {
+			return busyInputExecuteImmediately
+		}
+		return busyInputReject
 	case slashMemory:
 		// list/status are read-only; mutations must wait for idle.
 		if memoryCommandAllowsBusy(arg) {

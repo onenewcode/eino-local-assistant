@@ -48,6 +48,67 @@ func TestDefaultRegistryCodexSubset(t *testing.T) {
 	}
 }
 
+func TestDefaultRegistrySharesDynamicApprovalState(t *testing.T) {
+	workspace := t.TempDir()
+	state, err := NewApprovalState(ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := DefaultWithOptions(DefaultOptions{
+		Shell: ShellOptions{
+			WorkspaceRoot: workspace,
+			Approval:      ApprovalOnRequest,
+			ApprovalState: state,
+			Approver:      AutoApprover{Action: ApprovalDeny},
+		},
+		// Omit ApplyPatch.ApprovalState: registration must share the shell state.
+		ApplyPatch: ApplyPatchOptions{WorkspaceRoot: workspace, Approval: ApprovalOnRequest},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell := registryToolByName(t, registry, "shell")
+	patch := registryToolByName(t, registry, "apply_patch")
+	if err := state.SetInteractiveMode("auto"); err != nil {
+		t.Fatal(err)
+	}
+	shellRaw, err := shell.InvokableRun(context.Background(), `{"command":"printf shared"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shellOut ShellOutput
+	if err := json.Unmarshal([]byte(shellRaw), &shellOut); err != nil {
+		t.Fatal(err)
+	}
+	if shellOut.Denied || shellOut.Stdout != "shared" {
+		t.Fatalf("shell auto result = %+v", shellOut)
+	}
+	patchRaw, err := patch.InvokableRun(context.Background(), `{"operations":[{"type":"create_file","path":"shared.txt","content":"shared"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var patchOut ApplyPatchOutput
+	if err := json.Unmarshal([]byte(patchRaw), &patchOut); err != nil {
+		t.Fatal(err)
+	}
+	if patchOut.Denied || len(patchOut.Results) != 1 {
+		t.Fatalf("apply_patch auto result = %+v", patchOut)
+	}
+	if err := state.SetInteractiveMode("ask"); err != nil {
+		t.Fatal(err)
+	}
+	patchRaw, err = patch.InvokableRun(context.Background(), `{"operations":[{"type":"create_file","path":"second.txt","content":"second"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(patchRaw), &patchOut); err != nil {
+		t.Fatal(err)
+	}
+	if !patchOut.Denied {
+		t.Fatalf("apply_patch ask result = %+v", patchOut)
+	}
+}
+
 func TestDefaultRegistryCanDisableShell(t *testing.T) {
 	root := t.TempDir()
 	reg, err := DefaultWithOptions(DefaultOptions{

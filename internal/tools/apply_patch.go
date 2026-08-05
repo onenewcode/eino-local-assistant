@@ -45,8 +45,11 @@ type ApplyPatchOptions struct {
 	Disabled      bool
 	WorkspaceRoot string
 	// MaxBytes caps create content and post-update file size. Zero uses 256KiB.
-	MaxBytes      int
-	Approval      ApprovalMode
+	MaxBytes int
+	Approval ApprovalMode
+	// ApprovalState, when set, supplies the current mode for each invocation.
+	// It is shared with shell by the production registry.
+	ApprovalState *ApprovalState
 	Approver      Approver
 	Permissions   *PermissionSet
 	SessionAllows *SessionAllowlist
@@ -466,7 +469,7 @@ func authorizeApplyPatch(ctx context.Context, opts ApplyPatchOptions, paths []st
 		}
 	}
 
-	if !needAsk || opts.Approval == ApprovalNever {
+	if !needAsk || effectiveApprovalMode(opts.Approval, opts.ApprovalState) == ApprovalNever {
 		return ApplyPatchOutput{}, false
 	}
 	if opts.Approver == nil {

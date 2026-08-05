@@ -56,6 +56,7 @@ type commandRuntime struct {
 	sessionOpts           chat.SessionOptions
 	composePrompt         func() (string, error)
 	approvalMode          tools.ApprovalMode
+	approvalState         *tools.ApprovalState
 	permissions           *tools.PermissionSet
 	sessionAllows         *tools.SessionAllowlist
 	sessionDenies         *tools.SessionDenylist
@@ -370,6 +371,10 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	sessionAllows := tools.NewSessionAllowlist()
 	sessionDenies := tools.NewSessionDenylist()
 	approvalMode := tools.NormalizeApprovalMode(cfg.ApprovalPolicyNormalized())
+	approvalState, err := tools.NewApprovalState(approvalMode)
+	if err != nil {
+		return nil, fmt.Errorf("create approval state: %w", err)
+	}
 	shell := cfg.Tools.Shell
 	patch := cfg.Tools.ApplyPatch
 
@@ -392,6 +397,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 			MaxOutputBytes: shell.MaxOutputBytes,
 			WorkingDir:     shell.WorkingDir,
 			Approval:       approvalMode,
+			ApprovalState:  approvalState,
 			WorkspaceOnly:  true,
 			WorkspaceRoot:  workspaceRoot,
 			Permissions:    perms,
@@ -405,6 +411,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 			WorkspaceRoot: workspaceRoot,
 			MaxBytes:      patch.MaxBytes,
 			Approval:      approvalMode,
+			ApprovalState: approvalState,
 			Permissions:   perms,
 			Approver:      approver,
 			SessionAllows: sessionAllows,
@@ -499,6 +506,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		rulesSnapshotReady:    start.resumeID == "",
 		rulesSnapshotStatus:   initialRulesSnapshotStatus(start.resumeID == ""),
 		approvalMode:          approvalMode,
+		approvalState:         approvalState,
 		permissions:           perms,
 		sessionAllows:         sessionAllows,
 		sessionDenies:         sessionDenies,

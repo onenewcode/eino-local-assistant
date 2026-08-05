@@ -21,6 +21,10 @@ Headless `exec` accepts `-o FILE` as an alias for the existing `--output-last-me
 
 Headless `exec` also accepts `-m, --model MODEL` on fresh and resume paths, including `--last` and ephemeral runs. The override is applied before provider startup for the current invocation; it changes neither the session identity nor prior transcript/source-snapshot content.
 
+TUI 会话内权限模式的范围严格为 `ask <-> auto`。`/permissions` 无参数是只读报告；`/permissions ask` 与 `/permissions auto` 只在 idle 时改变当前 TUI 进程的临时运行时状态，非 idle 拒绝且不进入 FIFO。`auto` 只在 `internal/tools` 的实际授权边界自动处理 `DecisionAsk`，不改写硬 deny、workspace/path clamp、sandbox 或 `sandbox_unavailable` fail-closed 结果；shell host escalation 仍逐次要求 once/deny。模式不写配置、session ledger 或 resume 数据，也不实现 `plan` / `read-only`。
+
+Headless `exec` 不使用该 TUI 状态，也没有 `/permissions` 交互命令；其 `approval_policy` 继续是启动时静态语义。`on-request` 在没有交互 approver 时对需要审批的请求 fail-closed，`never` 仅保留既有的 `DecisionAsk` 自动处理，不能绕过硬权限、路径钳制或 sandbox。该 TUI 切换不改变 headless 行为。
+
 TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并通过 `cmd/eino-assistant` 的 `SideQuestion` callback 发起一次旁路模型请求。它是本仓库的安全子集：主 turn 不被打断，旁路问题不进入 FIFO queue，多个问题可并发。请求使用当前 active session 的 frozen system prompt 和 transcript 作为 reference-only；不调用 tools 或 subagents，不写主 ledger、`usage` 或 `journal`，不修改文件、git state、configuration 或 permissions。结果只进入 TUI 的 side-only display，错误和空回答也可见；没有 callback 的嵌入调用方显示 unavailable。它不是完整持久 fork，也不提供独立 session、ledger 或 resume；Codex/Claude 的行为只作为研究参考，不宣称完全等价。
 
 `internal/store` 提供可选的 `ThreadForkRepository.ForkThread` 与 `ThreadForkBeforeFirstRepository.ForkThreadBeforeFirstTurn` source-preserving primitive；`internal/chat.Session.Fork` 与 `Session.ForkBeforeFirstTurn` 负责用 source 的模型、frozen system prompt 与会话配置发布并打开 child，TUI `/fork` 是当前用户入口。`/fork` 仅允许 idle、无参数，按最新完整 `turn.committed` 自动生成 child ID；child 成功打开前 source 仍是 active session 且 source ledger 不写入，打开成功后才切换到 child，并清理旧 queue、side、tool/reasoning card 与 task UI。child 继承 source title 和 frozen system prompt；打开失败时 source 仍 active（已发布的 child ledger 不回滚）。TUI 另提供 idle 两阶段 `Esc` backtrack：从有可见 user prompt 的 committed history 中选择边界，首个 prompt 通过显式 before-first API 创建空 committed prefix 的 source-preserving child，后续 prompt 仍以之前的 committed turn 为边界，并把 prompt 回填到 child composer，不写入 child transcript。普通 fork 的空边界仍表示 latest。backtrack 与 `/fork` 都不实现 destructive rewind，也不回滚 source、workspace、Git、进程、网络或其他外部副作用，详细边界见 [会话持久化](./session-persistence.md)。
@@ -34,11 +38,11 @@ TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并
 | `internal/store` | thread journal、checkpoint、artifact、resume，以及可选的 V1 source-preserving `ThreadStore.ForkThread` / `ForkThreadBeforeFirstTurn` ledger primitives | 项目记忆；TUI 命令编排；workspace、git 或外部副作用回滚 |
 | `internal/contextbuild` | prompt 规划与 compaction | 工具执行 |
 | `internal/memory` | 项目级语义记忆与 consolidation | `/resume`、权限 |
-| `internal/tools` | shell、apply_patch、artifact、memory 只读工具 | TUI 策略展示 |
+| `internal/tools` | shell、apply_patch、artifact、memory 只读工具；权限规则求值及 ask/auto 在工具授权边界的应用 | TUI 策略展示；配置与 TUI 命令编排 |
 | `internal/sandbox` | 工具的 OS 隔离边界 | prompt 规则 |
-| `internal/config` | TOML 读取、默认值与校验 | 运行时状态 |
-| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、状态栏、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、旁路请求的模型调用、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
-| `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema |
+| `internal/config` | TOML 读取、默认值与校验；静态 `approval_policy` | TUI 会话运行时状态 |
+| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、idle-only `/permissions ask|auto` 命令入口、状态栏与权限模式展示、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、工具授权真相、旁路请求的模型调用、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
+| `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线（包括 TUI 与 side-effecting tools 的同一会话模式状态）、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema、headless 的动态 TUI 模式 |
 | `internal/provider` | OpenAI / Anthropic 模型适配 | 产品流程 |
 | `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
 
@@ -58,7 +62,8 @@ turn 成功 commit 时，只有实际被 `TakeTurnSteers` 消费的输入才随�
 
 | 面 | 所有者 / 位置 | 生命周期 | 关键边界 |
 | --- | --- | --- | --- |
-| 硬权限 | `permissions` + `tools` + `sandbox` | 进程 / 每次工具调用 | 不依赖 AGENTS.md 或 memory 文本执行 |
+| 硬权限 | `permissions` + `tools` + `sandbox` | 进程 / 每次工具调用 | 不依赖 AGENTS.md 或 memory 文本执行；模式不能绕过 deny、workspace/path clamp、sandbox 或不可用 fail-closed |
+| TUI 会话权限模式 | `internal/tui` 的命令/idle admission 与展示；`cmd/eino-assistant` runtime 接线；`internal/tools` 在 shell/apply_patch 授权边界执行 | 当前 TUI 进程；不进入 config、ledger 或 resume | 仅 `ask <-> auto`；`auto` 只处理 `DecisionAsk`，shell host escalation 仍 once/deny；不提供 plan/read-only |
 | 会话账本 | `store` + `chat` | 可 `/resume` | journal、artifact 与 checkpoint 是真相 |
 | 会话 fork / backtrack | `store` + `chat` + `tui` | `/fork` 仅 idle、无参数；backtrack 为 idle 两阶段 `Esc`，child 成功打开后切换 active session | store 复制 committed 前缀、重建 journal hash/seq、记录 parent provenance 并复制前缀 artifacts；首个 prompt 使用显式 before-first 空 prefix，后续 prompt 在前一 committed turn 前 fork 并只回填 composer；拒绝 active/pending compaction/checkpoint/task-derived 状态；不实现 destructive rewind 或 source/workspace/Git/外部副作用回滚 |
 | 用户/项目指令 | `agent` 选择 home 与 workspace AGENTS 指令 | `/new` / `/clear` 刷新；`/rules` 只读观察 | system prefix 的软指导；override 与 base 不拼接；用户和项目预算独立；`/rules` 不 reload |
@@ -101,6 +106,7 @@ memory -> store, usage
 | source-preserving thread fork V1 | `internal/store` + `internal/chat` + `internal/tui` + [session-persistence.md](./session-persistence.md)；用户命令入口在 TUI，cmd 层不单独解析同名 CLI 命令；普通空边界是 latest，before-first 是独立 API |
 | interactive backtrack V1 | `internal/tui/backtrack.go` + `internal/tui` + `internal/chat` + `internal/store`；复用 source-preserving fork，首个 selector target 显式走 before-first，不新增 workspace 回滚层 |
 | 新工具或权限语义 | `internal/tools` + `sandbox` + [command-policy.md](./command-policy.md) |
+| TUI 会话内 `ask <-> auto` 切换 | `internal/tui`（slash、idle gate、展示）+ `cmd/eino-assistant`（共享 runtime 状态接线）+ `internal/tools`（实际授权边界）；不新增 config/store 持久层 |
 | 项目记忆 | `internal/memory` + [memory.md](./memory.md) |
 | slash、队列、状态展示 | `internal/tui` |
 | 配置字段 | `internal/config` + `config.example.toml` |

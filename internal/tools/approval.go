@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,80 @@ const (
 	// ApprovalNever auto-allows ask decisions (hard deny still applies).
 	ApprovalNever ApprovalMode = "never"
 )
+
+// ApprovalState is the process-local approval mode shared by side-effecting
+// tools. The mutex makes reads made by tool calls race-free while the TUI
+// changes the mode between calls.
+type ApprovalState struct {
+	mu   sync.RWMutex
+	mode ApprovalMode
+}
+
+// NewApprovalState creates a shared approval state from a static mode.
+func NewApprovalState(mode ApprovalMode) (*ApprovalState, error) {
+	state := &ApprovalState{}
+	if err := state.Set(mode); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+// Mode returns the current canonical approval mode.
+func (s *ApprovalState) Mode() ApprovalMode {
+	if s == nil {
+		return ApprovalOnRequest
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.mode == "" {
+		return ApprovalOnRequest
+	}
+	return s.mode
+}
+
+// InteractiveMode returns the TUI-facing name for the current mode.
+func (s *ApprovalState) InteractiveMode() string {
+	if s.Mode() == ApprovalNever {
+		return "auto"
+	}
+	return "ask"
+}
+
+// Set updates the state using a canonical or TUI-facing mode name.
+func (s *ApprovalState) Set(mode ApprovalMode) error {
+	if s == nil {
+		return fmt.Errorf("approval state is nil")
+	}
+	normalized := strings.ToLower(strings.TrimSpace(string(mode)))
+	switch normalized {
+	case "", string(ApprovalOnRequest), "on-request", "ask":
+		normalized = string(ApprovalOnRequest)
+	case string(ApprovalNever), "auto":
+		normalized = string(ApprovalNever)
+	default:
+		return fmt.Errorf("approval mode must be ask or auto, got %q", mode)
+	}
+	s.mu.Lock()
+	s.mode = ApprovalMode(normalized)
+	s.mu.Unlock()
+	return nil
+}
+
+// SetInteractiveMode updates the state using only the supported TUI modes.
+func (s *ApprovalState) SetInteractiveMode(mode string) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "ask" && mode != "auto" {
+		return fmt.Errorf("permission mode must be ask or auto, got %q", mode)
+	}
+	return s.Set(ApprovalMode(mode))
+}
+
+func effectiveApprovalMode(static ApprovalMode, state *ApprovalState) ApprovalMode {
+	if state != nil {
+		return state.Mode()
+	}
+	return static
+}
 
 // NormalizeApprovalMode maps empty / Codex "on-request" to on_request.
 func NormalizeApprovalMode(mode string) ApprovalMode {

@@ -85,6 +85,42 @@ func TestHostEscalationAlwaysPromptsAndNeverUsesSessionState(t *testing.T) {
 	}
 }
 
+func TestHostEscalationAutoModeStillRequiresOnceApproval(t *testing.T) {
+	workspace := t.TempDir()
+	hostDir := t.TempDir()
+	state, err := NewApprovalState(ApprovalNever)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approver := &recordingApprover{responses: []ApprovalAction{ApprovalOnce}}
+	invokable, err := NewShell(ShellOptions{
+		Approval:      ApprovalOnRequest,
+		ApprovalState: state,
+		WorkspaceOnly: true,
+		WorkspaceRoot: workspace,
+		Approver:      approver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"command":"printf host","working_dir":"` + hostDir + `","sandbox_permissions":"require_escalated","justification":"host-only test"}`
+	raw, err := invokable.InvokableRun(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Denied || out.Stdout != "host" {
+		t.Fatalf("host escalation output = %+v", out)
+	}
+	requests := approver.Requests()
+	if len(requests) != 1 || !requests[0].Escalated || requests[0].AllowSession {
+		t.Fatalf("host escalation approval requests = %+v", requests)
+	}
+}
+
 func TestRequireEscalatedNeedsJustification(t *testing.T) {
 	invokable, err := NewShell(ShellOptions{Approval: ApprovalNever})
 	if err != nil {

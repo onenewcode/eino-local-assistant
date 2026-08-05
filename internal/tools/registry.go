@@ -57,6 +57,11 @@ func DefaultWithOptions(opts DefaultOptions) (*Registry, error) {
 	}
 
 	patchOpts := opts.ApplyPatch
+	sharedApprovalState := opts.Shell.ApprovalState
+	if sharedApprovalState == nil {
+		sharedApprovalState = opts.ApplyPatch.ApprovalState
+	}
+	patchOpts.ApprovalState = sharedApprovalState
 	if strings.TrimSpace(patchOpts.WorkspaceRoot) == "" && strings.TrimSpace(opts.Shell.WorkspaceRoot) != "" {
 		patchOpts.WorkspaceRoot = opts.Shell.WorkspaceRoot
 	}
@@ -82,6 +87,7 @@ func DefaultWithOptions(opts DefaultOptions) (*Registry, error) {
 		patchOpts.Sandbox = opts.Shell.Sandbox
 	}
 	shellOpts := opts.Shell
+	shellOpts.ApprovalState = sharedApprovalState
 	if shellOpts.Sandbox == nil {
 		shellOpts.Sandbox = patchOpts.Sandbox
 	}

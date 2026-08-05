@@ -81,7 +81,9 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 	consolidator.StartLoop(processCtx, 5*time.Minute)
 
 	cmdMode := "ask"
-	if runtime.approvalMode == tools.ApprovalNever {
+	if runtime.approvalState != nil {
+		cmdMode = runtime.approvalState.InteractiveMode()
+	} else if runtime.approvalMode == tools.ApprovalNever {
 		cmdMode = "auto"
 	}
 	availability := sandbox.CurrentAvailability()
@@ -105,6 +107,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 	policyInfo := tui.CommandPolicyInfo{
 		Mode:          cmdMode,
 		Approval:      string(runtime.approvalMode),
+		ApprovalState: runtime.approvalState,
 		Profile:       runtime.cfg.Permissions.PermissionsProfile(),
 		WorkspaceOnly: true,
 		WorkspaceRoot: runtime.workspaceRoot,

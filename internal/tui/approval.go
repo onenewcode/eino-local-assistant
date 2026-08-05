@@ -541,7 +541,10 @@ type CommandPolicyInfo struct {
 	Mode string
 	// Approval is the raw config value (on_request|never).
 	Approval string
-	Profile  string
+	// ApprovalState is the process-local mode used by registered side-effecting
+	// tools. When present, it is the source of truth for display and switching.
+	ApprovalState *tools.ApprovalState
+	Profile       string
 	// WorkspaceOnly and WorkspaceRoot describe path clamping.
 	WorkspaceOnly bool
 	WorkspaceRoot string
@@ -559,12 +562,15 @@ type CommandPolicyInfo struct {
 
 // FormatPermissions builds the /permissions report.
 func (info CommandPolicyInfo) FormatPermissions() string {
-	if info.Mode == "" && info.Approval == "" && info.Permissions == nil &&
+	if info.Mode == "" && info.Approval == "" && info.ApprovalState == nil && info.Permissions == nil &&
 		!info.Sandbox.Configured() && !info.Runtime.Configured() {
 		return "tool permissions: (not configured)"
 	}
 	mode := info.Mode
-	if mode == "" {
+	approvalPolicy := info.Approval
+	if info.ApprovalState != nil {
+		mode = info.ApprovalState.InteractiveMode()
+	} else if mode == "" {
 		if info.Approval == string(tools.ApprovalNever) {
 			mode = "auto"
 		} else {
@@ -573,7 +579,7 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "tool permissions (Codex subset)\n")
-	fmt.Fprintf(&b, "  mode: %s (%s)\n", mode, info.Approval)
+	fmt.Fprintf(&b, "  mode: %s (%s)\n", mode, approvalPolicy)
 	fmt.Fprintf(&b, "  profile: %s\n", info.Profile)
 	fmt.Fprintf(&b, "  workspace_only: %v\n", info.WorkspaceOnly)
 	if info.WorkspaceRoot != "" {
@@ -581,7 +587,7 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 	}
 	info.writeSandboxReport(&b)
 	info.writeRuntimeReport(&b)
-	fmt.Fprintf(&b, "  approval_policy: %s\n", info.Approval)
+	fmt.Fprintf(&b, "  approval_policy: %s\n", approvalPolicy)
 	if info.Permissions != nil {
 		fmt.Fprintf(&b, "  permissions (Claude-style):\n")
 		for _, line := range info.Permissions.SummaryLines() {
@@ -678,6 +684,9 @@ func (info CommandPolicyInfo) writeRuntimeReport(b *strings.Builder) {
 
 // CmdPolicyFragment returns the status-bar badge (cmd=ask|auto).
 func (info CommandPolicyInfo) CmdPolicyFragment() string {
+	if info.ApprovalState != nil {
+		return "cmd=" + info.ApprovalState.InteractiveMode()
+	}
 	if info.Mode != "" {
 		return "cmd=" + info.Mode
 	}

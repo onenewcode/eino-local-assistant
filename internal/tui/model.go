@@ -1212,7 +1212,12 @@ func (m *model) statusLabel() string {
 
 func (m *model) statusPolicyFragment() string {
 	fragments := make([]string, 0, 4)
-	command := strings.TrimSpace(m.deps.Status.CmdPolicy)
+	command := ""
+	if m.deps.PolicyInfo.ApprovalState != nil {
+		command = m.deps.PolicyInfo.CmdPolicyFragment()
+	} else {
+		command = strings.TrimSpace(m.deps.Status.CmdPolicy)
+	}
 	if command == "" {
 		command = m.deps.PolicyInfo.CmdPolicyFragment()
 	}
@@ -1355,6 +1360,10 @@ func (m *model) queueWhileBusy(input string) (tea.Model, tea.Cmd) {
 		// active operation; queued prompts must not run before it takes effect.
 		return m.submit(input)
 	}
+	if action, _ := parseSlash(input); action == slashPermissions {
+		m.appendLine(lineError, "permission mode changes are unavailable while busy; retry when idle")
+		return m, nil
+	}
 	if !isQueueableInput(input) {
 		m.appendLine(lineError, "cannot queue mutative command while busy (try after the turn, or /queue clear)")
 		return m, nil
@@ -1419,9 +1428,7 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 	case slashQueue:
 		return m.cmdQueue(arg)
 	case slashPermissions:
-		m.appendLine(lineSystem, m.deps.PolicyInfo.FormatPermissions())
-		m.appendLine(lineSep, "")
-		return m, nil
+		return m.cmdPermissions(arg)
 	case slashMemory:
 		return m.cmdMemory(arg)
 	case slashUnknown:
@@ -1432,6 +1439,32 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 	m.appendLine(lineUser, input)
 	m.streamingAssistant = false
 	return m.startTurn(input)
+}
+
+// cmdPermissions keeps the no-argument report read-only and limits changes to
+// the two process-local interactive modes supported by the TUI.
+func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		m.appendLine(lineSystem, m.deps.PolicyInfo.FormatPermissions())
+		m.appendLine(lineSep, "")
+		return m, nil
+	}
+	if m.mode != modeIdle {
+		m.appendLine(lineError, "permission mode changes are unavailable while busy; retry when idle")
+		return m, nil
+	}
+	state := m.deps.PolicyInfo.ApprovalState
+	if state == nil {
+		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
+		return m, nil
+	}
+	if err := state.SetInteractiveMode(arg); err != nil {
+		m.appendLine(lineError, "usage: /permissions [ask|auto]")
+		return m, nil
+	}
+	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
+	return m, nil
 }
 
 func sideQuestionLabel(input string) string {
