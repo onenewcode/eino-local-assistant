@@ -33,8 +33,8 @@ func TestRuntimeReActOptionsEnableExplicitSteer(t *testing.T) {
 	if !options.EnableSteer {
 		t.Fatal("production ReAct options must enable explicit steer")
 	}
-	if options.MaxStep != 4 {
-		t.Fatalf("max steps = %d, want 4", options.MaxStep)
+	if options.MaxModelSteps != 4 {
+		t.Fatalf("max model steps = %d, want 4", options.MaxModelSteps)
 	}
 }
 
@@ -144,6 +144,26 @@ func TestResolveUserInstructionsRootUsesHomeWithoutStorageConfig(t *testing.T) {
 	}
 	if got != filepath.Join("/home/tester", ".eino-assistant") {
 		t.Fatalf("root = %q", got)
+	}
+}
+
+func TestLoadCommandConfigInitializesRulesBeforeRemovedPermissionsError(t *testing.T) {
+	toolPolicyRoot := filepath.Join(t.TempDir(), ".eino-assistant")
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[permissions]\nallow = [\"Shell(*)\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := loadCommandConfigAt(configPath, toolPolicyRoot)
+	if err == nil || !strings.Contains(err.Error(), "[permissions] is no longer supported") {
+		t.Fatalf("loadCommandConfigAt() error = %v, want legacy permissions migration", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(toolPolicyRoot, "rules", "default.rules"))
+	if err != nil {
+		t.Fatalf("read initialized default.rules: %v", err)
+	}
+	if !strings.Contains(string(contents), "intentionally grants no commands") {
+		t.Fatalf("default.rules = %q, want embedded zero-authorization starter", contents)
 	}
 }
 

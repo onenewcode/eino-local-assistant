@@ -14,17 +14,26 @@ import (
 // turnUsageTracker assigns IDs to callbacks that do not supply one. Durable
 // deduplication belongs to the store so conflicting replays are never hidden.
 type turnUsageTracker struct {
-	mu       sync.Mutex
-	seen     bool
-	nextCall int
+	mu        sync.Mutex
+	seen      bool
+	nextCall  int
+	allocator *turnCallIDAllocator
+}
+
+func newTurnUsageTracker(allocator *turnCallIDAllocator) *turnUsageTracker {
+	return &turnUsageTracker{allocator: allocator}
 }
 
 func (t *turnUsageTracker) normalize(event ModelUsageEvent) ModelUsageEvent {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if strings.TrimSpace(event.CallID) == "" {
-		t.nextCall++
-		event.CallID = fmt.Sprintf("model-%d", t.nextCall)
+		if t.allocator != nil {
+			event.CallID = t.allocator.nextModelUsageID()
+		} else {
+			t.nextCall++
+			event.CallID = fmt.Sprintf("model-%d", t.nextCall)
+		}
 	}
 	t.seen = true
 	return event

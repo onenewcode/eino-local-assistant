@@ -234,14 +234,13 @@ func TestHostEscalationApprovalPagesFullCommandDetails(t *testing.T) {
 	}
 }
 
-func TestFormatPermissionsMentionsOpaqueShell(t *testing.T) {
+func TestFormatPermissionsExplainsRulesAndImpact(t *testing.T) {
 	info := CommandPolicyInfo{
 		Mode:     "ask",
 		Approval: "on_request",
-		Profile:  "cautious",
 	}
 	text := info.FormatPermissions()
-	if !containsAll(text, "shell metacharacters", "sandbox: (not configured)", "apply_patch") {
+	if !containsAll(text, "Rules decide authorization", "sandbox: (not configured)", "apply_patch") {
 		t.Fatalf("permissions text missing notes:\n%s", text)
 	}
 }
@@ -250,7 +249,6 @@ func TestFormatPermissionsShowsSandboxAndRuntime(t *testing.T) {
 	info := CommandPolicyInfo{
 		Mode:     "ask",
 		Approval: "on_request",
-		Profile:  "cautious",
 		Sandbox: SandboxInfo{
 			Mode:           "workspace-write",
 			Backend:        "seatbelt",
@@ -259,7 +257,12 @@ func TestFormatPermissionsShowsSandboxAndRuntime(t *testing.T) {
 			AllowedDomains: []string{"api.example.test", "packages.example.test"},
 			HostEscalation: true,
 		},
-		Runtime: RuntimeInfo{MaxTurnSeconds: 600, MaxReactSteps: 8, MaxToolCalls: 16},
+		Runtime: RuntimeInfo{
+			MaxTurnSeconds:                    600,
+			MaxModelSteps:                     8,
+			MaxToolCalls:                      16,
+			MaxConsecutiveEquivalentToolCalls: 3,
+		},
 	}
 	text := info.FormatPermissions()
 	if !containsAll(text,
@@ -270,8 +273,9 @@ func TestFormatPermissionsShowsSandboxAndRuntime(t *testing.T) {
 		"network: allow:2",
 		"host_escalation: once/deny only",
 		"max_turn_seconds: 600",
-		"max_react_steps: 8",
+		"max_model_steps: 8",
 		"max_tool_calls: 16",
+		"max_consecutive_equivalent_tool_calls: 3",
 	) {
 		t.Fatalf("permissions text missing sandbox details:\n%s", text)
 	}
@@ -303,18 +307,32 @@ func TestSandboxStatusFragments(t *testing.T) {
 
 func TestStatusUsesPolicySandboxFallbackAndRuntime(t *testing.T) {
 	m := &model{deps: Deps{
-		Status: StatusInfo{CmdPolicy: "cmd=ask"},
+		Status: StatusInfo{CmdPolicy: "cmd=ask", MaxModelSteps: 8},
 		PolicyInfo: CommandPolicyInfo{
 			Sandbox: SandboxInfo{Mode: "workspace-write", Backend: "seatbelt"},
-			Runtime: RuntimeInfo{MaxTurnSeconds: 600, MaxReactSteps: 8, MaxToolCalls: 16},
+			Runtime: RuntimeInfo{
+				MaxTurnSeconds:                    600,
+				MaxModelSteps:                     8,
+				MaxToolCalls:                      16,
+				MaxConsecutiveEquivalentToolCalls: 3,
+			},
 		},
 	}}
 	if got := m.statusPolicyFragment(); got != "cmd=ask · sb=rw · sb_backend=seatbelt · net=off" {
 		t.Fatalf("status policy = %q", got)
 	}
 	report := m.statusReport()
-	if !containsAll(report, "max_turn_seconds=600", "max_react_steps=8", "max_tool_calls=16") {
+	if !containsAll(
+		report,
+		"max_turn_seconds=600",
+		"max_model_steps=8",
+		"max_tool_calls=16",
+		"max_consecutive_equivalent_tool_calls=3",
+	) {
 		t.Fatalf("status report missing runtime info:\n%s", report)
+	}
+	if strings.Count(report, "max_model_steps=") != 1 {
+		t.Fatalf("status report duplicated max_model_steps: %s", report)
 	}
 }
 

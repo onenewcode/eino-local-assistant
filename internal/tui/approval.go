@@ -532,14 +532,16 @@ func (info SandboxInfo) statusFragments() []string {
 // RuntimeInfo is display-only per-turn guardrail state. Zero values mean the
 // caller has no runtime data to display.
 type RuntimeInfo struct {
-	MaxTurnSeconds int
-	MaxReactSteps  int
-	MaxToolCalls   int
+	MaxTurnSeconds                    int
+	MaxModelSteps                     int
+	MaxToolCalls                      int
+	MaxConsecutiveEquivalentToolCalls int
 }
 
 // Configured reports whether any runtime limit is known.
 func (info RuntimeInfo) Configured() bool {
-	return info.MaxTurnSeconds > 0 || info.MaxReactSteps > 0 || info.MaxToolCalls > 0
+	return info.MaxTurnSeconds > 0 || info.MaxModelSteps > 0 || info.MaxToolCalls > 0 ||
+		info.MaxConsecutiveEquivalentToolCalls > 0
 }
 
 // CommandPolicyInfo is display-only policy state for /permissions and the status bar.
@@ -551,12 +553,11 @@ type CommandPolicyInfo struct {
 	// ApprovalState is the process-local mode used by registered side-effecting
 	// tools. When present, it is the source of truth for display and switching.
 	ApprovalState *tools.ApprovalState
-	Profile       string
 	// WorkspaceOnly and WorkspaceRoot describe path clamping.
 	WorkspaceOnly bool
 	WorkspaceRoot string
-	// Permissions is Claude-style allow/ask/deny.
-	Permissions *tools.PermissionSet
+	// ToolPolicy is the loaded Codex .rules policy.
+	ToolPolicy *tools.ToolPolicy
 	// SessionAllows is optional session memory.
 	SessionAllows *tools.SessionAllowlist
 	// SessionDenies is optional session memory for user-denied rule keys.
@@ -569,7 +570,7 @@ type CommandPolicyInfo struct {
 
 // FormatPermissions builds the /permissions report.
 func (info CommandPolicyInfo) FormatPermissions() string {
-	if info.Mode == "" && info.Approval == "" && info.ApprovalState == nil && info.Permissions == nil &&
+	if info.Mode == "" && info.Approval == "" && info.ApprovalState == nil && info.ToolPolicy == nil &&
 		!info.Sandbox.Configured() && !info.Runtime.Configured() && !info.yoloActive() {
 		return "tool permissions: (not configured)"
 	}
@@ -585,7 +586,7 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 		}
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "tool permissions (Codex subset)\n")
+	fmt.Fprintf(&b, "tool policy (Codex .rules)\n")
 	fmt.Fprintf(&b, "  mode: %s (%s)\n", mode, approvalPolicy)
 	if info.yoloActive() {
 		fmt.Fprintf(&b, "  !!! %s !!!\n", tools.YoloModeWarning)
@@ -594,7 +595,6 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 		fmt.Fprintf(&b, "  hard_denies: enforced\n")
 		fmt.Fprintf(&b, "  workspace_path_safety: enforced at tool boundary\n")
 	}
-	fmt.Fprintf(&b, "  profile: %s\n", info.Profile)
 	fmt.Fprintf(&b, "  workspace_only: %v\n", info.WorkspaceOnly)
 	if info.WorkspaceRoot != "" {
 		fmt.Fprintf(&b, "  workspace: %s\n", info.WorkspaceRoot)
@@ -602,9 +602,9 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 	info.writeSandboxReport(&b)
 	info.writeRuntimeReport(&b)
 	fmt.Fprintf(&b, "  approval_policy: %s\n", approvalPolicy)
-	if info.Permissions != nil {
-		fmt.Fprintf(&b, "  permissions (Claude-style):\n")
-		for _, line := range info.Permissions.SummaryLines() {
+	if info.ToolPolicy != nil {
+		fmt.Fprintf(&b, "  rules:\n")
+		for _, line := range info.ToolPolicy.SummaryLines() {
 			fmt.Fprintf(&b, "    %s\n", line)
 		}
 	}
@@ -631,10 +631,10 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 		}
 	}
 	fmt.Fprintf(&b, "\nTool surface (Codex subset): shell · apply_patch · get_current_time · read_artifact.\n")
-	fmt.Fprintf(&b, "Hard deny cannot be bypassed by session allow.\n")
+	fmt.Fprintf(&b, "Hard safety and forbidden rules cannot be bypassed by session allow.\n")
 	fmt.Fprintf(&b, "User deny sets stop_retrying and session-denies the same rule_key (no re-prompt).\n")
 	fmt.Fprintf(&b, "Prefer apply_patch over shell for file create/update/delete.\n")
-	fmt.Fprintf(&b, "Shell allow is downgraded to ask when shell metacharacters are present.\n")
+	fmt.Fprintf(&b, "Rules decide authorization; command impact is classified independently.\n")
 	fmt.Fprintf(&b, "Sandboxed tools fail closed when their OS backend is unavailable; host escalation is never remembered.")
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -693,11 +693,18 @@ func (info CommandPolicyInfo) writeRuntimeReport(b *strings.Builder) {
 	if info.Runtime.MaxTurnSeconds > 0 {
 		fmt.Fprintf(b, "    max_turn_seconds: %d\n", info.Runtime.MaxTurnSeconds)
 	}
-	if info.Runtime.MaxReactSteps > 0 {
-		fmt.Fprintf(b, "    max_react_steps: %d\n", info.Runtime.MaxReactSteps)
+	if info.Runtime.MaxModelSteps > 0 {
+		fmt.Fprintf(b, "    max_model_steps: %d\n", info.Runtime.MaxModelSteps)
 	}
 	if info.Runtime.MaxToolCalls > 0 {
 		fmt.Fprintf(b, "    max_tool_calls: %d\n", info.Runtime.MaxToolCalls)
+	}
+	if info.Runtime.MaxConsecutiveEquivalentToolCalls > 0 {
+		fmt.Fprintf(
+			b,
+			"    max_consecutive_equivalent_tool_calls: %d\n",
+			info.Runtime.MaxConsecutiveEquivalentToolCalls,
+		)
 	}
 }
 

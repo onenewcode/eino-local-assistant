@@ -644,7 +644,7 @@ func newTestModel(t *testing.T) *model {
 	m := newModel(Deps{
 		Ctx:     context.Background(),
 		Session: session,
-		Status:  StatusInfo{Model: "test-model", Tools: []string{"get_current_time"}, MaxStep: 8},
+		Status:  StatusInfo{Model: "test-model", Tools: []string{"get_current_time"}, MaxModelSteps: 8},
 	})
 	m.width = 80
 	m.height = 24

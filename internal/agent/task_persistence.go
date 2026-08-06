@@ -53,6 +53,7 @@ type taskObservationSnapshot struct {
 
 type taskShellResultSnapshot struct {
 	Command   string `json:"command"`
+	Impact    string `json:"impact,omitempty"`
 	ExitCode  *int   `json:"exit_code"`
 	TimedOut  bool   `json:"timed_out,omitempty"`
 	Cancelled bool   `json:"cancelled,omitempty"`
@@ -220,6 +221,7 @@ func taskShellSnapshotFromResult(result proofShellResult) *taskShellResultSnapsh
 	exitCode := *result.ExitCode
 	return &taskShellResultSnapshot{
 		Command:   result.Command,
+		Impact:    result.Impact,
 		ExitCode:  &exitCode,
 		TimedOut:  result.TimedOut,
 		Cancelled: result.Cancelled,
@@ -315,6 +317,7 @@ func applyTaskSnapshotRuntimeFields(run *taskRun, snapshot taskRunSnapshot) {
 		if persisted.Shell != nil && persisted.Shell.ExitCode != nil {
 			restoredShell := proofShellResult{
 				Command:   persisted.Shell.Command,
+				Impact:    persisted.Shell.Impact,
 				ExitCode:  persisted.Shell.ExitCode,
 				TimedOut:  persisted.Shell.TimedOut,
 				Cancelled: persisted.Shell.Cancelled,

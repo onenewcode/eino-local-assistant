@@ -66,44 +66,62 @@ func taskStateRecoveryFromEvents(state ThreadState, events []ThreadEvent) TaskSt
 		recovery.SnapshotTurnCommitted = true
 	}
 	firstAfterSnapshot := latestSnapshot + 1
+	openPotentialMutations := make(map[string]struct{})
 	for _, event := range events[firstAfterSnapshot:] {
 		if recovery.SnapshotTurnID != "" && event.Kind == EventTurnCommitted && event.TurnID == recovery.SnapshotTurnID {
 			recovery.SnapshotTurnCommitted = true
 		}
-		if event.Kind != EventToolStarted && event.Kind != EventToolCompleted {
-			continue
+		switch event.Kind {
+		case EventToolStarted:
+			var payload ToolStarted
+			if json.Unmarshal(event.Payload, &payload) != nil {
+				recovery.PotentiallyMutatingToolAfterSnapshot = true
+				continue
+			}
+			if taskLifecycleToolNameMayMutate(payload.ToolName) {
+				openPotentialMutations[taskLifecycleToolKey(event.TurnID, payload.ToolCallID)] = struct{}{}
+			}
+		case EventToolCompleted:
+			var payload ToolCompleted
+			if json.Unmarshal(event.Payload, &payload) != nil {
+				recovery.PotentiallyMutatingToolAfterSnapshot = true
+				continue
+			}
+			delete(openPotentialMutations, taskLifecycleToolKey(event.TurnID, payload.ToolCallID))
+			if taskLifecycleCompletedToolMayMutate(payload) {
+				recovery.PotentiallyMutatingToolAfterSnapshot = true
+			}
 		}
-		if taskLifecycleToolMayMutate(event) {
-			recovery.PotentiallyMutatingToolAfterSnapshot = true
-		}
+	}
+	if len(openPotentialMutations) > 0 {
+		recovery.PotentiallyMutatingToolAfterSnapshot = true
 	}
 	return recovery
 }
 
-func taskLifecycleToolMayMutate(event ThreadEvent) bool {
-	var name string
-	switch event.Kind {
-	case EventToolStarted:
-		var payload ToolStarted
-		if json.Unmarshal(event.Payload, &payload) != nil {
-			return true
-		}
-		name = payload.ToolName
-	case EventToolCompleted:
-		var payload ToolCompleted
-		if json.Unmarshal(event.Payload, &payload) != nil {
-			return true
-		}
-		name = payload.ToolName
-	default:
-		return false
-	}
+func taskLifecycleToolNameMayMutate(name string) bool {
 	switch strings.TrimSpace(name) {
 	case "shell", "apply_patch":
 		return true
 	default:
 		return false
 	}
+}
+
+func taskLifecycleCompletedToolMayMutate(input ToolCompleted) bool {
+	switch strings.TrimSpace(input.ToolName) {
+	case "shell":
+		// Older journals and malformed results did not retain impact metadata.
+		return strings.TrimSpace(input.Impact) != "read_only"
+	case "apply_patch":
+		return true
+	default:
+		return false
+	}
+}
+
+func taskLifecycleToolKey(turnID, callID string) string {
+	return turnID + "\x00" + callID
 }
 
 // UpdateTaskState appends one recoverable task-state projection. turnID is

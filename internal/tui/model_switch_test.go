@@ -33,10 +33,10 @@ func TestModelSwitchIdleKeepsSessionAndUpdatesSnapshots(t *testing.T) {
 		DeclaredCatalogLifecycle: "active",
 		Tools:                    []string{"shell", "apply_patch"},
 		ReasoningEffort:          "medium",
-		MaxStep:                  8,
+		MaxModelSteps:            8,
 		CmdPolicy:                "cmd=ask",
 		Sandbox:                  SandboxInfo{Mode: "workspace", Backend: "seatbelt"},
-		Runtime:                  RuntimeInfo{MaxReactSteps: 8, MaxToolCalls: 12},
+		Runtime:                  RuntimeInfo{MaxModelSteps: 8, MaxToolCalls: 12, MaxConsecutiveEquivalentToolCalls: 3},
 	}
 	oldOpts := chat.SessionOptions{Store: threadStore, ModelName: "old-model"}
 	m := newModel(Deps{
@@ -59,7 +59,7 @@ func TestModelSwitchIdleKeepsSessionAndUpdatesSnapshots(t *testing.T) {
 		DeclaredCatalogLifecycle: "deprecated",
 		Tools:                    []string{"shell", "apply_patch", "memory_read"},
 		ReasoningEffort:          "high",
-		MaxStep:                  12,
+		MaxModelSteps:            12,
 		CmdPolicy:                oldStatus.CmdPolicy,
 		Sandbox:                  oldStatus.Sandbox,
 		Runtime:                  oldStatus.Runtime,
@@ -221,7 +221,7 @@ func TestResumeCallbackReplacesRuntimeSnapshotAfterOpeningTarget(t *testing.T) {
 		Status:      StatusInfo{Model: "openai/active-model"},
 		SessionOpts: chat.SessionOptions{Store: threadStore, ModelName: "active-model"},
 	})
-	wantStatus := StatusInfo{Model: "openai/target-model", ReasoningEffort: "high", MaxStep: 9}
+	wantStatus := StatusInfo{Model: "openai/target-model", ReasoningEffort: "high", MaxModelSteps: 9}
 	wantOpts := chat.SessionOptions{Store: threadStore, ModelName: "target-model"}
 	var gotID string
 	var gotRecover bool

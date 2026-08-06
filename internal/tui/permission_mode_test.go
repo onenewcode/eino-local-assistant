@@ -63,7 +63,7 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 	m = next.(*model)
 	var report string
 	for _, line := range m.lines {
-		if line.kind == lineSystem && strings.Contains(line.text, "tool permissions") {
+		if line.kind == lineSystem && strings.Contains(line.text, "tool policy") {
 			report = line.text
 		}
 	}
@@ -115,7 +115,7 @@ func TestPermissionsYoloIsExplicitAndVisible(t *testing.T) {
 	m = next.(*model)
 	var report string
 	for _, line := range m.lines {
-		if line.kind == lineSystem && strings.Contains(line.text, "tool permissions") {
+		if line.kind == lineSystem && strings.Contains(line.text, "tool policy") {
 			report = line.text
 		}
 	}

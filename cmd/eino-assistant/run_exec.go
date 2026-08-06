@@ -210,8 +210,10 @@ func defaultExecCommandDeps() execCommandDeps {
 		return &guardedExecSession{
 			session: runtime.session,
 			options: runtimeguard.TurnOptions{
-				MaxToolCalls: runtime.runtimeCfg.MaxToolCalls,
-				Timeout:      time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
+				MaxModelSteps:                     runtime.runtimeCfg.MaxModelSteps,
+				MaxToolCalls:                      runtime.runtimeCfg.MaxToolCalls,
+				MaxConsecutiveEquivalentToolCalls: runtime.runtimeCfg.MaxConsecutiveEquivalentToolCalls,
+				Timeout:                           time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
 			},
 		}, runtime, nil
 	}

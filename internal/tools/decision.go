@@ -14,17 +14,13 @@ const (
 	DecisionDeny  Decision = "deny"
 )
 
-// Evaluation is the result of matching a command or path against permissions.
+// Evaluation is the effective shell authorization result.
 type Evaluation struct {
-	Decision Decision
-	RuleID   string
-	Reason   string
+	Decision     Decision
+	RuleID       string
+	Reason       string
+	PolicyPrompt bool // true only for a matching Codex decision = "prompt" rule.
 }
-
-// Profile names supported by the built-in permission expander.
-const (
-	ProfileCautious = "cautious"
-)
 
 // HasShellMetacharacters reports whether command likely embeds shell control
 // syntax beyond a simple argv list. Conservative: false positives only force ask.
@@ -59,12 +55,4 @@ func HasShellMetacharacters(command string) bool {
 		}
 	}
 	return false
-}
-
-func profileOrUnknown(profile string) string {
-	profile = strings.TrimSpace(profile)
-	if profile == "" {
-		return "policy"
-	}
-	return profile
 }

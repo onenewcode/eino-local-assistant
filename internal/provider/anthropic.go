@@ -50,6 +50,10 @@ func NewAnthropicModel(ctx context.Context, cfg config.ModelConfig) (model.ToolC
 // The adapter itself owns Anthropic HTTP, SSE, tools, and usage conversion.
 type anthropicModel struct {
 	delegate model.ToolCallingChatModel
+	// unbound is the original no-tools binding. Eino's Claude adapter rejects
+	// WithTools(nil), while the agent needs that operation to reserve a final
+	// response that cannot request another tool batch.
+	unbound *anthropicModel
 }
 
 var _ model.ToolCallingChatModel = (*anthropicModel)(nil)
@@ -63,11 +67,18 @@ func (m *anthropicModel) Stream(ctx context.Context, input []*schema.Message, op
 }
 
 func (m *anthropicModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
-	bound, err := m.delegate.WithTools(tools)
+	base := m
+	if m.unbound != nil {
+		base = m.unbound
+	}
+	if len(tools) == 0 {
+		return base, nil
+	}
+	bound, err := base.delegate.WithTools(tools)
 	if err != nil {
 		return nil, err
 	}
-	return &anthropicModel{delegate: bound}, nil
+	return &anthropicModel{delegate: bound, unbound: base}, nil
 }
 
 func (m *anthropicModel) GetType() string {

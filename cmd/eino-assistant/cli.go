@@ -10,7 +10,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
@@ -161,7 +160,7 @@ func newVersionCommand() *cobra.Command {
 }
 
 func listSessions(configPath string, stdout io.Writer) error {
-	cfg, err := config.Load(configPath)
+	cfg, _, err := loadCommandConfig(configPath)
 	if err != nil {
 		return err
 	}

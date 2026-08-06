@@ -2638,7 +2638,7 @@ func TestExecOnRequestPermissionFailsClosedWithoutApprover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewShell: %v", err)
 	}
-	raw, err := shell.InvokableRun(context.Background(), `{"command":"echo needs approval"}`)
+	raw, err := shell.InvokableRun(context.Background(), `{"command":"printf needs-approval"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun: %v", err)
 	}
@@ -2656,18 +2656,30 @@ func TestGuardedExecSessionAppliesTurnBudget(t *testing.T) {
 	guarded := &guardedExecSession{
 		session: inner,
 		options: runtimeguard.TurnOptions{
-			MaxToolCalls: 3,
+			MaxModelSteps:                     2,
+			MaxToolCalls:                      3,
+			MaxConsecutiveEquivalentToolCalls: 2,
 		},
 	}
 	if err := guarded.Ask(context.Background(), "prompt", nil); err != nil {
 		t.Fatalf("Ask: %v", err)
 	}
+	if inner.maxModelSteps != 2 {
+		t.Fatalf("max model steps = %d, want 2", inner.maxModelSteps)
+	}
 	if inner.maxToolCalls != 3 {
 		t.Fatalf("max tool calls = %d, want 3", inner.maxToolCalls)
 	}
+	if inner.maxConsecutiveEquivalentToolCalls != 2 {
+		t.Fatalf("max consecutive equivalent tool calls = %d, want 2", inner.maxConsecutiveEquivalentToolCalls)
+	}
 }
 
-type observingExecSession struct{ maxToolCalls int }
+type observingExecSession struct {
+	maxModelSteps                     int
+	maxToolCalls                      int
+	maxConsecutiveEquivalentToolCalls int
+}
 
 func (s *observingExecSession) ID() string { return "observing-exec-session" }
 
@@ -2676,7 +2688,9 @@ func (s *observingExecSession) Ask(ctx context.Context, _ string, _ func(string)
 	if !ok {
 		return errors.New("missing turn budget")
 	}
+	s.maxModelSteps = budget.MaxModelSteps()
 	s.maxToolCalls = budget.MaxToolCalls()
+	s.maxConsecutiveEquivalentToolCalls = budget.MaxConsecutiveEquivalentToolCalls()
 	return nil
 }
 

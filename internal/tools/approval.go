@@ -14,20 +14,20 @@ type ApprovalMode string
 const (
 	// ApprovalOnRequest prompts the user (or denys when no Approver is wired).
 	ApprovalOnRequest ApprovalMode = "on_request"
-	// ApprovalNever auto-allows ask decisions (hard deny still applies).
+	// ApprovalNever auto-allows ask decisions (evaluated deny rules still apply).
 	ApprovalNever ApprovalMode = "never"
 	// ApprovalPlan is a read-only interactive phase. Tool-specific gates must
 	// enforce it; it is not an alias for either approval policy.
 	ApprovalPlan ApprovalMode = "plan"
 	// ApprovalYolo is an explicitly selected dangerous mode. It bypasses
-	// approval prompts and the normal OS sandbox, while tool hard denies and
-	// path validation remain in force.
+	// approval prompts and the normal OS sandbox. Remaining command and path
+	// checks are defense-in-depth, not a host security boundary.
 	ApprovalYolo ApprovalMode = "yolo"
 )
 
 // YoloModeWarning is shown wherever the dangerous mode becomes active. Keep
 // the wording stable so logs and tests can identify the bypass unambiguously.
-const YoloModeWarning = "WARNING: YOLO MODE ACTIVE - approvals and the OS sandbox are bypassed; hard denies and tool path safety remain enforced"
+const YoloModeWarning = "WARNING: YOLO MODE ACTIVE - approvals and OS sandbox bypassed; remaining command and path checks are best-effort, not a security boundary"
 
 // ApprovalState is the process-local approval mode shared by side-effecting
 // tools. The mutex makes reads made by tool calls race-free while the TUI

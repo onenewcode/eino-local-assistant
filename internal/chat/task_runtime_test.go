@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,62 @@ type taskGateModel struct {
 	scriptedModel
 	streamCalls  int
 	alwaysActive bool
+}
+
+// continuationIDModel exercises the EventAwareModel path that ReAct uses:
+// one durable turn receives two model attempts after the task gate rejects the
+// first response. It deliberately omits both provider model-call and tool-call
+// IDs so Session must allocate them across the continuation boundary.
+type continuationIDModel struct {
+	calls       int
+	toolCallIDs []string
+}
+
+func (m *continuationIDModel) Stream(context.Context, []*schema.Message) (Stream, error) {
+	return nil, errors.New("expected event-aware stream")
+}
+
+func (m *continuationIDModel) StreamWithEvents(ctx context.Context, _ []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error) {
+	id, ok := NextLocalToolCallID(ctx)
+	if !ok {
+		return nil, nil, errors.New("missing durable-turn call ID allocator")
+	}
+	m.calls++
+	m.toolCallIDs = append(m.toolCallIDs, id)
+	if emit != nil {
+		emit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &ModelUsageEvent{}})
+		emit(TurnEvent{Kind: TurnEventToolStart, Tool: "read", ToolCallID: id, Input: `{}`})
+		emit(TurnEvent{Kind: TurnEventToolEnd, Tool: "read", ToolCallID: id, Output: "observation"})
+	}
+	content := "premature delivery"
+	if m.calls >= 2 {
+		content = "verified delivery"
+	}
+	done := make(chan struct{})
+	close(done)
+	return &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage(content, nil)}}}, done, nil
+}
+
+func (m *continuationIDModel) TaskExecutionStatus(context.Context) TaskRunStatus {
+	return TaskRunStatus{Available: true, State: "active"}
+}
+
+func (m *continuationIDModel) TaskCompletionGate(context.Context) TaskCompletionGate {
+	if m.calls == 0 {
+		return TaskCompletionGate{}
+	}
+	if m.calls >= 2 {
+		return TaskCompletionGate{Active: true, Complete: true, Summary: "complete"}
+	}
+	return TaskCompletionGate{
+		Active:  true,
+		Summary: "task remains active",
+		Gap:     "continue the active task",
+	}
+}
+
+func (*continuationIDModel) InterruptTask(context.Context, string) TaskInterruptReceipt {
+	return TaskInterruptReceipt{}
 }
 
 func (m *taskGateModel) Stream(ctx context.Context, messages []*schema.Message) (Stream, error) {
@@ -226,6 +283,49 @@ func TestSessionTaskCompletionGateContinuesWithoutCommittingPrematureAnswer(t *t
 		{role: schema.User, content: "implement it"},
 		{role: schema.Assistant, content: "verified delivery"},
 	})
+}
+
+func TestSessionTaskContinuationAllocatesDistinctUsageAndToolCallIDs(t *testing.T) {
+	model := &continuationIDModel{}
+	threadStore := newDurableThreadStore(t)
+	session, err := NewSession(model, "system", SessionOptions{Store: threadStore})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if err := session.AskWithEvents(context.Background(), "implement it", nil, func(TurnEvent) {}); err != nil {
+		t.Fatalf("AskWithEvents: %v", err)
+	}
+	if model.calls != 2 {
+		t.Fatalf("model calls = %d, want 2 continuation attempts", model.calls)
+	}
+	if got, want := model.toolCallIDs, []string{"local-tool-call-1", "local-tool-call-2"}; !slices.Equal(got, want) {
+		t.Fatalf("allocated tool call IDs = %#v, want %#v", got, want)
+	}
+
+	groups, err := threadStore.LoadTurnGroups(context.Background(), session.ID())
+	if err != nil {
+		t.Fatalf("LoadTurnGroups: %v", err)
+	}
+	if len(groups) != 1 {
+		t.Fatalf("turn groups = %#v, want one durable turn", groups)
+	}
+	group := groups[0]
+	if len(group.Usages) != 2 {
+		t.Fatalf("usage records = %#v, want two model calls", group.Usages)
+	}
+	if !strings.HasSuffix(group.Usages[0].CallID, ":model-1") || !strings.HasSuffix(group.Usages[1].CallID, ":model-2") || group.Usages[0].CallID == group.Usages[1].CallID {
+		t.Fatalf("durable usage IDs = %#v, want unique model-1/model-2", group.Usages)
+	}
+	if len(group.Tools) != 2 {
+		t.Fatalf("durable tool groups = %#v, want two tools", group.Tools)
+	}
+	for index, tool := range group.Tools {
+		want := model.toolCallIDs[index]
+		if tool.ToolCallID != want || tool.Started == nil || tool.Completed == nil || tool.Started.ToolCallID != want || tool.Completed.ToolCallID != want {
+			t.Fatalf("tool group %d = %#v, want completed %q", index, tool, want)
+		}
+	}
 }
 
 func TestSessionTaskCompletionGateFailsRatherThanCommittingUnresolvedRun(t *testing.T) {

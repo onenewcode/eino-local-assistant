@@ -109,9 +109,10 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		HostEscalation: !modelCfg.Tools.Shell.Disabled,
 	}
 	runtimeInfo := tui.RuntimeInfo{
-		MaxTurnSeconds: runtime.runtimeCfg.MaxTurnSeconds,
-		MaxReactSteps:  runtime.runtimeCfg.MaxReactSteps,
-		MaxToolCalls:   runtime.runtimeCfg.MaxToolCalls,
+		MaxTurnSeconds:                    runtime.runtimeCfg.MaxTurnSeconds,
+		MaxModelSteps:                     runtime.runtimeCfg.MaxModelSteps,
+		MaxToolCalls:                      runtime.runtimeCfg.MaxToolCalls,
+		MaxConsecutiveEquivalentToolCalls: runtime.runtimeCfg.MaxConsecutiveEquivalentToolCalls,
 	}
 	policyInfo := tui.CommandPolicyInfo{
 		Mode: cmdMode,
@@ -119,10 +120,9 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		// override so /permissions does not mislabel yolo as a persisted policy.
 		Approval:      modelCfg.ApprovalPolicyNormalized(),
 		ApprovalState: runtime.approvalState,
-		Profile:       modelCfg.Permissions.PermissionsProfile(),
 		WorkspaceOnly: true,
 		WorkspaceRoot: runtime.workspaceRoot,
-		Permissions:   runtime.permissions,
+		ToolPolicy:    runtime.toolPolicy,
 		SessionAllows: runtime.sessionAllows,
 		SessionDenies: runtime.sessionDenies,
 		Sandbox:       sandboxInfo,
@@ -146,7 +146,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 				return tui.ModelSwitchResult{}, switchErr
 			}
 			return tui.ModelSwitchResult{
-				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
 				SessionOpts: bundle.sessionOpts,
 			}, nil
 		},
@@ -156,7 +156,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 				return tui.ModelSwitchResult{}, switchErr
 			}
 			return tui.ModelSwitchResult{
-				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
 				SessionOpts: bundle.sessionOpts,
 			}, nil
 		},
@@ -167,7 +167,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 			}
 			return tui.SessionOpenResult{
 				Session:     opened.session,
-				Status:      statusFromConfig(opened.bundle.cfg, runtime.registry, cmdMode, opened.bundle.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+				Status:      statusFromConfig(opened.bundle.cfg, runtime.registry, cmdMode, opened.bundle.reactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
 				SessionOpts: opened.bundle.sessionOpts,
 			}, nil
 		},
@@ -175,11 +175,13 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		WorkspaceDiff:           runtime.workspaceDiff,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
 		SessionOpts:             initialSessionOpts,
-		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, initialReactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, initialReactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
 		ModelCatalog:            modelCatalogFromConfig(modelCfg.Model.CatalogEntries()),
 		TurnOptions: runtimeguard.TurnOptions{
-			MaxToolCalls: runtime.runtimeCfg.MaxToolCalls,
-			Timeout:      time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
+			MaxModelSteps:                     runtime.runtimeCfg.MaxModelSteps,
+			MaxToolCalls:                      runtime.runtimeCfg.MaxToolCalls,
+			MaxConsecutiveEquivalentToolCalls: runtime.runtimeCfg.MaxConsecutiveEquivalentToolCalls,
+			Timeout:                           time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
 		},
 		HideTurnUsage: !modelCfg.UI.TurnUsageEnabled(),
 		Approval:      approvalBridge,
@@ -206,6 +208,14 @@ func effectiveSandboxProtectedPaths(workspaceRoot string, configured []string, c
 }
 
 func effectiveSandboxProtectedPathsWithSourceThreadPaths(workspaceRoot string, configured []string, configPath, dataDir string, sourceDataDirs, sourceThreadPaths []string) ([]string, error) {
+	return effectiveSandboxProtectedPathsWithUserToolPolicyRoot(workspaceRoot, configured, configPath, dataDir, "", sourceDataDirs, sourceThreadPaths)
+}
+
+// effectiveSandboxProtectedPathsWithUserToolPolicyRoot also protects the
+// user-owned tool-policy directory when it is below the workspace. This keeps
+// project trust and user rules outside the normal workspace-write surface even
+// when session storage was configured elsewhere.
+func effectiveSandboxProtectedPathsWithUserToolPolicyRoot(workspaceRoot string, configured []string, configPath, dataDir, userToolPolicyRoot string, sourceDataDirs, sourceThreadPaths []string) ([]string, error) {
 	canonicalWorkspace, err := tools.ResolveWorkspaceRoot(workspaceRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sandbox workspace: %w", err)
@@ -217,10 +227,21 @@ func effectiveSandboxProtectedPathsWithSourceThreadPaths(workspaceRoot string, c
 	if err := rejectWorkspaceControlSymlink(workspaceRoot, dataDir, "session storage"); err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(userToolPolicyRoot) != "" {
+		if err := rejectWorkspaceControlSymlink(workspaceRoot, userToolPolicyRoot, "user tool-policy directory"); err != nil {
+			return nil, err
+		}
+	}
 	paths := append([]string(nil), configured...)
 	paths, _, err = addWorkspaceProtectedPath(paths, workspaceRoot, configPath, "configuration file")
 	if err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(userToolPolicyRoot) != "" {
+		paths, _, err = addWorkspaceProtectedPath(paths, workspaceRoot, userToolPolicyRoot, "user tool-policy directory")
+		if err != nil {
+			return nil, err
+		}
 	}
 	resolvedDataDir, err := resolveExistingPath(dataDir)
 	if err != nil {
@@ -395,7 +416,7 @@ func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 }
 
-func statusFrom(modelName, reasoningEffort string, registry *tools.Registry, cmdMode string, maxStep int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
+func statusFrom(modelName, reasoningEffort string, registry *tools.Registry, cmdMode string, maxModelSteps int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
 	names := make([]string, 0)
 	if registry != nil {
 		infos, err := registry.Infos(context.Background())
@@ -415,20 +436,20 @@ func statusFrom(modelName, reasoningEffort string, registry *tools.Registry, cmd
 		Model:           modelName,
 		ReasoningEffort: reasoningEffort,
 		Tools:           names,
-		MaxStep:         maxStep,
+		MaxModelSteps:   maxModelSteps,
 		CmdPolicy:       cmdPolicy,
 		Sandbox:         sandboxInfo,
 		Runtime:         runtimeInfo,
 	}
 }
 
-func statusFromConfig(cfg config.Config, registry *tools.Registry, cmdMode string, maxStep int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
+func statusFromConfig(cfg config.Config, registry *tools.Registry, cmdMode string, maxModelSteps int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
 	status := statusFrom(
 		cfg.Model.Provider+"/"+cfg.Model.Name,
 		cfg.Model.ReasoningEffort,
 		registry,
 		cmdMode,
-		maxStep,
+		maxModelSteps,
 		sandboxInfo,
 		runtimeInfo,
 	)

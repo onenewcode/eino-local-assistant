@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-
-	"eino-local-assistant/internal/tools"
 )
 
 // Config is the complete TOML configuration accepted by the CLI.
@@ -22,22 +20,20 @@ import (
 // Tool posture follows Codex + Claude Code conventions:
 //   - approval_policy (Codex): when to ask the human
 //   - [workspace] (Codex lite): path clamp root
-//   - [permissions] allow/ask/deny (Claude): Tool or Tool(specifier) rules
 //   - [sandbox]: OS worker filesystem and network boundary
 //   - [runtime]: whole-turn ReAct budgets
 //   - [tools.shell] / [tools.apply_patch]: per-tool limits
 type Config struct {
 	Model ModelConfig `toml:"model"`
 	// ApprovalPolicy is Codex-style: on-request | never (also accepts on_request).
-	ApprovalPolicy string            `toml:"approval_policy"`
-	Assistant      AssistantConfig   `toml:"assistant"`
-	Storage        StorageConfig     `toml:"storage"`
-	Workspace      WorkspaceConfig   `toml:"workspace"`
-	Permissions    PermissionsConfig `toml:"permissions"`
-	Tools          ToolsConfig       `toml:"tools"`
-	Sandbox        SandboxConfig     `toml:"sandbox"`
-	Runtime        RuntimeConfig     `toml:"runtime"`
-	UI             UIConfig          `toml:"ui"`
+	ApprovalPolicy string          `toml:"approval_policy"`
+	Assistant      AssistantConfig `toml:"assistant"`
+	Storage        StorageConfig   `toml:"storage"`
+	Workspace      WorkspaceConfig `toml:"workspace"`
+	Tools          ToolsConfig     `toml:"tools"`
+	Sandbox        SandboxConfig   `toml:"sandbox"`
+	Runtime        RuntimeConfig   `toml:"runtime"`
+	UI             UIConfig        `toml:"ui"`
 	// Rules loads workspace AGENTS.md as durable project instructions.
 	Rules RulesConfig `toml:"rules"`
 	// Memory is project-scoped semantic memory (not session resume).
@@ -212,19 +208,6 @@ type WorkspaceConfig struct {
 	Root string `toml:"root"`
 }
 
-// PermissionsConfig is Claude Code-style allow/ask/deny rule lists.
-// Rules use Tool or Tool(specifier), e.g. Shell(git status), ApplyPatch(.env).
-type PermissionsConfig struct {
-	// Profile seeds built-in rules before user lists (default cautious).
-	Profile string `toml:"profile"`
-	// Allow rules auto-approve matching tool calls (still subject to opaque-shell downgrade for Bash).
-	Allow []string `toml:"allow"`
-	// Ask rules force a human prompt when matched.
-	Ask []string `toml:"ask"`
-	// Deny rules block matching tool calls.
-	Deny []string `toml:"deny"`
-}
-
 // UIConfig controls interactive display options.
 type UIConfig struct {
 	// ShowTurnUsage controls the post-turn API usage footer in the transcript.
@@ -272,15 +255,18 @@ const (
 	// DefaultRuntimeMaxTurnSeconds bounds a complete ReAct turn when no runtime
 	// override is configured.
 	DefaultRuntimeMaxTurnSeconds = 600
-	// DefaultRuntimeMaxReactSteps bounds model/tool loop iterations by default.
-	DefaultRuntimeMaxReactSteps = 8
+	// DefaultRuntimeMaxModelSteps bounds tool-enabled model decisions by default.
+	DefaultRuntimeMaxModelSteps = 8
 	// DefaultRuntimeMaxToolCalls bounds all tool invocations within one turn.
 	DefaultRuntimeMaxToolCalls = 16
+	// DefaultRuntimeMaxConsecutiveEquivalentToolCalls bounds repeated equivalent
+	// tool invocations before the runtime stops retrying them.
+	DefaultRuntimeMaxConsecutiveEquivalentToolCalls = 3
 )
 
 const (
 	maxRuntimeTurnSeconds = 3_600
-	maxRuntimeReactSteps  = 64
+	maxRuntimeModelSteps  = 32
 	maxRuntimeToolCalls   = 128
 )
 
@@ -304,12 +290,17 @@ type SandboxNetworkConfig struct {
 
 // RuntimeConfig bounds one agent turn independently from per-command shell limits.
 type RuntimeConfig struct {
-	// MaxTurnSeconds is the total ReAct turn deadline. Zero uses 600 seconds.
+	// MaxTurnSeconds is the total agent-turn deadline. Zero uses 600 seconds.
 	MaxTurnSeconds int `toml:"max_turn_seconds"`
-	// MaxReactSteps is the ReAct model/tool loop budget. Zero uses 8.
-	MaxReactSteps int `toml:"max_react_steps"`
+	// MaxModelSteps is the number of tool-enabled model decisions per turn.
+	// One model response counts once even when it contains multiple tool calls.
+	// Zero uses 8.
+	MaxModelSteps int `toml:"max_model_steps"`
 	// MaxToolCalls is the total tool-invocation budget per turn. Zero uses 16.
 	MaxToolCalls int `toml:"max_tool_calls"`
+	// MaxConsecutiveEquivalentToolCalls permits this many equivalent tool calls
+	// before the runtime rejects a further retry. Zero uses 3.
+	MaxConsecutiveEquivalentToolCalls int `toml:"max_consecutive_equivalent_tool_calls"`
 }
 
 // ApprovalPolicyNormalized returns Codex-style approval_policy as on_request|never.
@@ -407,12 +398,13 @@ func (c RuntimeConfig) EffectiveMaxTurnSeconds() int {
 	return c.MaxTurnSeconds
 }
 
-// EffectiveMaxReactSteps returns the configured ReAct step budget or its product default.
-func (c RuntimeConfig) EffectiveMaxReactSteps() int {
-	if c.MaxReactSteps == 0 {
-		return DefaultRuntimeMaxReactSteps
+// EffectiveMaxModelSteps returns the configured model-decision budget or its
+// product default.
+func (c RuntimeConfig) EffectiveMaxModelSteps() int {
+	if c.MaxModelSteps == 0 {
+		return DefaultRuntimeMaxModelSteps
 	}
-	return c.MaxReactSteps
+	return c.MaxModelSteps
 }
 
 // EffectiveMaxToolCalls returns the configured per-turn tool budget or its product default.
@@ -423,21 +415,25 @@ func (c RuntimeConfig) EffectiveMaxToolCalls() int {
 	return c.MaxToolCalls
 }
 
+// EffectiveMaxConsecutiveEquivalentToolCalls returns the configured repeated
+// equivalent-call budget or its product default.
+func (c RuntimeConfig) EffectiveMaxConsecutiveEquivalentToolCalls() int {
+	if c.MaxConsecutiveEquivalentToolCalls != 0 {
+		return c.MaxConsecutiveEquivalentToolCalls
+	}
+	// The default threshold cannot exceed the total per-turn call budget. This
+	// keeps a deliberately small max_tool_calls setting valid while preserving
+	// the documented default of three whenever that budget permits it.
+	return min(DefaultRuntimeMaxConsecutiveEquivalentToolCalls, c.EffectiveMaxToolCalls())
+}
+
 // Normalize fills omitted runtime limits with product defaults.
 func (c RuntimeConfig) Normalize() RuntimeConfig {
 	c.MaxTurnSeconds = c.EffectiveMaxTurnSeconds()
-	c.MaxReactSteps = c.EffectiveMaxReactSteps()
+	c.MaxModelSteps = c.EffectiveMaxModelSteps()
 	c.MaxToolCalls = c.EffectiveMaxToolCalls()
+	c.MaxConsecutiveEquivalentToolCalls = c.EffectiveMaxConsecutiveEquivalentToolCalls()
 	return c
-}
-
-// PermissionsProfile returns the permissions profile name (default cautious).
-func (c PermissionsConfig) PermissionsProfile() string {
-	p := strings.ToLower(strings.TrimSpace(c.Profile))
-	if p == "" {
-		return "cautious"
-	}
-	return p
 }
 
 // StorageConfig controls local session persistence.
@@ -520,6 +516,21 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse TOML configuration: %w", err)
 	}
 	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
+		for _, key := range undecoded {
+			if len(key) == 0 {
+				continue
+			}
+			switch key[0] {
+			case "permissions":
+				return Config{}, errors.New("parse TOML configuration: [permissions] is no longer supported; delete it. Move shell prefix approvals to ~/.eino-assistant/rules/*.rules (default.rules is initialized before runtime configuration is validated); configure apply_patch through approval_policy and [sandbox].protected_paths. This table is not migrated automatically")
+			case "projects":
+				return Config{}, errors.New("parse TOML configuration: [projects] is only read from the user-owned ~/.eino-assistant/config.toml tool-policy trust file; remove it from the runtime configuration passed to --config")
+			case "runtime":
+				if len(key) > 1 && key[1] == "max_react_steps" {
+					return Config{}, errors.New("parse TOML configuration: runtime.max_react_steps is no longer supported; replace it with runtime.max_model_steps. One tool-enabled model response consumes a model step; individual tool executions use runtime.max_tool_calls")
+				}
+			}
+		}
 		return Config{}, fmt.Errorf("parse TOML configuration: unknown field %s", undecoded[0].String())
 	}
 
@@ -543,13 +554,6 @@ func (c *Config) Validate() error {
 	case "on_request", "never":
 	default:
 		return fmt.Errorf("approval_policy must be on-request or never")
-	}
-	if profile := c.Permissions.PermissionsProfile(); profile != "cautious" {
-		return fmt.Errorf("permissions.profile %q is unsupported (supported: cautious)", c.Permissions.Profile)
-	}
-	// Fail fast on invalid Claude-style rules.
-	if _, err := c.BuildPermissions(); err != nil {
-		return err
 	}
 	if err := c.Workspace.Validate(); err != nil {
 		return err
@@ -641,16 +645,6 @@ func (c MemoryConfig) Validate() error {
 	return nil
 }
 
-// BuildPermissions compiles Claude-style [permissions] rules for the tool layer.
-func (c Config) BuildPermissions() (*tools.PermissionSet, error) {
-	return tools.BuildPermissionSet(
-		c.Permissions.PermissionsProfile(),
-		c.Permissions.Allow,
-		c.Permissions.Ask,
-		c.Permissions.Deny,
-	)
-}
-
 // Validate checks workspace.root when set.
 func (c WorkspaceConfig) Validate() error {
 	root := strings.TrimSpace(c.Root)
@@ -727,7 +721,7 @@ func (c ShellToolConfig) Validate() error {
 var defaultSandboxProtectedPaths = []string{
 	".git",
 	".agents",
-	".codex",
+	".eino-assistant",
 	".eino",
 	".env",
 }
@@ -863,7 +857,7 @@ func (c RuntimeConfig) Validate() error {
 		max   int
 	}{
 		{name: "runtime.max_turn_seconds", value: c.MaxTurnSeconds, max: maxRuntimeTurnSeconds},
-		{name: "runtime.max_react_steps", value: c.MaxReactSteps, max: maxRuntimeReactSteps},
+		{name: "runtime.max_model_steps", value: c.MaxModelSteps, max: maxRuntimeModelSteps},
 		{name: "runtime.max_tool_calls", value: c.MaxToolCalls, max: maxRuntimeToolCalls},
 	} {
 		if limit.value < 0 {
@@ -872,6 +866,15 @@ func (c RuntimeConfig) Validate() error {
 		if limit.value > limit.max {
 			return fmt.Errorf("%s must be <= %d", limit.name, limit.max)
 		}
+	}
+	if c.MaxConsecutiveEquivalentToolCalls < 0 {
+		return errors.New("runtime.max_consecutive_equivalent_tool_calls must be >= 0")
+	}
+	if c.MaxConsecutiveEquivalentToolCalls > 0 && c.MaxConsecutiveEquivalentToolCalls > c.EffectiveMaxToolCalls() {
+		return fmt.Errorf(
+			"runtime.max_consecutive_equivalent_tool_calls must be <= runtime.max_tool_calls (%d)",
+			c.EffectiveMaxToolCalls(),
+		)
 	}
 	return nil
 }

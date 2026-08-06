@@ -168,7 +168,7 @@ func TestStatusHelpDocumentsReasoningVisibility(t *testing.T) {
 	}
 
 	help := helpText()
-	if !strings.Contains(help, "/status            model, session, tokens, cost, max_step, context, declared catalog lifecycle, reasoning effort (requested/default); declared catalog effort options/default; ctrl+o toggles details") {
+	if !strings.Contains(help, "/status            model, session, tokens, cost, max_model_steps, context, declared catalog lifecycle, reasoning effort (requested/default); declared catalog effort options/default; ctrl+o toggles details") {
 		t.Fatalf("status help line missing reasoning visibility details: %s", help)
 	}
 }

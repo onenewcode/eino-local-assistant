@@ -610,8 +610,8 @@ func TestAnthropicModelMergesAdjacentToolResultsWithoutLosingIDs(t *testing.T) {
 	assertToolResultBlock(t, toolResults[1], "toolu_london", "Rainy.")
 }
 
-func TestAnthropicModelWithToolsDoesNotMutateBaseModel(t *testing.T) {
-	requests := make(chan anthropicRequest, 2)
+func TestAnthropicModelWithToolsDoesNotMutateBaseModelOrFinalOnlyBinding(t *testing.T) {
+	requests := make(chan anthropicRequest, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -648,6 +648,10 @@ func TestAnthropicModelWithToolsDoesNotMutateBaseModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WithTools() error = %v", err)
 	}
+	finalOnlyModel, err := toolModel.WithTools(nil)
+	if err != nil {
+		t.Fatalf("WithTools(nil) error = %v", err)
+	}
 
 	if _, err := toolModel.Generate(context.Background(), []*schema.Message{schema.UserMessage("Use a tool if needed.")}); err != nil {
 		t.Fatalf("tool-bound Generate() error = %v", err)
@@ -658,9 +662,16 @@ func TestAnthropicModelWithToolsDoesNotMutateBaseModel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("base Generate() error = %v", err)
 	}
+	if _, err := finalOnlyModel.Generate(context.Background(), []*schema.Message{
+		schema.SystemMessage("Answer from the observations."),
+		schema.UserMessage("Give the final answer."),
+	}); err != nil {
+		t.Fatalf("final-only Generate() error = %v", err)
+	}
 
 	toolRequest := receiveAnthropicRequest(t, requests)
 	baseRequest := receiveAnthropicRequest(t, requests)
+	finalOnlyRequest := receiveAnthropicRequest(t, requests)
 	tools := arrayValue(t, toolRequest.body["tools"])
 	if got, want := len(tools), 1; got != want {
 		t.Errorf("tool-bound request tools = %d, want %d", got, want)
@@ -670,6 +681,12 @@ func TestAnthropicModelWithToolsDoesNotMutateBaseModel(t *testing.T) {
 	}
 	if _, exists := baseRequest.body["tool_choice"]; exists {
 		t.Errorf("base model request unexpectedly includes tool_choice: %#v", baseRequest.body["tool_choice"])
+	}
+	if _, exists := finalOnlyRequest.body["tools"]; exists {
+		t.Errorf("final-only request unexpectedly includes tools: %#v", finalOnlyRequest.body["tools"])
+	}
+	if _, exists := finalOnlyRequest.body["tool_choice"]; exists {
+		t.Errorf("final-only request unexpectedly includes tool_choice: %#v", finalOnlyRequest.body["tool_choice"])
 	}
 }
 

@@ -1,9 +1,10 @@
 # 复制为 config.toml 后填写；不要提交含密钥的 config.toml。
 #
 # 工具面 = Codex 子集：shell + apply_patch（另加 get_current_time / read_artifact）
-# 权限语法：approval_policy + [workspace] + [sandbox] + [permissions] allow/ask/deny
-#   Shell(...)  — shell 命令
-#   ApplyPatch(path-glob) — 文件补丁
+# 工具授权规则使用 Codex-compatible Starlark 子集：~/.eino-assistant/rules/*.rules，项目层为
+# <workspace>/.eino-assistant/rules/*.rules。程序仅在用户层首次创建 default.rules；
+# 项目层还须由用户在 ~/.eino-assistant/config.toml 的
+# [projects."/absolute/workspace"] 中设 trust_level = "trusted" 才会载入。
 
 approval_policy = "on-request"
 
@@ -62,24 +63,23 @@ root = ""
 mode = "workspace-write"
 # 仅接受已存在的绝对目录；按真实路径规范化后以只读方式挂载。
 # read_only_roots = ["/absolute/path/to/go-or-node-toolchain"]
-# 这里只能追加字面工作区路径或字面 `/**` 子树；内建 .git、.agents、.codex、.eino、.env 永远受保护。
+# 这里只能追加字面工作区路径或字面 `/**` 子树；内建 .git、.agents、.eino-assistant、.eino、.env 永远受保护。
 # protected_paths = [".env.local", "secrets/**"]
 
 # 空列表表示无网络。仅允许精确 DNS 主机名（不接受 URL、端口、IP 或通配符）。
 # [sandbox.network]
 # allowed_domains = ["proxy.golang.org", "registry.npmjs.org"]
 
-# 单个 ReAct turn 的总预算；0 也会采用下列默认值。
+# 单个 agent turn 的总预算；0 也会采用下列默认值。
+# 一个 tool-enabled 模型响应计一个 model step；该响应中的 0..N 个工具调用
+# 仍独立计入 tool-call 预算，并可并行执行。
 [runtime]
 max_turn_seconds = 600
-max_react_steps = 8
+max_model_steps = 8
 max_tool_calls = 16
-
-[permissions]
-profile = "cautious"
-# allow = ["Shell(go test *)", "ApplyPatch(src/**)"]
-# ask = ["Shell(git push *)"]
-# deny = ["Shell(sudo *)", "ApplyPatch(.env)"]
+# 同一 tool name + 规范化 JSON 参数在实际工作区/外部状态改变前最多执行 3 次；
+# 第 4 次会被拒绝。非零值不得超过 max_tool_calls。
+max_consecutive_equivalent_tool_calls = 3
 
 # [tools.shell]
 # timeout_seconds = 60

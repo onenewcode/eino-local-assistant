@@ -17,6 +17,7 @@ func TestComposeSystemPromptAppendsToolPolicy(t *testing.T) {
 		"get_current_time",
 		"user_denied",
 		"never invent tool results",
+		"prerequisite is clearly unavailable",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("policy missing %q", want)

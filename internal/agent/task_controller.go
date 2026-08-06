@@ -1247,6 +1247,7 @@ func applyPatchMayHaveMutated(output string) bool {
 
 type proofShellResult struct {
 	Command   string `json:"command"`
+	Impact    string `json:"impact"`
 	ExitCode  *int   `json:"exit_code"`
 	TimedOut  bool   `json:"timed_out"`
 	Cancelled bool   `json:"cancelled"`
@@ -1291,7 +1292,15 @@ func taskObservationShellResult(observation *taskObservation) (proofShellResult,
 
 func shellMayHaveMutated(output string) bool {
 	result, err := parseProofShellResult(output)
-	return err != nil || !result.Denied
+	if err != nil {
+		return true
+	}
+	if result.Denied {
+		return false
+	}
+	// Impact is decided by the agent's built-in policy before the shell starts.
+	// Older, malformed, and unavailable results stay conservative.
+	return result.Impact != "read_only"
 }
 
 func isSuccessfulDeclaredProofCommand(run *taskRun, output string) bool {

@@ -248,11 +248,14 @@ type ToolStarted struct {
 // ToolCompleted records the terminal result of a tool call. Large output can
 // be stored once as an artifact and referenced here.
 type ToolCompleted struct {
-	TurnID     string       `json:"turn_id"`
-	ToolCallID string       `json:"tool_call_id"`
-	ToolName   string       `json:"tool_name"`
-	Output     string       `json:"output,omitempty"`
-	Artifact   *ArtifactRef `json:"artifact,omitempty"`
+	TurnID     string `json:"turn_id"`
+	ToolCallID string `json:"tool_call_id"`
+	ToolName   string `json:"tool_name"`
+	// Impact is a tool-provided, versioned classification retained separately
+	// from output so crash recovery need not inspect or retain raw arguments.
+	Impact   string       `json:"impact,omitempty"`
+	Output   string       `json:"output,omitempty"`
+	Artifact *ArtifactRef `json:"artifact,omitempty"`
 }
 
 // TurnCommit atomically commits all visible messages for a completed turn.

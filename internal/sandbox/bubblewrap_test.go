@@ -61,7 +61,7 @@ func TestExistingLinuxRuntimeMountsExcludeBroadUsr(t *testing.T) {
 func TestBubblewrapArgsReadOnlyAndAbsentProtectedPath(t *testing.T) {
 	t.Parallel()
 	policy, worker := testPolicyAndWorker(t, ReadOnly)
-	policy.ProtectedPaths = append(policy.ProtectedPaths, ".codex")
+	policy.ProtectedPaths = append(policy.ProtectedPaths, ".eino-assistant")
 	normalized, err := NormalizePolicy(policy)
 	if err != nil {
 		t.Fatalf("NormalizePolicy() error = %v", err)
@@ -76,7 +76,7 @@ func TestBubblewrapArgsReadOnlyAndAbsentProtectedPath(t *testing.T) {
 	if !containsSequence(args, []string{"--ro-bind", normalized.Workspace, normalized.Workspace}) {
 		t.Errorf("read-only argv is missing read-only workspace bind: %#v", args)
 	}
-	if !containsSequence(args, []string{"--tmpfs", filepath.Join(normalized.Workspace, ".codex")}) {
+	if !containsSequence(args, []string{"--tmpfs", filepath.Join(normalized.Workspace, ".eino-assistant")}) {
 		t.Errorf("absent protected path is not reserved with tmpfs: %#v", args)
 	}
 	if containsSequence(args, []string{"--setenv", "HTTP_PROXY", "http://127.0.0.1:"}) {

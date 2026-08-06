@@ -66,6 +66,47 @@ func TestRunCommandEchoesStdout(t *testing.T) {
 	}
 }
 
+func TestRunCommandReportsPolicyImpact(t *testing.T) {
+	workspace := t.TempDir()
+	tool, err := NewShell(autoRunOpts(ShellOptions{
+		Approval:      ApprovalNever,
+		WorkspaceRoot: workspace,
+	}))
+	if err != nil {
+		t.Fatalf("NewShell() error = %v", err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"ls -la"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v", err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatalf("decode output %q: %v", raw, err)
+	}
+	if out.Impact != ToolImpactReadOnly {
+		t.Fatalf("impact = %q, want %q", out.Impact, ToolImpactReadOnly)
+	}
+}
+
+func TestRunCommandNeverRejectsCodexPromptRule(t *testing.T) {
+	policy := planTestToolPolicy(t, `prefix_rule(pattern = ["printf"], decision = "prompt")`)
+	tool, err := NewShell(ShellOptions{Approval: ApprovalNever, Rules: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"printf blocked"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Denied || !strings.Contains(out.Reason, "approval_policy is never") {
+		t.Fatalf("prompt rule under never = %+v", out)
+	}
+}
+
 func TestRunCommandReturnsNonZeroExitAsSoftResult(t *testing.T) {
 	tool, err := NewShell(autoRunOpts())
 	if err != nil {
@@ -349,8 +390,8 @@ func TestNormalizeShellOptionsDefaults(t *testing.T) {
 	if opts.Approval != ApprovalOnRequest {
 		t.Errorf("Approval = %q, want %q", opts.Approval, ApprovalOnRequest)
 	}
-	if opts.Permissions == nil || opts.Permissions.Profile != ProfileCautious {
-		t.Errorf("Permissions = %+v, want cautious", opts.Permissions)
+	if opts.Rules != nil {
+		t.Errorf("Rules = %+v, want nil built-in fallback", opts.Rules)
 	}
 	if opts.WorkspaceRoot == "" {
 		t.Error("WorkspaceRoot should resolve to cwd")
@@ -393,7 +434,7 @@ func TestRunCommandAskWithoutApproverSoftDenies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewShell: %v", err)
 	}
-	raw, err := tool.InvokableRun(context.Background(), `{"command":"echo hi"}`)
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"printf hi"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun: %v", err)
 	}
@@ -415,7 +456,7 @@ func TestRunCommandShellChainNotAutoAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewShell: %v", err)
 	}
-	raw, err := tool.InvokableRun(context.Background(), `{"command":"ls && echo pwned"}`)
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"ls $(pwd)"}`)
 	if err != nil {
 		t.Fatalf("InvokableRun: %v", err)
 	}
@@ -439,7 +480,7 @@ func TestRunCommandDenyStreakStopRetrying(t *testing.T) {
 	}
 	var last ShellOutput
 	for i := 0; i < 3; i++ {
-		raw, err := tool.InvokableRun(context.Background(), `{"command":"echo retry"}`)
+		raw, err := tool.InvokableRun(context.Background(), `{"command":"printf retry"}`)
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
@@ -466,7 +507,7 @@ func TestRunCommandUserDenyReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewShell: %v", err)
 	}
-	raw, err := tool.InvokableRun(context.Background(), `{"command":"echo no"}`)
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"printf no"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +580,7 @@ func TestRunCommandApprovalTimeoutReason(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewShell: %v", err)
 	}
-	raw, err := tool.InvokableRun(context.Background(), `{"command":"echo no"}`)
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"printf no"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +625,7 @@ func TestRunCommandApprovalStateSwitchesAskAndAuto(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := `{"command":"echo dynamic-approval"}`
+	payload := `{"command":"printf dynamic-approval"}`
 
 	run := func() ShellOutput {
 		raw, runErr := tool.InvokableRun(context.Background(), payload)
@@ -603,7 +644,7 @@ func TestRunCommandApprovalStateSwitchesAskAndAuto(t *testing.T) {
 	if err := state.SetInteractiveMode("auto"); err != nil {
 		t.Fatal(err)
 	}
-	if out := run(); out.Denied || out.Stdout != "dynamic-approval\n" {
+	if out := run(); out.Denied || out.Stdout != "dynamic-approval" {
 		t.Fatalf("auto mode output = %+v", out)
 	}
 	if err := state.SetInteractiveMode("ask"); err != nil {
@@ -760,7 +801,7 @@ func TestSessionAllowDoesNotBypassOpaqueShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := tool.InvokableRun(context.Background(), `{"command":"ls && echo pwned"}`)
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"ls $(pwd)"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -798,8 +839,8 @@ func TestRunCommandApprovalOnceAndSession(t *testing.T) {
 		t.Fatalf("once result = %+v", out)
 	}
 
-	// session allow key is "go env" for both of these commands
-	raw, err = tool.InvokableRun(context.Background(), `{"command":"go env GOPATH"}`)
+	// session allow key is "go list" for both of these commands.
+	raw, err = tool.InvokableRun(context.Background(), `{"command":"go list ."}`)
 	if err != nil {
 		t.Fatalf("session1: %v", err)
 	}
@@ -809,7 +850,7 @@ func TestRunCommandApprovalOnceAndSession(t *testing.T) {
 	if out.Denied || out.ExitCode != 0 {
 		t.Fatalf("session1 = %+v", out)
 	}
-	raw, err = tool.InvokableRun(context.Background(), `{"command":"go env GOROOT"}`)
+	raw, err = tool.InvokableRun(context.Background(), `{"command":"go list ./..."}`)
 	if err != nil {
 		t.Fatalf("session2: %v", err)
 	}
@@ -820,7 +861,7 @@ func TestRunCommandApprovalOnceAndSession(t *testing.T) {
 		t.Fatalf("session2 = %+v", out)
 	}
 	if approver.calls != 2 {
-		// once + first go env; second go env reuses session allowlist
+		// once + first go list; second go list reuses session allowlist
 		t.Fatalf("approver calls = %d, want 2", approver.calls)
 	}
 }

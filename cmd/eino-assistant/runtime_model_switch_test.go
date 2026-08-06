@@ -105,7 +105,7 @@ func newRuntimeModelSwitchFixture(t *testing.T) (*commandRuntime, *chat.Session,
 		registry:       tools.New(),
 		reactModel:     oldReact,
 		taskController: agent.NewTaskController(),
-		runtimeCfg:     config.RuntimeConfig{MaxReactSteps: 7},
+		runtimeCfg:     config.RuntimeConfig{MaxModelSteps: 7},
 		sessionOpts: chat.SessionOptions{
 			Store:     threadStore,
 			ModelName: "old-model",

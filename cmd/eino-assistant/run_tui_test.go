@@ -31,6 +31,42 @@ func TestEffectiveSandboxProtectedPathsProtectsHostControlFilesInWorkspace(t *te
 	}
 }
 
+func TestEffectiveSandboxProtectedPathsProtectsUserToolPolicyRootInWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.toml")
+	dataDir := t.TempDir()
+	userToolPolicyRoot := filepath.Join(workspace, ".eino-assistant")
+	if err := os.WriteFile(configPath, []byte("api_key = \"secret\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(userToolPolicyRoot, "rules"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userToolPolicyRoot, "config.toml"), []byte("[projects]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userToolPolicyRoot, "rules", "default.rules"), []byte("# user policy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := effectiveSandboxProtectedPathsWithUserToolPolicyRoot(
+		workspace,
+		nil,
+		configPath,
+		dataDir,
+		userToolPolicyRoot,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("effectiveSandboxProtectedPathsWithUserToolPolicyRoot() error = %v", err)
+	}
+	if want := []string{".eino-assistant"}; !reflect.DeepEqual(paths, want) {
+		t.Fatalf("protected paths = %#v, want %#v", paths, want)
+	}
+}
+
 func TestApplyModelOverrideChangesOnlyInvocationModel(t *testing.T) {
 	cfg := config.Config{
 		Model: config.ModelConfig{

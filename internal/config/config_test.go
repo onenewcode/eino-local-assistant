@@ -7,8 +7,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"eino-local-assistant/internal/tools"
 )
 
 const validConfiguration = `
@@ -259,18 +257,12 @@ func TestModelValidateNormalizesBlankReasoningEffort(t *testing.T) {
 	}
 }
 
-func TestLoadAcceptsCodexToolPermissions(t *testing.T) {
+func TestLoadAcceptsToolRuntimeSettingsWithoutPermissionsTable(t *testing.T) {
 	dir := t.TempDir()
 	doc := validConfiguration + `
 
 [workspace]
 root = "` + dir + `"
-
-[permissions]
-profile = "cautious"
-allow = ["Shell(go test *)", "ApplyPatch(src/**)"]
-ask = ["Shell(git push *)"]
-deny = ["ApplyPatch(.env)", "Shell(sudo *)"]
 
 [tools.shell]
 timeout_seconds = 90
@@ -284,29 +276,44 @@ max_bytes = 4096
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	perms, err := got.BuildPermissions()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ev := perms.EvaluateBash("go test ./..."); ev.Decision != tools.DecisionAllow {
-		t.Fatalf("go test = %+v", ev)
-	}
-	if ev := perms.EvaluateBash("git push origin main"); ev.Decision != tools.DecisionAsk {
-		t.Fatalf("git push = %+v", ev)
-	}
 	if got.Tools.Shell.TimeoutSeconds != 90 || got.Tools.ApplyPatch.MaxBytes != 4096 {
 		t.Fatalf("tools = %#v", got.Tools)
 	}
 }
 
-func TestLoadRejectsBadPermissionRule(t *testing.T) {
+func TestLoadRejectsRemovedPermissionsTable(t *testing.T) {
 	doc := validConfiguration + `
 [permissions]
 allow = ["NotATool(foo)"]
 `
 	_, err := Load(writeConfiguration(t, doc))
-	if err == nil || !strings.Contains(err.Error(), "unknown permission tool") {
-		t.Fatalf("Load() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "[permissions] is no longer supported") || !strings.Contains(err.Error(), "~/.eino-assistant/rules/*.rules") || !strings.Contains(err.Error(), "approval_policy") || !strings.Contains(err.Error(), "[sandbox].protected_paths") {
+		t.Fatalf("Load() error = %v, want actionable permissions migration", err)
+	}
+}
+
+func TestLoadRejectsProjectTrustRecordInRuntimeConfig(t *testing.T) {
+	doc := validConfiguration + `
+[projects."relative-workspace"]
+trust_level = "trusted"
+`
+	_, err := Load(writeConfiguration(t, doc))
+	if err == nil || !strings.Contains(err.Error(), "[projects] is only read") || !strings.Contains(err.Error(), "~/.eino-assistant/config.toml") {
+		t.Fatalf("Load() error = %v, want user trust source guidance", err)
+	}
+}
+
+func TestLoadReportsRemovedPermissionsRegardlessOfUnknownFieldOrder(t *testing.T) {
+	doc := validConfiguration + `
+[unrelated]
+value = true
+
+[permissions]
+allow = ["NotATool(foo)"]
+`
+	_, err := Load(writeConfiguration(t, doc))
+	if err == nil || !strings.Contains(err.Error(), "[permissions] is no longer supported") {
+		t.Fatalf("Load() error = %v, want permissions migration guidance", err)
 	}
 }
 
@@ -401,14 +408,48 @@ func TestLoadSandboxAndRuntimeDefaults(t *testing.T) {
 		t.Fatalf("read-only roots = %v, %v", roots, err)
 	}
 	if got.Runtime.EffectiveMaxTurnSeconds() != DefaultRuntimeMaxTurnSeconds ||
-		got.Runtime.EffectiveMaxReactSteps() != DefaultRuntimeMaxReactSteps ||
-		got.Runtime.EffectiveMaxToolCalls() != DefaultRuntimeMaxToolCalls {
+		got.Runtime.EffectiveMaxModelSteps() != DefaultRuntimeMaxModelSteps ||
+		got.Runtime.EffectiveMaxToolCalls() != DefaultRuntimeMaxToolCalls ||
+		got.Runtime.EffectiveMaxConsecutiveEquivalentToolCalls() != DefaultRuntimeMaxConsecutiveEquivalentToolCalls {
 		t.Fatalf("runtime defaults = %#v", got.Runtime.Normalize())
 	}
 
 	protected := got.Sandbox.EffectiveProtectedPaths()
 	if !reflect.DeepEqual(protected, DefaultSandboxProtectedPaths()) {
 		t.Fatalf("protected paths = %#v", protected)
+	}
+}
+
+func TestLoadRuntimeZeroValuesUseDefaults(t *testing.T) {
+	doc := validConfiguration + `
+[runtime]
+max_turn_seconds = 0
+max_model_steps = 0
+max_tool_calls = 0
+max_consecutive_equivalent_tool_calls = 0
+`
+	got, err := Load(writeConfiguration(t, doc))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := RuntimeConfig{
+		MaxTurnSeconds:                    DefaultRuntimeMaxTurnSeconds,
+		MaxModelSteps:                     DefaultRuntimeMaxModelSteps,
+		MaxToolCalls:                      DefaultRuntimeMaxToolCalls,
+		MaxConsecutiveEquivalentToolCalls: DefaultRuntimeMaxConsecutiveEquivalentToolCalls,
+	}
+	if got := got.Runtime.Normalize(); got != want {
+		t.Fatalf("runtime = %#v, want %#v", got, want)
+	}
+}
+
+func TestRuntimeConfigCapsDefaultEquivalentToolCallLimitAtToolBudget(t *testing.T) {
+	config := RuntimeConfig{MaxToolCalls: 2}
+	if got := config.EffectiveMaxConsecutiveEquivalentToolCalls(); got != 2 {
+		t.Fatalf("effective equivalent-call limit = %d, want 2", got)
+	}
+	if got := config.Normalize().MaxConsecutiveEquivalentToolCalls; got != 2 {
+		t.Fatalf("normalized equivalent-call limit = %d, want 2", got)
 	}
 }
 
@@ -430,8 +471,9 @@ allowed_domains = ["API.Example.TEST", "api.example.test"]
 
 [runtime]
 max_turn_seconds = 120
-max_react_steps = 4
+max_model_steps = 4
 max_tool_calls = 12
+max_consecutive_equivalent_tool_calls = 2
 `, link, realRoot)
 	got, err := Load(writeConfiguration(t, doc))
 	if err != nil {
@@ -454,8 +496,24 @@ max_tool_calls = 12
 	if !reflect.DeepEqual(got.Sandbox.EffectiveProtectedPaths(), wantProtected) {
 		t.Fatalf("effective protected paths = %#v, want %#v", got.Sandbox.EffectiveProtectedPaths(), wantProtected)
 	}
-	if got.Runtime.Normalize() != (RuntimeConfig{MaxTurnSeconds: 120, MaxReactSteps: 4, MaxToolCalls: 12}) {
+	if got.Runtime.Normalize() != (RuntimeConfig{
+		MaxTurnSeconds:                    120,
+		MaxModelSteps:                     4,
+		MaxToolCalls:                      12,
+		MaxConsecutiveEquivalentToolCalls: 2,
+	}) {
 		t.Fatalf("runtime = %#v", got.Runtime.Normalize())
+	}
+}
+
+func TestLoadRejectsRemovedMaxReactSteps(t *testing.T) {
+	doc := validConfiguration + `
+[runtime]
+max_react_steps = 8
+`
+	_, err := Load(writeConfiguration(t, doc))
+	if err == nil || !strings.Contains(err.Error(), "runtime.max_react_steps is no longer supported") || !strings.Contains(err.Error(), "runtime.max_model_steps") {
+		t.Fatalf("Load() error = %v, want actionable model-step migration", err)
 	}
 }
 
@@ -566,14 +624,25 @@ func TestLoadRejectsInvalidSandboxSettings(t *testing.T) {
 			want: "runtime.max_turn_seconds",
 		},
 		{
-			name: "runtime react bound",
-			doc:  "[runtime]\nmax_react_steps = 65\n",
-			want: "runtime.max_react_steps",
+			name: "runtime model-step bound",
+			doc:  "[runtime]\nmax_model_steps = 33\n",
+			want: "runtime.max_model_steps",
 		},
 		{
 			name: "runtime tool-call bound",
 			doc:  "[runtime]\nmax_tool_calls = 129\n",
 			want: "runtime.max_tool_calls",
+		},
+		{
+			name: "negative equivalent tool-call bound",
+			doc:  "[runtime]\nmax_consecutive_equivalent_tool_calls = -1\n",
+			want: "runtime.max_consecutive_equivalent_tool_calls",
+		},
+		{
+			name: "equivalent tool-call bound exceeds tool budget",
+			doc: "[runtime]\nmax_tool_calls = 2\n" +
+				"max_consecutive_equivalent_tool_calls = 3\n",
+			want: "runtime.max_consecutive_equivalent_tool_calls",
 		},
 	}
 

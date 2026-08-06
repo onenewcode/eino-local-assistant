@@ -1,0 +1,10 @@
+# Eino Assistant shell authorization rules.
+#
+# This product-owned starter file intentionally grants no commands. It is not
+# copied from another tool or from any user's approval history.
+# Eino creates it once at ~/.eino-assistant/rules/default.rules and never
+# overwrites an existing file.
+#
+# Add only the Codex-compatible prefix rules that you intend to authorize for
+# this user. Commands without a matching rule still use Eino's conservative
+# read-only fallback or the normal approval flow.

@@ -62,7 +62,7 @@ type commandRuntime struct {
 	composePrompt         func() (string, error)
 	approvalMode          tools.ApprovalMode
 	approvalState         *tools.ApprovalState
-	permissions           *tools.PermissionSet
+	toolPolicy            *tools.ToolPolicy
 	sessionAllows         *tools.SessionAllowlist
 	sessionDenies         *tools.SessionDenylist
 	workspaceRoot         string
@@ -121,11 +121,34 @@ func (lister readOnlyExecThreadLister) ListThreads(ctx context.Context) ([]store
 	return lister.store.ListThreadsReadOnly(ctx)
 }
 
+// loadCommandConfig establishes the product-owned user rule template before
+// decoding a runtime configuration. It intentionally does not load rules here:
+// project-rule trust requires the validated workspace root and belongs to the
+// later tool-policy wiring.
+func loadCommandConfig(configPath string) (config.Config, string, error) {
+	toolPolicyRoot, err := tools.UserToolPolicyRoot()
+	if err != nil {
+		return config.Config{}, "", err
+	}
+	return loadCommandConfigAt(configPath, toolPolicyRoot)
+}
+
+func loadCommandConfigAt(configPath, toolPolicyRoot string) (config.Config, string, error) {
+	if err := tools.InitializeUserToolRulesAt(toolPolicyRoot); err != nil {
+		return config.Config{}, "", fmt.Errorf("initialize user tool rules: %w", err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return config.Config{}, toolPolicyRoot, err
+	}
+	return cfg, toolPolicyRoot, nil
+}
+
 // selectLastExecSession deliberately uses only the configured durable store.
 // ListThreads owns newest ordering; no cwd/project or active-turn filtering is
 // added here, and OpenSession remains the recovery and locking boundary.
 func selectLastExecSession(ctx context.Context, configPath string) (string, error) {
-	cfg, err := config.Load(configPath)
+	cfg, _, err := loadCommandConfig(configPath)
 	if err != nil {
 		return "", fmt.Errorf("load config: %w", err)
 	}
@@ -142,7 +165,7 @@ func selectLastExecSession(ctx context.Context, configPath string) (string, erro
 }
 
 func selectLastEphemeralExecSession(ctx context.Context, configPath string) (string, error) {
-	cfg, err := config.Load(configPath)
+	cfg, _, err := loadCommandConfig(configPath)
 	if err != nil {
 		return "", fmt.Errorf("load config: %w", err)
 	}
@@ -372,7 +395,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := config.Load(configPath)
+	cfg, toolPolicyRoot, err := loadCommandConfig(configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -440,11 +463,11 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		sourceStore = nil
 	}
 
-	perms, err := cfg.BuildPermissions()
+	workspaceRoot, err := tools.ResolveWorkspaceRoot(cfg.Workspace.Root)
 	if err != nil {
 		return nil, err
 	}
-	workspaceRoot, err := tools.ResolveWorkspaceRoot(cfg.Workspace.Root)
+	toolPolicy, err := tools.LoadToolPolicyAt(toolPolicyRoot, workspaceRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -454,11 +477,12 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		protectedSourceDataDir = sourceDataDir
 		protectedSourceThreadPaths = []string{sourceThreadPath}
 	}
-	protectedPaths, err := effectiveSandboxProtectedPathsWithSourceThreadPaths(
+	protectedPaths, err := effectiveSandboxProtectedPathsWithUserToolPolicyRoot(
 		workspaceRoot,
 		cfg.Sandbox.EffectiveProtectedPaths(),
 		configPath,
 		dataDir,
+		toolPolicyRoot,
 		[]string{protectedSourceDataDir},
 		protectedSourceThreadPaths,
 	)
@@ -528,7 +552,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 			ApprovalState:  approvalState,
 			WorkspaceOnly:  true,
 			WorkspaceRoot:  workspaceRoot,
-			Permissions:    perms,
+			Rules:          toolPolicy,
 			Approver:       approver,
 			SessionAllows:  sessionAllows,
 			SessionDenies:  sessionDenies,
@@ -540,7 +564,6 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 			MaxBytes:      patch.MaxBytes,
 			Approval:      approvalMode,
 			ApprovalState: approvalState,
-			Permissions:   perms,
 			Approver:      approver,
 			SessionAllows: sessionAllows,
 			SessionDenies: sessionDenies,
@@ -566,7 +589,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		memStore:           memStore,
 		approvalMode:       approvalMode,
 		approvalState:      approvalState,
-		permissions:        perms,
+		toolPolicy:         toolPolicy,
 		sessionAllows:      sessionAllows,
 		sessionDenies:      sessionDenies,
 		workspaceRoot:      workspaceRoot,
@@ -631,9 +654,9 @@ func initialRulesSnapshotStatus(ready bool) string {
 	return "resumed session; active system prompt is frozen"
 }
 
-func runtimeReActOptions(maxSteps int, taskController *agent.TaskController) agent.ReActOptions {
+func runtimeReActOptions(maxModelSteps int, taskController *agent.TaskController) agent.ReActOptions {
 	return agent.ReActOptions{
-		MaxStep:        maxSteps,
+		MaxModelSteps:  maxModelSteps,
 		EnableSteer:    true,
 		TaskController: taskController,
 	}
@@ -686,7 +709,7 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 		ctx,
 		rawModel,
 		r.registry.All(),
-		runtimeReActOptions(r.runtimeCfg.MaxReactSteps, r.taskController),
+		runtimeReActOptions(r.runtimeCfg.MaxModelSteps, r.taskController),
 	)
 	if err != nil {
 		return runtimeModelBundle{}, fmt.Errorf("create ReAct model: %w", err)

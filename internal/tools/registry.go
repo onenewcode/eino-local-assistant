@@ -77,9 +77,6 @@ func DefaultWithOptions(opts DefaultOptions) (*Registry, error) {
 	if patchOpts.Approval == "" {
 		patchOpts.Approval = opts.Shell.Approval
 	}
-	if patchOpts.Permissions == nil {
-		patchOpts.Permissions = opts.Shell.Permissions
-	}
 	// Side-effecting tools share the same OS boundary by default. This keeps a
 	// caller that configures only one options struct from silently leaving the
 	// other tool on the host.
@@ -107,17 +104,29 @@ func DefaultWithOptions(opts DefaultOptions) (*Registry, error) {
 		}
 		registered = append(registered, shellTool)
 	}
-	for i, registeredTool := range registered {
-		registered[i] = guardRuntimeTool(registeredTool)
-	}
 	return New(registered...), nil
 }
 
-// New builds a registry from an explicit tool list.
+// New builds a registry from an explicit tool list. Invokable tools are
+// runtime-guarded once so product-owned additions cannot bypass turn budgets.
 func New(tools ...tool.BaseTool) *Registry {
-	copied := make([]tool.BaseTool, 0, len(tools))
-	copied = append(copied, tools...)
-	return &Registry{tools: copied}
+	registry := &Registry{}
+	registry.Append(tools...)
+	return registry
+}
+
+// Append adds tools to an existing registry through the same runtime guard as
+// built-ins. It is intended for product-owned tools such as task_plan,
+// task_progress, and task_complete that are registered after construction.
+// Passing an already guarded tool is idempotent and does not double-charge its
+// runtime budget.
+func (r *Registry) Append(tools ...tool.BaseTool) {
+	if r == nil {
+		return
+	}
+	for _, base := range tools {
+		r.tools = append(r.tools, guardRuntimeTool(base))
+	}
 }
 
 // All returns the registered tools for ToolsNode / ReAct configuration.

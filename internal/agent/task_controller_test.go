@@ -149,9 +149,9 @@ func TestTaskControllerFailedProofNeedsReplanAndPatchInvalidatesEvidence(t *test
 		t.Fatalf("gate after patch = %#v", gate)
 	}
 
-	// Even though the product prompt prefers apply_patch, a successful shell
-	// command outside the declared proof set could have changed the workspace.
-	// It must invalidate evidence just as a successful patch does.
+	// A shell command that cannot be proven observational outside the declared
+	// proof set could have changed the workspace. It must invalidate evidence
+	// just as a successful patch does.
 	if _, err := controller.StartTask(ctx, "implement"); err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestTaskControllerFailedProofNeedsReplanAndPatchInvalidatesEvidence(t *test
 	if result, err := controller.RecordProof(ctx, "implement", "unit", "call-pass-again"); err != nil || !result.OK {
 		t.Fatalf("proof after patch = %#v, %v", result, err)
 	}
-	controller.RecordToolResult(ctx, "shell", "unknown-shell", "", `{"command":"git status","exit_code":0}`)
+	controller.RecordToolResult(ctx, "shell", "unknown-shell", "", `{"command":"touch changed.txt","exit_code":0}`)
 	if status := controller.TaskExecutionStatus(ctx); status.DoneTasks != 0 {
 		t.Fatalf("unplanned shell command should invalidate evidence: %#v", status)
 	}
@@ -905,6 +905,62 @@ func TestTaskControllerReopensCompletedRunWhenRecoveryFindsLaterShellEvent(t *te
 	gate := NewTaskController().TaskCompletionGate(ctx)
 	if !gate.Active || gate.Complete || !strings.Contains(gate.Summary, "before a task plan") {
 		t.Fatalf("late durable shell must reopen completion gate: %#v", gate)
+	}
+}
+
+func TestTaskControllerKeepsCompletedRunAfterRecoveryForLaterReadOnlyShell(t *testing.T) {
+	threadStore, err := store.NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const threadID = "task-recovery-late-read-only-shell"
+	if _, err := threadStore.CreateThread(context.Background(), store.ThreadMeta{ID: threadID}, "system"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := durableTaskTestContext(t, threadStore, threadID)
+	controller := NewTaskController()
+	if result, err := controller.SetPlan(ctx, simpleTaskPlan()); err != nil || !result.OK {
+		t.Fatalf("SetPlan = %#v, %v", result, err)
+	}
+	if result, err := controller.StartTask(ctx, "implement"); err != nil || !result.OK {
+		t.Fatalf("StartTask = %#v, %v", result, err)
+	}
+	controller.RecordToolResult(ctx, "shell", "proof", "", `{"command":"go test ./internal/example","impact":"workspace_write","exit_code":0}`)
+	if result, err := controller.RecordProof(ctx, "implement", "unit", "proof"); err != nil || !result.OK {
+		t.Fatalf("RecordProof = %#v, %v", result, err)
+	}
+	if result, err := controller.RequestCompletion(ctx); err != nil || !result.OK || !result.Complete {
+		t.Fatalf("RequestCompletion = %#v, %v", result, err)
+	}
+
+	state, err := threadStore.LoadThread(ctx, threadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartTurn(ctx, threadID, state.Revision, store.TurnStart{TurnID: "turn-late-read-only", Input: "inspect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.ToolStarted(ctx, threadID, state.Revision, store.ToolStarted{
+		TurnID: "turn-late-read-only", ToolCallID: "late-read-only", ToolName: "shell",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.ToolCompleted(ctx, threadID, state.Revision, store.ToolCompleted{
+		TurnID: "turn-late-read-only", ToolCallID: "late-read-only", ToolName: "shell",
+		Impact: "read_only", Output: `{"command":"git status","impact":"read_only","exit_code":0}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := threadStore.FinishTurn(ctx, threadID, store.TurnFinish{TurnID: "turn-late-read-only", Cancelled: true, Reason: "simulated crash recovery"}); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := NewTaskController().TaskCompletionGate(ctx)
+	if gate.Active || !gate.Complete {
+		t.Fatalf("late read-only shell must preserve completed gate: %#v", gate)
 	}
 }
 

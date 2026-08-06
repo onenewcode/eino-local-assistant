@@ -32,6 +32,9 @@ func TestApplyPatchCreateUpdateDelete(t *testing.T) {
 	if out.Denied || len(out.Results) != 3 {
 		t.Fatalf("out = %+v", out)
 	}
+	if out.Impact != ToolImpactWorkspaceWrite {
+		t.Fatalf("impact = %q, want %q", out.Impact, ToolImpactWorkspaceWrite)
+	}
 	if _, err := os.Stat(filepath.Join(root, "a.txt")); !os.IsNotExist(err) {
 		t.Fatalf("file should be deleted: %v", err)
 	}
@@ -198,41 +201,6 @@ func TestApplyPatchYoloBypassesApprovalAndSandbox(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "yolo.txt")); err != nil || string(got) != "host" {
 		t.Fatalf("yolo patch file = %q, err=%v", got, err)
-	}
-}
-
-func TestApplyPatchYoloStillEnforcesHardDeny(t *testing.T) {
-	root := t.TempDir()
-	state, err := NewApprovalState(ApprovalYolo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	permissions, err := BuildPermissionSet(ProfileCautious, nil, nil, []string{"ApplyPatch(.env)"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tool, err := NewApplyPatch(ApplyPatchOptions{
-		WorkspaceRoot: root,
-		Approval:      ApprovalYolo,
-		ApprovalState: state,
-		Permissions:   permissions,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := tool.InvokableRun(context.Background(), `{"operations":[{"type":"create_file","path":".env","content":"secret"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out ApplyPatchOutput
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		t.Fatal(err)
-	}
-	if !out.Denied || !strings.Contains(out.Reason, ReasonPolicyDenied) {
-		t.Fatalf("yolo patch hard-deny output = %+v", out)
-	}
-	if _, err := os.Stat(filepath.Join(root, ".env")); !os.IsNotExist(err) {
-		t.Fatalf("hard-denied yolo patch created .env: %v", err)
 	}
 }
 

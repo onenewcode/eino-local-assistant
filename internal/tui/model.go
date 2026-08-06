@@ -45,8 +45,8 @@ type StatusInfo struct {
 	// DeclaredReasoningEffortDefault is the catalog-declared default for the
 	// current model. It is not an observed provider-effective value.
 	DeclaredReasoningEffortDefault string
-	// MaxStep is the ReAct step budget (0 omits from /status).
-	MaxStep int
+	// MaxModelSteps is the tool-enabled model-decision budget (0 omits from /status).
+	MaxModelSteps int
 	// CmdPolicy is the status-bar fragment like "cmd=ask" or "cmd=auto".
 	CmdPolicy string
 	// Sandbox supplies compact worker-boundary state for the status bar.
@@ -3147,9 +3147,6 @@ func (m *model) statusReport() string {
 	if title != "" {
 		report += "  title=" + title
 	}
-	if m.deps.Status.MaxStep > 0 {
-		report += fmt.Sprintf("  max_step=%d", m.deps.Status.MaxStep)
-	}
 	report += "  reasoning_effort=" + reasoningEffortStatus(m.deps.Status.ReasoningEffort)
 	if efforts := m.deps.Status.DeclaredReasoningEfforts; len(efforts) > 0 {
 		report += "  reasoning_effort_declared_available=" + strings.Join(efforts, ",")
@@ -3164,14 +3161,24 @@ func (m *model) statusReport() string {
 	if !runtime.Configured() {
 		runtime = m.deps.PolicyInfo.Runtime
 	}
+	maxModelSteps := m.deps.Status.MaxModelSteps
+	if maxModelSteps == 0 {
+		maxModelSteps = runtime.MaxModelSteps
+	}
+	if maxModelSteps > 0 {
+		report += fmt.Sprintf("  max_model_steps=%d", maxModelSteps)
+	}
 	if runtime.MaxTurnSeconds > 0 {
 		report += fmt.Sprintf("  max_turn_seconds=%d", runtime.MaxTurnSeconds)
 	}
-	if runtime.MaxReactSteps > 0 {
-		report += fmt.Sprintf("  max_react_steps=%d", runtime.MaxReactSteps)
-	}
 	if runtime.MaxToolCalls > 0 {
 		report += fmt.Sprintf("  max_tool_calls=%d", runtime.MaxToolCalls)
+	}
+	if runtime.MaxConsecutiveEquivalentToolCalls > 0 {
+		report += fmt.Sprintf(
+			"  max_consecutive_equivalent_tool_calls=%d",
+			runtime.MaxConsecutiveEquivalentToolCalls,
+		)
 	}
 	if m.queuePaused {
 		report += fmt.Sprintf("  queue_paused=true  queued=%d  queue_resume=/queue resume", len(m.queue))

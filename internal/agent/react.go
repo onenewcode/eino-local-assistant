@@ -11,31 +11,34 @@ import (
 	"unicode/utf8"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/usage"
 
 	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 	cbtemplate "github.com/cloudwego/eino/utils/callbacks"
 )
 
 const (
-	// DefaultMaxStep is the ReAct graph step budget used unless configured.
-	DefaultMaxStep = 8
-	// MaxStep preserves the legacy default for callers that only need to show a
-	// static status value. New construction should use ReActOptions instead.
-	MaxStep = DefaultMaxStep
+	// DefaultMaxModelSteps bounds tool-enabled model decisions in one turn.
+	// A tools-disabled final response is reserved separately when the last
+	// permitted decision requests tools.
+	DefaultMaxModelSteps = 8
+
+	finalModelInstruction = "Tool-planning budget is exhausted. Use the observations already present and answer the user now. Do not request tools."
+	finalModelFallback    = "Tool-planning budget reached before a final answer was produced from the available evidence."
 )
 
 // ReActOptions configures a ReAct model. Zero values use the package defaults;
 // negative values are rejected.
 type ReActOptions struct {
-	// MaxStep bounds model and tool graph iterations in one ReAct turn.
-	MaxStep int
+	// MaxModelSteps bounds tool-enabled model decisions in one ReAct turn.
+	// A response with multiple parallel tool calls still consumes one step.
+	MaxModelSteps int
 	// EnableSteer opts this ReAct implementation into the explicit
 	// chat.TurnSteerModel contract. The production default is enabled so the
 	// formal runtime constructor does not leave Session.Steer unreachable.
@@ -50,16 +53,20 @@ type ReActOptions struct {
 
 // DefaultReActOptions returns the options used by NewReActModel.
 func DefaultReActOptions() ReActOptions {
-	return ReActOptions{MaxStep: DefaultMaxStep, EnableSteer: true}
+	return ReActOptions{MaxModelSteps: DefaultMaxModelSteps, EnableSteer: true}
 }
 
-// ReActModel adapts Eino's ReAct agent to the local chat.Model stream interface.
-// Tool calls are handled inside the agent; callers only see the final assistant stream.
+// ReActModel drives a bounded tool-calling loop over Eino model and tool
+// components. Product model steps deliberately do not depend on Eino Pregel
+// graph-node scheduling.
 type ReActModel struct {
-	agent          *react.Agent
-	maxStep        int
-	taskController *TaskController
-	steer          *turnSteerRegistry
+	toolModel           model.ToolCallingChatModel
+	finalModel          model.ToolCallingChatModel
+	toolsNode           *compose.ToolsNode
+	executableToolNames map[string]struct{}
+	maxModelSteps       int
+	taskController      *TaskController
+	steer               *turnSteerRegistry
 }
 
 // NewReActModel builds a streaming chat model backed by Eino ReAct + tools.
@@ -85,41 +92,56 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 	if opts.EnableSteer {
 		steer = newTurnSteerRegistry()
 	}
-	agentConfig := &react.AgentConfig{
-		ToolCallingModel: chatModel,
-		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: tools,
-			UnknownToolsHandler: func(_ context.Context, name, _ string) (string, error) {
-				return fmt.Sprintf("error: unknown tool %q", name), nil
-			},
-			// Eino's Claude adapter emits an empty argument string for a streamed
-			// tool_use whose input is {}. Inferred Go tools still require JSON.
-			ToolArgumentsHandler: normalizeToolArguments,
-		},
-		// DeepSeek and similar providers often stream assistant text before
-		// tool_calls. Eino's default first-chunk checker would END early and
-		// leave a dangling tool_calls assistant in history.
-		StreamToolCallChecker: contentThenToolStreamToolCallChecker,
-		// Model -> Tools -> Model is a few graph steps; keep headroom without unbounded loops.
-		MaxStep: opts.MaxStep,
+	toolInfos := make([]*schema.ToolInfo, 0, len(tools))
+	executableToolNames := make(map[string]struct{}, len(tools))
+	for index, base := range tools {
+		info, infoErr := base.Info(ctx)
+		if infoErr != nil {
+			return nil, fmt.Errorf("get tool info at index %d: %w", index, infoErr)
+		}
+		if info == nil || strings.TrimSpace(info.Name) == "" {
+			return nil, fmt.Errorf("tool info at index %d has no name", index)
+		}
+		toolInfos = append(toolInfos, info)
+		executableToolNames[info.Name] = struct{}{}
 	}
-	if steer != nil {
-		agentConfig.MessageRewriter = steer.rewrite
-	}
-	ag, err := react.NewAgent(ctx, agentConfig)
+	toolModel, err := chatModel.WithTools(toolInfos)
 	if err != nil {
-		return nil, fmt.Errorf("create ReAct agent: %w", err)
+		return nil, fmt.Errorf("bind tool-calling model: %w", err)
+	}
+	toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
+		Tools: tools,
+		UnknownToolsHandler: func(_ context.Context, name, _ string) (string, error) {
+			return fmt.Sprintf("error: unknown tool %q", name), nil
+		},
+		// Eino's Claude adapter emits an empty argument string for a streamed
+		// tool_use whose input is {}. Inferred Go tools still require JSON.
+		ToolArgumentsHandler: normalizeToolArguments,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create tools node: %w", err)
 	}
 
-	return &ReActModel{agent: ag, maxStep: opts.MaxStep, taskController: opts.TaskController, steer: steer}, nil
+	return &ReActModel{
+		toolModel: toolModel,
+		// The base model is retained unbound for a forced final response. This
+		// avoids requiring every ToolCallingChatModel implementation to support
+		// WithTools(nil) as an unbind operation.
+		finalModel:          chatModel,
+		toolsNode:           toolsNode,
+		executableToolNames: executableToolNames,
+		maxModelSteps:       opts.MaxModelSteps,
+		taskController:      opts.TaskController,
+		steer:               steer,
+	}, nil
 }
 
 func normalizeReActOptions(opts ReActOptions) (ReActOptions, error) {
-	if opts.MaxStep < 0 {
-		return ReActOptions{}, fmt.Errorf("max step must be >= 0")
+	if opts.MaxModelSteps < 0 {
+		return ReActOptions{}, fmt.Errorf("max model steps must be >= 0")
 	}
-	if opts.MaxStep == 0 {
-		opts.MaxStep = DefaultReActOptions().MaxStep
+	if opts.MaxModelSteps == 0 {
+		opts.MaxModelSteps = DefaultReActOptions().MaxModelSteps
 	}
 	if opts.DisableSteer {
 		opts.EnableSteer = false
@@ -131,12 +153,12 @@ func normalizeReActOptions(opts ReActOptions) (ReActOptions, error) {
 	return opts, nil
 }
 
-// MaxSteps returns the effective ReAct graph step budget for this model.
-func (m *ReActModel) MaxSteps() int {
+// MaxModelSteps returns the effective tool-enabled model-decision budget.
+func (m *ReActModel) MaxModelSteps() int {
 	if m == nil {
 		return 0
 	}
-	return m.maxStep
+	return m.maxModelSteps
 }
 
 // RegisterTurnSteer opts one durable turn into this model's turn-local
@@ -163,23 +185,15 @@ func normalizeToolArguments(_ context.Context, _ string, arguments string) (stri
 	return arguments, nil
 }
 
-// Stream runs one ReAct turn and returns the final assistant message stream.
+// Stream runs one bounded ReAct turn and returns the final assistant stream.
 func (m *ReActModel) Stream(ctx context.Context, messages []*schema.Message) (chat.Stream, error) {
-	options := make([]agent.AgentOption, 0, 1)
-	if m.taskController != nil {
-		// Ask() has no UI emitter, but task proof acceptance still needs the
-		// immutable shell observation from the callback.
-		options = append(options, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(nil, m.taskController))))
-	}
-	stream, err := m.agent.Stream(ctx, m.messagesWithTaskPacket(ctx, messages), options...)
-	if err != nil {
-		return nil, err
-	}
-	return stream, nil
+	stream, _, err := m.runTurn(ctx, messages, nil)
+	return stream, err
 }
 
 // ReasoningEventsFromStreams marks ReActModel as a chat.ReasoningEventSource:
-// observeModelStreams live-emits TurnEventReasoning for every model call.
+// runTurn emits TurnEventReasoning for every model call before returning the
+// final stream.
 func (m *ReActModel) ReasoningEventsFromStreams() {}
 
 // StreamWithEvents runs one ReAct turn and emits tool lifecycle events when emit is set.
@@ -188,25 +202,537 @@ func (m *ReActModel) StreamWithEvents(ctx context.Context, messages []*schema.Me
 		stream, err := m.Stream(ctx, messages)
 		return stream, nil, err
 	}
-	usageOption, future := react.WithMessageFuture()
-	opts := []agent.AgentOption{usageOption}
+	return m.runTurn(ctx, messages, emit)
+}
 
-	if m.taskController != nil {
-		opts = append(opts, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(emit, m.taskController))))
-	} else {
-		opts = append(opts, agent.WithComposeOptions(compose.WithCallbacks(toolEventCallback(emit, nil))))
+func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, emit chat.EventEmitter) (chat.Stream, <-chan struct{}, error) {
+	if m == nil || m.toolModel == nil || m.finalModel == nil || m.toolsNode == nil {
+		return nil, nil, errors.New("ReAct model is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	stream, err := m.agent.Stream(ctx, m.messagesWithTaskPacket(ctx, messages), opts...)
+	toolContext := ctx
+	if emit != nil || m.taskController != nil {
+		toolContext = callbacks.InitCallbacks(ctx, &callbacks.RunInfo{}, toolEventCallback(emit, m.taskController))
+	}
+	history := m.messagesWithTaskPacket(ctx, messages)
+	modelCallNumber := 0
+	for step := 0; step < m.maxModelSteps; step++ {
+		if err := runtimeguard.AcquireModelStep(toolContext); err != nil {
+			if errors.Is(err, runtimeguard.ErrModelStepBudgetExceeded) {
+				break
+			}
+			return nil, nil, fmt.Errorf("acquire model step: %w", err)
+		}
+		history = m.rewriteMessages(toolContext, history)
+		modelCallNumber++
+		// Session owns durable model-call IDs. Keeping this empty lets its
+		// turn-scoped usage tracker allocate IDs across task continuations.
+		response, presentation, err := m.inspectModelStream(toolContext, m.toolModel, history, "", emit)
+		if err != nil {
+			return nil, nil, err
+		}
+		response = withToolCallIDs(toolContext, response, modelCallNumber)
+		if len(response.ToolCalls) == 0 {
+			return presentation, completedEventStream(), nil
+		}
+		presentation.Close()
+
+		history = append(history, response)
+		admissions, err := m.admitToolBatch(toolContext, response)
+		if err != nil {
+			return nil, nil, err
+		}
+		results, err := m.invokeAdmittedToolBatch(toolContext, response, admissions, emit)
+		if err != nil {
+			return nil, nil, fmt.Errorf("run tool batch: %w", err)
+		}
+		// The session recorder persists large outputs as artifacts before it
+		// exposes their bounded projection. Do not let a persistence failure
+		// fall back to the raw tool output in the next model request.
+		if err := chat.ToolResultProjectionFailure(toolContext); err != nil {
+			return nil, nil, fmt.Errorf("persist tool lifecycle: %w", err)
+		}
+		history = append(history, projectToolResultMessages(toolContext, results)...)
+	}
+
+	history = withFinalModelInstruction(history)
+	history = m.rewriteMessages(toolContext, history)
+	if err := runtimeguard.AcquireFinalResponse(toolContext); err != nil {
+		return nil, nil, fmt.Errorf("acquire final response: %w", err)
+	}
+	modelCallNumber++
+	stream, done, err := newFinalModelResponseStream(toolContext, m.finalModel, history, "", emit)
 	if err != nil {
 		return nil, nil, err
 	}
+	return stream, done, nil
+}
 
-	// The agent exposes only its final stream. MessageFuture gives the observer a
-	// copy of every model stream inside the ReAct loop, including tool-planning
-	// calls that would otherwise disappear from session accounting and UI.
-	done := observeModelStreams(future, emit)
-	return &usageTrackingStream{stream: stream, done: done}, done, nil
+func completedEventStream() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+// projectToolResultMessages substitutes the session's durable preview for a
+// large raw tool result in the same ReAct turn. The full result remains in the
+// artifact ledger and can be read deliberately through read_artifact.
+func projectToolResultMessages(ctx context.Context, results []*schema.Message) []*schema.Message {
+	projected := make([]*schema.Message, len(results))
+	for index, result := range results {
+		if result == nil {
+			continue
+		}
+		content := chat.ProjectToolResultForModel(ctx, result.ToolCallID, result.Content)
+		if content == result.Content {
+			projected[index] = result
+			continue
+		}
+		copyResult := *result
+		copyResult.Content = content
+		projected[index] = &copyResult
+	}
+	return projected
+}
+
+func (m *ReActModel) rewriteMessages(ctx context.Context, messages []*schema.Message) []*schema.Message {
+	if m == nil || m.steer == nil {
+		return messages
+	}
+	return m.steer.rewrite(ctx, messages)
+}
+
+func (m *ReActModel) inspectModelStream(ctx context.Context, chatModel model.BaseChatModel, messages []*schema.Message, callID string, emit chat.EventEmitter) (*schema.Message, *schema.StreamReader[*schema.Message], error) {
+	stream, err := chatModel.Stream(ctx, messages)
+	if err != nil {
+		return nil, nil, fmt.Errorf("run model: %w", err)
+	}
+	if stream == nil {
+		return nil, nil, errors.New("model returned no stream")
+	}
+	// A tools-enabled response must be fully classified before its content can
+	// reach Session. Some providers emit ordinary text and only later emit
+	// tool_calls; a speculative text chunk cannot be withdrawn if the response
+	// turns out to be a tool-planning step. The tools-disabled forced-final path
+	// below is safe to forward live because later tool calls are not actionable.
+	copies := stream.Copy(2)
+	response, err := collectModelResponse(copies[0], callID, emit)
+	if err != nil {
+		copies[1].Close()
+		return nil, nil, err
+	}
+	return response, copies[1], nil
+}
+
+// newFinalModelResponseStream leaves a known tools-disabled response live for
+// Session while collecting its complete provider response as it is consumed.
+// Tool-planning requests still use inspectModelStream because their complete
+// response is needed before a batch can be admitted.
+func newFinalModelResponseStream(ctx context.Context, chatModel model.BaseChatModel, messages []*schema.Message, callID string, emit chat.EventEmitter) (chat.Stream, <-chan struct{}, error) {
+	stream, err := chatModel.Stream(ctx, messages)
+	if err != nil {
+		return nil, nil, fmt.Errorf("run model: %w", err)
+	}
+	if stream == nil {
+		return nil, nil, errors.New("model returned no stream")
+	}
+	final := &finalModelResponseStream{
+		stream: stream,
+		callID: callID,
+		emit:   emit,
+		done:   make(chan struct{}),
+	}
+	return final, final.done, nil
+}
+
+type toolBatchAdmission struct {
+	executable bool
+	arguments  string
+	admission  runtimeguard.ToolAdmission
+}
+
+func (m *ReActModel) admitToolBatch(ctx context.Context, response *schema.Message) ([]toolBatchAdmission, error) {
+	if response == nil {
+		return nil, errors.New("tool-call response is required")
+	}
+	decisions := make([]toolBatchAdmission, len(response.ToolCalls))
+	calls := make([]runtimeguard.ToolCall, 0, len(response.ToolCalls))
+	indexes := make([]int, 0, len(response.ToolCalls))
+	for index, call := range response.ToolCalls {
+		arguments, err := normalizeToolArguments(ctx, call.Function.Name, call.Function.Arguments)
+		if err != nil {
+			return nil, fmt.Errorf("normalize tool arguments for %q: %w", call.Function.Name, err)
+		}
+		decisions[index].arguments = arguments
+		if _, executable := m.executableToolNames[call.Function.Name]; !executable {
+			continue
+		}
+		calls = append(calls, runtimeguard.ToolCall{
+			ID:        call.ID,
+			Name:      call.Function.Name,
+			Arguments: arguments,
+		})
+		indexes = append(indexes, index)
+		decisions[index].executable = true
+	}
+	if len(calls) == 0 {
+		return decisions, nil
+	}
+	admissions, err := runtimeguard.AdmitToolBatch(ctx, calls)
+	if err != nil {
+		return nil, fmt.Errorf("admit tool batch: %w", err)
+	}
+	if len(admissions) != len(indexes) {
+		return nil, errors.New("runtime guard returned an incomplete tool admission batch")
+	}
+	for index, admission := range admissions {
+		decisions[indexes[index]].admission = admission
+	}
+	return decisions, nil
+}
+
+// invokeAdmittedToolBatch sends only registered calls that passed runtime
+// admission to ToolsNode. BaseTool implementations supplied outside the
+// registry do not necessarily call runtimeguard.StartToolCall themselves, so
+// this is the final execution boundary. Unknown calls receive a bounded
+// synthetic result here rather than becoming an unbudgeted node dispatch.
+func (m *ReActModel) invokeAdmittedToolBatch(ctx context.Context, response *schema.Message, decisions []toolBatchAdmission, emit chat.EventEmitter) ([]*schema.Message, error) {
+	if response == nil {
+		return nil, errors.New("tool-call response is required")
+	}
+	if len(decisions) != len(response.ToolCalls) {
+		return nil, errors.New("tool admission batch does not match tool-call response")
+	}
+
+	permittedCalls := make([]schema.ToolCall, 0, len(response.ToolCalls))
+	deniedResults := make([]*schema.Message, len(response.ToolCalls))
+	for index, call := range response.ToolCalls {
+		decision := decisions[index]
+		if !decision.executable {
+			result := unknownToolResult(call)
+			deniedResults[index] = result
+			emitDeniedToolLifecycle(emit, call, decision.arguments, result.Content)
+			continue
+		}
+		if !decision.admission.Allowed {
+			result := deniedToolResult(call, decision.admission.Reason)
+			deniedResults[index] = result
+			emitDeniedToolLifecycle(emit, call, decision.arguments, result.Content)
+			continue
+		}
+		permittedCalls = append(permittedCalls, call)
+	}
+
+	permittedResults := make([]*schema.Message, 0, len(permittedCalls))
+	if len(permittedCalls) > 0 {
+		permittedResponse := *response
+		permittedResponse.ToolCalls = permittedCalls
+		var err error
+		permittedResults, err = m.toolsNode.Invoke(ctx, &permittedResponse)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	results := make([]*schema.Message, 0, len(response.ToolCalls))
+	permittedIndex := 0
+	for index := range response.ToolCalls {
+		if denied := deniedResults[index]; denied != nil {
+			results = append(results, denied)
+			continue
+		}
+		if permittedIndex >= len(permittedResults) {
+			return nil, errors.New("tools node returned an incomplete permitted tool-result batch")
+		}
+		results = append(results, permittedResults[permittedIndex])
+		permittedIndex++
+	}
+	if permittedIndex != len(permittedResults) {
+		return nil, errors.New("tools node returned an oversized permitted tool-result batch")
+	}
+	return results, nil
+}
+
+func deniedToolResult(call schema.ToolCall, reason string) *schema.Message {
+	if strings.TrimSpace(reason) == "" {
+		reason = runtimeguard.DenialReason(runtimeguard.ErrToolCallNotAdmitted)
+	}
+	return schema.ToolMessage(
+		fmt.Sprintf(`{"denied":true,"reason":%q,"stop_retrying":true}`, reason),
+		call.ID,
+		schema.WithToolName(call.Function.Name),
+	)
+}
+
+func unknownToolResult(call schema.ToolCall) *schema.Message {
+	return deniedToolResult(call, "unknown_tool")
+}
+
+func emitDeniedToolLifecycle(emit chat.EventEmitter, call schema.ToolCall, arguments, output string) {
+	if emit == nil {
+		return
+	}
+	emit(chat.TurnEvent{
+		Kind:       chat.TurnEventToolStart,
+		Tool:       call.Function.Name,
+		ToolCallID: call.ID,
+		Input:      arguments,
+	})
+	emit(chat.TurnEvent{
+		Kind:       chat.TurnEventToolEnd,
+		Tool:       call.Function.Name,
+		ToolCallID: call.ID,
+		Output:     output,
+	})
+}
+
+func collectModelResponse(stream *schema.StreamReader[*schema.Message], callID string, emit chat.EventEmitter) (*schema.Message, error) {
+	if stream == nil {
+		return nil, errors.New("model stream is required")
+	}
+	defer stream.Close()
+
+	chunks := make([]*schema.Message, 0)
+	var streamErr error
+	for {
+		message, err := stream.Recv()
+		if message != nil {
+			chunks = append(chunks, message)
+			if emit != nil {
+				if reasoning := chat.DisplayReasoningContent(message); reasoning != "" {
+					emit(chat.TurnEvent{Kind: chat.TurnEventReasoning, Chunk: reasoning})
+				}
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			streamErr = err
+			break
+		}
+	}
+
+	return finalizeModelResponse(chunks, streamErr, callID, emit)
+}
+
+// finalizeModelResponse preserves the model-call accounting contract for both
+// eagerly collected tool-planning responses and the live final response.
+func finalizeModelResponse(chunks []*schema.Message, streamErr error, callID string, emit chat.EventEmitter) (*schema.Message, error) {
+	message, concatErr := concatModelResponse(chunks)
+	turn, available := usageFromChunks(chunks)
+	if concatErr == nil {
+		turn, available = usage.FromMessageUsage(message)
+	}
+	if streamErr != nil && !available {
+		emitModelUsage(emit, callID, usage.Turn{}, false)
+	} else {
+		emitModelUsage(emit, callID, turn, available)
+	}
+	if concatErr != nil {
+		return nil, fmt.Errorf("combine model stream: %w", concatErr)
+	}
+	if streamErr != nil {
+		return nil, fmt.Errorf("read model stream: %w", streamErr)
+	}
+	return message, nil
+}
+
+func concatModelResponse(chunks []*schema.Message) (*schema.Message, error) {
+	if len(chunks) == 0 {
+		return schema.AssistantMessage("", nil), nil
+	}
+	message, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		return nil, err
+	}
+	if message.Role == "" {
+		message.Role = schema.Assistant
+	}
+	return message, nil
+}
+
+func withToolCallIDs(ctx context.Context, message *schema.Message, modelCallNumber int) *schema.Message {
+	if message == nil || len(message.ToolCalls) == 0 {
+		return message
+	}
+	copyMessage := *message
+	copyMessage.ToolCalls = append([]schema.ToolCall(nil), message.ToolCalls...)
+	for index := range copyMessage.ToolCalls {
+		if strings.TrimSpace(copyMessage.ToolCalls[index].ID) == "" {
+			if id, ok := chat.NextLocalToolCallID(ctx); ok {
+				copyMessage.ToolCalls[index].ID = id
+			} else {
+				copyMessage.ToolCalls[index].ID = fmt.Sprintf("local-tool-call-%d-%d", modelCallNumber, index+1)
+			}
+		}
+	}
+	return &copyMessage
+}
+
+func withFinalModelInstruction(messages []*schema.Message) []*schema.Message {
+	insertAt := 0
+	for insertAt < len(messages) && messages[insertAt] != nil && messages[insertAt].Role == schema.System {
+		insertAt++
+	}
+	withInstruction := make([]*schema.Message, 0, len(messages)+1)
+	withInstruction = append(withInstruction, messages[:insertAt]...)
+	withInstruction = append(withInstruction, schema.SystemMessage(finalModelInstruction))
+	withInstruction = append(withInstruction, messages[insertAt:]...)
+	return withInstruction
+}
+
+func hasFinalText(message *schema.Message) bool {
+	return message != nil && strings.TrimSpace(message.Content) != ""
+}
+
+type finalModelResponseStream struct {
+	stream *schema.StreamReader[*schema.Message]
+	callID string
+	emit   chat.EventEmitter
+	done   chan struct{}
+
+	mu              sync.Mutex
+	chunks          []*schema.Message
+	response        *schema.Message
+	terminalErr     error
+	finalized       bool
+	fallbackPending bool
+	fallbackSent    bool
+
+	finishOnce sync.Once
+	closeOnce  sync.Once
+}
+
+// Recv forwards final text as it arrives. It records every raw provider chunk
+// before removing any unexpected tool calls from the user-visible stream.
+func (s *finalModelResponseStream) Recv() (*schema.Message, error) {
+	if fallback, ok := s.nextFallback(); ok {
+		return fallback, nil
+	}
+	if finished, err := s.terminalResult(); finished {
+		return nil, err
+	}
+
+	message, streamErr := s.stream.Recv()
+	if message != nil {
+		s.record(message)
+		if s.emit != nil {
+			if reasoning := chat.DisplayReasoningContent(message); reasoning != "" {
+				s.emit(chat.TurnEvent{Kind: chat.TurnEventReasoning, Chunk: reasoning})
+			}
+		}
+		message = withoutToolCalls(message)
+	}
+
+	switch {
+	case errors.Is(streamErr, io.EOF):
+		response, err := s.finish(nil)
+		s.closeSource()
+		if err != nil {
+			return message, err
+		}
+		if hasFinalText(response) {
+			return message, streamErr
+		}
+		s.setFallbackPending()
+		if message != nil {
+			// Eino normally returns EOF on a separate receive. Preserve a rare
+			// terminal metadata chunk before presenting the fallback next.
+			return message, nil
+		}
+		fallback, _ := s.nextFallback()
+		return fallback, nil
+	case streamErr != nil:
+		_, err := s.finish(streamErr)
+		s.closeSource()
+		return message, err
+	default:
+		return message, nil
+	}
+}
+
+func (s *finalModelResponseStream) Close() {
+	s.closeSource()
+	_, _ = s.finish(context.Canceled)
+}
+
+func (s *finalModelResponseStream) record(message *schema.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalized {
+		return
+	}
+	s.chunks = append(s.chunks, message)
+}
+
+func (s *finalModelResponseStream) finish(streamErr error) (*schema.Message, error) {
+	s.finishOnce.Do(func() {
+		s.mu.Lock()
+		chunks := append([]*schema.Message(nil), s.chunks...)
+		s.mu.Unlock()
+
+		response, err := finalizeModelResponse(chunks, streamErr, s.callID, s.emit)
+
+		s.mu.Lock()
+		s.response = response
+		s.terminalErr = err
+		s.finalized = true
+		s.mu.Unlock()
+		close(s.done)
+	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.response, s.terminalErr
+}
+
+func (s *finalModelResponseStream) closeSource() {
+	s.closeOnce.Do(func() {
+		s.stream.Close()
+	})
+}
+
+func (s *finalModelResponseStream) terminalResult() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.finalized {
+		return false, nil
+	}
+	if s.terminalErr != nil {
+		return true, s.terminalErr
+	}
+	if s.fallbackPending && !s.fallbackSent {
+		return false, nil
+	}
+	return true, io.EOF
+}
+
+func (s *finalModelResponseStream) setFallbackPending() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fallbackPending = true
+}
+
+func (s *finalModelResponseStream) nextFallback() (*schema.Message, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.fallbackPending || s.fallbackSent {
+		return nil, false
+	}
+	s.fallbackSent = true
+	return schema.AssistantMessage(finalModelFallback, nil), true
+}
+
+func withoutToolCalls(message *schema.Message) *schema.Message {
+	if message == nil || len(message.ToolCalls) == 0 {
+		return message
+	}
+	copyMessage := *message
+	copyMessage.ToolCalls = nil
+	return &copyMessage
 }
 
 type usageTrackingStream struct {

@@ -51,7 +51,6 @@ type ApplyPatchOptions struct {
 	// It is shared with shell by the production registry.
 	ApprovalState *ApprovalState
 	Approver      Approver
-	Permissions   *PermissionSet
 	SessionAllows *SessionAllowlist
 	SessionDenies *SessionDenylist
 	// Sandbox executes approved mutations in a one-shot strict worker. Nil is
@@ -85,6 +84,7 @@ type ApplyPatchOutput struct {
 	Decision     string          `json:"decision,omitempty"`
 	Reason       string          `json:"reason,omitempty"`
 	StopRetrying bool            `json:"stop_retrying,omitempty"`
+	Impact       ToolImpact      `json:"impact"`
 	Sandbox      *SandboxOutcome `json:"sandbox,omitempty"`
 }
 
@@ -108,7 +108,14 @@ func NewApplyPatch(opts ApplyPatchOptions) (tool.InvokableTool, error) {
 		"apply_patch",
 		applyPatchToolDescription,
 		func(ctx context.Context, input ApplyPatchInput) (ApplyPatchOutput, error) {
-			return applyPatch(ctx, defaults, input)
+			output, err := applyPatch(ctx, defaults, input)
+			if err != nil {
+				return ApplyPatchOutput{}, err
+			}
+			// apply_patch can create, update, or delete workspace files even when
+			// this particular request is later denied.
+			output.Impact = ToolImpactWorkspaceWrite
+			return output, nil
 		},
 	)
 }
@@ -439,29 +446,6 @@ func preflightSandboxPatch(opts ApplyPatchOptions, input ApplyPatchInput) ([]str
 }
 
 func authorizeApplyPatch(ctx context.Context, opts ApplyPatchOptions, paths []string, totalBytes int) (ApplyPatchOutput, bool) {
-	// Permissions: any path deny blocks; all must be allow to skip ask; else ask.
-	needAsk := true
-	if opts.Permissions != nil {
-		allAllow := true
-		for _, abs := range paths {
-			ev := opts.Permissions.EvaluatePath(PermToolApplyPatch, opts.WorkspaceRoot, abs)
-			switch ev.Decision {
-			case DecisionDeny:
-				return ApplyPatchOutput{
-					Denied: true, Decision: string(DecisionDeny),
-					Reason: fmt.Sprintf("%s: %s", ReasonPolicyDenied, ev.Reason),
-				}, true
-			case DecisionAllow:
-				// keep scanning
-			default:
-				allAllow = false
-			}
-		}
-		if allAllow {
-			needAsk = false
-		}
-	}
-
 	// Session deny on any path key.
 	for _, abs := range paths {
 		key := PathRuleKey("apply_patch", abs, opts.WorkspaceRoot)
@@ -485,7 +469,7 @@ func authorizeApplyPatch(ctx context.Context, opts ApplyPatchOptions, paths []st
 	}
 
 	mode := effectiveApprovalMode(opts.Approval, opts.ApprovalState)
-	if !needAsk || mode == ApprovalNever || isYoloApprovalMode(mode) {
+	if mode == ApprovalNever || isYoloApprovalMode(mode) {
 		return ApplyPatchOutput{}, false
 	}
 	if opts.Approver == nil {

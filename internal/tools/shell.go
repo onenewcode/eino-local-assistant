@@ -59,9 +59,9 @@ type ShellOptions struct {
 	WorkspaceOnly bool
 	// WorkspaceRoot is the path clamp root. Empty resolves to process cwd at normalize time.
 	WorkspaceRoot string
-	// Permissions is the allow/ask/deny set for Shell (shared with apply_patch).
-	// Nil installs a default cautious PermissionSet at normalize time.
-	Permissions *PermissionSet
+	// Rules is the loaded Codex execpolicy. Nil retains the built-in known-safe
+	// fallback and asks for commands that have no matching rule.
+	Rules *ToolPolicy
 	// Approver is invoked for ask decisions when Approval is on_request.
 	// Nil with on_request yields a soft deny (fail-closed).
 	Approver Approver
@@ -112,6 +112,8 @@ type ShellOutput struct {
 	Reason string `json:"reason,omitempty"`
 	// StopRetrying hints the model should not re-issue the same blocked command prefix.
 	StopRetrying bool `json:"stop_retrying,omitempty"`
+	// Impact is the policy-derived command tier, independent of authorization.
+	Impact ToolImpact `json:"impact"`
 	// Sandbox records the actual boundary used for this execution.
 	Sandbox *SandboxOutcome `json:"sandbox,omitempty"`
 }
@@ -127,7 +129,13 @@ func NewShell(opts ShellOptions) (tool.InvokableTool, error) {
 		"shell",
 		shellToolDescription,
 		func(ctx context.Context, input ShellInput) (ShellOutput, error) {
-			return runShell(ctx, defaults, input)
+			impact := ClassifyShellCommand(input.Command)
+			output, err := runShell(ctx, defaults, input)
+			if err != nil {
+				return ShellOutput{}, err
+			}
+			output.Impact = impact
+			return output, nil
 		},
 	)
 }
@@ -192,13 +200,6 @@ func normalizeShellOptions(opts ShellOptions) (ShellOptions, error) {
 	}
 	opts.WorkspaceRoot = root
 
-	if opts.Permissions == nil {
-		perms, err := BuildPermissionSet(ProfileCautious, nil, nil, nil)
-		if err != nil {
-			return ShellOptions{}, err
-		}
-		opts.Permissions = perms
-	}
 	if opts.DenyStreaks == nil {
 		opts.DenyStreaks = NewDenyStreak(0)
 	}
@@ -211,16 +212,15 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 	}
 
 	command := strings.TrimSpace(input.Command)
+	impact := ClassifyShellCommand(command)
 	approvalMode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState)
 	// Reject an explicit host escape before validating its justification or
 	// resolving/pinning its executable. Plan mode must not even inspect the
 	// host command, and this path deliberately avoids all deny bookkeeping.
 	if approvalMode == ApprovalPlan && strings.EqualFold(strings.TrimSpace(input.SandboxPermissions), string(sandboxPermissionsEscalated)) {
-		if defaults.Permissions != nil {
-			if ev := defaults.Permissions.EvaluateBash(command); ev.Decision == DecisionDeny {
-				reason := fmt.Sprintf("%s: %s", ReasonPolicyDenied, ev.Reason)
-				return softDeny(command, defaults.WorkingDir, DecisionDeny, reason, false), nil
-			}
+		if ev := defaults.Rules.EvaluateShell(command); ev.Decision == DecisionDeny {
+			reason := fmt.Sprintf("%s: %s", ReasonPolicyDenied, ev.Reason)
+			return softDeny(command, defaults.WorkingDir, DecisionDeny, reason, false), nil
 		}
 		return softDeny(command, defaults.WorkingDir, DecisionDeny, ReasonPlanReadOnly, false), nil
 	}
@@ -267,7 +267,7 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 
 	// Authorization runs before the per-command timeout so approval wait is not
 	// charged against the shell timeout budget.
-	if out, blocked, err := authorizeShell(ctx, defaults, command, cwd, forceHost, input.Justification, hostCommand, approvalMode); err != nil {
+	if out, blocked, err := authorizeShell(ctx, defaults, command, cwd, forceHost, input.Justification, hostCommand, approvalMode, impact); err != nil {
 		return ShellOutput{}, err
 	} else if blocked {
 		return out, nil
@@ -458,7 +458,7 @@ func runDirectCommand(runCtx, parentCtx context.Context, defaults ShellOptions, 
 // host must already be prepared when forceHost is true so the modal displays
 // the pinned absolute executable before the user answers.
 // blocked=true means a soft result is ready and the shell must not start.
-func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd string, forceHost bool, justification string, host hostEscalationCommand, approvalMode ApprovalMode) (ShellOutput, bool, error) {
+func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd string, forceHost bool, justification string, host hostEscalationCommand, approvalMode ApprovalMode, impact ToolImpact) (ShellOutput, bool, error) {
 	ruleKey := RuleKey("shell", command, defaults.WorkspaceRoot)
 
 	if forceHost && host.program == "" {
@@ -485,8 +485,9 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		return finishDeny(defaults, command, cwd, DecisionDeny, reason, ruleKey, true), true, nil
 	}
 
-	ev := defaults.Permissions.EvaluateBash(command)
-	// Hard policy deny remains authoritative in every mode.
+	ev := defaults.Rules.EvaluateShell(command)
+	// An evaluated deny is not bypassed by yolo. The string-based command checks
+	// in that evaluation are defense-in-depth, not a complete host boundary.
 	if ev.Decision == DecisionDeny {
 		reason := fmt.Sprintf("%s: %s", ReasonPolicyDenied, ev.Reason)
 		if approvalMode == ApprovalPlan {
@@ -494,17 +495,8 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 		return finishDeny(defaults, command, cwd, DecisionDeny, reason, ruleKey, false), true, nil
 	}
-	// Compound syntax is not a plain PermissionSet allow, even when its first
-	// token matches an allow rule.
-	if ev.Decision == DecisionAllow && HasShellMetacharacters(command) {
-		ev = Evaluation{
-			Decision: DecisionAsk,
-			RuleID:   "opaque-shell",
-			Reason:   "shell metacharacters present; session allow downgraded to ask",
-		}
-	}
 	if approvalMode == ApprovalPlan {
-		if forceHost || ev.Decision != DecisionAllow || !isPlanReadOnlyShellCommand(command) {
+		if forceHost || ev.Decision != DecisionAllow || impact != ToolImpactReadOnly {
 			return softDeny(command, cwd, DecisionDeny, ReasonPlanReadOnly, true), true, nil
 		}
 		if defaults.Sandbox == nil {
@@ -512,9 +504,9 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 		return ShellOutput{}, false, nil
 	}
-	// Yolo is an explicit process-local bypass of ordinary approval. The hard
-	// PermissionSet deny above still applies, and host/path validation already
-	// ran before this branch.
+	// Yolo is an explicit process-local bypass of ordinary approval. Evaluated
+	// rule denies and tool path validation above still run, but the remaining
+	// string checks are not a complete host security boundary.
 	if isYoloApprovalMode(approvalMode) {
 		if defaults.DenyStreaks != nil {
 			defaults.DenyStreaks.Reset(ruleKey)
@@ -522,22 +514,13 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		return ShellOutput{}, false, nil
 	}
 
-	// Session allow upgrades ask → allow only; never overrides deny.
-	// Also never upgrades opaque-shell asks without an explicit re-approval —
-	// session keys are still prefix-based, so compound commands must re-prompt.
-	if !forceHost && ev.Decision == DecisionAsk && ev.RuleID != "opaque-shell" &&
+	// Session allow upgrades ordinary approval requests only; it never changes a
+	// Codex prompt rule or an opaque shell command into a blanket allow.
+	if !forceHost && ev.Decision == DecisionAsk && ev.RuleID != "opaque-shell" && !ev.PolicyPrompt &&
 		defaults.SessionAllows != nil && defaults.SessionAllows.Contains(ruleKey) {
 		ev.Decision = DecisionAllow
 		ev.Reason = "session allow " + ruleKey
 		ev.RuleID = "session-allow"
-	}
-	// Session allow must not auto-run compound shell either.
-	if ev.Decision == DecisionAllow && HasShellMetacharacters(command) {
-		ev = Evaluation{
-			Decision: DecisionAsk,
-			RuleID:   "opaque-shell",
-			Reason:   "shell metacharacters present; session allow downgraded to ask",
-		}
 	}
 	if forceHost && ev.Decision != DecisionDeny {
 		return authorizeHostEscalation(ctx, defaults, command, cwd, ruleKey, justification, host)
@@ -553,7 +536,16 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 		return ShellOutput{}, false, nil
 	case DecisionAsk:
-		if mode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState); mode == ApprovalNever || isYoloApprovalMode(mode) {
+		if mode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState); isYoloApprovalMode(mode) {
+			if defaults.DenyStreaks != nil {
+				defaults.DenyStreaks.Reset(ruleKey)
+			}
+			return ShellOutput{}, false, nil
+		}
+		if mode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState); mode == ApprovalNever && ev.PolicyPrompt {
+			return finishDeny(defaults, command, cwd, DecisionDeny, "approval required by Codex rule, but approval_policy is never", ruleKey, false), true, nil
+		}
+		if mode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState); mode == ApprovalNever {
 			if defaults.DenyStreaks != nil {
 				defaults.DenyStreaks.Reset(ruleKey)
 			}
@@ -623,49 +615,6 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 	default:
 		return finishDeny(defaults, command, cwd, DecisionDeny, "unknown policy decision", ruleKey, false), true, nil
-	}
-}
-
-// isPlanReadOnlyShellCommand is intentionally a small allowlist of commands
-// whose normal form is observational. Permission allow rules remain
-// authoritative; this second check prevents an explicit allow for a mutative
-// or ambiguous command from becoming executable in plan mode.
-func isPlanReadOnlyShellCommand(command string) bool {
-	fields := strings.Fields(strings.TrimSpace(command))
-	if len(fields) == 0 {
-		return false
-	}
-	switch fields[0] {
-	case "pwd", "ls", "rg", "grep", "cat", "head", "tail":
-		return true
-	case "find":
-		for _, arg := range fields[1:] {
-			arg = strings.Trim(arg, "'\"")
-			for _, prefix := range []string{"-exec", "-ok", "-delete", "-fls", "-fprint"} {
-				if arg == prefix || strings.HasPrefix(arg, prefix+"=") {
-					return false
-				}
-			}
-		}
-		return true
-	case "git":
-		if len(fields) < 2 {
-			return false
-		}
-		switch fields[1] {
-		case "status", "diff", "log":
-			for _, arg := range fields[2:] {
-				trimmed := strings.TrimLeft(arg, "-")
-				if strings.HasPrefix(trimmed, "output") || arg == "-o" || (strings.HasPrefix(arg, "-o") && !strings.HasPrefix(arg, "--")) {
-					return false
-				}
-			}
-			return true
-		default:
-			return false
-		}
-	default:
-		return false
 	}
 }
 
