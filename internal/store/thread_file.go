@@ -1,30 +1,10 @@
 package store
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 )
-
-func writeMaterializedState(dir string, state ThreadState) error {
-	if err := writeJSONAtomic(filepath.Join(dir, stateFileName), state); err != nil {
-		return fmt.Errorf("write thread state: %w", err)
-	}
-	if err := writeJSONAtomic(filepath.Join(dir, metaFileName), state.Meta); err != nil {
-		return fmt.Errorf("write thread meta: %w", err)
-	}
-	return nil
-}
-
-func writeJSONAtomic(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode JSON: %w", err)
-	}
-	data = append(data, '\n')
-	return writeBytesAtomic(path, data)
-}
 
 func writeBytesAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
@@ -64,14 +44,6 @@ func writeBytesAtomic(path string, data []byte) error {
 	}
 	cleanup = false
 	return syncDirectory(dir)
-}
-
-func readJSON(path string, target any) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, target)
 }
 
 func syncDirectory(path string) error {

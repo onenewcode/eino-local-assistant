@@ -91,7 +91,7 @@ profile = "cautious"
 [storage]
 data_dir = ""
 
-# Project instructions + semantic memory (not session resume). See docs/memory.md.
+# Project instructions + semantic memory (not session resume).
 [rules]
 enabled = true
 # workspace root: AGENTS.override.md, then AGENTS.md; symlinks allowed; blank content skipped

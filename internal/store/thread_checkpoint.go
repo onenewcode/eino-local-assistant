@@ -5,15 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
-// CommitCheckpoint atomically publishes an immutable context checkpoint. The
-// checkpoint file is written before its journal event, so an interrupted write
-// can only leave an unreferenced file and never a dangling active state.
+// CommitCheckpoint atomically publishes an immutable context checkpoint in the
+// JSONL ledger. The event is its only durable representation.
 func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedRevision uint64, input CheckpointInput) (Checkpoint, ThreadState, error) {
 	input.OperationID = strings.TrimSpace(input.OperationID)
 	if err := validateCheckpointInput(input); err != nil {
@@ -47,7 +44,7 @@ func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedR
 		}
 	}
 	if input.Summary != nil {
-		if err := validateArtifactRef(dir, *input.Summary); err != nil {
+		if err := validateArtifactRef(*input.Summary); err != nil {
 			return Checkpoint{}, ThreadState{}, err
 		}
 	}
@@ -56,16 +53,6 @@ func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedR
 	if _, existingErr := checkpointFromJournal(events, checkpoint.ID); existingErr == nil {
 		return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint %q already exists in journal", checkpoint.ID)
 	}
-	path := checkpointPath(dir, checkpoint.ID)
-	if _, err := os.Stat(path); err == nil {
-		return Checkpoint{}, ThreadState{}, fmt.Errorf("checkpoint %q already exists", checkpoint.ID)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return Checkpoint{}, ThreadState{}, fmt.Errorf("stat checkpoint: %w", err)
-	}
-	if err := writeJSONAtomic(path, checkpoint); err != nil {
-		return Checkpoint{}, ThreadState{}, fmt.Errorf("write checkpoint: %w", err)
-	}
-
 	next, err := s.appendLocked(dir, state, expectedRevision, EventContextCompacted, "", checkpointCommittedPayload{Checkpoint: checkpoint})
 	if err != nil {
 		return Checkpoint{}, ThreadState{}, err
@@ -73,8 +60,7 @@ func (s *ThreadStore) CommitCheckpoint(ctx context.Context, id string, expectedR
 	return checkpoint, next, nil
 }
 
-// LoadCheckpoint loads an immutable checkpoint. If the checkpoint file was
-// lost after its event became durable, it is rebuilt from the journal payload.
+// LoadCheckpoint loads an immutable checkpoint from its journal event.
 func (s *ThreadStore) LoadCheckpoint(ctx context.Context, id, checkpointID string) (Checkpoint, error) {
 	if err := validateThreadID(checkpointID); err != nil {
 		return Checkpoint{}, fmt.Errorf("invalid checkpoint id: %w", err)
@@ -88,21 +74,12 @@ func (s *ThreadStore) LoadCheckpoint(ctx context.Context, id, checkpointID strin
 	if err != nil {
 		return Checkpoint{}, err
 	}
-	// The journal payload is authoritative. A checkpoint file is only a
-	// materialized convenience copy and must not override the event ledger.
 	checkpoint, err := checkpointFromJournal(events, checkpointID)
 	if err != nil {
 		return Checkpoint{}, err
 	}
 	if err := validateCheckpoint(checkpoint, id); err != nil {
 		return Checkpoint{}, err
-	}
-	path := checkpointPath(dir, checkpointID)
-	var onDisk Checkpoint
-	if err := readJSON(path, &onDisk); err != nil || onDisk.Hash != checkpoint.Hash {
-		if err := writeJSONAtomic(path, checkpoint); err != nil {
-			return Checkpoint{}, fmt.Errorf("repair checkpoint: %w", err)
-		}
 	}
 	return checkpoint, nil
 }
@@ -206,10 +183,6 @@ func validateCheckpointInput(input CheckpointInput) error {
 	return nil
 }
 
-func checkpointPath(dir, checkpointID string) string {
-	return filepath.Join(dir, checkpointsDir, checkpointID+".json")
-}
-
 func checkpointHash(checkpoint Checkpoint) string {
 	checkpointCopy := checkpoint
 	checkpointCopy.Hash = ""
@@ -258,5 +231,6 @@ func cloneArtifactRef(ref *ArtifactRef) *ArtifactRef {
 	refCopy := *ref
 	refCopy.Head = append([]byte(nil), ref.Head...)
 	refCopy.Tail = append([]byte(nil), ref.Tail...)
+	refCopy.Data = append([]byte(nil), ref.Data...)
 	return &refCopy
 }

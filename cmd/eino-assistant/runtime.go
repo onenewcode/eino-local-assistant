@@ -394,7 +394,10 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		if err != nil {
 			return nil, fmt.Errorf("open durable source session store: %w", err)
 		}
-		sourceThreadPath = filepath.Join(sourceDataDir, "sessions", strings.TrimSpace(start.resumeID))
+		sourceThreadPath, err = sourceStore.ThreadPath(strings.TrimSpace(start.resumeID))
+		if err != nil {
+			return nil, fmt.Errorf("resolve durable source session path: %w", err)
+		}
 	}
 	ephemeralStoreRoot := ""
 	if start.ephemeral {

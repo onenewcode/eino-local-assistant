@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/styles"
@@ -198,7 +199,7 @@ func wrapCJKMarkdownLine(line string, width int) []string {
 		body = line
 		available = width
 	}
-	parts := wrapCellText(body, available)
+	parts := wrapMarkdownCellText(body, available)
 	if len(parts) <= 1 {
 		return []string{line}
 	}
@@ -209,6 +210,89 @@ func wrapCJKMarkdownLine(line string, width int) []string {
 		result = append(result, continuation+part)
 	}
 	return result
+}
+
+// wrapMarkdownCellText wraps CJK prose without cutting through an inline
+// Markdown construct. Glamour parses after this pass, so splitting `**text**`
+// or a link destination would otherwise turn formatting into literal text and
+// can make a wrapped nested item look like several list items.
+func wrapMarkdownCellText(text string, width int) []string {
+	if width < 1 {
+		return []string{text}
+	}
+	var lines []string
+	var current strings.Builder
+	currentWidth := 0
+	flush := func() {
+		lines = append(lines, strings.TrimRight(current.String(), " \t"))
+		current.Reset()
+		currentWidth = 0
+	}
+	appendToken := func(token string, unbreakable bool) {
+		tokenWidth := lipgloss.Width(token)
+		if current.Len() > 0 && currentWidth+tokenWidth > width {
+			flush()
+		}
+		if current.Len() == 0 && !unbreakable {
+			token = strings.TrimLeft(token, " \t")
+			tokenWidth = lipgloss.Width(token)
+		}
+		current.WriteString(token)
+		currentWidth += tokenWidth
+	}
+	for index := 0; index < len(text); {
+		if token, next, ok := markdownInlineToken(text, index); ok {
+			appendToken(token, true)
+			index = next
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[index:])
+		appendToken(string(r), false)
+		index += size
+	}
+	if current.Len() > 0 || len(lines) == 0 {
+		flush()
+	}
+	return lines
+}
+
+// markdownInlineToken returns complete constructs that must survive the
+// pre-render wrapping pass. It intentionally leaves ordinary prose as runes
+// so wide CJK paragraphs continue to wrap naturally.
+func markdownInlineToken(text string, start int) (string, int, bool) {
+	remaining := text[start:]
+	if strings.HasPrefix(remaining, "\\") {
+		_, size := utf8.DecodeRuneInString(remaining)
+		if start+size < len(text) {
+			_, escapedSize := utf8.DecodeRuneInString(text[start+size:])
+			return text[start : start+size+escapedSize], start + size + escapedSize, true
+		}
+	}
+	for _, delimiter := range []string{"**", "__", "~~", "`"} {
+		if !strings.HasPrefix(remaining, delimiter) {
+			continue
+		}
+		if end := strings.Index(text[start+len(delimiter):], delimiter); end >= 0 {
+			next := start + len(delimiter) + end + len(delimiter)
+			return text[start:next], next, true
+		}
+	}
+	if remaining[0] == '[' || (remaining[0] == '!' && len(remaining) > 1 && remaining[1] == '[') {
+		labelStart := start
+		if remaining[0] == '!' {
+			labelStart++
+		}
+		if labelEnd := strings.IndexByte(text[labelStart:], ']'); labelEnd >= 0 {
+			afterLabel := labelStart + labelEnd + 1
+			if afterLabel < len(text) && text[afterLabel] == '(' {
+				if destinationEnd := strings.IndexByte(text[afterLabel+1:], ')'); destinationEnd >= 0 {
+					next := afterLabel + destinationEnd + 2
+					return text[start:next], next, true
+				}
+			}
+		}
+	}
+	return "", start, false
 }
 
 func markdownLinePrefixEnd(line string) int {

@@ -9,9 +9,9 @@
 | --- | --- | --- |
 | ReAct、system prompt、**AGENTS.md 加载** | `internal/agent` | `project_instructions.go` 读本文件；**不要**再引入 `internal/rules` |
 | 跨会话语义记忆 | `internal/memory` | `.eino/memory/`、`/memory`、candidate；≠ `/resume` |
-| 会话账本 / resume / compact | `internal/store` + `internal/chat` | 见 `docs/session-persistence.md` |
+| 会话账本 / resume / compact | `internal/store` + `internal/chat` | 单一 JSONL 账本；checkpoint 与 artifact 为事件 payload |
 | 工具实现 | `internal/tools` | shell、apply_patch、memory_* 只读等 |
-| 硬权限 / 沙箱 | `permissions` 配置 + `sandbox` | 见 `docs/command-policy.md`；**勿**只靠本文件写「禁止 rm」当执行保证 |
+| 硬权限 / 沙箱 | `permissions` 配置 + `sandbox` | **勿**只靠本文件写「禁止 rm」当执行保证 |
 | TUI / 斜杠 | `internal/tui` | |
 | 配置 | `internal/config` | `[rules]` = 是否注入 AGENTS；`[memory]` = 语义记忆 |
 

@@ -59,7 +59,6 @@ type RulesConfig struct {
 }
 
 // MemoryConfig controls project-scoped long-term memory under .eino/memory/.
-// See docs/memory.md.
 type MemoryConfig struct {
 	// Enabled controls summary injection and read tools. Omitted defaults to true.
 	Enabled *bool `toml:"enabled"`
@@ -444,7 +443,7 @@ func (c PermissionsConfig) PermissionsProfile() string {
 // StorageConfig controls local session persistence.
 type StorageConfig struct {
 	// DataDir is the root for session data. Empty uses ~/.eino-assistant.
-	// Sessions are stored under <DataDir>/sessions/<id>/.
+	// Sessions are date-partitioned bundles under <DataDir>/sessions/YYYY/MM/DD/.
 	DataDir string `toml:"data_dir"`
 }
 
@@ -886,7 +885,7 @@ func validatePercent(name string, value int) error {
 
 // ResolveDataDir returns the absolute session storage root.
 // Empty DataDir defaults to ~/.eino-assistant. Session files live under
-// <root>/sessions/<id>/.
+// <root>/sessions/YYYY/MM/DD/<id>/.
 func (c StorageConfig) ResolveDataDir() (string, error) {
 	dir := strings.TrimSpace(c.DataDir)
 	if dir == "" {

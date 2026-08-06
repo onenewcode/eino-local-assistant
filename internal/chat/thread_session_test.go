@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +15,15 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 )
+
+func threadPathForTest(t *testing.T, threadStore *store.ThreadStore, id string) string {
+	t.Helper()
+	path, err := threadStore.ThreadPath(id)
+	if err != nil {
+		t.Fatalf("ThreadPath(%q): %v", id, err)
+	}
+	return path
+}
 
 type checkpointCompactorFunc func(context.Context, contextbuild.CompactionRequest, contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error)
 
@@ -1251,7 +1258,7 @@ func TestCandidateCheckpointMustFitBeforeInstallation(t *testing.T) {
 	}
 }
 
-func TestAutomaticCompactionArtifactReadFailurePauses(t *testing.T) {
+func TestAutomaticCompactionReadsInlineArtifact(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.NewThreadStore(t.TempDir())
 	if err != nil {
@@ -1295,15 +1302,12 @@ func TestAutomaticCompactionArtifactReadFailurePauses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(st.Root(), "sessions", state.ID, "artifacts", artifact.Digest+".blob")); err != nil {
-		t.Fatal(err)
-	}
 	calls := 0
 	session, err := OpenSession(&scriptedModel{}, st, state.ID, SessionOptions{
 		Store: st,
-		Compactor: checkpointCompactorFunc(func(context.Context, contextbuild.CompactionRequest, contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
+		Compactor: checkpointCompactorFunc(func(_ context.Context, request contextbuild.CompactionRequest, _ contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
 			calls++
-			return contextbuild.Checkpoint{}, errors.New("compactor should not run")
+			return contextbuild.DeterministicCheckpoint(request)
 		}),
 		Context: contextbuild.Config{
 			WindowTokens:              1_200,
@@ -1321,18 +1325,15 @@ func TestAutomaticCompactionArtifactReadFailurePauses(t *testing.T) {
 	if !session.NeedsAutoCompaction() {
 		t.Fatalf("automatic compaction was not requested: %+v", session.ContextStatus())
 	}
-	if _, err := session.CompactAutomatically(ctx); err == nil || !strings.Contains(err.Error(), "load compaction artifacts") {
-		t.Fatalf("CompactAutomatically error = %v, want artifact read failure", err)
+	if _, err := session.CompactAutomatically(ctx); err == nil || strings.Contains(err.Error(), "load compaction artifacts") || calls != 1 {
+		t.Fatalf("automatic compaction error = %v calls=%d", err, calls)
 	}
 	loaded, err := st.LoadThread(ctx, state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loaded.AutoCompactionPaused || loaded.LastCompaction == nil || loaded.LastCompaction.Status != store.CompactionOutcomeFailed || !loaded.LastCompaction.Automatic || calls != 0 {
-		t.Fatalf("artifact failure state = %#v calls=%d", loaded, calls)
-	}
-	if session.NeedsAutoCompaction() {
-		t.Fatalf("artifact failure left automatic compaction runnable: %+v", session.ContextStatus())
+	if loaded.LastCompaction == nil || loaded.LastCompaction.Status != store.CompactionOutcomeFailed {
+		t.Fatalf("inline artifact compaction state = %#v", loaded)
 	}
 }
 
@@ -1405,10 +1406,6 @@ func TestOpenSessionSkipsUnrelatedMissingArtifactDuringCheckpointVerification(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(st.Root(), "sessions", state.ID, "artifacts", artifact.Digest+".blob")); err != nil {
-		t.Fatal(err)
-	}
-
 	resumed, err := OpenSession(&scriptedModel{}, st, state.ID, SessionOptions{Store: st})
 	if err != nil {
 		t.Fatalf("OpenSession with unrelated missing artifact: %v", err)
@@ -1464,10 +1461,6 @@ func TestAutomaticCompactionSkipsUnselectedMissingArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(st.Root(), "sessions", state.ID, "artifacts", artifact.Digest+".blob")); err != nil {
-		t.Fatal(err)
-	}
-
 	calls := 0
 	session, err := OpenSession(&scriptedModel{}, st, state.ID, SessionOptions{
 		Store: st,

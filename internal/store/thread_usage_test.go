@@ -6,7 +6,6 @@ import (
 	"errors"
 	"math"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -248,7 +247,7 @@ func TestThreadStoreRejectsJournalAgentUsageWithoutTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName)
+	journal := threadJournalPathForTest(t, threadStore, state.ID)
 	if err := appendJournalEvent(journal, event); err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +485,7 @@ func TestThreadStoreReplaysPreAccountingJournalAsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName)
+	journal := threadJournalPathForTest(t, threadStore, state.ID)
 	if err := appendJournalEvent(journal, legacyEvent); err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +542,7 @@ func TestThreadStoreReplaysPreAccountingJournalAsUnavailable(t *testing.T) {
 
 func rewriteThreadCreationWithoutUsageStatus(t *testing.T, threadStore *ThreadStore, threadID string) {
 	t.Helper()
-	journal := filepath.Join(threadStore.Root(), sessionsDirName, threadID, journalFileName)
+	journal := threadJournalPathForTest(t, threadStore, threadID)
 	raw, err := os.ReadFile(journal)
 	if err != nil {
 		t.Fatal(err)

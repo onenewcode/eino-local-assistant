@@ -9,7 +9,7 @@ import (
 )
 
 // shortSessionID shortens a session id for the status bar.
-// Prefer the trailing hex suffix when the id matches YYYYMMDD-HHMMSS-xxxxxx.
+// Prefer the trailing random suffix when the ID carries one.
 func shortSessionID(id string) string {
 	id = strings.TrimSpace(id)
 	if id == "" {

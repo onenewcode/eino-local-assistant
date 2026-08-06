@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bufio"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -17,50 +16,34 @@ const (
 	SessionProjectionSchemaVersion = 1
 )
 
-func rejectLegacyThreadStore(root string) error {
-	sessions := filepath.Join(root, sessionsDirName)
-	entries, err := os.ReadDir(sessions)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+// sessionSummary is the small, atomically replaced per-session projection.
+// The JSONL ledger remains authoritative; this file gives directory scans a
+// stable metadata entry without replaying a full conversation.
+type sessionSummary struct {
+	FormatVersion      int        `json:"format_version"`
+	ID                 string     `json:"id"`
+	Revision           uint64     `json:"revision"`
+	HeadSequence       uint64     `json:"head_sequence"`
+	ActiveCheckpointID string     `json:"active_checkpoint_id,omitempty"`
+	UpdatedAt          string     `json:"updated_at"`
+	Meta               ThreadMeta `json:"meta"`
+}
+
+func writeSessionSummary(dir string, state ThreadState) error {
+	summary := sessionSummary{
+		FormatVersion:      SessionJournalFormatVersion,
+		ID:                 state.ID,
+		Revision:           state.Revision,
+		HeadSequence:       state.HeadSequence,
+		ActiveCheckpointID: state.ActiveCheckpointID,
+		UpdatedAt:          state.UpdatedAt.UTC().Format(timeFormat),
+		Meta:               state.Meta,
 	}
+	raw, err := json.Marshal(summary)
 	if err != nil {
-		return fmt.Errorf("inspect sessions: %w", err)
+		return err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() || validateThreadID(entry.Name()) != nil {
-			continue
-		}
-		path := filepath.Join(sessions, entry.Name(), journalFileName)
-		f, openErr := os.Open(path)
-		if openErr != nil {
-			return fmt.Errorf("inspect thread %q: %w", entry.Name(), openErr)
-		}
-		scanner := bufio.NewScanner(f)
-		var header struct {
-			Version int `json:"format_version"`
-		}
-		if scanner.Scan() {
-			openErr = json.Unmarshal(scanner.Bytes(), &header)
-		} else if scanner.Err() != nil {
-			openErr = scanner.Err()
-		}
-		_ = f.Close()
-		if openErr != nil {
-			return fmt.Errorf("inspect thread %q format: %w", entry.Name(), openErr)
-		}
-		if header.Version == 3 {
-			return fmt.Errorf("legacy v3 session detected at %s; move or remove legacy sessions before starting", sessions)
-		}
-		if header.Version != 0 && header.Version != SessionJournalFormatVersion {
-			return fmt.Errorf("unsupported session format %d in %q", header.Version, entry.Name())
-		}
-		for _, legacy := range []string{stateFileName, metaFileName} {
-			if _, statErr := os.Lstat(filepath.Join(sessions, entry.Name(), legacy)); statErr == nil {
-				return fmt.Errorf("legacy session projection %s detected in %q", legacy, entry.Name())
-			}
-		}
-	}
-	return nil
+	return writeBytesAtomic(filepath.Join(dir, summaryFileName), raw)
 }
 
 func (s *ThreadStore) openProjection(readOnly bool) error {
@@ -114,19 +97,22 @@ CREATE TABLE IF NOT EXISTS checkpoint_sources(thread_id TEXT NOT NULL, checkpoin
 }
 
 func (s *ThreadStore) projectEvent(dir string, state ThreadState, event ThreadEvent) error {
+	if err := writeSessionSummary(dir, state); err != nil {
+		return err
+	}
 	if s.db == nil || s.readOnly {
 		return errors.New("thread projection is read-only")
 	}
 	var headSequence uint64
 	var headHash string
 	if err := s.db.QueryRow(`SELECT head_sequence,head_hash FROM threads WHERE id=?`, state.ID).Scan(&headSequence, &headHash); err != nil || headSequence+1 != event.Sequence || headHash != event.PreviousHash {
-		_, events, _, replayErr := replayJournalReadOnly(filepath.Join(dir, journalFileName), state.ID)
+		_, events, _, replayErr := replayJournalReadOnly(journalPath(dir, state.ID), state.ID)
 		if replayErr != nil {
 			return replayErr
 		}
 		return s.projectThread(dir, state, events)
 	}
-	info, err := os.Stat(filepath.Join(dir, journalFileName))
+	info, err := os.Stat(journalPath(dir, state.ID))
 	if err != nil {
 		return err
 	}
@@ -236,10 +222,13 @@ func projectEventDetails(tx *sql.Tx, threadID string, event ThreadEvent) error {
 }
 
 func (s *ThreadStore) projectThread(dir string, state ThreadState, events []ThreadEvent) error {
+	if err := writeSessionSummary(dir, state); err != nil {
+		return err
+	}
 	if s.db == nil || s.readOnly {
 		return nil
 	}
-	info, err := os.Stat(filepath.Join(dir, journalFileName))
+	info, err := os.Stat(journalPath(dir, state.ID))
 	if err != nil {
 		return err
 	}
@@ -342,7 +331,7 @@ func (s *ThreadStore) projectedMetaIfFresh(id string) (ThreadMeta, bool, error) 
 	if err != nil {
 		return ThreadMeta{}, false, err
 	}
-	info, err := os.Stat(filepath.Join(dir, journalFileName))
+	info, err := os.Stat(journalPath(dir, id))
 	if err != nil {
 		return ThreadMeta{}, false, err
 	}
@@ -369,7 +358,7 @@ func (s *ThreadStore) loadProjectedThread(dir, id string) (ThreadState, []Thread
 	if s.db == nil {
 		return ThreadState{}, nil, false, nil
 	}
-	info, err := os.Stat(filepath.Join(dir, journalFileName))
+	info, err := os.Stat(journalPath(dir, id))
 	if err != nil {
 		return ThreadState{}, nil, false, err
 	}
@@ -423,7 +412,7 @@ func (s *ThreadStore) loadProjectedThread(dir, id string) (ThreadState, []Thread
 	if len(events) == 0 {
 		return ThreadState{}, nil, false, nil
 	}
-	if err := hydrateSystemPrompt(dir, events[0], &state); err != nil {
+	if err := hydrateSystemPrompt(events[0], &state); err != nil {
 		return ThreadState{}, nil, false, err
 	}
 	return state, events, true, nil

@@ -234,14 +234,14 @@ func TestEffectiveSandboxProtectedPathsProtectsResolvedEphemeralSourceThreadAlia
 	if err := os.WriteFile(configPath, []byte("api_key = \"secret\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(workspaceSource, sourceID), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(workspaceSource, "2026", "08", "06", sourceID), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(workspaceSource, sourceSessions); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	sourceThreadPath := filepath.Join(sourceSessions, sourceID)
+	sourceThreadPath := filepath.Join(sourceSessions, "2026", "08", "06", sourceID)
 	paths, err := effectiveSandboxProtectedPathsWithSourceThreadPaths(
 		workspace,
 		nil,
@@ -253,7 +253,7 @@ func TestEffectiveSandboxProtectedPathsProtectsResolvedEphemeralSourceThreadAlia
 	if err != nil {
 		t.Fatalf("effectiveSandboxProtectedPathsWithSourceThreadPaths() error = %v", err)
 	}
-	want := []string{"config.toml", filepath.ToSlash(filepath.Join("source-sessions", sourceID))}
+	want := []string{"config.toml", filepath.ToSlash(filepath.Join("source-sessions", "2026", "08", "06", sourceID))}
 	if !reflect.DeepEqual(paths, want) {
 		t.Fatalf("protected paths = %#v, want %#v", paths, want)
 	}

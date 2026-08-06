@@ -108,7 +108,7 @@ func TestThreadStoreJournalLifecycleAndCAS(t *testing.T) {
 		t.Fatalf("second page = %#v, hasMore=%v", page, hasMore)
 	}
 
-	journal := filepath.Join(store.Root(), sessionsDirName, state.ID, journalFileName)
+	journal := threadJournalPathForTest(t, store, state.ID)
 	data, err := os.ReadFile(journal)
 	if err != nil {
 		t.Fatal(err)
@@ -118,15 +118,11 @@ func TestThreadStoreJournalLifecycleAndCAS(t *testing.T) {
 	if err := json.Unmarshal([]byte(firstLine), &event); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "system instructions") {
-		t.Fatalf("journal duplicated system prompt: %s", data)
+	if !strings.Contains(string(data), "system instructions") {
+		t.Fatalf("journal did not preserve the frozen system prompt: %s", data)
 	}
-	prompt, err := os.ReadFile(filepath.Join(store.Root(), sessionsDirName, state.ID, systemPromptFileName))
-	if err != nil {
-		t.Fatalf("read system prompt file: %v", err)
-	}
-	if string(prompt) != "system instructions" {
-		t.Fatalf("system prompt file = %q", prompt)
+	if got := state.SystemPrompt; got != "system instructions" {
+		t.Fatalf("stored system prompt = %q", got)
 	}
 	for _, field := range []string{
 		"format_version", "seq", "event_id", "timestamp", "kind", "payload", "hash",
@@ -391,43 +387,13 @@ func TestThreadStoreReplayRejectsSecondActiveTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newThreadEvent: %v", err)
 	}
-	journal := filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName)
+	journal := threadJournalPathForTest(t, threadStore, state.ID)
 	if err := appendJournalEvent(journal, event); err != nil {
 		t.Fatalf("append invalid lifecycle event: %v", err)
 	}
 	_, err = threadStore.LoadThread(ctx, state.ID)
 	if !errors.Is(err, ErrJournalCorrupt) || !errors.Is(err, ErrInvalidThreadLifecycle) {
 		t.Fatalf("replay error = %v, want journal corruption wrapping lifecycle error", err)
-	}
-}
-
-func TestThreadStoreRetainsCommittedRevisionWhenProjectionWriteFails(t *testing.T) {
-	threadStore, err := NewThreadStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	state, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "thread-projection-failure"}, "system")
-	if err != nil {
-		t.Fatal(err)
-	}
-	threadStore.materialize = func(string, ThreadState) error {
-		return errors.New("projection filesystem unavailable")
-	}
-	next, err := threadStore.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: "turn-1", Input: "hello"})
-	if err != nil {
-		t.Fatalf("StartTurn should report durable journal success: %v", err)
-	}
-	if next.Revision != state.Revision+1 {
-		t.Fatalf("revision = %d, want %d", next.Revision, state.Revision+1)
-	}
-	threadStore.materialize = writeMaterializedState
-	reloaded, err := threadStore.LoadThread(ctx, state.ID)
-	if err != nil {
-		t.Fatalf("LoadThread after projection recovery: %v", err)
-	}
-	if reloaded.Revision != next.Revision {
-		t.Fatalf("reloaded revision = %d, want %d", reloaded.Revision, next.Revision)
 	}
 }
 
@@ -441,7 +407,7 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	journal := filepath.Join(store.Root(), sessionsDirName, state.ID, journalFileName)
+	journal := threadJournalPathForTest(t, store, state.ID)
 	f, err := os.OpenFile(journal, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -468,13 +434,7 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if next.Revision != recovered.Revision+1 {
 		t.Fatalf("next revision = %d", next.Revision)
 	}
-	dir := filepath.Join(store.Root(), sessionsDirName, state.ID)
-	if _, err := os.Stat(filepath.Join(dir, stateFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy state projection exists: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, metaFileName)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy meta projection exists: %v", err)
-	}
+	dir := threadPathForTest(t, store, state.ID)
 	rebuilt, err := store.LoadThread(ctx, state.ID)
 	if err != nil {
 		t.Fatalf("LoadThread state replay: %v", err)
@@ -482,10 +442,12 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if rebuilt.Revision != next.Revision {
 		t.Fatalf("rebuilt revision = %d, want %d", rebuilt.Revision, next.Revision)
 	}
-	for _, name := range []string{stateFileName, metaFileName} {
-		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("replay created legacy %s: %v", name, err)
-		}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Name() != summaryFileName || entries[1].Name() != journalFileName {
+		t.Fatalf("session directory entries = %#v, want %q and %q", entries, summaryFileName, journalFileName)
 	}
 	data, err := os.ReadFile(journal)
 	if err != nil {
@@ -577,10 +539,6 @@ func TestThreadStoreArtifactTruncationAndCheckpointRecovery(t *testing.T) {
 		t.Fatalf("checkpoint = %#v", checkpoint)
 	}
 
-	checkpointFile := filepath.Join(store.Root(), sessionsDirName, state.ID, checkpointsDir, checkpoint.ID+".json")
-	if err := os.Remove(checkpointFile); err != nil {
-		t.Fatal(err)
-	}
 	recovered, err := store.LoadCheckpoint(ctx, state.ID, checkpoint.ID)
 	if err != nil {
 		t.Fatalf("LoadCheckpoint recovery: %v", err)
@@ -588,22 +546,12 @@ func TestThreadStoreArtifactTruncationAndCheckpointRecovery(t *testing.T) {
 	if recovered.Hash != checkpoint.Hash || string(recovered.Payload) != string(payload) {
 		t.Fatalf("recovered checkpoint = %#v", recovered)
 	}
-	if _, err := os.Stat(checkpointFile); err != nil {
-		t.Fatalf("repaired checkpoint file: %v", err)
-	}
-	// A valid-but-stale materialized file must not override the journal event.
-	tampered := recovered
-	tampered.Focus = "tampered file projection"
-	tampered.Hash = checkpointHash(tampered)
-	if err := writeJSONAtomic(checkpointFile, tampered); err != nil {
-		t.Fatalf("write tampered checkpoint: %v", err)
-	}
 	loaded, err := store.LoadCheckpoint(ctx, state.ID, checkpoint.ID)
 	if err != nil {
 		t.Fatalf("LoadCheckpoint authoritative journal: %v", err)
 	}
 	if loaded.Focus != "current task" || loaded.Hash != checkpoint.Hash {
-		t.Fatalf("journal did not repair checkpoint projection: %#v", loaded)
+		t.Fatalf("journal checkpoint is not authoritative: %#v", loaded)
 	}
 }
 
@@ -678,6 +626,7 @@ func TestThreadStoreReadsRetentionTruncatedArtifactInBoundedPages(t *testing.T) 
 	if !artifact.Truncated || string(artifact.Head) != "0123" || string(artifact.Tail) != "wxyz" {
 		t.Fatalf("truncated artifact = %#v", artifact)
 	}
+	state = persistArtifactForThreadTest(ctx, t, threadStore, state, artifact, "artifact-pages")
 	want := "0123" + artifactTruncationMarker + "wxyz"
 
 	first, err := threadStore.ReadArtifact(ctx, state.ID, artifact.ID, 0, 3)
@@ -755,22 +704,13 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if first.Truncated {
 		t.Fatalf("first artifact unexpectedly truncated: %#v", first)
 	}
-	if _, err := os.Stat(filepath.Join(store.Root(), sessionsDirName, state.ID, artifactsDir, first.SHA256+".blob")); err != nil {
-		t.Fatalf("full artifact blob: %v", err)
-	}
+	state = persistArtifactForThreadTest(ctx, t, store, state, first, "artifact-full")
 	read, err := store.ReadArtifact(ctx, state.ID, first.ID, 2, 4)
 	if err != nil {
 		t.Fatalf("ReadArtifact full range: %v", err)
 	}
 	if got, want := string(read.Data), "3456"; got != want || !read.HasMore {
 		t.Fatalf("full artifact range = %q hasMore=%v", got, read.HasMore)
-	}
-	metadata, err := os.ReadFile(filepath.Join(store.Root(), sessionsDirName, state.ID, artifactsDir, first.SHA256+".json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(metadata), `"data"`) {
-		t.Fatalf("artifact metadata must not inline the raw body: %s", metadata)
 	}
 	second, err := store.PutArtifact(ctx, state.ID, ArtifactInput{Data: []byte("abcdefghijklmnopqrstuvwxyz")})
 	if err != nil {
@@ -779,6 +719,7 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if !second.Truncated || second.StoredSize != 0 {
 		t.Fatalf("thread-cap artifact = %#v", second)
 	}
+	state = persistArtifactForThreadTest(ctx, t, store, state, second, "artifact-truncated")
 	read, err = store.ReadArtifact(ctx, state.ID, second.ID, 0, 16)
 	if err != nil {
 		t.Fatalf("ReadArtifact truncated range: %v", err)
@@ -786,6 +727,29 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if !read.Ref.Truncated || len(read.Data) != 0 || read.HasMore {
 		t.Fatalf("truncated artifact range = %#v", read)
 	}
+}
+
+func persistArtifactForThreadTest(ctx context.Context, t *testing.T, threadStore *ThreadStore, state ThreadState, artifact ArtifactRef, suffix string) ThreadState {
+	t.Helper()
+	var err error
+	turnID := "turn-" + suffix
+	state, err = threadStore.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: turnID, Input: suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.ToolStarted(ctx, state.ID, state.Revision, ToolStarted{TurnID: turnID, ToolCallID: suffix + "-call", ToolName: "shell"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.ToolCompleted(ctx, state.ID, state.Revision, ToolCompleted{TurnID: turnID, ToolCallID: suffix + "-call", ToolName: "shell", Artifact: &artifact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.CancelTurn(ctx, state.ID, state.Revision, TurnCancel{TurnID: turnID, Reason: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 func TestThreadStoreMetadataListAndDelete(t *testing.T) {
@@ -840,9 +804,29 @@ func TestThreadStoreMetadataListAndDelete(t *testing.T) {
 	}
 }
 
+func TestThreadStoreRejectsDuplicateIDAcrossDatePaths(t *testing.T) {
+	store, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := store.CreateThread(ctx, ThreadMeta{
+		ID:        "duplicate-thread",
+		CreatedAt: time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC),
+	}, "system"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateThread(ctx, ThreadMeta{
+		ID:        "duplicate-thread",
+		CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	}, "system"); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("CreateThread duplicate across dates error = %v, want collision", err)
+	}
+}
+
 func TestNewThreadIDFormat(t *testing.T) {
 	id := NewThreadID(time.Date(2026, 7, 15, 9, 30, 45, 0, time.UTC))
-	if !strings.HasPrefix(id, "20260715-093045-") {
+	if !strings.HasPrefix(id, "093045-") {
 		t.Fatalf("thread id = %q", id)
 	}
 	if err := validateThreadID(id); err != nil {

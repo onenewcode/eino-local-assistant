@@ -25,6 +25,17 @@ func TestReadArtifactIsScopedAndRangeBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutArtifact: %v", err)
 	}
+	state, err = threadStore.StartTurn(context.Background(), state.ID, state.Revision, store.TurnStart{TurnID: "turn", Input: "input"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.ToolStarted(context.Background(), state.ID, state.Revision, store.ToolStarted{TurnID: "turn", ToolCallID: "call", ToolName: "shell"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = threadStore.ToolCompleted(context.Background(), state.ID, state.Revision, store.ToolCompleted{TurnID: "turn", ToolCallID: "call", ToolName: "shell", Artifact: &artifact}); err != nil {
+		t.Fatal(err)
+	}
 	readTool, err := NewReadArtifact()
 	if err != nil {
 		t.Fatalf("NewReadArtifact: %v", err)

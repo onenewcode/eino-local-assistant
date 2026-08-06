@@ -270,6 +270,6 @@ func helpText() string {
 		"Mutative commands (/compact /clear /new /resume /model /fork /title /delete /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny); plan keeps the existing read-only tool boundary. Status shows cmd=ask|auto|plan or cmd=yolo. Shift+Tab never enters yolo and never changes mode while busy, compacting, awaiting approval, or serving a side question.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",
-		"Persistent memory is project-scoped (not /resume). See docs/memory.md.",
+		"Persistent memory is project-scoped and separate from /resume.",
 	}, "\n")
 }

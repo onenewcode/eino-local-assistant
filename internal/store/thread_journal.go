@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,9 +20,9 @@ type threadCreatedPayload struct {
 }
 
 type systemPromptRef struct {
-	File   string `json:"file"`
-	SHA256 string `json:"sha256"`
-	Bytes  int64  `json:"bytes"`
+	Content string `json:"content"`
+	SHA256  string `json:"sha256"`
+	Bytes   int64  `json:"bytes"`
 }
 
 type titleUpdatedPayload struct {
@@ -195,7 +194,7 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 	if len(events) == 0 {
 		return ThreadState{}, nil, false, fmt.Errorf("%w: thread %q has no creation event", ErrJournalCorrupt, id)
 	}
-	if err := hydrateSystemPrompt(filepath.Dir(path), events[0], &state); err != nil {
+	if err := hydrateSystemPrompt(events[0], &state); err != nil {
 		return ThreadState{}, nil, false, err
 	}
 
@@ -301,9 +300,8 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 		if err := validateSystemPromptRef(payload.SystemPrompt); err != nil {
 			return fmt.Errorf("%w: invalid system prompt reference: %v", ErrJournalCorrupt, err)
 		}
-		// The system message is reconstructed from system_prompt.txt after the
-		// event chain has been verified. Keep it counted as visible context
-		// without embedding its body in the journal.
+		// Replay hydrates the frozen system message from this validated creation
+		// event after the complete chain has been verified.
 		state.Meta.MessageCount = 1
 	case EventTurnCommitted:
 		var payload TurnCommit
@@ -574,19 +572,22 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 }
 
 func validateSystemPromptRef(ref systemPromptRef) error {
-	if ref.File != systemPromptFileName {
-		return fmt.Errorf("unexpected system prompt file %q", ref.File)
-	}
 	if ref.Bytes <= 0 {
 		return errors.New("system prompt size must be positive")
 	}
 	if len(ref.SHA256) != 64 {
 		return errors.New("system prompt sha256 is required")
 	}
+	if int64(len(ref.Content)) != ref.Bytes {
+		return errors.New("system prompt size mismatch")
+	}
+	if sha256Hex([]byte(ref.Content)) != ref.SHA256 {
+		return errors.New("system prompt hash mismatch")
+	}
 	return nil
 }
 
-func hydrateSystemPrompt(dir string, created ThreadEvent, state *ThreadState) error {
+func hydrateSystemPrompt(created ThreadEvent, state *ThreadState) error {
 	if state == nil {
 		return errors.New("thread state is required")
 	}
@@ -597,25 +598,7 @@ func hydrateSystemPrompt(dir string, created ThreadEvent, state *ThreadState) er
 	if err := validateSystemPromptRef(payload.SystemPrompt); err != nil {
 		return fmt.Errorf("%w: invalid system prompt reference: %v", ErrJournalCorrupt, err)
 	}
-	path := filepath.Join(dir, payload.SystemPrompt.File)
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("read system prompt: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("%w: system prompt is not a regular file", ErrJournalCorrupt)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read system prompt: %w", err)
-	}
-	if int64(len(data)) != payload.SystemPrompt.Bytes {
-		return fmt.Errorf("%w: system prompt size mismatch", ErrJournalCorrupt)
-	}
-	if digest := sha256Hex(data); digest != payload.SystemPrompt.SHA256 {
-		return fmt.Errorf("%w: system prompt hash mismatch", ErrJournalCorrupt)
-	}
-	state.SystemPrompt = string(data)
+	state.SystemPrompt = payload.SystemPrompt.Content
 	return nil
 }
 

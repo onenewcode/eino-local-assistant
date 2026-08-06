@@ -57,6 +57,22 @@ func TestRenderAssistantMarkdownPreservesEnglishMarkdownAndCodeBlock(t *testing.
 	}
 }
 
+func TestRenderAssistantMarkdownKeepsCJKNestedListInlineFormatting(t *testing.T) {
+	text := "下面是我可以帮你的事项：\n- **实现新功能**：根据需求完成代码、测试和文档。\n- **修复问题**：定位根因并给出可验证的修复。"
+	out := ansi.Strip(renderAssistant(text, 34, false))
+	if strings.Contains(out, "**") {
+		t.Fatalf("bold markers leaked after CJK wrapping: %q", out)
+	}
+	for _, want := range []string{"实现新功能", "修复问题", "根据需求完成", "定位根因"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("formatted list lost %q: %q", want, out)
+		}
+	}
+	if got := strings.Count(out, "•"); got != 3 { // assistant prefix plus two Markdown list items
+		t.Fatalf("list item count changed after wrapping: got %d in %q", got, out)
+	}
+}
+
 func nonEmptyLines(text string) []string {
 	var lines []string
 	for _, line := range strings.Split(text, "\n") {

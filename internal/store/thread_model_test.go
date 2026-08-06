@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -49,7 +48,7 @@ func TestThreadStoreModelBindingReplaysRequestedEffort(t *testing.T) {
 		t.Fatalf("replayed binding = %#v, want model-b/high", reloaded.Meta)
 	}
 
-	_, events, _, err := replayJournal(filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName), state.ID)
+	_, events, _, err := replayJournal(threadJournalPathForTest(t, threadStore, state.ID), state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +86,7 @@ func TestThreadStoreReplaysLegacyModelPayloadWithoutReasoningEffort(t *testing.T
 		t.Fatal(err)
 	}
 
-	journalPath := filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName)
+	journalPath := threadJournalPathForTest(t, threadStore, state.ID)
 	_, events, _, err := replayJournal(journalPath, state.ID)
 	if err != nil {
 		t.Fatalf("replay journal before legacy assertions: %v", err)
@@ -297,7 +296,7 @@ func TestThreadStoreSetThreadModelPreservesThreadProjection(t *testing.T) {
 		t.Fatalf("context/usage projection changed during model replacement: %#v", after.Meta)
 	}
 
-	_, events, _, err := replayJournal(filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName), state.ID)
+	_, events, _, err := replayJournal(threadJournalPathForTest(t, threadStore, state.ID), state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

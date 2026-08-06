@@ -9,10 +9,9 @@ import (
 )
 
 const (
-	// SessionJournalFormatVersion is the on-disk format used by ThreadStore. Version 4
-	// keeps the journal envelope compact and stores the frozen system prompt in
-	// a sibling file instead of repeating it in the first JSONL record.
-	SessionJournalFormatVersion = 4
+	// SessionJournalFormatVersion is the on-disk format used by ThreadStore. Version 5
+	// stores each active session as one date-partitioned JSONL file.
+	SessionJournalFormatVersion = 5
 
 	// MaxArtifactBytes bounds full payload retention for one artifact. Larger
 	// inputs are retained as digest plus head/tail metadata.
@@ -92,7 +91,7 @@ const (
 	EventContextCheckpointReset EventKind = "context.checkpoint.reset"
 )
 
-// ThreadEvent is one hash-chained entry in journal.jsonl. Fields marked with
+// ThreadEvent is one hash-chained entry in a session JSONL ledger. Fields marked with
 // json:"-" are derived from the compact on-disk envelope during replay.
 type ThreadEvent struct {
 	Version          int             `json:"format_version"`
@@ -134,7 +133,7 @@ type ThreadState struct {
 	// from being counted twice during replay.
 	recordedUsage map[string]ModelUsage
 	// recordedCheckpointIDs is rebuilt from context.compacted events and rejects
-	// duplicate IDs even when a materialized checkpoint file was lost.
+	// duplicate IDs within the JSONL ledger.
 	recordedCheckpointIDs map[string]struct{}
 	// recordedCompactionOperationIDs is rebuilt from compaction lifecycle events
 	// so a later transaction cannot reuse accounting correlation data.
@@ -302,6 +301,8 @@ type ArtifactRef struct {
 	Truncated    bool   `json:"truncated,omitempty"`
 	Head         []byte `json:"head,omitempty"`
 	Tail         []byte `json:"tail,omitempty"`
+	// Data is retained with non-truncated evidence in the same JSONL event.
+	Data []byte `json:"data,omitempty"`
 }
 
 // ArtifactRead is one bounded range from a retained artifact. For a truncated
@@ -346,8 +347,8 @@ type CheckpointInput struct {
 	OperationID     string `json:"operation_id,omitempty"`
 }
 
-// Checkpoint is an immutable checkpoint persisted both in a file and in the
-// corresponding context.compacted journal event. SourceEventIDs are direct
+// Checkpoint is an immutable checkpoint persisted in its corresponding
+// context.compacted journal event. SourceEventIDs are direct
 // coverage only; callers resolve ParentID lineage to recover the full source
 // manifest without placing it in the model-visible payload.
 type Checkpoint struct {

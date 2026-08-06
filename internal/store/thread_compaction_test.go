@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -224,7 +223,7 @@ func TestCompactionFailureJournalsAbsoluteLowGainStreak(t *testing.T) {
 		t.Fatalf("projected streak = %d", state.LowGainStreak)
 	}
 
-	data, err := os.ReadFile(filepath.Join(threadStore.Root(), sessionsDirName, state.ID, journalFileName))
+	data, err := os.ReadFile(threadJournalPathForTest(t, threadStore, state.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,13 +402,6 @@ func TestCommitCheckpointRejectsDuplicateJournalIDAfterProjectionLoss(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := threadStore.threadDir(state.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(checkpointPath(dir, checkpoint.ID)); err != nil {
-		t.Fatal(err)
-	}
 	_, _, err = threadStore.CommitCheckpoint(ctx, state.ID, state.Revision, CheckpointInput{
 		ID:             checkpoint.ID,
 		ParentID:       checkpoint.ID,
@@ -512,7 +504,7 @@ func TestLoadCompactionUsageDeduplicatesReplayRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := appendJournalEvent(filepath.Join(dir, journalFileName), duplicate); err != nil {
+	if err := appendJournalEvent(journalPath(dir, state.ID), duplicate); err != nil {
 		t.Fatal(err)
 	}
 
@@ -609,7 +601,7 @@ func TestLoadThreadRejectsDuplicateStartedCompactionOperationID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := appendJournalEvent(filepath.Join(dir, journalFileName), duplicate); err != nil {
+	if err := appendJournalEvent(journalPath(dir, state.ID), duplicate); err != nil {
 		t.Fatal(err)
 	}
 
@@ -659,7 +651,7 @@ func TestCheckpointWithOperationIDRequiresPendingCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := appendJournalEvent(filepath.Join(dir, journalFileName), delayed); err != nil {
+	if err := appendJournalEvent(journalPath(dir, state.ID), delayed); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := threadStore.LoadThread(ctx, state.ID); !errors.Is(err, ErrJournalCorrupt) || !strings.Contains(err.Error(), "requires a pending compaction") {
@@ -716,7 +708,7 @@ func TestCompactionUsageWithOperationIDRequiresPendingOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := appendJournalEvent(filepath.Join(dir, journalFileName), delayedEvent); err != nil {
+	if err := appendJournalEvent(journalPath(dir, state.ID), delayedEvent); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := threadStore.LoadThread(ctx, state.ID); !errors.Is(err, ErrJournalCorrupt) || !strings.Contains(err.Error(), "requires a pending compaction") {
