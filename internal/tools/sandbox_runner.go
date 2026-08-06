@@ -197,6 +197,11 @@ func (r *SandboxRunner) Execute(ctx context.Context, request SandboxWorkerReques
 	if err != nil {
 		return SandboxWorkerResponse{}, SandboxOutcome{}, err
 	}
+	if request.ReadOnly {
+		// A plan shell call temporarily narrows the session's normal policy. Do
+		// not mutate basePolicy: later non-plan calls retain workspace-write.
+		policy.Mode = sandbox.ReadOnly
+	}
 
 	var proxy sandboxProxy
 	proxyPort := 0

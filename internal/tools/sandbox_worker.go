@@ -28,6 +28,9 @@ type SandboxWorkerRequest struct {
 	Command        string `json:"command,omitempty"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	MaxOutputBytes int    `json:"max_output_bytes,omitempty"`
+	// ReadOnly is parent-only execution metadata. The model cannot select this
+	// protocol directly; SandboxRunner maps it to the OS policy before launch.
+	ReadOnly bool `json:"read_only,omitempty"`
 
 	Operations    []PatchOperation `json:"operations,omitempty"`
 	PatchMaxBytes int              `json:"patch_max_bytes,omitempty"`

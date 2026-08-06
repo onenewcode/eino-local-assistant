@@ -25,6 +25,7 @@ const (
 	slashUsage
 	slashPermissions
 	slashMemory
+	slashModel
 	// slashBacktrack is an internal Esc action; it intentionally has no
 	// textual slash command or catalog entry.
 	slashBacktrack
@@ -47,7 +48,7 @@ const maxSlashMenuRows = 8
 func slashCatalog() []slashCommand {
 	return []slashCommand{
 		{Name: "/help", Aliases: []string{"/?"}, Description: "show commands and Esc key behavior"},
-		{Name: "/status", Description: "model, session, tokens, cost, max_step, context"},
+		{Name: "/status", Description: "model, session, tokens, cost, max_step, context, reasoning effort (requested/default), Ctrl+O details"},
 		{Name: "/rules", Description: "show captured instruction source metadata (no reload)"},
 		{Name: "/btw", Aliases: []string{"/side"}, Description: "ask a temporary side question without interrupting the current turn", NeedsArg: true},
 		{Name: "/steer", Description: "redirect the current regular turn without starting another turn", NeedsArg: true},
@@ -57,11 +58,12 @@ func slashCatalog() []slashCommand {
 		{Name: "/sessions", Description: "list saved sessions (tokens/cost)"},
 		{Name: "/new", Description: "start a new session", NeedsArg: true},
 		{Name: "/resume", Description: "resume a saved session ([--recover] after confirming prior process stopped)", NeedsArg: true},
+		{Name: "/model", Description: "switch while idle, or open the configured model picker", NeedsArg: true},
 		{Name: "/fork", Description: "fork the current session at its latest committed turn"},
 		{Name: "/delete", Description: "delete a saved session (not the active one)", NeedsArg: true},
 		{Name: "/title", Description: "rename the current session", NeedsArg: true},
 		{Name: "/queue", Description: "list queued follow-ups (or: clear/drop/edit/resume)", NeedsArg: true},
-		{Name: "/permissions", Aliases: []string{"/policy"}, Description: "show policy or switch session mode (ask|auto)"},
+		{Name: "/permissions", Aliases: []string{"/policy"}, Description: "show policy or switch session mode (ask|auto|plan)", NeedsArg: true},
 		{Name: "/memory", Description: "project memory (list|add|update|delete|accept|on|off|generate|status|rebuild|reset --confirm)", NeedsArg: true},
 		{Name: "/clear", Description: "clear screen and start a new thread (previous thread retained)"},
 		{Name: "/exit", Aliases: []string{"/quit"}, Description: "quit"},
@@ -173,6 +175,8 @@ func parseSlash(input string) (slashAction, string) {
 		return slashSessions, arg
 	case "/resume":
 		return slashResume, arg
+	case "/model":
+		return slashModel, arg
 	case "/fork":
 		return slashFork, arg
 	case "/title":
@@ -194,7 +198,7 @@ func helpText() string {
 	return strings.Join([]string{
 		"Commands:",
 		"  /help              show this help and key bindings (including Esc backtrack)",
-		"  /status            model, session, tokens, cost, max_step, context",
+		"  /status            model, session, tokens, cost, max_step, context, reasoning effort (requested/default); ctrl+o toggles details",
 		"  /rules             captured instruction sources and budgets (no reload)",
 		"  /btw <question>    ask a temporary side question without interrupting the current turn (alias: /side)",
 		"  /steer <text>      steer only the active regular busy turn; failures are not queued",
@@ -204,6 +208,7 @@ func helpText() string {
 		"  /sessions          list saved sessions (tokens/cost)",
 		"  /new [title]       start a new session",
 		"  /resume <id> [--recover]  resume a saved session; explicitly recover an interrupted operation",
+		"  /model [name]     switch the active model while idle; no name opens the configured picker",
 		"  /fork              fork the current session at its latest committed turn (auto child ID)",
 		"  /delete <id>       delete a saved session (not the active one)",
 		"  /title <text>      rename the current session",
@@ -212,7 +217,7 @@ func helpText() string {
 		"  /queue drop <1-based-index>  drop one queued follow-up",
 		"  /queue edit <1-based-index> <new text>  edit one queued follow-up in place",
 		"  /queue resume      continue a queue paused after a turn error",
-		"  /permissions [ask|auto]  show policy or switch session approval mode",
+		"  /permissions [ask|auto|plan]  show policy or switch session approval mode",
 		"  /memory            project memory (list|add|update|delete|accept|on|off|generate|status|rebuild)",
 		"  /memory reset --confirm  clear this workspace's semantic memory; keep session threads",
 		"  /clear             clear screen and start a new thread (previous thread retained)",
@@ -224,6 +229,8 @@ func helpText() string {
 		"  tab       complete selected slash command",
 		"  ctrl+j    newline",
 		"  ctrl+t    show/hide complex task progress when available",
+		"  ctrl+o    show/hide reasoning details (display only)",
+		"  alt+p     open/close the configured model picker (keeps the draft)",
 		"  pgup/pgdn scroll transcript (or review a long host-escalation command)",
 		"  home/end  jump to top / bottom of transcript",
 		"  esc       idle with an empty composer: first arms backtrack; second opens history prompt selector",
@@ -231,8 +238,8 @@ func helpText() string {
 		"            backtrack requires an empty composer; Esc leaves a non-empty draft unchanged",
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
-		"While busy, /steer <text> targets only the active regular turn and failed admission is never queued; /help /context /status /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; /permissions ask|auto changes require idle and are never queued; /queue resume is only available when idle; while busy/compacting, retry after the current operation finishes and the queue remains paused; side questions never enter the FIFO queue.",
-		"Mutative commands (/compact /clear /new /resume /fork /title /delete /exit) cannot be queued.",
+		"While busy, /steer <text> targets only the active regular turn and failed admission is never queued; /help /context /status /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; /permissions ask|auto changes, the model picker, and /model changes require idle and are never queued; while busy/compacting, retry after the current operation finishes and the queue remains paused; side questions never enter the FIFO queue.",
+		"Mutative commands (/compact /clear /new /resume /model /fork /title /delete /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny). Status shows cmd=ask|auto.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",
 		"Persistent memory is project-scoped (not /resume). See docs/memory.md.",

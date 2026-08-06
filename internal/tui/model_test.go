@@ -60,14 +60,31 @@ func TestSubmitHelpAndClear(t *testing.T) {
 
 func TestSubmitStatus(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
-	m := newModel(Deps{Ctx: context.Background(), Session: session, Status: StatusInfo{Model: "deepseek", Tools: []string{"get_current_time"}}})
-	next, _ := m.submit("/status")
-	mm := next.(*model)
-	if !hasLineContaining(mm.lines, lineSystem, "model=deepseek") {
-		t.Fatalf("status missing model: %#v", mm.lines)
-	}
-	if !hasLineContaining(mm.lines, lineSystem, "get_current_time") {
-		t.Fatalf("status missing tools: %#v", mm.lines)
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "explicit", want: "reasoning_effort=requested:high"},
+		{name: "provider default", want: "reasoning_effort=provider-default/unspecified"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := StatusInfo{Model: "deepseek", Tools: []string{"get_current_time"}}
+			if test.name == "explicit" {
+				status.ReasoningEffort = "high"
+			}
+			m := newModel(Deps{Ctx: context.Background(), Session: session, Status: status})
+			next, _ := m.submit("/status")
+			mm := next.(*model)
+			if !hasLineContaining(mm.lines, lineSystem, "model=deepseek") {
+				t.Fatalf("status missing model: %#v", mm.lines)
+			}
+			if !hasLineContaining(mm.lines, lineSystem, "get_current_time") {
+				t.Fatalf("status missing tools: %#v", mm.lines)
+			}
+			if !hasLineContaining(mm.lines, lineSystem, test.want) {
+				t.Fatalf("status missing reasoning effort %q: %#v", test.want, mm.lines)
+			}
+		})
 	}
 }
 
@@ -184,9 +201,87 @@ func TestReasoningEventsStreamThenFold(t *testing.T) {
 	if !folded.folded || !strings.Contains(folded.text, "thinking") {
 		t.Fatalf("expected folded summary, got %#v", *folded)
 	}
-	// Fold is lossy by design (ephemeral UI); body is not retained.
+	if folded.reasoningBody != "consider options" {
+		t.Fatalf("folded reasoning body = %q, want retained display body", folded.reasoningBody)
+	}
+	// The folded summary keeps the existing compact preview behavior.
 	if strings.Contains(folded.text, "consider options") && !strings.Contains(folded.text, "chars") {
 		t.Fatalf("expected summary form, got %#v", *folded)
+	}
+}
+
+func TestCtrlOTogglesReasoningDetailsWithoutReRequesting(t *testing.T) {
+	m := newTestModel(t)
+	m.turnID = 1
+	m.mode = modeBusy
+
+	next, _ := m.Update(turnReasoningMsg{turnID: 1, chunk: "consider options"})
+	m = next.(*model)
+	if !m.reasoningDetailsVisible {
+		t.Fatal("reasoning details should be visible by default")
+	}
+	if !strings.Contains(m.View(), "consider options") || !strings.Contains(m.View(), "ctrl+o hide reasoning") {
+		t.Fatalf("default reasoning view or affordance missing:\n%s", m.View())
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = next.(*model)
+	if m.reasoningDetailsVisible {
+		t.Fatal("ctrl+o should hide reasoning details")
+	}
+	hidden := m.View()
+	if !strings.Contains(hidden, "thinking…") || !strings.Contains(hidden, "16 chars") {
+		t.Fatalf("hidden reasoning marker missing:\n%s", hidden)
+	}
+	if strings.Contains(hidden, "consider options") || !strings.Contains(hidden, "ctrl+o show reasoning") {
+		t.Fatalf("hidden reasoning body or affordance leaked:\n%s", hidden)
+	}
+
+	// Chunks continue to arrive while hidden; the display projection, not the
+	// model request, is what the toggle controls.
+	next, _ = m.Update(turnReasoningMsg{turnID: 1, chunk: " and more"})
+	m = next.(*model)
+	if strings.Contains(m.View(), "and more") {
+		t.Fatalf("hidden reasoning body leaked after another chunk:\n%s", m.View())
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = next.(*model)
+	if !m.reasoningDetailsVisible || !strings.Contains(m.View(), "consider options and more") {
+		t.Fatalf("ctrl+o should reveal already-received reasoning:\n%s", m.View())
+	}
+}
+
+func TestCtrlOHidesFoldedReasoningPreview(t *testing.T) {
+	m := newTestModel(t)
+	m.turnID = 1
+	m.mode = modeBusy
+
+	next, _ := m.Update(turnReasoningMsg{turnID: 1, chunk: "consider options"})
+	m = next.(*model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = next.(*model)
+	next, _ = m.Update(turnToolStartMsg{turnID: 1, tool: "search", callID: "c1", input: "{}"})
+	m = next.(*model)
+
+	hidden := m.View()
+	if !strings.Contains(hidden, "thinking · 16 chars") || strings.Contains(hidden, "consider options") {
+		t.Fatalf("hidden folded reasoning should omit its preview:\n%s", hidden)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = next.(*model)
+	if !strings.Contains(m.View(), "consider options") {
+		t.Fatalf("visible folded reasoning should reveal its retained preview:\n%s", m.View())
+	}
+}
+
+func TestCtrlOIsIgnoredByApprovalModal(t *testing.T) {
+	m := newTestModel(t)
+	m.pendingApproval = &approvalRequestMsg{}
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlO})
+	m = next.(*model)
+	if !m.reasoningDetailsVisible {
+		t.Fatal("approval modal should retain ownership of ctrl+o")
 	}
 }
 

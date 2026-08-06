@@ -146,6 +146,16 @@ func applyPatch(ctx context.Context, opts ApplyPatchOptions, input ApplyPatchInp
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Plan is a hard phase gate: reject before validation, file reads, approval,
+	// or sandbox worker startup. The OS read-only sandbox is an additional
+	// defense for shell, but apply_patch never enters it in this phase.
+	if effectiveApprovalMode(opts.Approval, opts.ApprovalState) == ApprovalPlan {
+		return ApplyPatchOutput{
+			Denied:   true,
+			Decision: string(DecisionDeny),
+			Reason:   ReasonPlanReadOnly,
+		}, nil
+	}
 	if len(input.Operations) == 0 {
 		return ApplyPatchOutput{}, errors.New("operations is required")
 	}

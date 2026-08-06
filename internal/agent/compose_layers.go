@@ -16,6 +16,9 @@ type LayerOptions struct {
 	ProjectInstructionsStartDir string
 	ProjectInstructionsEnabled  bool
 	ProjectInstructionsTokens   int
+	// ProjectInstructionsFallbackFilenames are basename-only project candidates
+	// tried after the canonical AGENTS candidates, in the configured order.
+	ProjectInstructionsFallbackFilenames []string
 	// MemoryBlock is an already-formatted memory section (may be empty).
 	// Use FormatMemoryBlock(summaryText) when injection is enabled.
 	MemoryBlock string
@@ -47,7 +50,12 @@ func BuildPromptLayersSnapshot(opts LayerOptions) (PromptLayers, PromptLayerSnap
 				Truncated: bundle.Truncated,
 			}
 		}
-		bundle, err := LoadProjectInstructionsAt(opts.WorkspaceRoot, opts.ProjectInstructionsStartDir, opts.ProjectInstructionsTokens)
+		bundle, err := LoadProjectInstructionsAtWithFallbacks(
+			opts.WorkspaceRoot,
+			opts.ProjectInstructionsStartDir,
+			opts.ProjectInstructionsTokens,
+			opts.ProjectInstructionsFallbackFilenames,
+		)
 		if err != nil {
 			return layers, PromptLayerSnapshot{}, err
 		}

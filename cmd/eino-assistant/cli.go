@@ -25,13 +25,17 @@ const appName = "eino-assistant"
 // rootOptions holds flags shared by all subcommands.
 type rootOptions struct {
 	configPath string
+	modelName  string
 }
 
 // commandDeps is immutable after construction. Tests create a fresh command
 // tree with a local session factory instead of mutating global runtime hooks.
 type commandDeps struct {
-	exec execCommandDeps
+	exec        execCommandDeps
+	interactive interactiveCommandRunner
 }
+
+type interactiveCommandRunner func(string, sessionStart, io.Writer) error
 
 func newRootCommand() *cobra.Command {
 	return newRootCommandWithDeps(commandDeps{exec: defaultExecCommandDeps()})
@@ -39,11 +43,14 @@ func newRootCommand() *cobra.Command {
 
 func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	opts := &rootOptions{}
+	if deps.interactive == nil {
+		deps.interactive = runTUI
+	}
 
 	root := &cobra.Command{
 		Use:   appName + " [command]",
 		Short: "Eino local coding assistant",
-		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools.",
+		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat and resume.",
 		Example: fmt.Sprintf(
 			"  %[1]s\n  %[1]s chat --config config.toml\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
 			appName,
@@ -53,16 +60,17 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		SilenceErrors: true,
 		// Bare invocation starts a new chat session.
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTUI(opts.configPath, sessionStart{}, cmd.ErrOrStderr())
+			return deps.interactive(opts.configPath, sessionStart{modelName: opts.modelName}, cmd.ErrOrStderr())
 		},
 	}
 
 	root.PersistentFlags().StringVar(&opts.configPath, "config", "config.toml", "path to the TOML configuration file")
+	root.Flags().StringVarP(&opts.modelName, "model", "m", "", "model name for this interactive session (startup override)")
 
 	root.AddCommand(
-		newChatCommand(opts),
+		newChatCommand(opts, deps.interactive),
 		newExecCommand(opts, deps.exec),
-		newResumeCommand(opts),
+		newResumeCommand(opts, deps.interactive),
 		newSessionsCommand(opts),
 		newVersionCommand(),
 	)
@@ -73,28 +81,31 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	return root
 }
 
-func newChatCommand(opts *rootOptions) *cobra.Command {
+func newChatCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
 	var title string
+	var modelName string
 	cmd := &cobra.Command{
 		Use:     "chat",
 		Aliases: []string{"new"},
 		Short:   "Start a new interactive chat session (default)",
-		Long:    "Start a new interactive chat session in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).",
+		Long:    "Start a new interactive chat session in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override.",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTUI(opts.configPath, sessionStart{title: strings.TrimSpace(title)}, cmd.ErrOrStderr())
+			return interactive(opts.configPath, sessionStart{title: strings.TrimSpace(title), modelName: modelName}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&title, "title", "", "optional title for the new session")
+	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
 	return cmd
 }
 
-func newResumeCommand(opts *rootOptions) *cobra.Command {
+func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
 	var recoverInterrupted bool
+	var modelName string
 	cmd := &cobra.Command{
 		Use:   "resume <session-id>",
 		Short: "Resume a saved session in the TUI",
-		Long:  "Resume a previously saved session and open it in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\n\nList ids with:\n  " + appName + " sessions",
+		Long:  "Resume a previously saved session and open it in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override; it does not rewrite the saved session.\n\nList ids with:\n  " + appName + " sessions",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return err
@@ -105,10 +116,11 @@ func newResumeCommand(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTUI(opts.configPath, sessionStart{resumeID: strings.TrimSpace(args[0]), recoverInterrupted: recoverInterrupted}, cmd.ErrOrStderr())
+			return interactive(opts.configPath, sessionStart{resumeID: strings.TrimSpace(args[0]), recoverInterrupted: recoverInterrupted, modelName: modelName}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn or pending compaction before resuming")
+	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
 	return cmd
 }
 

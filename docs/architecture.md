@@ -21,9 +21,13 @@ Headless `exec` accepts `-o FILE` as an alias for the existing `--output-last-me
 
 Headless `exec` also accepts `-m, --model MODEL` on fresh and resume paths, including `--last` and ephemeral runs. The override is applied before provider startup for the current invocation; it changes neither the session identity nor prior transcript/source-snapshot content.
 
-TUI 会话内权限模式的范围严格为 `ask <-> auto`。`/permissions` 无参数是只读报告；`/permissions ask` 与 `/permissions auto` 只在 idle 时改变当前 TUI 进程的临时运行时状态，非 idle 拒绝且不进入 FIFO。`auto` 只在 `internal/tools` 的实际授权边界自动处理 `DecisionAsk`，不改写硬 deny、workspace/path clamp、sandbox 或 `sandbox_unavailable` fail-closed 结果；shell host escalation 仍逐次要求 once/deny。模式不写配置、session ledger 或 resume 数据，也不实现 `plan` / `read-only`。
+会话模型身份与会话内替换的最小契约由 `store`、`chat` 和上层 runtime 分层承担：`internal/store` 可选提供 `ThreadModelRepository` 扩展，`ThreadStore.SetThreadModel` 以普通 thread mutation 记录 `model.changed`；`internal/chat.Session.ReplaceModel` 只允许在 idle 调用，成功后保留 thread ID、冻结 system prompt、transcript、active checkpoint、context 和累计 usage，active turn 或 pending compaction 时拒绝。生产 runtime 已将这条路径接入 TUI：`/model [name]` 带名称时接受 free-form 名称，省略名称或 `Alt+P` 则使用 `[model]` 下显式配置的 catalog picker；alias 在 provider 构造前解析为 canonical name，picker 的 display label 与声明 capability 只用于选择和展示。所有路径先构造完整的 provider/ReAct/compactor bundle，再调用 `ReplaceModel`，成功后更新同一会话的 runtime snapshot；构造或提交失败时保留旧 session/runtime。provider 实例由上层构造，`store` / `chat` 不负责 provider discovery、catalog refresh 或 health。该契约不重写全局配置。
 
-Headless `exec` 不使用该 TUI 状态，也没有 `/permissions` 交互命令；其 `approval_policy` 继续是启动时静态语义。`on-request` 在没有交互 approver 时对需要审批的请求 fail-closed，`never` 仅保留既有的 `DecisionAsk` 自动处理，不能绕过硬权限、路径钳制或 sandbox。该 TUI 切换不改变 headless 行为。
+TUI 的 `/model` 与 `Alt+P` picker 只在 idle、无 pending approval、无运行中的 side question 时执行；busy、compacting 或其他非 idle 情况拒绝且不进入 FIFO。没有显式 catalog 时 picker 会明确提示使用 `/model <name>`，而未知 free-form 名称仍可直接提交。runtime-owned 的 `/resume` 会先读取目标 thread 的 durable model identity，再据此构造 provider bundle；成功打开后才替换 active session 与 runtime snapshot，失败时保留旧 session/runtime。当前 catalog 是本地声明，不提供 live provider discovery、health/entitlement refresh、reasoning effort 二级选择或完整的 Codex/Claude 模型选择对齐；`-m` / `--model` 仍是启动时的本次进程 override。
+
+TUI 会话内权限模式为 `ask`、`auto` 和 `plan`。`plan` 是 TUI 进程级临时 read-only phase，不是配置持久化，也不是完整的 plan artifact workflow；它不生成或持久化任务计划、计划文件或独立 plan 账本。`/permissions` 无参数是只读报告；`/permissions plan` 只在 idle 时进入，`/permissions ask` 与 `/permissions auto` 只在 idle 时退出 plan，busy、compacting 或其他非 idle 状态拒绝且不进入 FIFO，并保留 composer draft。`auto` 只在 `internal/tools` 的实际授权边界自动处理 `DecisionAsk`。plan 下 `apply_patch` 无条件返回结构化 `plan_read_only` 拒绝；shell 只有 `PermissionSet` 原始 `DecisionAllow` 才能进入 enforced OS read-only worker，hard deny 仍按既有策略拒绝，其他非原始 allow 不进入 ask；缺少或无法证明该 sandbox 时 fail-closed，不无 sandbox 执行，也不请求 host escalation。所有模式仍受硬 deny、workspace/path clamp、sandbox 与 host escalation 上限约束。模式不写配置、session ledger 或 resume 数据。
+
+Headless `exec` 不使用该 TUI 状态，也没有 `/permissions` 交互命令；其 `approval_policy` 继续是启动时静态语义，默认 execute 行为不变。`on-request` 在没有交互 approver 时对需要审批的请求 fail-closed，`never` 仅保留既有的 `DecisionAsk` 自动处理，不能绕过硬权限、路径钳制或 sandbox。该 TUI 切换不改变 headless 行为。
 
 TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并通过 `cmd/eino-assistant` 的 `SideQuestion` callback 发起一次旁路模型请求。它是本仓库的安全子集：主 turn 不被打断，旁路问题不进入 FIFO queue，多个问题可并发。请求使用当前 active session 的 frozen system prompt 和 transcript 作为 reference-only；不调用 tools 或 subagents，不写主 ledger、`usage` 或 `journal`，不修改文件、git state、configuration 或 permissions。结果只进入 TUI 的 side-only display，错误和空回答也可见；没有 callback 的嵌入调用方显示 unavailable。它不是完整持久 fork，也不提供独立 session、ledger 或 resume；Codex/Claude 的行为只作为研究参考，不宣称完全等价。
 
@@ -34,19 +38,19 @@ TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并
 | 位置 | 负责 | 不负责 |
 | --- | --- | --- |
 | `internal/agent` | ReAct、system prompt、用户/项目 AGENTS 指令选择、任务图与 completion controller | 自己管理账本文件或记忆落盘 |
-| `internal/chat` | turn 生命周期、流式事件、completion gate、上下文协作、显式 steer admission/expected-ID 校验与成功 commit 结算、`Session.Fork` / `Session.ForkBeforeFirstTurn` child session 打开 | 任务业务正确性、workspace/Git 回滚 |
-| `internal/store` | thread journal、checkpoint、artifact、resume，以及可选的 V1 source-preserving `ThreadStore.ForkThread` / `ForkThreadBeforeFirstTurn` ledger primitives | 项目记忆；TUI 命令编排；workspace、git 或外部副作用回滚 |
+| `internal/chat` | turn 生命周期、流式事件、completion gate、上下文协作、显式 steer admission/expected-ID 校验与成功 commit 结算、`Session.Fork` / `Session.ForkBeforeFirstTurn` child session 打开，以及 idle-only 的 `Session.ReplaceModel` 模型绑定替换 | 任务业务正确性、provider 构造、catalog/picker、workspace/Git 回滚 |
+| `internal/store` | thread journal、checkpoint、artifact、resume，以及可选的 V1 source-preserving `ThreadStore.ForkThread` / `ForkThreadBeforeFirstTurn` ledger primitives；可选的 `ThreadModelRepository` / `ThreadStore.SetThreadModel` 以 `model.changed` 保存 thread 模型身份 | 项目记忆；provider 构造；catalog/picker；全局配置重写；TUI 命令编排；workspace、git 或外部副作用回滚 |
 | `internal/contextbuild` | prompt 规划与 compaction | 工具执行 |
 | `internal/memory` | 项目级语义记忆与 consolidation | `/resume`、权限 |
-| `internal/tools` | shell、apply_patch、artifact、memory 只读工具；权限规则求值及 ask/auto 在工具授权边界的应用 | TUI 策略展示；配置与 TUI 命令编排 |
+| `internal/tools` | shell、apply_patch、artifact、memory 只读工具；权限规则求值及 ask/auto/plan 在工具授权边界的应用 | TUI 策略展示；配置与 TUI 命令编排 |
 | `internal/sandbox` | 工具的 OS 隔离边界 | prompt 规则 |
-| `internal/config` | TOML 读取、默认值与校验；静态 `approval_policy` | TUI 会话运行时状态 |
-| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、idle-only `/permissions ask|auto` 命令入口、状态栏与权限模式展示、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、工具授权真相、旁路请求的模型调用、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
-| `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线（包括 TUI 与 side-effecting tools 的同一会话模式状态）、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema、headless 的动态 TUI 模式 |
-| `internal/provider` | OpenAI / Anthropic 模型适配 | 产品流程 |
+| `internal/config` | TOML 读取、默认值与校验；静态 `approval_policy`；`model.catalog` 的显式 label/alias/lifecycle/capability 声明；可选的 provider/model-specific opaque `model.reasoning_effort` | TUI 会话运行时状态；provider discovery/health；会话内模型切换不重写全局配置 |
+| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、idle-only `/permissions ask|auto|plan` 命令入口、idle-only `/model [name]` 命令入口、显式 catalog picker 与 `Alt+P`、状态栏与权限模式展示、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、provider 构造、工具授权真相、旁路请求的模型调用、provider discovery/health/capability enforcement、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
+| `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线（包括 TUI 与 side-effecting tools 的同一会话模式状态）、provider 构造、启动时模型 override、catalog alias 解析、TUI idle model replacement 与 runtime-owned resume 的模型身份选择、picker DTO 接线、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema、provider discovery/health、headless 的动态 TUI 模式 |
+| `internal/provider` | OpenAI / Anthropic 模型适配；将规范化后的非空 `model.reasoning_effort` 交给各自 provider 请求字段，空值保留 provider 默认 | 产品流程；跨 provider effort 值校验 |
 | `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
 
-AGENTS 指令加载在 `agent`：用户 home `~/.eino-assistant` 与 workspace 每层都按 `AGENTS.override.md`、`AGENTS.md` 顺序选择首个有效候选；符号链接会跟随到普通文件目标，去掉 UTF-8 BOM 后仅含空白的候选会跳过。用户块与项目块使用独立预算。不要新建或恢复 `internal/rules`；`[rules]` 只是配置名称。
+AGENTS 指令加载在 `agent`：用户 home `~/.eino-assistant` 按 `AGENTS.override.md`、`AGENTS.md` 顺序选择首个有效候选；workspace 每层先按相同 canonical 顺序，再按 `[rules].project_doc_fallback_filenames` 配置的 basename 顺序选择首个有效候选。默认 fallback 为空，canonical 行为不变；每个发现目录至多选择一个文件。符号链接会跟随到普通文件目标，去掉 UTF-8 BOM 后仅含空白的候选会跳过。fallback 只属于项目层，用户块与项目块使用独立预算。不要新建或恢复 `internal/rules`；`[rules]` 只是配置名称。
 
 `internal/tui` 的 follow-up queue 是当前进程、当前 session 内的非 durable FIFO，不写 session ledger。active turn busy 时，Enter 对普通 follow-up 只做 FIFO admission，不启动第二个 turn；普通 follow-up 不会隐式 steer。`/queue` 提供列表、`drop`、`edit`、`clear`、`resume`；非取消 turn error 会保留尚未启动的项目并暂停自动 drain，`/queue resume` 仅在 idle 时继续，busy 或 compacting 时 fail-closed。Esc/Ctrl+C 取消在 turn 完成清理后保持既有自动 drain；`/clear`、`/new`、`/resume`、`/fork` 等 session switch 清理 queue 与 pause 状态。
 
@@ -63,15 +67,16 @@ turn 成功 commit 时，只有实际被 `TakeTurnSteers` 消费的输入才随�
 | 面 | 所有者 / 位置 | 生命周期 | 关键边界 |
 | --- | --- | --- | --- |
 | 硬权限 | `permissions` + `tools` + `sandbox` | 进程 / 每次工具调用 | 不依赖 AGENTS.md 或 memory 文本执行；模式不能绕过 deny、workspace/path clamp、sandbox 或不可用 fail-closed |
-| TUI 会话权限模式 | `internal/tui` 的命令/idle admission 与展示；`cmd/eino-assistant` runtime 接线；`internal/tools` 在 shell/apply_patch 授权边界执行 | 当前 TUI 进程；不进入 config、ledger 或 resume | 仅 `ask <-> auto`；`auto` 只处理 `DecisionAsk`，shell host escalation 仍 once/deny；不提供 plan/read-only |
+| TUI 会话权限模式 | `internal/tui` 的命令/idle admission 与展示；`cmd/eino-assistant` runtime 接线；`internal/tools` 在 shell/apply_patch 授权边界执行 | 当前 TUI 进程；不进入 config、ledger 或 resume | `ask`、`auto`、`plan`；plan 是临时 read-only phase，不是完整 plan artifact workflow；apply_patch 无条件结构化拒绝，shell 仅原始 PermissionSet allow 进入 enforced OS read-only worker；hard deny、path clamp、sandbox 与 host escalation 上限仍有效 |
 | 会话账本 | `store` + `chat` | 可 `/resume` | journal、artifact 与 checkpoint 是真相 |
 | 会话 fork / backtrack | `store` + `chat` + `tui` | `/fork` 仅 idle、无参数；backtrack 为 idle 两阶段 `Esc`，child 成功打开后切换 active session | store 复制 committed 前缀、重建 journal hash/seq、记录 parent provenance 并复制前缀 artifacts；首个 prompt 使用显式 before-first 空 prefix，后续 prompt 在前一 committed turn 前 fork 并只回填 composer；拒绝 active/pending compaction/checkpoint/task-derived 状态；不实现 destructive rewind 或 source/workspace/Git/外部副作用回滚 |
+| 会话模型身份 / live 替换 | 可选 `store.ThreadModelRepository` + `chat.Session` + 上层 runtime + TUI `/model [name]` / `Alt+P` | thread 生命周期；替换只在 idle；模型身份可由 `model.changed` 追踪 | runtime 先解析显式 catalog alias（未知值保留 free-form），构造完整 provider bundle，再原地调用 `ReplaceModel`；picker 展示本地声明的 label/canonical/lifecycle/capabilities，但不宣称 provider health；成功不新建 thread 且保留 ID、system prompt、transcript、checkpoint、context、usage；active turn/pending compaction、pending approval 或 side question 拒绝；不改全局配置 |
 | 用户/项目指令 | `agent` 选择 home 与 workspace AGENTS 指令 | `/new` / `/clear` 刷新；`/rules` 只读观察 | system prefix 的软指导；override 与 base 不拼接；用户和项目预算独立；`/rules` 不 reload |
 | 语义记忆 | `memory`，`.eino/memory/` | 跨会话 | 不等于 `/resume`；agent 只读 |
 | 旁路问题 | `cmd/eino-assistant` runtime + `internal/tui` | 单次请求；结果只存在当前 TUI 展示 | 使用 frozen session context 作 reference；不打断/不排队主 turn；不进主 ledger、`usage`、`journal`；不调用 tools/subagents；不修改文件、git、config、permissions；错误/空回答可见；无 callback 时 unavailable |
 | 复杂任务图 | `agent.TaskController` + `store` | 当前会话，可 `/resume` | `task.state.updated` 是图的恢复投影；工具/artifact 仍是证据真相 |
 
-System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、用户 instructions、项目 AGENTS 指令和记忆摘要。创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。用户 root 在 runtime 构造时固定为 `os.UserHomeDir()/.eino-assistant`，不随 `storage.data_dir` 改变；resume 继续使用 thread 创建时冻结的 system prompt。`agent.ComposeWithLayersSnapshot` 同步返回不含正文的 source metadata，runtime 将其保留到 active session 生命周期；TUI `/rules` 只读该 snapshot，不调用 loader。resume 若 provenance 未进入持久化账本，会明确报告 source metadata unavailable，而不是用当前磁盘内容冒充 active snapshot。
+System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 policy、用户 instructions、项目指令（canonical AGENTS 优先，配置 fallback 次之）和记忆摘要。配置的 fallback 只在 fresh session prompt 组合时生效，每个发现目录至多选一个项目文件；创建 session 后冻结；`/resume`、`/memory`、`/compact` 不重写前缀。用户 root 在 runtime 构造时固定为 `os.UserHomeDir()/.eino-assistant`，不随 `storage.data_dir` 改变；resume 继续使用 thread 创建时冻结的 system prompt。`agent.ComposeWithLayersSnapshot` 同步返回不含正文的 source metadata，runtime 将其保留到 active session 生命周期；TUI `/rules` 只读该 snapshot，不调用 loader。resume 若 provenance 未进入持久化账本，会明确报告 source metadata unavailable，而不是用当前磁盘内容冒充 active snapshot。
 
 ## 复杂任务运行时
 
@@ -103,10 +108,11 @@ memory -> store, usage
 | --- | --- |
 | ReAct、prompt、AGENTS 指令、任务控制 | `internal/agent` |
 | 会话、resume、compaction | `internal/chat` + `internal/store` |
+| 会话模型身份与 idle-only model replacement | 可选 `internal/store.ThreadModelRepository` / `ThreadStore.SetThreadModel` + `internal/chat.Session.ReplaceModel` + 上层 runtime + TUI `/model [name]` / `Alt+P`；`internal/config` 提供显式 `model.catalog` 的 label/alias/lifecycle/capability 声明，未知名称保留 free-form fallback；不新增全局配置重写层或 provider discovery/health 层 |
 | source-preserving thread fork V1 | `internal/store` + `internal/chat` + `internal/tui` + [session-persistence.md](./session-persistence.md)；用户命令入口在 TUI，cmd 层不单独解析同名 CLI 命令；普通空边界是 latest，before-first 是独立 API |
 | interactive backtrack V1 | `internal/tui/backtrack.go` + `internal/tui` + `internal/chat` + `internal/store`；复用 source-preserving fork，首个 selector target 显式走 before-first，不新增 workspace 回滚层 |
 | 新工具或权限语义 | `internal/tools` + `sandbox` + [command-policy.md](./command-policy.md) |
-| TUI 会话内 `ask <-> auto` 切换 | `internal/tui`（slash、idle gate、展示）+ `cmd/eino-assistant`（共享 runtime 状态接线）+ `internal/tools`（实际授权边界）；不新增 config/store 持久层 |
+| TUI 会话内 `ask` / `auto` / `plan` 切换 | `internal/tui`（slash、idle gate、展示）+ `cmd/eino-assistant`（共享 runtime 状态接线）+ `internal/tools`（实际授权边界）；不新增 config/store 持久层 |
 | 项目记忆 | `internal/memory` + [memory.md](./memory.md) |
 | slash、队列、状态展示 | `internal/tui` |
 | 配置字段 | `internal/config` + `config.example.toml` |

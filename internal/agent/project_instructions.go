@@ -57,19 +57,40 @@ type ProjectInstructionSource struct {
 // LoadProjectInstructions reads one workspace-root instruction file and caps
 // its complete formatted rules block by maxTokens. AGENTS.override.md takes
 // precedence over AGENTS.md; the files are alternatives and are never
-// concatenated. Missing files return Found=false without error.
+// concatenated. Missing files return Found=false without error. This legacy
+// entry point keeps fallback filenames disabled.
 func LoadProjectInstructions(workspaceRoot string, maxTokens int) (ProjectInstructions, error) {
 	return LoadProjectInstructionsAt(workspaceRoot, workspaceRoot, maxTokens)
+}
+
+// LoadProjectInstructionsWithFallbacks is the root-only form of
+// LoadProjectInstructionsAtWithFallbacks.
+func LoadProjectInstructionsWithFallbacks(workspaceRoot string, maxTokens int, fallbackFilenames []string) (ProjectInstructions, error) {
+	return LoadProjectInstructionsAtWithFallbacks(workspaceRoot, workspaceRoot, maxTokens, fallbackFilenames)
 }
 
 // LoadProjectInstructionsAt reads project instruction files from workspaceRoot
 // through startDir, inclusive, and caps the aggregate formatted block by
 // maxTokens. If startDir is outside workspaceRoot, only workspaceRoot is
 // inspected and StartDirOutsideWorkspace records that compatibility fallback.
+// The legacy entry point keeps fallback filenames disabled.
 func LoadProjectInstructionsAt(workspaceRoot, startDir string, maxTokens int) (ProjectInstructions, error) {
+	return LoadProjectInstructionsAtWithFallbacks(workspaceRoot, startDir, maxTokens, nil)
+}
+
+// LoadProjectInstructionsAtWithFallbacks is the configurable project-layer
+// loader. Each discovered directory tries the canonical AGENTS candidates
+// first, then fallbackFilenames in order, selecting at most one non-empty
+// regular file. Fallback names must be basenames; callers normally obtain the
+// validated list from config.RulesConfig before passing it through LayerOptions.
+func LoadProjectInstructionsAtWithFallbacks(workspaceRoot, startDir string, maxTokens int, fallbackFilenames []string) (ProjectInstructions, error) {
 	ws := strings.TrimSpace(workspaceRoot)
 	if ws == "" {
 		return ProjectInstructions{}, errors.New("workspace root is required")
+	}
+	fallbackFilenames, err := normalizeProjectInstructionFallbackFilenames(fallbackFilenames)
+	if err != nil {
+		return ProjectInstructions{}, err
 	}
 	abs, err := filepath.Abs(ws)
 	if err != nil {
@@ -93,7 +114,7 @@ func LoadProjectInstructionsAt(workspaceRoot, startDir string, maxTokens int) (P
 	directories, outside := projectInstructionDirectories(abs, startAbs)
 	sources := make([]ProjectInstructionSource, 0, len(directories))
 	for _, directory := range directories {
-		path, text, found, err := readProjectInstructionsFile(directory)
+		path, text, found, err := readProjectInstructionsFileWithFallbacks(directory, fallbackFilenames)
 		if err != nil {
 			return ProjectInstructions{}, err
 		}
@@ -172,8 +193,17 @@ func projectInstructionDirectories(workspaceRoot, startDir string) ([]string, bo
 	return directories, false
 }
 
-func readProjectInstructionsFile(workspaceRoot string) (string, string, bool, error) {
-	for _, name := range [...]string{agentsOverrideFile, agentsFile} {
+func readProjectInstructionsFileWithFallbacks(workspaceRoot string, fallbackFilenames []string) (string, string, bool, error) {
+	names := make([]string, 0, 2+len(fallbackFilenames))
+	seen := make(map[string]struct{}, 2+len(fallbackFilenames))
+	for _, name := range append([]string{agentsOverrideFile, agentsFile}, fallbackFilenames...) {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for _, name := range names {
 		path := filepath.Join(workspaceRoot, name)
 		info, err := os.Stat(path)
 		if err != nil {
@@ -199,6 +229,29 @@ func readProjectInstructionsFile(workspaceRoot string) (string, string, bool, er
 		return path, text, true, nil
 	}
 	return "", "", false, nil
+}
+
+func normalizeProjectInstructionFallbackFilenames(names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	normalized := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, raw := range names {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			return nil, errors.New("project instruction fallback filenames must not contain empty entries")
+		}
+		if name == "." || name == ".." || strings.ContainsRune(name, '\x00') || strings.ContainsAny(name, "/\\:\r\n") || filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
+			return nil, fmt.Errorf("project instruction fallback filename %q must be a basename without path separators", raw)
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	return normalized, nil
 }
 
 // FormatProjectInstructionsBlock returns the system-prompt section for the

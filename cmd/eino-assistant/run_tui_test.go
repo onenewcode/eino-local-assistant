@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"eino-local-assistant/internal/config"
+	"eino-local-assistant/internal/tui"
 )
 
 func TestEffectiveSandboxProtectedPathsProtectsHostControlFilesInWorkspace(t *testing.T) {
@@ -52,6 +53,34 @@ func TestApplyModelOverrideChangesOnlyInvocationModel(t *testing.T) {
 	}
 }
 
+func TestApplyModelOverrideResolvesConfiguredCatalogAlias(t *testing.T) {
+	cfg := config.Config{
+		Model: config.ModelConfig{
+			Provider:       config.ProviderOpenAI,
+			BaseURL:        "https://api.example.test/v1",
+			APIKey:         "test-api-key",
+			Name:           "configured-model",
+			TimeoutSeconds: 60,
+			Context: config.ModelContextConfig{
+				WindowTokens:    32000,
+				MaxOutputTokens: 4096,
+			},
+			Catalog: []config.ModelCatalogEntry{
+				{Name: "gpt-5.2-coding", DisplayName: "Coding 5.2", Aliases: []string{"coding"}},
+			},
+		},
+	}
+	if err := applyModelOverride(&cfg, "CODING"); err != nil {
+		t.Fatalf("applyModelOverride() error = %v", err)
+	}
+	if cfg.Model.Name != "gpt-5.2-coding" {
+		t.Fatalf("model name = %q, want canonical catalog name", cfg.Model.Name)
+	}
+	if got := cfg.Model.CatalogDisplayName(cfg.Model.Name); got != "Coding 5.2" {
+		t.Fatalf("catalog display name = %q, want Coding 5.2", got)
+	}
+}
+
 func TestApplyModelOverrideRejectsInvalidModel(t *testing.T) {
 	cfg := config.Config{Model: config.ModelConfig{Name: "configured-model"}}
 	if err := applyModelOverride(&cfg, ""); err != nil {
@@ -62,6 +91,23 @@ func TestApplyModelOverrideRejectsInvalidModel(t *testing.T) {
 	}
 	if err := applyModelOverride(&cfg, "invocation-model"); err == nil || !strings.Contains(err.Error(), "validate model override") {
 		t.Fatalf("invalid model override error = %v, want validation error", err)
+	}
+}
+
+func TestStatusFromCarriesRequestedReasoningEffort(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want string
+	}{
+		{name: "explicit", want: "high"},
+		{name: "provider default", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := statusFrom("openai/test", test.want, nil, "ask", 8, tui.SandboxInfo{}, tui.RuntimeInfo{})
+			if status.ReasoningEffort != test.want {
+				t.Fatalf("reasoning effort = %q, want %q", status.ReasoningEffort, test.want)
+			}
+		})
 	}
 }
 

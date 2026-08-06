@@ -12,7 +12,29 @@ provider = "openai"
 base_url = "https://your-openai-endpoint/v1"
 api_key = "replace-with-your-api-key"
 name = "your-model-name"
+# Optional provider/model-specific opaque string; empty preserves the provider default.
+reasoning_effort = ""
 timeout_seconds = 60
+
+# Optional explicit picker catalog for this endpoint. These are local declared
+# values, not live provider discovery; unknown names remain available through
+# /model <name> for custom deployments. Aliases resolve to the canonical name
+# before provider startup and durable session metadata is written.
+# [[model.catalog]]
+# name = "your-model-name"
+# display_name = "Primary coding model"
+# aliases = ["primary"]
+# description = "Configured deployment for general coding"
+# lifecycle = "active" # active | deprecated | retired
+#
+# [model.catalog.capabilities]
+# context_window_tokens = 128000
+# max_output_tokens = 8192
+# supports_reasoning = true
+# reasoning_efforts = ["low", "medium", "high"]
+# input_modalities = ["text", "image"]
+# supports_tools = true
+# supports_streaming = true
 
 [model.context]
 window_tokens = 32000
@@ -72,7 +94,10 @@ data_dir = ""
 # Project instructions + semantic memory (not session resume). See docs/memory.md.
 [rules]
 enabled = true
-# workspace root: override, then base; symlinks allowed; blank content skipped
+# workspace root: AGENTS.override.md, then AGENTS.md; symlinks allowed; blank content skipped
+# Optional project-only fallback basenames, tried in order after both canonical candidates are invalid.
+# Each discovered directory contributes at most one file; this is read when a fresh session is created.
+# project_doc_fallback_filenames = ["CLAUDE.md", "CONVENTIONS.md"]
 # max_tokens = 8000
 # user home (~/.eino-assistant): override, then base; independent soft-context budget
 # global_max_tokens = 4000

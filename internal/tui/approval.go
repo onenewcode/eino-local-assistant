@@ -537,7 +537,7 @@ func (info RuntimeInfo) Configured() bool {
 
 // CommandPolicyInfo is display-only policy state for /permissions and the status bar.
 type CommandPolicyInfo struct {
-	// Mode is "ask" (on_request) or "auto" (never).
+	// Mode is "ask", "auto", or the process-local read-only "plan" mode.
 	Mode string
 	// Approval is the raw config value (on_request|never).
 	Approval string
@@ -682,7 +682,7 @@ func (info CommandPolicyInfo) writeRuntimeReport(b *strings.Builder) {
 	}
 }
 
-// CmdPolicyFragment returns the status-bar badge (cmd=ask|auto).
+// CmdPolicyFragment returns the status-bar badge (cmd=ask|auto|plan).
 func (info CommandPolicyInfo) CmdPolicyFragment() string {
 	if info.ApprovalState != nil {
 		return "cmd=" + info.ApprovalState.InteractiveMode()

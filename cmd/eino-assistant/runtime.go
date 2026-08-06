@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"eino-local-assistant/internal/agent"
@@ -21,6 +22,7 @@ import (
 	"eino-local-assistant/internal/usage"
 
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -50,8 +52,11 @@ type commandRuntime struct {
 	sessionStore          *store.ThreadStore
 	ephemeralStoreRoot    string
 	chatModel             model.ToolCallingChatModel
+	modelMu               sync.RWMutex
 	registry              *tools.Registry
 	reactModel            *agent.ReActModel
+	taskController        *agent.TaskController
+	modelFactory          runtimeModelFactory
 	memStore              *memory.Store
 	sessionOpts           chat.SessionOptions
 	composePrompt         func() (string, error)
@@ -71,12 +76,45 @@ type commandRuntime struct {
 	rulesSnapshotStatus   string
 }
 
+type runtimeModelFactory struct {
+	newChatModel  func(context.Context, config.ModelConfig) (model.ToolCallingChatModel, error)
+	newReActModel func(context.Context, model.ToolCallingChatModel, []tool.BaseTool, agent.ReActOptions) (*agent.ReActModel, error)
+	newCompactor  func(model.BaseChatModel, contextbuild.Config) (contextbuild.CheckpointCompactor, error)
+}
+
+type runtimeModelBundle struct {
+	cfg         config.Config
+	chatModel   model.ToolCallingChatModel
+	reactModel  *agent.ReActModel
+	compactor   contextbuild.CheckpointCompactor
+	sessionOpts chat.SessionOptions
+}
+
+type runtimeSessionOpenResult struct {
+	session *chat.Session
+	bundle  runtimeModelBundle
+}
+
+func defaultRuntimeModelFactory() runtimeModelFactory {
+	return runtimeModelFactory{
+		newChatModel:  provider.NewChatModel,
+		newReActModel: agent.NewReActModelWithOptions,
+		newCompactor: func(chatModel model.BaseChatModel, cfg contextbuild.Config) (contextbuild.CheckpointCompactor, error) {
+			return contextbuild.NewModelCompactor(chatModel, cfg)
+		},
+	}
+}
+
 type execThreadLister interface {
 	ListThreads(context.Context) ([]store.ThreadMeta, error)
 }
 
 type readOnlyExecThreadLister struct {
 	store *store.ThreadStore
+}
+
+type runtimeThreadMetaLoader interface {
+	LoadThreadMeta(context.Context, string) (store.ThreadMeta, error)
 }
 
 func (lister readOnlyExecThreadLister) ListThreads(ctx context.Context) ([]store.ThreadMeta, error) {
@@ -134,6 +172,44 @@ func selectNewestExecSession(ctx context.Context, lister execThreadLister) (stri
 		return "", errors.New("newest durable session has no id")
 	}
 	return id, nil
+}
+
+// resolveStartupModelConfig keeps startup model selection in one place. A
+// fresh session uses config, an explicit override wins for every start mode,
+// and an unqualified resume inherits the target thread's durable identity
+// only when that identity is non-empty. Legacy threads without one keep the
+// current config model.
+func resolveStartupModelConfig(
+	ctx context.Context,
+	cfg config.Config,
+	start sessionStart,
+	source runtimeThreadMetaLoader,
+) (config.Config, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if modelName := strings.TrimSpace(start.modelName); modelName != "" {
+		if err := applyModelOverride(&cfg, modelName); err != nil {
+			return config.Config{}, err
+		}
+		return cfg, nil
+	}
+	if strings.TrimSpace(start.resumeID) == "" {
+		return cfg, nil
+	}
+	if source == nil {
+		return config.Config{}, errors.New("resume model source is unavailable")
+	}
+	meta, err := source.LoadThreadMeta(ctx, strings.TrimSpace(start.resumeID))
+	if err != nil {
+		return config.Config{}, fmt.Errorf("load resume session metadata: %w", err)
+	}
+	if modelName := strings.TrimSpace(meta.Model); modelName != "" {
+		if err := applyModelOverride(&cfg, modelName); err != nil {
+			return config.Config{}, fmt.Errorf("validate resume session model: %w", err)
+		}
+	}
+	return cfg, nil
 }
 
 // Close releases runtime workers and removes the fresh ephemeral ledger root.
@@ -245,13 +321,14 @@ func newSystemPromptSnapshotComposer(
 			}
 		}
 		return agent.ComposeWithLayersSnapshot(cfg.Assistant.SystemPrompt, agent.LayerOptions{
-			WorkspaceRoot:               workspaceRoot,
-			UserInstructionsRoot:        userInstructionsRoot,
-			UserInstructionsTokens:      cfg.Rules.RulesGlobalMaxTokens(),
-			ProjectInstructionsStartDir: startupCWD,
-			ProjectInstructionsEnabled:  cfg.Rules.RulesEnabled(),
-			ProjectInstructionsTokens:   cfg.Rules.RulesMaxTokens(),
-			MemoryBlock:                 memBlock,
+			WorkspaceRoot:                        workspaceRoot,
+			UserInstructionsRoot:                 userInstructionsRoot,
+			UserInstructionsTokens:               cfg.Rules.RulesGlobalMaxTokens(),
+			ProjectInstructionsStartDir:          startupCWD,
+			ProjectInstructionsEnabled:           cfg.Rules.RulesEnabled(),
+			ProjectInstructionsTokens:            cfg.Rules.RulesMaxTokens(),
+			ProjectInstructionsFallbackFilenames: cfg.Rules.ProjectDocFallbackFilenames,
+			MemoryBlock:                          memBlock,
 		})
 	}
 }
@@ -275,8 +352,10 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
-	if err := applyModelOverride(&cfg, start.modelName); err != nil {
-		return nil, err
+	if strings.TrimSpace(start.resumeID) == "" || strings.TrimSpace(start.modelName) != "" {
+		if cfg, err = resolveStartupModelConfig(ctx, cfg, start, nil); err != nil {
+			return nil, err
+		}
 	}
 
 	dataDir, err := cfg.Storage.ResolveDataDir()
@@ -285,7 +364,12 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	}
 	sourceDataDir := dataDir
 	sourceThreadPath := ""
+	var sourceStore *store.ThreadStore
 	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+		sourceStore, err = store.NewThreadStore(sourceDataDir)
+		if err != nil {
+			return nil, fmt.Errorf("open durable source session store: %w", err)
+		}
 		sourceThreadPath = filepath.Join(sourceDataDir, "sessions", strings.TrimSpace(start.resumeID))
 	}
 	ephemeralStoreRoot := ""
@@ -305,19 +389,18 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, fmt.Errorf("open session store: %w", err)
 	}
-	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
-		sourceStore, sourceErr := store.NewThreadStore(sourceDataDir)
-		if sourceErr != nil {
-			return nil, fmt.Errorf("open durable source session store: %w", sourceErr)
-		}
-		if sourceErr = sourceStore.SnapshotThread(ctx, start.resumeID, sessionStore); sourceErr != nil {
-			return nil, fmt.Errorf("snapshot durable resume session: %w", sourceErr)
+	if start.resumeID != "" && !start.ephemeral {
+		sourceStore = sessionStore
+	}
+	if strings.TrimSpace(start.resumeID) != "" && strings.TrimSpace(start.modelName) == "" {
+		if cfg, err = resolveStartupModelConfig(ctx, cfg, start, sourceStore); err != nil {
+			return nil, err
 		}
 	}
-
-	chatModel, err := provider.NewChatModel(ctx, cfg.Model)
-	if err != nil {
-		return nil, err
+	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+		if err = sourceStore.SnapshotThread(ctx, start.resumeID, sessionStore); err != nil {
+			return nil, fmt.Errorf("snapshot durable resume session: %w", err)
+		}
 	}
 
 	perms, err := cfg.BuildPermissions()
@@ -428,37 +511,28 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		return nil, fmt.Errorf("create task tools: %w", err)
 	}
 	registry = tools.New(append(registry.All(), taskTools...)...)
-
-	reactModel, err := agent.NewReActModelWithOptions(ctx, chatModel, registry.All(), runtimeReActOptions(runtimeCfg.MaxReactSteps, taskController))
+	runtime := &commandRuntime{
+		cfg:                cfg,
+		sessionStore:       sessionStore,
+		ephemeralStoreRoot: ephemeralStoreRoot,
+		registry:           registry,
+		taskController:     taskController,
+		modelFactory:       defaultRuntimeModelFactory(),
+		memStore:           memStore,
+		approvalMode:       approvalMode,
+		approvalState:      approvalState,
+		permissions:        perms,
+		sessionAllows:      sessionAllows,
+		sessionDenies:      sessionDenies,
+		workspaceRoot:      workspaceRoot,
+		readOnlyRoots:      readOnlyRoots,
+		protectedPaths:     protectedPaths,
+		sandboxRunner:      sandboxRunner,
+		runtimeCfg:         runtimeCfg,
+	}
+	bundle, err := runtime.buildModelBundle(ctx, cfg, start.recoverInterrupted)
 	if err != nil {
 		return nil, err
-	}
-	modelContext := cfg.Model.Context
-	contextCfg := contextbuild.Config{
-		WindowTokens:              modelContext.WindowTokens,
-		MaxOutputTokens:           modelContext.MaxOutputTokens,
-		KeepRecentTurns:           modelContext.KeepRecentTurns,
-		AutoCompactTriggerPercent: modelContext.AutoCompactTriggerPercent,
-		PostCompactTargetPercent:  modelContext.PostCompactTargetPercent,
-		SummaryMaxTokens:          modelContext.SummaryMaxTokens,
-		LowGainThresholdPercent:   modelContext.LowGainThresholdPercent,
-	}
-	compactor, err := contextbuild.NewModelCompactor(chatModel, contextCfg)
-	if err != nil {
-		return nil, fmt.Errorf("create context compactor: %w", err)
-	}
-
-	sessionOpts := chat.SessionOptions{
-		Store:     sessionStore,
-		ModelName: cfg.Model.Name,
-		Pricing: usage.Pricing{
-			InputPerMillion:  cfg.Model.Pricing.InputPerMillion,
-			OutputPerMillion: cfg.Model.Pricing.OutputPerMillion,
-		},
-		Context:            contextCfg,
-		MaxLowGainAttempts: modelContext.MaxLowGainAttempts,
-		Compactor:          compactor,
-		RecoverInterrupted: start.recoverInterrupted,
 	}
 	composePromptSnapshot := newSystemPromptSnapshotComposer(cfg, workspaceRoot, startupCWD, userInstructionsRoot, func() (string, error) {
 		if !memStore.UseEnabled() {
@@ -474,48 +548,33 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	var session *chat.Session
 	var initialSnapshot agent.PromptLayerSnapshot
 	if start.resumeID != "" {
-		session, err = chat.OpenSession(reactModel, sessionStore, start.resumeID, sessionOpts)
+		// Resume uses the durable thread system prompt; project fallback files are
+		// discovered only when composing a new session prompt below.
+		session, err = chat.OpenSession(bundle.reactModel, sessionStore, start.resumeID, bundle.sessionOpts)
 		if err != nil {
 			return nil, fmt.Errorf("resume session: %w", err)
 		}
 	} else {
-		sessionOpts.Title = start.title
+		bundle.sessionOpts.Title = start.title
 		fullPrompt, promptSnapshot, promptErr := composePromptSnapshot()
 		if promptErr != nil {
 			return nil, fmt.Errorf("compose system prompt: %w", promptErr)
 		}
 		initialSnapshot = promptSnapshot
-		session, err = chat.NewSession(reactModel, fullPrompt, sessionOpts)
+		session, err = chat.NewSession(bundle.reactModel, fullPrompt, bundle.sessionOpts)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	runtime := &commandRuntime{
-		cfg:                   cfg,
-		session:               session,
-		sessionStore:          sessionStore,
-		ephemeralStoreRoot:    ephemeralStoreRoot,
-		chatModel:             chatModel,
-		registry:              registry,
-		reactModel:            reactModel,
-		memStore:              memStore,
-		sessionOpts:           sessionOpts,
-		composePromptSnapshot: composePromptSnapshot,
-		rulesSnapshot:         initialSnapshot,
-		rulesSnapshotReady:    start.resumeID == "",
-		rulesSnapshotStatus:   initialRulesSnapshotStatus(start.resumeID == ""),
-		approvalMode:          approvalMode,
-		approvalState:         approvalState,
-		permissions:           perms,
-		sessionAllows:         sessionAllows,
-		sessionDenies:         sessionDenies,
-		workspaceRoot:         workspaceRoot,
-		readOnlyRoots:         readOnlyRoots,
-		protectedPaths:        protectedPaths,
-		sandboxRunner:         sandboxRunner,
-		runtimeCfg:            runtimeCfg,
-	}
+	runtime.session = session
+	runtime.chatModel = bundle.chatModel
+	runtime.reactModel = bundle.reactModel
+	runtime.sessionOpts = bundle.sessionOpts
+	runtime.composePromptSnapshot = composePromptSnapshot
+	runtime.rulesSnapshot = initialSnapshot
+	runtime.rulesSnapshotReady = start.resumeID == ""
+	runtime.rulesSnapshotStatus = initialRulesSnapshotStatus(start.resumeID == "")
 	runtime.composePrompt = runtime.composeSystemPrompt
 	return runtime, nil
 }
@@ -533,6 +592,175 @@ func runtimeReActOptions(maxSteps int, taskController *agent.TaskController) age
 		EnableSteer:    true,
 		TaskController: taskController,
 	}
+}
+
+func contextConfigFromModel(cfg config.ModelContextConfig) contextbuild.Config {
+	return contextbuild.Config{
+		WindowTokens:              cfg.WindowTokens,
+		MaxOutputTokens:           cfg.MaxOutputTokens,
+		KeepRecentTurns:           cfg.KeepRecentTurns,
+		AutoCompactTriggerPercent: cfg.AutoCompactTriggerPercent,
+		PostCompactTargetPercent:  cfg.PostCompactTargetPercent,
+		SummaryMaxTokens:          cfg.SummaryMaxTokens,
+		LowGainThresholdPercent:   cfg.LowGainThresholdPercent,
+	}
+}
+
+func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config, recoverInterrupted bool) (runtimeModelBundle, error) {
+	if r == nil {
+		return runtimeModelBundle{}, errors.New("runtime is required")
+	}
+	if r.registry == nil {
+		return runtimeModelBundle{}, errors.New("tool registry is required")
+	}
+	if r.sessionStore == nil {
+		return runtimeModelBundle{}, errors.New("session store is required")
+	}
+	factory := r.modelFactory
+	defaults := defaultRuntimeModelFactory()
+	if factory.newChatModel == nil {
+		factory.newChatModel = defaults.newChatModel
+	}
+	if factory.newReActModel == nil {
+		factory.newReActModel = defaults.newReActModel
+	}
+	if factory.newCompactor == nil {
+		factory.newCompactor = defaults.newCompactor
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rawModel, err := factory.newChatModel(ctx, cfg.Model)
+	if err != nil {
+		return runtimeModelBundle{}, fmt.Errorf("create chat model: %w", err)
+	}
+	if rawModel == nil {
+		return runtimeModelBundle{}, errors.New("create chat model: provider returned nil model")
+	}
+	reactModel, err := factory.newReActModel(
+		ctx,
+		rawModel,
+		r.registry.All(),
+		runtimeReActOptions(r.runtimeCfg.MaxReactSteps, r.taskController),
+	)
+	if err != nil {
+		return runtimeModelBundle{}, fmt.Errorf("create ReAct model: %w", err)
+	}
+	if reactModel == nil {
+		return runtimeModelBundle{}, errors.New("create ReAct model: factory returned nil model")
+	}
+	contextCfg := contextConfigFromModel(cfg.Model.Context)
+	compactor, err := factory.newCompactor(rawModel, contextCfg)
+	if err != nil {
+		return runtimeModelBundle{}, fmt.Errorf("create context compactor: %w", err)
+	}
+	if compactor == nil {
+		return runtimeModelBundle{}, errors.New("create context compactor: factory returned nil compactor")
+	}
+	modelContext := cfg.Model.Context
+	return runtimeModelBundle{
+		cfg:        cfg,
+		chatModel:  rawModel,
+		reactModel: reactModel,
+		compactor:  compactor,
+		sessionOpts: chat.SessionOptions{
+			Store:     r.sessionStore,
+			ModelName: strings.TrimSpace(cfg.Model.Name),
+			Pricing: usage.Pricing{
+				InputPerMillion:  cfg.Model.Pricing.InputPerMillion,
+				OutputPerMillion: cfg.Model.Pricing.OutputPerMillion,
+			},
+			Context:            contextCfg,
+			MaxLowGainAttempts: modelContext.MaxLowGainAttempts,
+			Compactor:          compactor,
+			RecoverInterrupted: recoverInterrupted,
+		},
+	}, nil
+}
+
+func (r *commandRuntime) modelSnapshot() (config.Config, model.ToolCallingChatModel, *agent.ReActModel, chat.SessionOptions) {
+	if r == nil {
+		return config.Config{}, nil, nil, chat.SessionOptions{}
+	}
+	r.modelMu.RLock()
+	defer r.modelMu.RUnlock()
+	return r.cfg, r.chatModel, r.reactModel, r.sessionOpts
+}
+
+func (r *commandRuntime) switchModel(ctx context.Context, session *chat.Session, requestedName string) (runtimeModelBundle, error) {
+	if r == nil {
+		return runtimeModelBundle{}, errors.New("runtime is required")
+	}
+	if session == nil {
+		return runtimeModelBundle{}, errors.New("active session is required")
+	}
+	requestedName = strings.TrimSpace(requestedName)
+	if requestedName == "" {
+		return runtimeModelBundle{}, errors.New("model name is required")
+	}
+	cfg, _, _, _ := r.modelSnapshot()
+	if err := applyModelOverride(&cfg, requestedName); err != nil {
+		return runtimeModelBundle{}, err
+	}
+	candidate, err := r.buildModelBundle(ctx, cfg, false)
+	if err != nil {
+		return runtimeModelBundle{}, err
+	}
+	if err := session.ReplaceModel(ctx, chat.ModelBinding{
+		Model:     candidate.reactModel,
+		ModelName: candidate.sessionOpts.ModelName,
+		Compactor: candidate.compactor,
+		Pricing:   candidate.sessionOpts.Pricing,
+	}); err != nil {
+		return runtimeModelBundle{}, err
+	}
+	r.modelMu.Lock()
+	r.cfg = candidate.cfg
+	r.chatModel = candidate.chatModel
+	r.reactModel = candidate.reactModel
+	r.sessionOpts = candidate.sessionOpts
+	r.session = session
+	r.modelMu.Unlock()
+	return candidate, nil
+}
+
+func (r *commandRuntime) openSession(ctx context.Context, id string, recoverInterrupted bool) (runtimeSessionOpenResult, error) {
+	if r == nil {
+		return runtimeSessionOpenResult{}, errors.New("runtime is required")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return runtimeSessionOpenResult{}, errors.New("session id is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	meta, err := r.sessionStore.LoadThreadMeta(ctx, id)
+	if err != nil {
+		return runtimeSessionOpenResult{}, fmt.Errorf("load session metadata: %w", err)
+	}
+	cfg, _, _, _ := r.modelSnapshot()
+	if durableName := strings.TrimSpace(meta.Model); durableName != "" && durableName != strings.TrimSpace(cfg.Model.Name) {
+		if err := applyModelOverride(&cfg, durableName); err != nil {
+			return runtimeSessionOpenResult{}, err
+		}
+	}
+	candidate, err := r.buildModelBundle(ctx, cfg, recoverInterrupted)
+	if err != nil {
+		return runtimeSessionOpenResult{}, err
+	}
+	session, err := chat.OpenSession(candidate.reactModel, r.sessionStore, id, candidate.sessionOpts)
+	if err != nil {
+		return runtimeSessionOpenResult{}, err
+	}
+	r.modelMu.Lock()
+	r.cfg = candidate.cfg
+	r.chatModel = candidate.chatModel
+	r.reactModel = candidate.reactModel
+	r.sessionOpts = candidate.sessionOpts
+	r.session = session
+	r.modelMu.Unlock()
+	return runtimeSessionOpenResult{session: session, bundle: candidate}, nil
 }
 
 // composeSystemPrompt is the only runtime path that both recomposes a prompt
@@ -559,7 +787,11 @@ func (r *commandRuntime) sideQuestion(ctx context.Context, session *chat.Session
 	if session == nil {
 		return "", errSideQuestionSessionUnavailable
 	}
-	if r == nil || r.chatModel == nil {
+	if r == nil {
+		return "", errSideQuestionModelUnavailable
+	}
+	_, chatModel, _, _ := r.modelSnapshot()
+	if chatModel == nil {
 		return "", errSideQuestionModelUnavailable
 	}
 	question = strings.TrimSpace(question)
@@ -569,7 +801,7 @@ func (r *commandRuntime) sideQuestion(ctx context.Context, session *chat.Session
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	response, err := r.chatModel.Generate(ctx, sideQuestionMessages(session, question))
+	response, err := chatModel.Generate(ctx, sideQuestionMessages(session, question))
 	if err != nil {
 		return "", fmt.Errorf("generate side question: %w", err)
 	}
@@ -703,7 +935,8 @@ func applyModelOverride(cfg *config.Config, modelName string) error {
 	if modelName == "" {
 		return nil
 	}
-	cfg.Model.Name = modelName
+	resolvedName, _ := cfg.Model.ResolveCatalogName(modelName)
+	cfg.Model.Name = resolvedName
 	if err := cfg.Model.Validate(); err != nil {
 		return fmt.Errorf("validate model override: %w", err)
 	}

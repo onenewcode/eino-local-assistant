@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -102,8 +103,16 @@ func renderSystem(text string) string {
 }
 
 // renderReasoning draws model reasoning summary (display-only).
-// Folded blocks are a single dim summary line; open/streaming blocks show body.
-func renderReasoning(text string, folded, streaming bool) string {
+// Hidden details retain only a compact marker/count; visible folded blocks keep
+// the existing preview and open/streaming blocks show their body.
+func renderReasoning(text string, folded, streaming, detailsVisible bool, reasoningBody string) string {
+	if !detailsVisible {
+		body := reasoningBody
+		if body == "" {
+			body = text
+		}
+		return reasoningStyle.Render(formatCompactReasoning(body, streaming))
+	}
 	if folded {
 		return reasoningStyle.Render("·· " + text)
 	}
@@ -126,6 +135,18 @@ func renderReasoning(text string, folded, streaming bool) string {
 		b.WriteString(reasoningStyle.Render("  " + line))
 	}
 	return b.String()
+}
+
+func formatCompactReasoning(body string, streaming bool) string {
+	prefix := "thinking"
+	if streaming {
+		prefix = "thinking…"
+	}
+	count := len([]rune(strings.TrimSpace(body)))
+	if count == 0 {
+		return prefix
+	}
+	return prefix + " · " + strconv.Itoa(count) + " chars"
 }
 
 func renderSeparator(width int) string {
@@ -170,6 +191,22 @@ var (
 	slashMenuCursorStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("114")).
 				Bold(true)
+
+	modelPickerTitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114")).
+				Bold(true)
+	modelPickerRowStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250"))
+	modelPickerSelectedStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("252")).
+					Background(lipgloss.Color("236")).
+					Bold(true)
+	modelPickerDisabledStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("242"))
+	modelPickerMetaStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243"))
+	modelPickerFooterStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("245"))
 
 	taskPaneTitleStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("114")).

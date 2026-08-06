@@ -586,3 +586,156 @@ func TestLoadProjectInstructionsAtReadErrorsFailFast(t *testing.T) {
 		t.Fatalf("error=%v, want read failure", err)
 	}
 }
+
+func TestLoadProjectInstructionsDefaultKeepsCanonicalCandidatesOnly(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, agentsFile), []byte("canonical instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "CLAUDE.md"), []byte("fallback instructions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := LoadProjectInstructions(ws, 100)
+	if err != nil {
+		t.Fatalf("LoadProjectInstructions: %v", err)
+	}
+	if !b.Found || b.Text != "canonical instructions" || filepath.Base(b.Path) != agentsFile {
+		t.Fatalf("bundle=%+v, want canonical candidate", b)
+	}
+}
+
+func TestLoadProjectInstructionsFallbackOnlyAfterCanonicalCandidatesAreInvalid(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		writeFiles func(t *testing.T, workspace string)
+	}{
+		{
+			name: "missing",
+			writeFiles: func(t *testing.T, workspace string) {
+				writeInstructionFile(t, workspace, "CLAUDE.md", "fallback instructions")
+			},
+		},
+		{
+			name: "blank",
+			writeFiles: func(t *testing.T, workspace string) {
+				writeInstructionFile(t, workspace, agentsOverrideFile, "\xef\xbb\xbf \n\t")
+				writeInstructionFile(t, workspace, agentsFile, "\n\t")
+				writeInstructionFile(t, workspace, "CLAUDE.md", "fallback instructions")
+			},
+		},
+		{
+			name: "nonregular",
+			writeFiles: func(t *testing.T, workspace string) {
+				if err := os.Mkdir(filepath.Join(workspace, agentsOverrideFile), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(filepath.Join(workspace, agentsFile), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				writeInstructionFile(t, workspace, "CLAUDE.md", "fallback instructions")
+			},
+		},
+		{
+			name: "canonical-valid",
+			writeFiles: func(t *testing.T, workspace string) {
+				writeInstructionFile(t, workspace, agentsFile, "canonical instructions")
+				writeInstructionFile(t, workspace, "CLAUDE.md", "fallback instructions")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			tc.writeFiles(t, workspace)
+			bundle, err := LoadProjectInstructionsWithFallbacks(workspace, 100, []string{"CLAUDE.md"})
+			if err != nil {
+				t.Fatalf("LoadProjectInstructionsWithFallbacks: %v", err)
+			}
+			if !bundle.Found {
+				t.Fatalf("bundle=%+v, want selected instructions", bundle)
+			}
+			wantText, wantFile := "fallback instructions", "CLAUDE.md"
+			if tc.name == "canonical-valid" {
+				wantText, wantFile = "canonical instructions", agentsFile
+			}
+			if bundle.Text != wantText || filepath.Base(bundle.Path) != wantFile {
+				t.Fatalf("bundle=%+v, want text=%q file=%q", bundle, wantText, wantFile)
+			}
+		})
+	}
+}
+
+func TestLoadProjectInstructionsFallbackOrderAndDirectoryCardinality(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeInstructionFile(t, ws, "CLAUDE.md", "claude fallback")
+	writeInstructionFile(t, ws, "CONVENTIONS.md", "conventions fallback")
+
+	b, err := LoadProjectInstructionsAtWithFallbacks(ws, ws, 100, []string{"CLAUDE.md", "CONVENTIONS.md", "CLAUDE.md"})
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAtWithFallbacks: %v", err)
+	}
+	if len(b.Sources) != 1 || b.Sources[0].Text != "claude fallback" || filepath.Base(b.Sources[0].Path) != "CLAUDE.md" {
+		t.Fatalf("sources=%+v, want first fallback only", b.Sources)
+	}
+
+	b, err = LoadProjectInstructionsAtWithFallbacks(ws, ws, 100, []string{"CONVENTIONS.md", "CLAUDE.md"})
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsAtWithFallbacks reversed: %v", err)
+	}
+	if len(b.Sources) != 1 || b.Sources[0].Text != "conventions fallback" || filepath.Base(b.Sources[0].Path) != "CONVENTIONS.md" {
+		t.Fatalf("sources=%+v, want configured fallback order", b.Sources)
+	}
+}
+
+func TestLoadProjectInstructionsFallbackAllowsRegularSymlink(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	target := filepath.Join(t.TempDir(), "linked-project-doc.md")
+	if err := os.WriteFile(target, []byte("linked fallback"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(ws, "CLAUDE.md")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("create symlink: %v", err)
+		}
+		t.Fatal(err)
+	}
+
+	b, err := LoadProjectInstructionsWithFallbacks(ws, 100, []string{"CLAUDE.md"})
+	if err != nil {
+		t.Fatalf("LoadProjectInstructionsWithFallbacks: %v", err)
+	}
+	canonicalWorkspace, err := filepath.EvalSymlinks(ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.Found || b.Text != "linked fallback" || b.Path != filepath.Join(canonicalWorkspace, "CLAUDE.md") {
+		t.Fatalf("bundle=%+v, want fallback symlink provenance", b)
+	}
+}
+
+func TestLoadProjectInstructionsFallbackRejectsNonBasenames(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	for _, name := range []string{"", " \t", "../escape.md", "nested/escape.md", filepath.Join(string(filepath.Separator), "escape.md"), `..\escape.md`, `C:\escape.md`, ".", ".."} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadProjectInstructionsWithFallbacks(ws, 100, []string{name})
+			if err == nil || (!strings.Contains(err.Error(), "basename") && !strings.Contains(err.Error(), "empty entries")) {
+				t.Fatalf("error=%v, want fallback filename validation", err)
+			}
+		})
+	}
+}
+
+func writeInstructionFile(t *testing.T, workspace, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(workspace, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

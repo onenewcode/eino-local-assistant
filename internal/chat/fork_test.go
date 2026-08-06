@@ -122,6 +122,72 @@ func TestSessionForkOpensChildWithProvenanceAndPreservesSource(t *testing.T) {
 	}
 }
 
+func TestSessionForkAfterModelSwitchUsesCurrentDurableIdentity(t *testing.T) {
+	ctx := context.Background()
+	threadStore := newDurableThreadStore(t)
+	initialModel := &scriptedModel{streams: []Stream{
+		&scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("source answer", nil)}}},
+	}}
+	source, err := NewSession(initialModel, "frozen system prompt", SessionOptions{
+		Store:     threadStore,
+		ModelName: "model-before",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := source.Ask(ctx, "source question", nil); err != nil {
+		t.Fatalf("source Ask: %v", err)
+	}
+	boundaryState, err := threadStore.LoadThread(ctx, source.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := &scriptedModel{}
+	if err := source.ReplaceModel(ctx, ModelBinding{Model: replacement, ModelName: "model-after"}); err != nil {
+		t.Fatalf("ReplaceModel: %v", err)
+	}
+	sourceState, err := threadStore.LoadThread(ctx, source.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceState.Meta.Model != "model-after" || sourceState.Revision != boundaryState.Revision+1 {
+		t.Fatalf("source model switch = %#v, boundary = %#v", sourceState, boundaryState)
+	}
+
+	child, result, err := source.Fork(ctx, "fork-model-session-child", "")
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if child.Model() != replacement || child.ModelName() != "model-after" {
+		t.Fatalf("fork runtime binding = %p/%q, want %p/model-after", child.Model(), child.ModelName(), replacement)
+	}
+	childState, err := threadStore.LoadThread(ctx, child.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childState.Meta.Model != "model-after" || result.ChildState.Meta.Model != "model-after" {
+		t.Fatalf("fork durable model = child=%q result=%q, want model-after", childState.Meta.Model, result.ChildState.Meta.Model)
+	}
+	if result.ChildState.Revision != boundaryState.Revision || result.SourceHash == sourceState.LastHash {
+		t.Fatalf("fork boundary included post-boundary model event: result=%#v source=%#v boundary=%#v", result, sourceState, boundaryState)
+	}
+
+	beforeFirst, _, err := source.ForkBeforeFirstTurn(ctx, "fork-model-session-before-first")
+	if err != nil {
+		t.Fatalf("ForkBeforeFirstTurn: %v", err)
+	}
+	if beforeFirst.Model() != replacement || beforeFirst.ModelName() != "model-after" {
+		t.Fatalf("before-first runtime binding = %p/%q, want %p/model-after", beforeFirst.Model(), beforeFirst.ModelName(), replacement)
+	}
+	beforeFirstState, err := threadStore.LoadThread(ctx, beforeFirst.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeFirstState.Meta.Model != "model-after" || beforeFirstState.Revision != 1 {
+		t.Fatalf("before-first durable model = %#v, want current model and creation-only prefix", beforeFirstState)
+	}
+}
+
 func TestSessionForkBeforeFirstTurnOpensEmptyChildAndPreservesSource(t *testing.T) {
 	ctx := context.Background()
 	threadStore := newDurableThreadStore(t)

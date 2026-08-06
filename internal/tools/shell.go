@@ -176,8 +176,11 @@ func normalizeShellOptions(opts ShellOptions) (ShellOptions, error) {
 		opts.Approval = ApprovalOnRequest
 	case ApprovalNever:
 		// ok
+	case ApprovalPlan:
+		// Plan is normally supplied through ApprovalState, but accepting the
+		// canonical value keeps direct tool construction consistent.
 	default:
-		return ShellOptions{}, fmt.Errorf("approval must be %q or %q", ApprovalOnRequest, ApprovalNever)
+		return ShellOptions{}, fmt.Errorf("approval must be %q, %q, or %q", ApprovalOnRequest, ApprovalNever, ApprovalPlan)
 	}
 
 	root, err := ResolveWorkspaceRoot(opts.WorkspaceRoot)
@@ -205,6 +208,19 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 	}
 
 	command := strings.TrimSpace(input.Command)
+	approvalMode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState)
+	// Reject an explicit host escape before validating its justification or
+	// resolving/pinning its executable. Plan mode must not even inspect the
+	// host command, and this path deliberately avoids all deny bookkeeping.
+	if approvalMode == ApprovalPlan && strings.EqualFold(strings.TrimSpace(input.SandboxPermissions), string(sandboxPermissionsEscalated)) {
+		if defaults.Permissions != nil {
+			if ev := defaults.Permissions.EvaluateBash(command); ev.Decision == DecisionDeny {
+				reason := fmt.Sprintf("%s: %s", ReasonPolicyDenied, ev.Reason)
+				return softDeny(command, defaults.WorkingDir, DecisionDeny, reason, false), nil
+			}
+		}
+		return softDeny(command, defaults.WorkingDir, DecisionDeny, ReasonPlanReadOnly, false), nil
+	}
 	if command == "" {
 		return ShellOutput{}, errors.New("command is required")
 	}
@@ -227,13 +243,16 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 		hostCommand, safety = prepareHostEscalationCommand(command, cwd, defaults.WorkspaceRoot)
 		if safety.Decision == DecisionDeny {
 			reason := fmt.Sprintf("%s: %s", ReasonPolicyDenied, safety.Reason)
+			if approvalMode == ApprovalPlan {
+				return softDeny(command, cwd, DecisionDeny, ReasonPlanReadOnly, false), nil
+			}
 			return finishDeny(defaults, command, cwd, DecisionDeny, reason, RuleKey("shell", command, defaults.WorkspaceRoot), true), nil
 		}
 	}
 
 	// Authorization runs before the per-command timeout so approval wait is not
 	// charged against the shell timeout budget.
-	if out, blocked, err := authorizeShell(ctx, defaults, command, cwd, forceHost, input.Justification, hostCommand); err != nil {
+	if out, blocked, err := authorizeShell(ctx, defaults, command, cwd, forceHost, input.Justification, hostCommand, approvalMode); err != nil {
 		return ShellOutput{}, err
 	} else if blocked {
 		return out, nil
@@ -250,7 +269,13 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 	if defaults.Sandbox != nil && permissions == sandboxPermissionsDefault {
-		return runSandboxShell(runCtx, defaults, command, cwd, timeoutSeconds)
+		return runSandboxShell(runCtx, defaults, command, cwd, timeoutSeconds, approvalMode == ApprovalPlan)
+	}
+	// authorizeShell rejects this path before execution. Keep a second guard at
+	// the execution boundary so a future authorization change cannot fall back
+	// to an unsandboxed host shell while plan mode is active.
+	if approvalMode == ApprovalPlan {
+		return softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": plan mode requires an enforced read-only sandbox", true), nil
 	}
 
 	var out ShellOutput
@@ -273,19 +298,25 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 	return out, nil
 }
 
-func runSandboxShell(ctx context.Context, defaults ShellOptions, command, cwd string, timeoutSeconds int) (ShellOutput, error) {
+func runSandboxShell(ctx context.Context, defaults ShellOptions, command, cwd string, timeoutSeconds int, readOnly bool) (ShellOutput, error) {
 	response, outcome, err := defaults.Sandbox.Execute(ctx, SandboxWorkerRequest{
 		Kind:           sandboxWorkerShell,
 		WorkingDir:     cwd,
 		Command:        command,
 		TimeoutSeconds: timeoutSeconds,
 		MaxOutputBytes: defaults.MaxOutputBytes,
+		ReadOnly:       readOnly,
 	})
 	if err != nil {
 		if stopped, ok := shellContextStopResult(ctx, command, cwd, outcome); ok {
 			return stopped, nil
 		}
 		out := softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": "+err.Error(), true)
+		out.Sandbox = &outcome
+		return out, nil
+	}
+	if readOnly && (outcome.Mode != string(sandbox.ReadOnly) || !outcome.Enforced || outcome.Escalated) {
+		out := softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": plan mode requires an enforced read-only sandbox", true)
 		out.Sandbox = &outcome
 		return out, nil
 	}
@@ -407,25 +438,60 @@ func runDirectCommand(runCtx, parentCtx context.Context, defaults ShellOptions, 
 // host must already be prepared when forceHost is true so the modal displays
 // the pinned absolute executable before the user answers.
 // blocked=true means a soft result is ready and the shell must not start.
-func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd string, forceHost bool, justification string, host hostEscalationCommand) (ShellOutput, bool, error) {
+func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd string, forceHost bool, justification string, host hostEscalationCommand, approvalMode ApprovalMode) (ShellOutput, bool, error) {
 	ruleKey := RuleKey("shell", command, defaults.WorkspaceRoot)
 
 	if forceHost && host.program == "" {
+		if approvalMode == ApprovalPlan {
+			return softDeny(command, cwd, DecisionDeny, ReasonPlanReadOnly, false), true, nil
+		}
 		return finishDeny(defaults, command, cwd, DecisionDeny, ReasonPolicyDenied+": host escalation command is required", ruleKey, true), true, nil
 	}
 
 	if !forceHost && defaults.WorkspaceOnly && !PathWithinWorkspace(defaults.WorkspaceRoot, cwd) {
 		reason := fmt.Sprintf("%s: working_dir is outside workspace root %s", ReasonWorkspaceOnly, defaults.WorkspaceRoot)
+		if approvalMode == ApprovalPlan {
+			return softDeny(command, cwd, DecisionDeny, reason, false), true, nil
+		}
 		return finishDeny(defaults, command, cwd, DecisionDeny, reason, ruleKey, false), true, nil
 	}
 
 	// Prior user deny for this rule_key: soft-deny without re-prompting.
 	if !forceHost && defaults.SessionDenies != nil && defaults.SessionDenies.Contains(ruleKey) {
 		reason := fmt.Sprintf("%s: %s; %s", ReasonUserDeniedSession, ruleKey, ReasonUserDeniedNoRetry)
+		if approvalMode == ApprovalPlan {
+			return softDeny(command, cwd, DecisionDeny, reason, false), true, nil
+		}
 		return finishDeny(defaults, command, cwd, DecisionDeny, reason, ruleKey, true), true, nil
 	}
 
 	ev := defaults.Permissions.EvaluateBash(command)
+	// Hard policy deny remains authoritative in every mode.
+	if ev.Decision == DecisionDeny {
+		reason := fmt.Sprintf("%s: %s", ReasonPolicyDenied, ev.Reason)
+		if approvalMode == ApprovalPlan {
+			return softDeny(command, cwd, DecisionDeny, reason, false), true, nil
+		}
+		return finishDeny(defaults, command, cwd, DecisionDeny, reason, ruleKey, false), true, nil
+	}
+	// Compound syntax is not a plain PermissionSet allow, even when its first
+	// token matches an allow rule.
+	if ev.Decision == DecisionAllow && HasShellMetacharacters(command) {
+		ev = Evaluation{
+			Decision: DecisionAsk,
+			RuleID:   "opaque-shell",
+			Reason:   "shell metacharacters present; session allow downgraded to ask",
+		}
+	}
+	if approvalMode == ApprovalPlan {
+		if forceHost || ev.Decision != DecisionAllow {
+			return softDeny(command, cwd, DecisionDeny, ReasonPlanReadOnly, true), true, nil
+		}
+		if defaults.Sandbox == nil {
+			return softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": plan mode requires an enforced read-only sandbox", true), true, nil
+		}
+		return ShellOutput{}, false, nil
+	}
 
 	// Session allow upgrades ask → allow only; never overrides deny.
 	// Also never upgrades opaque-shell asks without an explicit re-approval —

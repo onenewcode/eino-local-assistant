@@ -24,12 +24,19 @@ func NewAnthropicModel(ctx context.Context, cfg config.ModelConfig) (model.ToolC
 	}
 
 	baseURL := cfg.BaseURL
+	var additionalRequestFields map[string]any
+	if cfg.ReasoningEffort != "" {
+		additionalRequestFields = map[string]any{
+			"output_config.effort": cfg.ReasoningEffort,
+		}
+	}
 	client, err := claude.NewChatModel(ctx, &claude.Config{
-		APIKey:         cfg.APIKey,
-		BaseURL:        &baseURL,
-		Model:          cfg.Name,
-		MaxTokens:      cfg.Context.MaxOutputTokens,
-		RequestTimeout: time.Duration(cfg.TimeoutSeconds) * time.Second,
+		APIKey:                  cfg.APIKey,
+		BaseURL:                 &baseURL,
+		Model:                   cfg.Name,
+		MaxTokens:               cfg.Context.MaxOutputTokens,
+		RequestTimeout:          time.Duration(cfg.TimeoutSeconds) * time.Second,
+		AdditionalRequestFields: additionalRequestFields,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create Anthropic Messages chat model: %w", err)

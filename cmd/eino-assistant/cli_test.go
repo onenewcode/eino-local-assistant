@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +74,67 @@ func TestCommandHelp(t *testing.T) {
 			}
 			if !strings.Contains(stdout, tc.want) {
 				t.Fatalf("expected %q in:\n%s", tc.want, stdout)
+			}
+		})
+	}
+}
+
+func TestInteractiveModelSelectionHelp(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"--help"},
+		{"chat", "--help"},
+		{"new", "--help"},
+		{"resume", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
+			stdout, _, err := executeForTest(args...)
+			if err != nil {
+				t.Fatalf("execute(%v): %v", args, err)
+			}
+			for _, want := range []string{"-m", "--model", "startup-only"} {
+				if !strings.Contains(stdout, want) {
+					t.Fatalf("help for %v missing %q:\n%s", args, want, stdout)
+				}
+			}
+		})
+	}
+}
+
+func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		args []string
+		want sessionStart
+	}{
+		{name: "bare", args: []string{"--model", "bare-model"}, want: sessionStart{modelName: "bare-model"}},
+		{name: "chat", args: []string{"chat", "--model", "chat-model"}, want: sessionStart{modelName: "chat-model"}},
+		{name: "new alias", args: []string{"new", "-m", "alias-model"}, want: sessionStart{modelName: "alias-model"}},
+		{name: "resume", args: []string{"resume", "saved-session", "-m", "resume-model"}, want: sessionStart{resumeID: "saved-session", modelName: "resume-model"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var got sessionStart
+			called := false
+			root := newRootCommandWithDeps(commandDeps{
+				interactive: func(_ string, start sessionStart, _ io.Writer) error {
+					called = true
+					got = start
+					return nil
+				},
+			})
+			root.SetArgs(tc.args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute(%v): %v", tc.args, err)
+			}
+			if !called {
+				t.Fatal("interactive runner was not called")
+			}
+			if got != tc.want {
+				t.Fatalf("session start = %#v, want %#v", got, tc.want)
 			}
 		})
 	}

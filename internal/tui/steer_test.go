@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"eino-local-assistant/internal/chat"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 type steerSessionStub struct {
@@ -56,7 +58,10 @@ func TestSteerBusyAdmitsUsingDurableTurnIDWithoutChangingTurnState(t *testing.T)
 	m.queuePaused = true
 	cancelled := false
 	m.turnCancel = func() { cancelled = true }
-	m.pendingApproval = &approvalRequestMsg{}
+	approval := &approvalRequestMsg{}
+	m.pendingApproval = approval
+	m.textarea.SetValue("/steer  change   direction  ")
+	m.syncComposerHeight()
 	beforeLines := len(m.lines)
 
 	next, cmd := m.queueWhileBusy("/steer  change   direction  ")
@@ -75,6 +80,12 @@ func TestSteerBusyAdmitsUsingDurableTurnIDWithoutChangingTurnState(t *testing.T)
 	}
 	if mm.queuePaused != true || len(mm.queue) != 1 || mm.queue[0] != "queued follow-up" {
 		t.Fatalf("steer changed queue state: queue=%v paused=%v", mm.queue, mm.queuePaused)
+	}
+	if mm.textarea.Value() != "" {
+		t.Fatalf("successful steer did not clear composer draft: %q", mm.textarea.Value())
+	}
+	if mm.pendingApproval != approval {
+		t.Fatalf("steer changed approval state: got=%p want=%p", mm.pendingApproval, approval)
 	}
 	if len(mm.lines) == beforeLines || !hasLineContaining(mm.lines, lineSystem, "steer admitted; awaiting next model call") {
 		t.Fatalf("steer success feedback missing: %#v", mm.lines)
@@ -168,10 +179,21 @@ func TestSteerExplicitFailuresNeverFallBackToQueueOrTurn(t *testing.T) {
 			m.turnID = 12
 			m.queue = []string{"keep me"}
 			m.queuePaused = true
-			next, cmd := m.submit("/steer correction")
+			approval := &approvalRequestMsg{}
+			m.pendingApproval = approval
+			draft := "/steer  correction  "
+			m.textarea.SetValue(draft)
+			m.syncComposerHeight()
+			next, cmd := m.queueWhileBusy(strings.TrimSpace(draft))
 			mm := next.(*model)
-			if cmd != nil || mm.mode != tc.mode || mm.turnID != 12 || len(mm.queue) != 1 || !mm.queuePaused {
+			if cmd != nil || mm.mode != tc.mode || mm.turnID != 12 || len(mm.queue) != 1 || mm.queue[0] != "keep me" || !mm.queuePaused {
 				t.Fatalf("failure changed state: cmd=%v mode=%s turn=%d queue=%v paused=%v", cmd, modeName(mm.mode), mm.turnID, mm.queue, mm.queuePaused)
+			}
+			if mm.textarea.Value() != draft {
+				t.Fatalf("failed steer changed composer draft: got=%q want=%q", mm.textarea.Value(), draft)
+			}
+			if mm.pendingApproval != approval {
+				t.Fatalf("failed steer changed approval state: got=%p want=%p", mm.pendingApproval, approval)
 			}
 			if tc.stub.steerCalls > 0 && tc.name != "core error" && tc.name != "mismatch" {
 				t.Fatalf("unexpected steer call count=%d", tc.stub.steerCalls)
@@ -216,6 +238,33 @@ func TestLegacySteerAdmissionDoesNotInventReceipt(t *testing.T) {
 	}
 	if legacy.calls != 1 {
 		t.Fatalf("legacy steer calls = %d, want 1", legacy.calls)
+	}
+}
+
+func TestIdleSteerRejectedByUpdateRetainsComposerDraft(t *testing.T) {
+	m := newTestModel(t)
+	draft := "/steer  correction  "
+	setComposer(m, draft)
+	beforeLines := len(m.lines)
+	beforeHistory := len(m.inputHist.entries)
+	beforeTurnID := m.turnID
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := next.(*model)
+	if cmd != nil {
+		t.Fatalf("rejected idle steer should not return a command: %#v", cmd)
+	}
+	if mm.textarea.Value() != draft {
+		t.Fatalf("rejected idle steer changed composer draft: got=%q want=%q", mm.textarea.Value(), draft)
+	}
+	if mm.mode != modeIdle || mm.turnID != beforeTurnID || mm.turnCancel != nil || mm.turnDone != nil {
+		t.Fatalf("rejected idle steer started a turn: mode=%s turn=%d cancel=%v done=%v", modeName(mm.mode), mm.turnID, mm.turnCancel != nil, mm.turnDone != nil)
+	}
+	if len(mm.inputHist.entries) != beforeHistory+1 || mm.inputHist.entries[len(mm.inputHist.entries)-1] != strings.TrimSpace(draft) {
+		t.Fatalf("idle steer changed input history unexpectedly: %#v", mm.inputHist.entries)
+	}
+	if len(mm.lines) <= beforeLines || !hasLineContaining(mm.lines, lineError, "regular turn is not running") {
+		t.Fatalf("rejected idle steer feedback missing: %#v", mm.lines)
 	}
 }
 

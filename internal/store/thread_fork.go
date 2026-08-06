@@ -518,6 +518,11 @@ func rebuildForkEvents(childID string, source forkSource) ([]ThreadEvent, Thread
 			}
 			created.Meta.ID = childID
 			created.Meta.Title = source.state.Meta.Title
+			// The child inherits the source's current provider identity even when
+			// that model change happened after the selected committed boundary.
+			// The post-boundary model.changed event itself remains out of the child
+			// prefix, so provenance still points at the exact source boundary.
+			created.Meta.Model = source.state.Meta.Model
 			created.Meta.ParentID = source.state.ID
 			created.Meta.ForkBoundaryTurnID = source.boundaryTurn
 			created.Meta.ForkSourceHash = source.sourceHash

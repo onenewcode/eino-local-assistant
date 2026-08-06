@@ -39,6 +39,7 @@ type ThreadStore struct {
 }
 
 var _ ThreadRepository = (*ThreadStore)(nil)
+var _ ThreadModelRepository = (*ThreadStore)(nil)
 
 type localThreadLock struct {
 	held chan struct{}
@@ -546,6 +547,36 @@ func (s *ThreadStore) FinishTurn(ctx context.Context, id string, input TurnFinis
 // SetThreadTitle emits title.changed using a revision compare-and-swap.
 func (s *ThreadStore) SetThreadTitle(ctx context.Context, id string, expectedRevision uint64, title string) (ThreadState, error) {
 	return s.mutate(ctx, id, expectedRevision, EventTitleChanged, "", titleUpdatedPayload{Title: strings.TrimSpace(title)})
+}
+
+// SetThreadModel emits model.changed after checking the full durable lifecycle
+// under the write lock. The caller supplies a constructed provider separately;
+// this method only records the selected identity and never constructs one.
+func (s *ThreadStore) SetThreadModel(ctx context.Context, id string, expectedRevision uint64, model string) (ThreadState, error) {
+	model = strings.TrimSpace(model)
+	dir, unlock, err := s.lockThread(ctx, id)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	defer unlock()
+	state, events, err := s.loadThreadLocked(dir, id)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	if err := checkExpectedRevision(state, expectedRevision); err != nil {
+		return ThreadState{}, err
+	}
+	tracker, err := lifecycleFromEvents(events)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	if tracker.activeTurnID != "" {
+		return ThreadState{}, fmt.Errorf("%w: %q", ErrModelChangeActiveTurn, tracker.activeTurnID)
+	}
+	if state.PendingCompaction != nil {
+		return ThreadState{}, fmt.Errorf("%w: %q", ErrModelChangePendingCompaction, state.PendingCompaction.OperationID)
+	}
+	return s.appendLocked(dir, state, expectedRevision, EventModelChanged, "", ModelChange{Model: model})
 }
 
 func (s *ThreadStore) mutate(ctx context.Context, id string, expectedRevision uint64, kind EventKind, turnID string, payload any) (ThreadState, error) {

@@ -40,6 +40,23 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 		t.Fatalf("switch confirmation missing: %#v", m.lines)
 	}
 
+	next, cmd = m.submit("/permissions plan")
+	if cmd != nil {
+		t.Fatal("plan switch should not start a turn")
+	}
+	m = next.(*model)
+	if got := state.InteractiveMode(); got != "plan" {
+		t.Fatalf("state mode = %q, want plan", got)
+	}
+	if got := m.statusPolicyFragment(); got != "cmd=plan" {
+		t.Fatalf("plan status policy = %q, want cmd=plan", got)
+	}
+	next, _ = m.submit("/status")
+	m = next.(*model)
+	if !hasLineContaining(m.lines, lineSystem, "cmd=plan") {
+		t.Fatalf("status report did not reflect plan mode: %#v", m.lines)
+	}
+
 	next, _ = m.submit("/permissions")
 	m = next.(*model)
 	var report string
@@ -48,7 +65,7 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 			report = line.text
 		}
 	}
-	if !strings.Contains(report, "mode: auto (on_request)") {
+	if !strings.Contains(report, "mode: plan (on_request)") {
 		t.Fatalf("dynamic mode report = %q", report)
 	}
 	if !strings.Contains(report, "approval_policy: on_request") || strings.Contains(report, "approval_policy: never") {
@@ -60,6 +77,21 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 	if got := state.InteractiveMode(); got != "ask" {
 		t.Fatalf("state mode after ask = %q, want ask", got)
 	}
+}
+
+func TestPermissionsPlanIsDocumentedInHelpAndSlashMenu(t *testing.T) {
+	if !strings.Contains(helpText(), "/permissions [ask|auto|plan]") {
+		t.Fatalf("help does not document plan mode: %s", helpText())
+	}
+	for _, command := range slashCatalog() {
+		if command.Name == "/permissions" {
+			if !strings.Contains(command.Description, "ask|auto|plan") {
+				t.Fatalf("permissions menu description = %q", command.Description)
+			}
+			return
+		}
+	}
+	t.Fatal("permissions command missing from slash catalog")
 }
 
 func TestPermissionsModeChangeIsRejectedBusyWithoutDroppingDraft(t *testing.T) {
@@ -97,6 +129,38 @@ func TestPermissionsModeChangeIsRejectedBusyWithoutDroppingDraft(t *testing.T) {
 	}
 }
 
+func TestPermissionsPlanChangeIsRejectedCompactingWithoutDroppingDraft(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(Deps{
+		Ctx: context.Background(),
+		PolicyInfo: CommandPolicyInfo{
+			Approval:      string(tools.ApprovalOnRequest),
+			ApprovalState: state,
+		},
+	})
+	m.mode = modeCompacting
+	m.queue = []string{"already queued"}
+	m.textarea.SetValue("/permissions plan")
+
+	next, cmd := m.queueWhileBusy(m.textarea.Value())
+	if cmd != nil {
+		t.Fatal("compacting permission switch should not start a command")
+	}
+	m = next.(*model)
+	if got := state.InteractiveMode(); got != "ask" {
+		t.Fatalf("compacting switch changed state to %q", got)
+	}
+	if len(m.queue) != 1 || m.queue[0] != "already queued" {
+		t.Fatalf("compacting switch changed queue: %#v", m.queue)
+	}
+	if got := m.textarea.Value(); got != "/permissions plan" {
+		t.Fatalf("compacting switch dropped draft: %q", got)
+	}
+}
+
 func TestPermissionsParseAndBusyClassification(t *testing.T) {
 	cases := []struct {
 		input  string
@@ -107,6 +171,7 @@ func TestPermissionsParseAndBusyClassification(t *testing.T) {
 		{input: "/permissions", action: slashPermissions, busy: busyInputExecuteImmediately},
 		{input: "/permissions ask", action: slashPermissions, arg: "ask", busy: busyInputReject},
 		{input: "/permissions auto", action: slashPermissions, arg: "auto", busy: busyInputReject},
+		{input: "/permissions plan", action: slashPermissions, arg: "plan", busy: busyInputReject},
 	}
 	for _, tc := range cases {
 		action, arg := parseSlash(tc.input)

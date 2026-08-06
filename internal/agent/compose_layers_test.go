@@ -71,6 +71,30 @@ func TestComposeWithLayersUsesProjectInstructionsStartDir(t *testing.T) {
 	}
 }
 
+func TestComposeWithLayersUsesConfiguredProjectFallback(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "CLAUDE.md"), []byte("fallback project rule"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, snapshot, err := ComposeWithLayersSnapshot("persona", LayerOptions{
+		WorkspaceRoot:                        ws,
+		ProjectInstructionsEnabled:           true,
+		ProjectInstructionsTokens:            8000,
+		ProjectInstructionsFallbackFilenames: []string{"CLAUDE.md"},
+	})
+	if err != nil {
+		t.Fatalf("ComposeWithLayersSnapshot: %v", err)
+	}
+	if !strings.Contains(prompt, "fallback project rule") {
+		t.Fatalf("prompt missing fallback rule: %q", prompt)
+	}
+	if len(snapshot.Project.Sources) != 1 || snapshot.Project.Sources[0].Title != "CLAUDE.md" {
+		t.Fatalf("project snapshot=%+v, want fallback provenance", snapshot.Project)
+	}
+}
+
 func TestComposeWithLayersSnapshotCapturesMetadataWithoutText(t *testing.T) {
 	t.Parallel()
 	globalRoot := t.TempDir()

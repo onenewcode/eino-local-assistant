@@ -12,7 +12,9 @@ import (
 
 	"eino-local-assistant/internal/config"
 
+	claude "github.com/cloudwego/eino-ext/components/model/claude"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 )
 
 func TestAnthropicModelStreamsMessagesAPIWithTools(t *testing.T) {
@@ -153,6 +155,64 @@ func TestAnthropicModelStreamsMessagesAPIWithTools(t *testing.T) {
 	}
 }
 
+func TestAnthropicModelPassesReasoningEffortWithoutDroppingOutputFormat(t *testing.T) {
+	requests := make(chan anthropicRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		requests <- anthropicRequest{
+			method:  r.Method,
+			path:    r.URL.Path,
+			headers: r.Header.Clone(),
+			body:    body,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_effort","type":"message","role":"assistant","content":[{"type":"text","text":"Done."}],"model":"claude-test","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	model, err := NewAnthropicModel(context.Background(), config.ModelConfig{
+		Provider:        config.ProviderAnthropic,
+		BaseURL:         server.URL,
+		APIKey:          "test-key",
+		Name:            "claude-test",
+		ReasoningEffort: " high ",
+		Context: config.ModelContextConfig{
+			WindowTokens:    32_000,
+			MaxOutputTokens: 777,
+		},
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("NewAnthropicModel() error = %v", err)
+	}
+
+	_, err = model.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")}, claude.WithResponseFormat(&claude.ResponseFormat{
+		Schema: &jsonschema.Schema{Type: "object"},
+	}))
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	request := receiveAnthropicRequest(t, requests)
+	outputConfig := objectValue(t, request.body["output_config"])
+	if got, want := stringValue(t, outputConfig["effort"]), "high"; got != want {
+		t.Errorf("output_config.effort = %q, want %q", got, want)
+	}
+	format := objectValue(t, outputConfig["format"])
+	if got, want := stringValue(t, format["type"]), "json_schema"; got != want {
+		t.Errorf("output_config.format.type = %q, want %q", got, want)
+	}
+	schemaObject := objectValue(t, format["schema"])
+	if got, want := stringValue(t, schemaObject["type"]), "object"; got != want {
+		t.Errorf("output_config.format.schema.type = %q, want %q", got, want)
+	}
+}
+
 type anthropicRequest struct {
 	method  string
 	path    string
@@ -197,6 +257,9 @@ func assertAnthropicRequest(t *testing.T, request anthropicRequest) {
 	}
 	if got, ok := request.body["stream"].(bool); !ok || !got {
 		t.Errorf("stream = %#v, want true", request.body["stream"])
+	}
+	if _, ok := request.body["output_config"]; ok {
+		t.Errorf("output_config = %#v, want omitted by default", request.body["output_config"])
 	}
 
 	system := arrayValue(t, request.body["system"])

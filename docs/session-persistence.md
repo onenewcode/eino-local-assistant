@@ -21,6 +21,16 @@
 8. 自主复杂任务将图、proof 接受状态和中断状态写为 `task.state.updated`；`/resume` 恢复该投影，但恢复时仍为 `working` 的节点先转为 `needs_replan`，不会自动重放操作。普通后续输入延续原始需求；只有显式以当前用户原文替换 `user-request` 才改变任务范围并使相关 proof 失效。
 9. `ThreadStore.ForkThread` 是 `internal/store` 的 V1 source-preserving ledger primitive；`chat.Session.Fork`、TUI `/fork` 与 idle 两阶段 `Esc` backtrack 在其上提供 child session 接入。backtrack 的可见 committed user prompt 包括首个 prompt；首个 prompt 通过显式 `ThreadForkBeforeFirstRepository` / `ForkThreadBeforeFirstTurn` / `Session.ForkBeforeFirstTurn` 创建只含 `thread.created` 的 child，普通 `ForkThread` / `Fork` 的空 `lastTurnID` 仍表示 latest，两种语义不能混用。backtrack 不实现 destructive rewind 或 workspace、Git、外部副作用回滚。
 
+## 模型身份与会话内切换（最小契约）
+
+thread 的模型身份是会话元数据，不等同于 provider 实例、凭据或全局配置。初始模型身份随 `thread.created` 记录；如果 `ThreadStore` 提供可选的 `ThreadModelRepository` 扩展，`ThreadStore.SetThreadModel` 通过正常的 revision/CAS mutation 追加 `model.changed`。journal 是身份变更的权威来源，物化 `meta.json` 可以展示最新身份；不支持该可选扩展的 store 不承诺持久化模型切换。
+
+`chat.Session.ReplaceModel` 是 session-level 的 idle-only 替换契约。provider 实例由上层先构造，再交给 `Session` 替换当前模型绑定；active turn 或 pending compaction 时必须拒绝，且拒绝不得部分修改 session。成功替换保留原 thread ID、冻结 system prompt、transcript、active checkpoint、context 和累计 usage；它不创建新 thread、不重放或截断 transcript、不清除 checkpoint/context/usage，也不写全局配置。当前生产 runtime 会把新的 provider、ReAct、compactor 和 `SessionOptions.ModelName` 作为一个 candidate bundle 完整构造后再提交；提交失败时旧 session binding、runtime snapshot 与 durable thread 都保持不变。provider 构造、模型身份持久化与替换调用之间的跨层编排由上层负责，store/chat 不承担 catalog 或 picker。
+
+resume 的目标语义是从 `thread.created` 与之后的 `model.changed` 重放出最新模型身份，再由上层据此构造 provider；runtime-owned 的 TUI `/resume` 已按目标 thread 的 durable model identity 构造 candidate bundle，并在成功打开后替换 active session/runtime。resume 不应因为当前全局配置而改写既有 thread 身份；打开/构造失败时，旧 active session、runtime bundle 和 TUI 状态保持不变。显式启动 `-m` / `--model` 仍只是本次进程的 provider override，不写入 `model.changed`，也不修改全局配置。
+
+TUI live switch 的用户入口仍是 idle-only 的 `/model [name]`：带名称时名称必须是单个非空参数，provider、ReAct、compactor 全部构造成功后才提交；省略名称时打开显式配置的 picker，`Alt+P` / `Option+P` 也可打开或关闭 picker。busy、compacting、pending approval 或 side question in-flight 时拒绝且不进入 FIFO。`[model]` 下的 `[[model.catalog]]` 是当前 endpoint 的本地声明，区分 display label、canonical provider/deployment name、alias、lifecycle 与声明的 reasoning/context/tool/streaming/modality 能力；alias 在 provider 构造前解析为 canonical name，durable session 只保存 canonical identity。catalog 没有 live provider discovery、entitlement、health 或 refresh 语义，声明能力只用于选择时展示，不自动改写当前 context 配置；未知名称始终保留 free-form fallback，适配 custom endpoint。picker 不提供 reasoning effort 二级选择、价格兼容性检查或缓存确认，也不宣称与 Codex/Claude 的完整模型选择行为对齐。
+
 fresh `exec --ephemeral` 使用同一个 v2 `ThreadStore` API，但根目录是本次进程创建的空临时目录，runtime 关闭时整体删除。`exec resume <id> --ephemeral` 和 `exec resume --last --ephemeral` 则在 durable source thread 锁下复制选定 session 的 authoritative journal、materialized state/meta、checkpoints 与 artifacts 到该临时根目录，再由临时 store 承担整个 resumed turn；source session 不接收 turn、journal、state、checkpoint 或 artifact 写入，source `locks/` 也不复制。ephemeral `--last` 使用不修复 durable projections 的只读 session 列表；普通 durable `--last` 仍使用既有 `ListThreads` 路径。该能力只保证 session ledger 的本次运行生命周期，不宣称 fork 语义；工具已经造成的工作区、网络或其他外部副作用不会回滚，项目级 semantic memory 也不会被清除。
 
 Headless `exec --output-schema FILE` 在打开/创建 session 前读取并编译本地 JSON Schema；文件不存在、不可读、JSON 无效或 schema 无效都是 input error，不会调用模型。有效 schema 只用于最终 assistant Content：内容必须是 JSON 实例且匹配 schema，校验发生在 `turn.committed` 前。失败会沿用 turn failed lifecycle，不写入 assistant message，但已记录的 provider usage 保留；`--output-last-message` 也只在校验成功并提交后写入。该能力是本地最终响应校验，不是 provider-enforced structured output，不会把 `response_format` 注入 ReAct loop；相对 `$ref` 按 schema 文件所在路径解析。
@@ -92,7 +102,7 @@ backtrack 不恢复或回滚 workspace 文件、Git working tree/index、进程�
 | --- | --- |
 | `journal.jsonl` | 权威 append-only 事件链；恢复时优先重放它。 |
 | `state.json` | revision、活动 checkpoint、任务图投影、自动压缩熔断和 meta 的物化投影。 |
-| `meta.json` | 列表和 CLI 展示用投影：标题、时间、消息数、API usage、最近 context 快照、本地费用估算，以及 source-preserving child 的 parent/boundary/hash provenance。 |
+| `meta.json` | 列表和 CLI 展示用投影：标题、时间、消息数、当前模型身份、API usage、最近 context 快照、本地费用估算，以及 source-preserving child 的 parent/boundary/hash provenance。 |
 | `checkpoints/*.json` | 不可变的结构化 checkpoint；有对应 journal 事件后才成为活动 checkpoint。 |
 | `artifacts/*.json` | 内容地址、大小、摘要、截断状态和 head/tail 元数据。 |
 | `artifacts/*.blob` | 未截断 artifact 的原始字节；截断 artifact 没有 blob。 |
@@ -114,10 +124,11 @@ previous_hash, payload_hash, payload, hash
 
 | 事件 | 含义 |
 | --- | --- |
-| `thread.created` | 创建 thread，包含 meta 和 system prompt；source-preserving child 还包含 parent、boundary turn 和 source hash provenance。 |
+| `thread.created` | 创建 thread，包含 meta、system prompt 和初始模型身份；source-preserving child 还包含 parent、boundary turn 和 source hash provenance。 |
 | `turn.started` | 接受一个 user 输入、开始 agent 生命周期。 |
 | `tool.started` / `tool.completed` | 以稳定 tool call ID 保存工具参数、结束状态和 artifact 引用；同名并发调用不会混淆。 |
 | `turn.committed` | 原子写入完整可见 user/assistant 消息。 |
+| `model.changed` | 记录 thread 模型身份的 revisioned 变更；不改写 system prompt、transcript、checkpoint、context 或既有 usage，也不是 provider 调用记录。 |
 | `usage.recorded` | 记录一个已完成模型调用的服务商 usage、调用类型和可用性；调用 ID 幂等，ReAct 中间调用与 compaction 调用均单独记账。 |
 | `task.state.updated` | 任务图、节点状态、accepted proof 引用和控制状态的紧凑投影；成功状态转换先持久化再发布，写入失败也不得把内存放宽为可交付。`task_complete` 要等所属 `turn.committed` 才是最终批准；恢复会比对其后的 shell/patch 生命周期。完整 tool output 仍只由 `tool.completed` / artifact 保存。 |
 | `context.compaction.started` | 在 compactor provider 调用前记录 operation ID；直到成功或失败事件到达前，该操作保持 pending，防止 crash/retry 重复计费。 |
@@ -161,6 +172,7 @@ previous_hash, payload_hash, payload, hash
 - 每个 v2 checkpoint 的 direct event IDs 与 source hash 都会重新从 immutable raw turn/artifact ledger 计算；payload 与 checkpoint metadata 彼此自洽但不对应 raw ledger 时，resume 显式失败，不会用它遮蔽 raw group。
 - 普通 `resume` 发现仅有 `turn.started` 而没有 terminal 事件时会拒绝接管，避免误伤暂时安静的其他进程；只有用户确认旧进程已退出后显式使用 `resume <id> --recover`，才会以已读取的 revision CAS 写入 `turn.failed`。若期间有其他 writer 更新 revision，则恢复显式失败，不会终止更新后的 turn。
 - 对已写入 `context.compaction.started` 但没有 terminal event 的 compaction，普通 resume 同样拒绝接管；`resume <id> --recover` 将其记为 cancelled 并保留已记录的 provider usage。自动 compaction 在 pending 期间保持暂停，避免 crash 后重复花费。
+- `model.changed` 遵循同一把写锁和 revision/CAS 规则；resume 重放后以最后一个有效模型身份为准。模型身份事件只描述 thread 的选择，不替代上层 provider 构造或全局配置。
 - 末尾 torn journal record 会被恢复到最后一个完整、哈希有效的事件；中间记录、序号、hash 或 thread ID 不一致会显式报 `ErrJournalCorrupt`，不静默丢历史。
 - 多 writer 使用 advisory file lock 和 revision CAS。CAS 失败返回 `ErrRevisionConflict`；compactor 丢弃过期候选，而不是覆盖新 turn。
 
@@ -253,6 +265,8 @@ checkpoint 必须是严格 JSON，并包含：
 | 操作 | 行为 |
 | --- | --- |
 | `resume <id> [--recover]` / `/resume <id> [--recover]` / `exec resume <id> [PROMPT] [--recover]` / `exec resume --last [PROMPT] [--recover]` | **存储层**：读取 state、活动 checkpoint 和最近可见 transcript。**模型层**：下一请求使用活动 checkpoint + 未覆盖热 groups + 当前 tools + 新消息，不把完整账本水合进 prompt。产品承诺是任务可继续，不是全文语义等价。headless `exec resume` 必须给精确、不透明 ID，除非显式使用 `--last`；`--ephemeral` 会把选定 source session 快照到临时 ledger，后续只由该临时 ledger 接收 turn lifecycle 写入。它只发送调用中提供的一条新 prompt，并且只通过 `chat.OpenSession` 恢复，不解析账本文件。若活动 checkpoint 是可识别 v1，先 CAS reset 指针并保留 raw ledger；若 thread 有活动 turn 或 pending compaction，普通 resume 仍拒绝接管；精确指定 `--recover` 才会显式恢复该目标，而且 ephemeral 恢复只写临时 ledger。`--output-format stream-json` 不读取或导出账本：它只在成功打开后写 session.started，工具 activity 也只在对应生命周期已经写入账本后投影，最终 result 则在 turn.committed 之后写出。 |
+| 恢复模型身份 | runtime-owned 的 TUI `/resume` 从 `thread.created` 与后续 `model.changed` 得到目标 thread 的最新模型身份，再由上层构造 provider bundle；成功打开后切换 active session，失败不污染旧 runtime。显式 `-m` / `--model` 是本次调用 override，不回写 `model.changed` 或全局配置。 |
+| 会话内模型替换（最小契约） | TUI `/model [name]` 与 `Alt+P` picker 只在 idle、无 pending approval、无 side question 时执行；picker 只来自显式 `[model]` `[[model.catalog]]`，选择时显示 label/canonical identity/lifecycle/声明能力，成功提交 canonical name；无 catalog 时 `/model` 仍提示使用 free-form `/model <name>`。上层先构造完整 provider bundle，再调用 `Session.ReplaceModel`，成功后复用同一 thread/session 并由 `ThreadStore.SetThreadModel` 追加 `model.changed`。active turn 或 pending compaction 拒绝且不入队；catalog 不做 provider discovery、health refresh、entitlement 或 capability enforcement。 |
 | 向上滚动 | 以稳定 message page 从 event ledger 读取更早 transcript；只扩展 UI 回放缓存，不改变模型工作集。 |
 | `/new [title]` | 创建独立 thread，旧 thread 保留。 |
 | `ThreadStore.ForkThread(...)`（内部 V1） | 在 `internal/store` 发布带新 ID 的 source-preserving child ledger：空 `lastTurnID` 选择 latest，非空值复制完整 committed event prefix，重建 journal hash/seq、记录 parent provenance 并复制前缀 artifacts；拒绝 active/pending compaction/checkpoint/task-derived 状态，不回滚 source/workspace/git/外部副作用。显式 before-first 边界由 `ForkThreadBeforeFirstTurn` 单独提供。 |
@@ -270,13 +284,13 @@ checkpoint 必须是严格 JSON，并包含：
 
 | 路径 | 职责 |
 | --- | --- |
-| `internal/store/thread*.go` | 账本、锁、CAS、artifact 范围读取、checkpoint、恢复和 transcript page。 |
+| `internal/store/thread*.go` | 账本、锁、CAS、artifact 范围读取、checkpoint、恢复和 transcript page；可选的 `ThreadModelRepository` / `ThreadStore.SetThreadModel` 模型身份 mutation，供 live runtime switch 持久化 `model.changed`。 |
 | `internal/store/thread_fork.go` | V1 source-preserving child ledger：边界校验、journal envelope/hash/seq 重建、parent provenance、前缀 artifact 复制和原子发布；不承担产品命令或 workspace rollback。 |
 | `internal/contextbuild/` | 完整 group planner、结构化 checkpoint、无工具 compactor、递归合并。 |
-| `internal/chat/session.go` | 生命周期 recorder、prompt projection、compaction transaction、resume tail，以及 `Session.Fork` child session 打开。 |
+| `internal/chat/session.go` | 生命周期 recorder、prompt projection、compaction transaction、resume tail，以及 `Session.Fork` child session 打开；idle-only `Session.ReplaceModel` 替换完整模型 binding 并保留会话上下文。 |
 | `internal/agent/react.go` | 发送未截断的工具事件；不承担显示限制。 |
-| `internal/tui/` | `/compact`、`/context`、`/fork`、Esc backtrack、自动压缩 barrier、队列隔离、session 切换和分页回放。 |
-| `cmd/eino-assistant/run_tui.go` | 共享 base model，并分别创建 ReAct model 与 no-tools compactor。 |
+| `internal/tui/` | `/compact`、`/context`、`/fork`、Esc backtrack、自动压缩 barrier、队列隔离、session 切换和分页回放；idle-only `/model [name]`、显式 catalog picker、`Alt+P`、其 admission 边界和状态更新；不负责 provider discovery/health 或能力真相。 |
+| `cmd/eino-assistant/runtime.go` / `run_tui.go` | 共享 base model、ReAct model 与 no-tools compactor 的 runtime bundle 构造；catalog alias 到 canonical name 的 runtime 选择、TUI `/model` 候选 bundle 原子提交、picker DTO 接线，以及 runtime-owned `/resume` 按 durable model identity 选择 provider。 |
 
 `model.context` 的压缩策略数值设为 `0` 时采用产品默认值，并非禁用开关。例如 `keep_recent_turns: 0` 使用默认 12，`low_gain_threshold_percent: 0` 使用默认 15%，`max_low_gain_attempts: 0` 使用默认 2。窗口与输出上限必须明确配置。
 

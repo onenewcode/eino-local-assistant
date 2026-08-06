@@ -71,17 +71,19 @@ max_bytes = 262144
 
 `approval_policy` 是进程启动时读取的静态配置，不是 TUI 会话内模式。Headless `exec` 没有交互 approver，继续按该静态值处理：`on-request` 遇到需要审批的 `DecisionAsk` 时 fail-closed，`never` 只保留现有的 `DecisionAsk` 自动放行语义；二者都不能改写 `DecisionDeny`、工作区/路径钳制或 sandbox 边界。TUI 的动态模式不会改写配置文件，也不改变 headless 语义。
 
-### 2.1 TUI 会话内模式（即将加入）
+### 2.1 TUI 会话内模式（当前实现）
 
-TUI 只规划 `ask <-> auto` 两个会话内模式，不扩展为 `plan`、`read-only` 或其他更大的权限档位。这里的模式是当前 TUI 进程的临时运行时状态，不写入 TOML、session ledger 或 resume 数据；进程退出后不保留。
+TUI 当前实现提供 `ask`、`auto` 和 `plan` 三个会话内模式。`plan` 是当前 TUI 进程级的临时 read-only phase，不是配置持久化，也不是完整的 plan artifact workflow；它不生成或持久化任务计划、计划文件或独立 plan 账本。三种模式都只存在于进程运行时，不写入 TOML、session ledger 或 resume 数据；进程退出后不保留。
 
 - `/permissions` 无参数只读展示当前模式、静态规则、sandbox 和 runtime 信息，不改变任何授权状态。
-- `/permissions ask` 与 `/permissions auto` 只在 idle 时接受；busy、compacting 或其他非 idle 状态拒绝命令，不进入 FIFO，也不改变正在运行的工具或审批。
+- `/permissions plan` 只在 idle 时进入 plan；`/permissions ask` 或 `/permissions auto` 只在 idle 时退出 plan 并恢复对应模式。busy、compacting 或其他非 idle 状态拒绝模式切换，不进入 FIFO，不改变正在运行的工具或审批，并保留 composer draft。
 - `ask` 让普通 `DecisionAsk` 继续进入现有 TUI once / session / deny 审批；`auto` 只在工具实际授权边界自动放行 `DecisionAsk`。`DecisionAllow` 仍受后续执行护栏约束，`DecisionDeny`（包括 hard deny）不能被模式改写。
-- `auto` 不绕过 `workspace_only`、路径解析与 path clamp；不绕过 sandbox，sandbox backend 不可用时仍返回 `sandbox_unavailable` 并 fail-closed；shell 的 host escalation 仍是逐次 once / deny，不能由 `auto` 或 session allow 自动放行。
+- plan 下 `apply_patch` 无条件返回结构化 `denied=true`、`decision=deny`、`reason=plan_read_only`，在输入校验、文件读取、审批或 worker 启动之前拒绝。
+- plan 下 `shell` 只有 `PermissionSet` 原始求值为 `DecisionAllow` 才能继续；session allow、`approval_policy = "never"` 或 TUI 审批不能把 `ask` 提升为 allow，含 shell 元字符的 allow 也会先降为 ask。hard deny 仍按既有策略拒绝；其他非原始 allow 直接以 `plan_read_only` 拒绝。通过后必须使用 enforced OS read-only worker；没有 sandbox、sandbox 不可用、worker 关闭或返回结果不是 enforced read-only 时，均以 `sandbox_unavailable` 结构化拒绝并 fail-closed，不回退到无 sandbox 或 host 执行，也不请求 ask/host escalation。
+- plan 仍受 hard deny、`workspace_only`、路径解析与 path clamp、sandbox 网络/文件边界、命令与 runtime 上限约束；shell 的 host escalation 在 plan 下始终拒绝。切换模式不能放宽这些边界。
 - 已注册的 `shell` 与 `apply_patch` 必须读取同一动态模式；只更新状态栏或 `/permissions` 文案而不改变工具授权路径，不算实现该模式。
 
-状态栏的 `cmd=ask|auto` 与 `/permissions` 的 `mode` 均反映当前 TUI 进程状态；`approval_policy` 仍作为独立的静态配置字段展示。
+状态栏的 `cmd=ask|auto|plan` 与 `/permissions` 的 `mode` 均反映当前 TUI 进程状态；`approval_policy` 仍作为独立的静态配置字段展示。plan 只改变 TUI 工具阶段门，不改变 headless `exec` 的静态 approval_policy 或默认执行行为。
 
 ## 3. Sandbox
 
@@ -106,10 +108,10 @@ TUI 只规划 `ask <-> auto` 两个会话内模式，不扩展为 `plan`、`read
 
 ## 5. TUI 与审计
 
-- `ask` 模式下普通审批提供 once / session / deny；Esc = deny。`auto` 只跳过这一步的 `DecisionAsk`，不改变 deny、路径钳制或 sandbox 决策。
+- `ask` 模式下普通审批提供 once / session / deny；Esc = deny。`auto` 只跳过这一步的 `DecisionAsk`，不改变 deny、路径钳制或 sandbox 决策；`plan` 不提供审批绕过，而是执行上述 read-only 阶段门。
 - 宿主升级审批带有明显风险提示，只提供 once / deny，不能记为 session allow；命令会完整换行显示，控制字符会转义，并附带 SHA-256 指纹以避免长命令或终端序列伪装审批内容。长命令用 PgUp/PgDn 在审批详情中逐页检查。
-- 状态栏显示当前 TUI 会话的 `cmd=ask|auto`、`sb=rw|ro`、后端可用性与 `net=off|allow:n`；不会把静态配置误报为持久化的会话设置。
-- `/permissions` 无参数只读显示当前模式、权限规则、sandbox 模式/后端、只读根数量、受保护路径、网络 allowlist、runtime 预算和 session allow/deny；带 `ask|auto` 参数的切换仅在 idle 生效。
+- 状态栏显示当前 TUI 会话的 `cmd=ask|auto|plan`、`sb=rw|ro`、后端可用性与 `net=off|allow:n`；不会把静态配置误报为持久化的会话设置。
+- `/permissions` 无参数只读显示当前模式、权限规则、sandbox 模式/后端、只读根数量、受保护路径、网络 allowlist、runtime 预算和 session allow/deny；带 `ask|auto|plan` 参数的切换仅在 idle 生效。
 - 工具输入、结果、沙盒元数据及 runtime 终止原因会进入该 session 的 tool lifecycle/artifact 记录；不要仅依赖 TUI 文案进行审计。
 
 普通审批的 session key：

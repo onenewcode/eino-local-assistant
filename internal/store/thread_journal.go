@@ -356,6 +356,12 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 			return fmt.Errorf("decode title update: %w", err)
 		}
 		state.Meta.Title = payload.Title
+	case EventModelChanged:
+		var payload ModelChange
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode model change: %w", err)
+		}
+		state.Meta.Model = strings.TrimSpace(payload.Model)
 	case EventContextCompactionStarted:
 		var payload CompactionStart
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {

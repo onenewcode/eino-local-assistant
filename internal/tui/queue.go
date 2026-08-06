@@ -92,6 +92,8 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 			return busyInputExecuteImmediately
 		}
 		return busyInputReject
+	case slashModel:
+		return busyInputReject
 	case slashMemory:
 		// list/status are read-only; mutations must wait for idle.
 		if memoryCommandAllowsBusy(arg) {

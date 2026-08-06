@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/memory"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/sandbox"
@@ -55,12 +57,13 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		// bust provider prefix cache and diverge from freeze-until-/new-or-/clear.
 		fmt.Fprintf(stderr, "resumed session %s\n", runtime.session.ID())
 	}
+	modelCfg, initialChatModel, initialReactModel, initialSessionOpts := runtime.modelSnapshot()
 
-	idleAfter, err := runtime.cfg.Memory.MemoryIdleAfterDuration()
+	idleAfter, err := modelCfg.Memory.MemoryIdleAfterDuration()
 	if err != nil {
 		return err
 	}
-	scanMaxAge, err := runtime.cfg.Memory.MemoryScanMaxAgeDuration()
+	scanMaxAge, err := modelCfg.Memory.MemoryScanMaxAgeDuration()
 	if err != nil {
 		return err
 	}
@@ -69,10 +72,10 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 	consolidator := &memory.Consolidator{
 		Store:      runtime.memStore,
 		Threads:    runtime.sessionStore,
-		Model:      runtime.chatModel,
+		Model:      initialChatModel,
 		IdleAfter:  idleAfter,
 		ScanMaxAge: scanMaxAge,
-		MaxPerScan: runtime.cfg.Memory.MemoryMaxRollouts(),
+		MaxPerScan: modelCfg.Memory.MemoryMaxRollouts(),
 		ActiveThreadID: func() string {
 			id, _ := activeSessionID.Load().(string)
 			return id
@@ -92,12 +95,12 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		backend = "unavailable"
 	}
 	sandboxInfo := tui.SandboxInfo{
-		Mode:           runtime.cfg.Sandbox.ModeNormalized(),
+		Mode:           modelCfg.Sandbox.ModeNormalized(),
 		Backend:        backend,
 		ReadOnlyRoots:  runtime.readOnlyRoots,
 		ProtectedPaths: runtime.protectedPaths,
-		AllowedDomains: runtime.cfg.Sandbox.Network.AllowedDomains,
-		HostEscalation: !runtime.cfg.Tools.Shell.Disabled,
+		AllowedDomains: modelCfg.Sandbox.Network.AllowedDomains,
+		HostEscalation: !modelCfg.Tools.Shell.Disabled,
 	}
 	runtimeInfo := tui.RuntimeInfo{
 		MaxTurnSeconds: runtime.runtimeCfg.MaxTurnSeconds,
@@ -108,7 +111,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		Mode:          cmdMode,
 		Approval:      string(runtime.approvalMode),
 		ApprovalState: runtime.approvalState,
-		Profile:       runtime.cfg.Permissions.PermissionsProfile(),
+		Profile:       modelCfg.Permissions.PermissionsProfile(),
 		WorkspaceOnly: true,
 		WorkspaceRoot: runtime.workspaceRoot,
 		Permissions:   runtime.permissions,
@@ -127,16 +130,38 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		ComposeSystemPrompt: func() (string, error) {
 			return runtime.composePrompt()
 		},
-		SideQuestion:            runtime.sideQuestion,
+		SideQuestion: runtime.sideQuestion,
+		SwitchModel: func(ctx context.Context, session *chat.Session, name string) (tui.ModelSwitchResult, error) {
+			bundle, switchErr := runtime.switchModel(ctx, session, name)
+			if switchErr != nil {
+				return tui.ModelSwitchResult{}, switchErr
+			}
+			return tui.ModelSwitchResult{
+				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+				SessionOpts: bundle.sessionOpts,
+			}, nil
+		},
+		OpenSession: func(ctx context.Context, id string, recoverInterrupted bool) (tui.SessionOpenResult, error) {
+			opened, openErr := runtime.openSession(ctx, id, recoverInterrupted)
+			if openErr != nil {
+				return tui.SessionOpenResult{}, openErr
+			}
+			return tui.SessionOpenResult{
+				Session:     opened.session,
+				Status:      statusFromConfig(opened.bundle.cfg, runtime.registry, cmdMode, opened.bundle.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+				SessionOpts: opened.bundle.sessionOpts,
+			}, nil
+		},
 		RulesReport:             runtime.rulesReport,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
-		SessionOpts:             runtime.sessionOpts,
-		Status:                  statusFrom(runtime.cfg.Model.Provider+"/"+runtime.cfg.Model.Name, runtime.registry, cmdMode, runtime.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+		SessionOpts:             initialSessionOpts,
+		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, initialReactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+		ModelCatalog:            modelCatalogFromConfig(modelCfg.Model.CatalogEntries()),
 		TurnOptions: runtimeguard.TurnOptions{
 			MaxToolCalls: runtime.runtimeCfg.MaxToolCalls,
 			Timeout:      time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
 		},
-		HideTurnUsage: !runtime.cfg.UI.TurnUsageEnabled(),
+		HideTurnUsage: !modelCfg.UI.TurnUsageEnabled(),
 		Approval:      approvalBridge,
 		PolicyInfo:    policyInfo,
 		Memory:        runtime.memStore,
@@ -350,7 +375,7 @@ func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 }
 
-func statusFrom(modelName string, registry *tools.Registry, cmdMode string, maxStep int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
+func statusFrom(modelName, reasoningEffort string, registry *tools.Registry, cmdMode string, maxStep int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
 	names := make([]string, 0)
 	if registry != nil {
 		infos, err := registry.Infos(context.Background())
@@ -367,11 +392,61 @@ func statusFrom(modelName string, registry *tools.Registry, cmdMode string, maxS
 		cmdPolicy = "cmd=" + cmdMode
 	}
 	return tui.StatusInfo{
-		Model:     modelName,
-		Tools:     names,
-		MaxStep:   maxStep,
-		CmdPolicy: cmdPolicy,
-		Sandbox:   sandboxInfo,
-		Runtime:   runtimeInfo,
+		Model:           modelName,
+		ReasoningEffort: reasoningEffort,
+		Tools:           names,
+		MaxStep:         maxStep,
+		CmdPolicy:       cmdPolicy,
+		Sandbox:         sandboxInfo,
+		Runtime:         runtimeInfo,
 	}
+}
+
+func statusFromConfig(cfg config.Config, registry *tools.Registry, cmdMode string, maxStep int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
+	status := statusFrom(
+		cfg.Model.Provider+"/"+cfg.Model.Name,
+		cfg.Model.ReasoningEffort,
+		registry,
+		cmdMode,
+		maxStep,
+		sandboxInfo,
+		runtimeInfo,
+	)
+	status.ModelDisplayName = cfg.Model.CatalogDisplayName(cfg.Model.Name)
+	return status
+}
+
+func modelCatalogFromConfig(entries []config.ModelCatalogEntry) []tui.ModelCatalogEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]tui.ModelCatalogEntry, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, tui.ModelCatalogEntry{
+			CanonicalName: strings.TrimSpace(entry.Name),
+			DisplayName:   strings.TrimSpace(entry.DisplayName),
+			Aliases:       append([]string(nil), entry.Aliases...),
+			Description:   strings.TrimSpace(entry.Description),
+			Lifecycle:     strings.TrimSpace(entry.Lifecycle),
+			Provenance:    "config",
+			Capabilities: tui.ModelCatalogCapabilities{
+				ContextWindowTokens: entry.Capabilities.ContextWindowTokens,
+				MaxOutputTokens:     entry.Capabilities.MaxOutputTokens,
+				SupportsReasoning:   copyBoolPointer(entry.Capabilities.SupportsReasoning),
+				ReasoningEfforts:    append([]string(nil), entry.Capabilities.ReasoningEfforts...),
+				InputModalities:     append([]string(nil), entry.Capabilities.InputModalities...),
+				SupportsTools:       copyBoolPointer(entry.Capabilities.SupportsTools),
+				SupportsStreaming:   copyBoolPointer(entry.Capabilities.SupportsStreaming),
+			},
+		})
+	}
+	return out
+}
+
+func copyBoolPointer(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }

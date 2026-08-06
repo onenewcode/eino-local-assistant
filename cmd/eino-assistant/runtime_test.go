@@ -114,6 +114,27 @@ func TestSystemPromptComposerUsesWorkspaceToStartupInstructionHierarchy(t *testi
 	}
 }
 
+func TestSystemPromptComposerPassesProjectFallbackFilenames(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspaceRoot, "CLAUDE.md"), []byte("fallback instruction"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	compose := newSystemPromptComposer(config.Config{
+		Assistant: config.AssistantConfig{SystemPrompt: "persona"},
+		Rules: config.RulesConfig{
+			ProjectDocFallbackFilenames: []string{"CLAUDE.md"},
+		},
+	}, workspaceRoot, workspaceRoot, "", nil)
+	got, err := compose()
+	if err != nil {
+		t.Fatalf("compose() error = %v", err)
+	}
+	if !strings.Contains(got, "fallback instruction") || !strings.Contains(got, "Project instructions (CLAUDE.md)") {
+		t.Fatalf("composed prompt missing configured fallback: %q", got)
+	}
+}
+
 func TestResolveUserInstructionsRootUsesHomeWithoutStorageConfig(t *testing.T) {
 	got, err := resolveUserInstructionsRoot(func() (string, error) {
 		return "/home/tester", nil

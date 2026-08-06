@@ -91,6 +91,13 @@ type ThreadRepository interface {
 	ResetIncompatibleCheckpoint(ctx context.Context, id string, expectedRevision uint64, input CheckpointSchemaReset) (ThreadState, error)
 }
 
+// ThreadModelRepository is an optional extension for idle model replacement.
+// It is deliberately separate from ThreadRepository so older repositories and
+// test fakes remain source-compatible while they adopt the new contract.
+type ThreadModelRepository interface {
+	SetThreadModel(ctx context.Context, id string, expectedRevision uint64, model string) (ThreadState, error)
+}
+
 // ThreadForkRepository is the optional v1 source-preserving fork extension.
 // It remains separate from ThreadRepository so existing runtime fakes do not
 // need to implement fork semantics before they consume them.

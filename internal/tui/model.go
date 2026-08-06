@@ -27,7 +27,13 @@ import (
 // StatusInfo is static metadata shown by /status.
 type StatusInfo struct {
 	Model string
-	Tools []string
+	// ModelDisplayName is an optional configured catalog label. Model remains
+	// the provider/canonical identity used for diagnostics and persistence.
+	ModelDisplayName string
+	Tools            []string
+	// ReasoningEffort is the configured/requested model reasoning effort.
+	// An empty value means the provider default is requested.
+	ReasoningEffort string
 	// MaxStep is the ReAct step budget (0 omits from /status).
 	MaxStep int
 	// CmdPolicy is the status-bar fragment like "cmd=ask" or "cmd=auto".
@@ -37,6 +43,55 @@ type StatusInfo struct {
 	// Runtime supplies per-turn limits for /status.
 	Runtime RuntimeInfo
 }
+
+// ModelCatalogCapabilities is the picker-facing copy of declared model
+// metadata. Unknown values are omitted rather than inferred from the provider.
+type ModelCatalogCapabilities struct {
+	ContextWindowTokens int
+	MaxOutputTokens     int
+	SupportsReasoning   *bool
+	ReasoningEfforts    []string
+	InputModalities     []string
+	SupportsTools       *bool
+	SupportsStreaming   *bool
+}
+
+// ModelCatalogEntry describes one explicitly configured picker option.
+// CanonicalName is the only value sent to the runtime switch callback.
+type ModelCatalogEntry struct {
+	CanonicalName string
+	DisplayName   string
+	Aliases       []string
+	Description   string
+	Lifecycle     string
+	Provenance    string
+	Capabilities  ModelCatalogCapabilities
+}
+
+// ModelSwitchResult is the complete TUI snapshot returned after a successful
+// in-place model binding replacement. The active Session pointer is unchanged.
+type ModelSwitchResult struct {
+	Status      StatusInfo
+	SessionOpts chat.SessionOptions
+}
+
+// ModelSwitchCallback builds and commits a new provider binding for the active
+// session. It is called only after TUI idle/approval/side-question admission.
+type ModelSwitchCallback func(context.Context, *chat.Session, string) (ModelSwitchResult, error)
+
+// SessionOpenResult carries the complete runtime snapshot for a resumed
+// session. Unlike ModelSwitchResult, opening a session intentionally changes
+// the active Session pointer.
+type SessionOpenResult struct {
+	Session     *chat.Session
+	Status      StatusInfo
+	SessionOpts chat.SessionOptions
+}
+
+// SessionOpenCallback lets the runtime choose a target thread's durable model
+// identity before opening it. TUI callers without this callback retain the
+// existing local fallback path.
+type SessionOpenCallback func(context.Context, string, bool) (SessionOpenResult, error)
 
 // StatusFragment returns compact command-policy and sandbox state.
 func (info StatusInfo) StatusFragment() string {
@@ -70,6 +125,15 @@ type Deps struct {
 	// SideQuestion answers a temporary side question without writing the main
 	// session ledger or changing the active turn.
 	SideQuestion func(context.Context, *chat.Session, string) (string, error)
+	// SwitchModel replaces the active session's provider binding in place. It
+	// never creates a new session or clears TUI transient state.
+	SwitchModel ModelSwitchCallback
+	// ModelCatalog is an explicitly configured picker catalog. An empty catalog
+	// keeps /model <name> available but leaves the Alt+P picker unavailable.
+	ModelCatalog []ModelCatalogEntry
+	// OpenSession is the optional runtime-owned resume path. When absent, TUI
+	// falls back to opening the target with the current model binding.
+	OpenSession SessionOpenCallback
 	// SessionOpts is reused for /new and /resume so pricing/context stay consistent.
 	SessionOpts chat.SessionOptions
 	Status      StatusInfo
@@ -104,6 +168,9 @@ type transcriptLine struct {
 	// folded is set when a lineReasoning block was collapsed to a one-line summary.
 	// Display-only; never enters the session ledger.
 	folded bool
+	// reasoningBody retains the display-only body after folding so a visibility
+	// toggle can reveal already-received reasoning without another model call.
+	reasoningBody string
 }
 
 type lineKind int
@@ -162,6 +229,10 @@ type model struct {
 	// slashItems is the live prefix-filtered command menu (empty => closed).
 	slashItems []slashCommand
 	slashSel   int
+	// modelPicker is a local, non-durable selection overlay. It never changes
+	// the active binding until the user confirms an entry.
+	modelPickerItems []ModelCatalogEntry
+	modelPickerSel   int
 	// taskPaneOpen exposes a compact, read-only task projection without making
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
@@ -212,8 +283,11 @@ type model struct {
 	streamingAssistant bool
 	// openReasoning is the index of the in-flight reasoning line, or noOpenReasoning.
 	openReasoning int
-	err           error
-	quitting      bool
+	// reasoningDetailsVisible controls only the human TUI projection. Reasoning
+	// events continue to arrive and remain display-only regardless of this flag.
+	reasoningDetailsVisible bool
+	err                     error
+	quitting                bool
 
 	// pendingApproval is set while run_command waits for a human decision.
 	pendingApproval *approvalRequestMsg
@@ -654,6 +728,8 @@ func (m *model) resetSessionTransientState() {
 	m.sideLines = nil
 	m.queue = nil
 	m.queuePaused = false
+	m.modelPickerItems = nil
+	m.modelPickerSel = 0
 	m.clearBacktrack()
 	m.clearSlashMenu()
 	m.closeTaskPane()
@@ -735,17 +811,18 @@ func newModel(deps Deps) *model {
 	vp.MouseWheelEnabled = true
 
 	m := &model{
-		deps:              deps,
-		viewport:          vp,
-		textarea:          ta,
-		spinner:           sp,
-		stickBottom:       true,
-		inputHist:         newInputHistory(),
-		openToolCards:     make(map[string]int),
-		openToolNames:     make(map[string]string),
-		openReasoning:     noOpenReasoning,
-		sessionGeneration: 1,
-		composerReady:     true,
+		deps:                    deps,
+		viewport:                vp,
+		textarea:                ta,
+		spinner:                 sp,
+		stickBottom:             true,
+		inputHist:               newInputHistory(),
+		openToolCards:           make(map[string]int),
+		openToolNames:           make(map[string]string),
+		openReasoning:           noOpenReasoning,
+		reasoningDetailsVisible: true,
+		sessionGeneration:       1,
+		composerReady:           true,
 	}
 	// CLI resume (and any Session with a loaded transcript) must show prior turns.
 	// In-TUI /resume uses the same seed helper for a single source of truth.
@@ -825,6 +902,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.backtrackState.mode == backtrackSelecting {
 			return m.handleBacktrackKey(msg)
 		}
+		if isModelPickerToggleKey(msg) {
+			if m.modelPickerOpen() {
+				m.closeModelPicker()
+				return m, nil
+			}
+			return m.openModelPicker()
+		}
+		if m.modelPickerOpen() {
+			return m.handleModelPickerKey(msg)
+		}
 		if m.backtrackState.mode == backtrackArmed && msg.Type != tea.KeyEsc {
 			m.clearBacktrack()
 			m.refreshBacktrackChrome()
@@ -872,6 +959,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshViewport()
 			}
 			return m, nil
+		case tea.KeyCtrlO:
+			m.reasoningDetailsVisible = !m.reasoningDetailsVisible
+			m.refreshViewport()
+			return m, nil
 		case tea.KeyTab:
 			// Complete the selected slash command; never insert a literal tab.
 			if m.slashMenuOpen() {
@@ -893,7 +984,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// queue does not wipe the draft the user just tried to send.
 				return m.queueWhileBusy(input)
 			}
-			m.textarea.Reset()
+			// Idle /steer has no successful admission path: submit reports that
+			// no regular turn is running, so keep the draft editable.
+			if action, _ := parseSlash(input); action != slashSteer {
+				m.textarea.Reset()
+			}
 			m.clearSlashMenu()
 			m.syncComposerHeight()
 			return m.submit(input)
@@ -1114,7 +1209,7 @@ func (m *model) View() string {
 	}
 
 	status := renderStatusBar(m.width, m.statusLabel())
-	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · esc interrupt · /help"
+	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	if m.hasPendingApproval() {
 		if approvalAllowsSession(m.pendingApproval.Request) {
 			helpTextLine = "1 once · 2 session · 3 deny · enter confirm · esc deny"
@@ -1123,12 +1218,14 @@ func (m *model) View() string {
 		}
 	} else if m.slashMenuOpen() {
 		helpTextLine = "↑↓ select · tab complete · enter accept · esc dismiss · ctrl+j newline"
+	} else if m.modelPickerOpen() {
+		helpTextLine = "↑↓/jk select model · enter apply · esc cancel · alt+p close"
 	} else if m.backtrackState.mode == backtrackSelecting {
 		helpTextLine = "↑↓/jk select prompt · enter fork before prompt · esc cancel"
 	} else if m.backtrackState.mode == backtrackArmed {
 		helpTextLine = "esc backtrack history · edit or submit to cancel · /help"
 	} else if m.taskPaneOpen {
-		helpTextLine = "ctrl+t hide task progress · esc interrupt · /help"
+		helpTextLine = "ctrl+t hide task progress · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	}
 	help := helpStyle.Render(helpTextLine)
 	composer := renderComposer(m.width, m.textarea.View())
@@ -1148,11 +1245,20 @@ func (m *model) View() string {
 		parts = append(parts, m.approvalModalPage().content)
 	} else if m.slashMenuOpen() {
 		parts = append(parts, renderSlashMenu(m.width, m.slashItems, m.slashSel))
+	} else if m.modelPickerOpen() {
+		parts = append(parts, renderModelPicker(m.width, m.modelPickerItems, m.modelPickerSel, m.currentModelIdentity()))
 	} else if m.backtrackState.mode == backtrackSelecting {
 		parts = append(parts, m.backtrackOverlayView())
 	}
 	parts = append(parts, composer, help)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+func (m *model) reasoningToggleHint() string {
+	if m.reasoningDetailsVisible {
+		return "ctrl+o hide reasoning"
+	}
+	return "ctrl+o show reasoning"
 }
 
 // statusLabel is the unstyled status text (spinner glyphs included when busy).
@@ -1258,7 +1364,7 @@ func (m *model) layout() {
 	// viewport = total - composer border - status(rule+line) - help - optional
 	// task pane - slash/approval/backtrack. Border +2; status rule+label +2; help +1.
 	composerHeight := m.textarea.Height() + 2
-	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.backtrackOverlayHeight()
+	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
 		extra = m.taskPaneHeight() + m.approvalModalHeight()
 	}
@@ -1266,6 +1372,17 @@ func (m *model) layout() {
 	h := max(5, m.height-reserved)
 	m.viewport.Width = m.width
 	m.viewport.Height = h
+}
+
+func (m *model) modelPickerHeight() int {
+	if !m.modelPickerOpen() {
+		return 0
+	}
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	return lipgloss.Height(renderModelPicker(width, m.modelPickerItems, m.modelPickerSel, m.currentModelIdentity()))
 }
 
 func (m *model) backtrackOverlayHeight() int {
@@ -1349,9 +1466,15 @@ func (m *model) syncComposerHeight() bool {
 
 func (m *model) queueWhileBusy(input string) (tea.Model, tea.Cmd) {
 	if action, arg := parseSlash(input); action == slashSteer {
-		m.textarea.Reset()
-		m.syncComposerHeight()
 		return m.cmdSteer(arg)
+	}
+	if action, _ := parseSlash(input); action == slashModel {
+		if m.hasPendingApproval() {
+			m.appendLine(lineError, "model switch unavailable while approval is pending; retry after it is resolved")
+		} else {
+			m.appendLine(lineError, "model switch unavailable while busy; retry when idle")
+		}
+		return m, nil
 	}
 	if isImmediatelyExecutableWhileBusy(input) {
 		m.textarea.Reset()
@@ -1419,6 +1542,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdSessions()
 	case slashResume:
 		return m.cmdResume(arg)
+	case slashModel:
+		return m.cmdModel(arg)
 	case slashFork:
 		return m.cmdFork(arg)
 	case slashTitle:
@@ -1441,8 +1566,32 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 	return m.startTurn(input)
 }
 
+func (m *model) cmdModel(arg string) (tea.Model, tea.Cmd) {
+	if !m.modelSwitchAvailable() {
+		return m, nil
+	}
+	if strings.TrimSpace(arg) == "" {
+		return m.openModelPicker()
+	}
+	name, ok := parseModelName(arg)
+	if !ok {
+		m.appendLine(lineError, "usage: /model <name>")
+		return m, nil
+	}
+	return m.applyModelName(name)
+}
+
+func parseModelName(arg string) (string, bool) {
+	fields := strings.Fields(arg)
+	if len(fields) != 1 {
+		return "", false
+	}
+	name := strings.TrimSpace(fields[0])
+	return name, name != ""
+}
+
 // cmdPermissions keeps the no-argument report read-only and limits changes to
-// the two process-local interactive modes supported by the TUI.
+// process-local interactive modes supported by the TUI.
 func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
@@ -1460,7 +1609,7 @@ func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if err := state.SetInteractiveMode(arg); err != nil {
-		m.appendLine(lineError, "usage: /permissions [ask|auto]")
+		m.appendLine(lineError, "usage: /permissions [ask|auto|plan]")
 		return m, nil
 	}
 	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
@@ -1525,6 +1674,10 @@ func (m *model) cmdSteer(input string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "steer failed: "+err.Error())
 		return m, nil
 	}
+	// Clear the draft only after the core has accepted the steer. Rejected
+	// admissions must remain editable in the composer.
+	m.textarea.Reset()
+	m.syncComposerHeight()
 	m.turnSteerAdmitted++
 	if receipt.Sequence != 0 && strings.TrimSpace(receipt.Content) != "" {
 		if m.turnSteerAdmissions == nil {
@@ -1733,7 +1886,7 @@ func (m *model) createSession(title string) (*chat.Session, error) {
 	opts := m.deps.SessionOpts
 	opts.Store = m.deps.Store
 	opts.Title = title
-	opts.ModelName = m.deps.Status.Model
+	opts.ModelName = m.currentModelIdentity()
 	opts.ID = ""
 	session, err := chat.NewSession(model, system, opts)
 	if err != nil {
@@ -1743,6 +1896,20 @@ func (m *model) createSession(title string) (*chat.Session, error) {
 		m.deps.NotifyActiveSession(session.ID())
 	}
 	return session, nil
+}
+
+func (m *model) currentModelIdentity() string {
+	if name := strings.TrimSpace(m.deps.SessionOpts.ModelName); name != "" {
+		return name
+	}
+	if session := m.activeSession(); session != nil {
+		if name := strings.TrimSpace(session.ModelName()); name != "" {
+			return name
+		}
+	}
+	// Keep hand-built/legacy embedding tests functional. Production runtime
+	// always supplies SessionOpts.ModelName as the raw cfg.Model.Name.
+	return strings.TrimSpace(m.deps.Status.Model)
 }
 
 func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
@@ -1819,6 +1986,33 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
 	}
+	if m.deps.OpenSession != nil {
+		result, err := m.deps.OpenSession(m.processCtx(), id, recoverInterrupted)
+		if err != nil {
+			m.appendLine(lineError, "resume: "+err.Error())
+			return m, nil
+		}
+		if result.Session == nil {
+			m.appendLine(lineError, "resume: runtime callback returned no session")
+			return m, nil
+		}
+		m.replaceSession(result.Session)
+		m.resetSessionTransientState()
+		m.deps.Status = result.Status
+		m.deps.SessionOpts = result.SessionOpts
+		if m.deps.InvalidateRulesSnapshot != nil {
+			m.deps.InvalidateRulesSnapshot()
+		}
+		if m.deps.NotifyActiveSession != nil {
+			m.deps.NotifyActiveSession(result.Session.ID())
+		}
+		transcript := result.Session.Transcript()
+		m.lines = seedLinesFromTranscript(transcript, resumeBanner(result.Session.ID(), len(transcript)), result.Session.Title())
+		m.appendLegacyCheckpointResetNotice(result.Session)
+		m.inputHist.seedFromMessages(transcript)
+		m.refreshViewport()
+		return m, nil
+	}
 	model := current.Model()
 	if model == nil {
 		m.appendLine(lineError, "chat model is unavailable")
@@ -1826,7 +2020,7 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	}
 	opts := m.deps.SessionOpts
 	opts.Store = m.deps.Store
-	opts.ModelName = m.deps.Status.Model
+	opts.ModelName = m.currentModelIdentity()
 	// Recovery is deliberately scoped to this command. In particular, a
 	// startup --recover must not authorize later plain /resume commands.
 	opts.RecoverInterrupted = recoverInterrupted
@@ -2636,7 +2830,7 @@ func (m *model) refreshViewport() {
 			b.WriteString(renderAssistant(line.text, m.viewport.Width, streaming))
 		case lineReasoning:
 			// text is body while open, or one-line summary after fold.
-			b.WriteString(renderReasoning(line.text, line.folded, m.reasoningIsStreaming(i)))
+			b.WriteString(renderReasoning(line.text, line.folded, m.reasoningIsStreaming(i), m.reasoningDetailsVisible, line.reasoningBody))
 		case lineTool:
 			b.WriteString(renderToolCard(line.text))
 		case lineError:
@@ -2744,12 +2938,16 @@ func (m *model) statusReport() string {
 	}
 	report := fmt.Sprintf("model=%s  session=%s  transcript=%d  tools=%s  mode=%s  turn_usage=%s",
 		modelName, sessionID, transcriptCount, tools, modeName(m.mode), turnUsage)
+	if label := strings.TrimSpace(m.deps.Status.ModelDisplayName); label != "" {
+		report += "  model_label=" + label
+	}
 	if title != "" {
 		report += "  title=" + title
 	}
 	if m.deps.Status.MaxStep > 0 {
 		report += fmt.Sprintf("  max_step=%d", m.deps.Status.MaxStep)
 	}
+	report += "  reasoning_effort=" + reasoningEffortStatus(m.deps.Status.ReasoningEffort)
 	if frag := m.statusPolicyFragment(); frag != "" {
 		report += "  " + frag
 	}
@@ -2772,6 +2970,13 @@ func (m *model) statusReport() string {
 		report += fmt.Sprintf("  queued=%d", n)
 	}
 	return report + usageLine + ctxLine
+}
+
+func reasoningEffortStatus(value string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return "requested:" + value
+	}
+	return "provider-default/unspecified"
 }
 
 func modeName(m mode) string {

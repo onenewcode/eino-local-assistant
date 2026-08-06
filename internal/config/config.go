@@ -53,6 +53,9 @@ type RulesConfig struct {
 	// GlobalMaxTokens caps user-home AGENTS injection. Zero uses
 	// DefaultGlobalRulesMaxTokens.
 	GlobalMaxTokens int `toml:"global_max_tokens"`
+	// ProjectDocFallbackFilenames are project-layer basename candidates tried
+	// after AGENTS.override.md and AGENTS.md in the configured order.
+	ProjectDocFallbackFilenames []string `toml:"project_doc_fallback_filenames"`
 }
 
 // MemoryConfig controls project-scoped long-term memory under .eino/memory/.
@@ -484,13 +487,15 @@ const (
 
 // ModelConfig describes a configured chat-model provider endpoint.
 type ModelConfig struct {
-	Provider       string             `toml:"provider"`
-	BaseURL        string             `toml:"base_url"`
-	APIKey         string             `toml:"api_key"`
-	Name           string             `toml:"name"`
-	TimeoutSeconds int                `toml:"timeout_seconds"`
-	Context        ModelContextConfig `toml:"context"`
-	Pricing        PricingConfig      `toml:"pricing"`
+	Provider        string              `toml:"provider"`
+	BaseURL         string              `toml:"base_url"`
+	APIKey          string              `toml:"api_key"`
+	Name            string              `toml:"name"`
+	Catalog         []ModelCatalogEntry `toml:"catalog"`
+	ReasoningEffort string              `toml:"reasoning_effort"`
+	TimeoutSeconds  int                 `toml:"timeout_seconds"`
+	Context         ModelContextConfig  `toml:"context"`
+	Pricing         PricingConfig       `toml:"pricing"`
 }
 
 // AssistantConfig controls the local assistant's initial conversation state.
@@ -562,6 +567,11 @@ func (c *Config) Validate() error {
 	if err := c.Rules.Validate(); err != nil {
 		return err
 	}
+	fallbackFilenames, err := normalizeProjectDocFallbackFilenames(c.Rules.ProjectDocFallbackFilenames)
+	if err != nil {
+		return err
+	}
+	c.Rules.ProjectDocFallbackFilenames = fallbackFilenames
 	if err := c.Memory.Validate(); err != nil {
 		return err
 	}
@@ -582,7 +592,31 @@ func (c RulesConfig) Validate() error {
 	if c.GlobalMaxTokens > 100_000 {
 		return errors.New("rules.global_max_tokens must be <= 100000")
 	}
-	return nil
+	_, err := normalizeProjectDocFallbackFilenames(c.ProjectDocFallbackFilenames)
+	return err
+}
+
+func normalizeProjectDocFallbackFilenames(names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	normalized := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, raw := range names {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			return nil, errors.New("rules.project_doc_fallback_filenames entries must not be empty")
+		}
+		if name == "." || name == ".." || strings.ContainsRune(name, '\x00') || strings.ContainsAny(name, "/\\:\r\n") || filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
+			return nil, fmt.Errorf("rules.project_doc_fallback_filenames %q must be a basename without path separators", raw)
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+	}
+	return normalized, nil
 }
 
 // Validate checks memory configuration.
@@ -876,6 +910,9 @@ func (c StorageConfig) ResolveDataDir() (string, error) {
 // An omitted provider is normalized to the backward-compatible OpenAI default.
 func (c *ModelConfig) Validate() error {
 	c.Provider = strings.TrimSpace(c.Provider)
+	// The accepted effort values belong to the selected provider and model.
+	// Keep this as an opaque string and let the provider report unsupported values.
+	c.ReasoningEffort = strings.TrimSpace(c.ReasoningEffort)
 	if c.Provider == "" {
 		c.Provider = ProviderOpenAI
 	}
@@ -897,6 +934,11 @@ func (c *ModelConfig) Validate() error {
 	if strings.TrimSpace(c.Name) == "" {
 		return errors.New("model.name is required")
 	}
+	catalog, err := normalizeModelCatalog(c.Catalog)
+	if err != nil {
+		return err
+	}
+	c.Catalog = catalog
 	if c.TimeoutSeconds <= 0 {
 		return errors.New("model.timeout_seconds must be greater than zero")
 	}

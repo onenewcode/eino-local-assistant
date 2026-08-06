@@ -87,3 +87,76 @@ func TestApplyPatchRejectsOutsideWorkspace(t *testing.T) {
 		t.Fatalf("want deny: %+v", out)
 	}
 }
+
+func TestApplyPatchPlanRejectsBeforeApprovalAndExecution(t *testing.T) {
+	root := t.TempDir()
+	state, err := NewApprovalState(ApprovalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approver := &recordingApprover{responses: []ApprovalAction{ApprovalOnce}}
+	tool, err := NewApplyPatch(ApplyPatchOptions{
+		WorkspaceRoot: root,
+		Approval:      ApprovalNever,
+		ApprovalState: state,
+		Approver:      approver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"operations":[{"type":"create_file","path":"blocked.txt","content":"blocked"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ApplyPatchOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Denied || out.Decision != string(DecisionDeny) || out.Reason != ReasonPlanReadOnly {
+		t.Fatalf("plan output = %+v", out)
+	}
+	if got := len(approver.Requests()); got != 0 {
+		t.Fatalf("plan approval requests = %d, want 0", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "blocked.txt")); !os.IsNotExist(err) {
+		t.Fatalf("plan apply_patch wrote a file: %v", err)
+	}
+}
+
+func TestApplyPatchPlanRejectsWithSandboxBeforeWorker(t *testing.T) {
+	root := t.TempDir()
+	runner, err := NewSandboxRunner(SandboxRunnerOptions{
+		WorkspaceRoot: root,
+		WorkerPath:    filepath.Join(t.TempDir(), "missing-worker"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewApprovalState(ApprovalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := NewApplyPatch(ApplyPatchOptions{
+		WorkspaceRoot: root,
+		Approval:      ApprovalOnRequest,
+		ApprovalState: state,
+		Sandbox:       runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"operations":[{"type":"create_file","path":"blocked.txt","content":"blocked"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ApplyPatchOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Denied || out.Decision != string(DecisionDeny) || out.Reason != ReasonPlanReadOnly {
+		t.Fatalf("sandbox plan output = %+v", out)
+	}
+	if out.Sandbox != nil {
+		t.Fatalf("plan gate should not start sandbox worker: %#v", out.Sandbox)
+	}
+}

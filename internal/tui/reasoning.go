@@ -44,6 +44,7 @@ func (m *model) foldOpenReasoning() {
 	if line.kind != lineReasoning || line.folded {
 		return
 	}
+	line.reasoningBody = line.text
 	line.text = formatFoldedReasoning(line.text)
 	line.folded = true
 	m.refreshViewport()

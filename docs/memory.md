@@ -17,7 +17,7 @@
 
 **是**：
 
-1. **项目指令**：workspace root 到 startup cwd 各层的 `AGENTS.override.md` 或 `AGENTS.md`（软规则，有界注入；见下方选择和生命周期）
+1. **项目指令**：workspace root 到 startup cwd 各层的 `AGENTS.override.md`、`AGENTS.md` 或配置的 project fallback basename（软规则，有界注入；见下方选择和生命周期）
 2. **用户指令**：用户 home 下 `~/.eino-assistant/AGENTS.override.md` 或 `AGENTS.md`（home scope、软规则、独立预算）
 3. **显式记忆**：用户通过 `/memory add` 写入的项目偏好/事实
 4. **自动候选**：空闲 session journal 异步抽取的 *candidate*（低信任）
@@ -62,9 +62,9 @@ summary.md         有界派生视图 · 供 system 注入
 
 语义记忆目录默认 **不提交 git**。团队共识应写在 `AGENTS.md`，不要依赖个人 candidate；仅本地需要的项目指令可写 `AGENTS.override.md` 并由项目自行决定是否 gitignore。
 
-每个发现目录至多选择一个指令文件，候选顺序为 `AGENTS.override.md`、`AGENTS.md`；项目层按 workspace root 到 startup cwd 收集各层。有效候选必须在解析符号链接后指向普通文件，且内容去掉开头的 UTF-8 BOM 后不能仅含空白；目录、FIFO、空白内容等会跳过。符号链接目标不要求位于 workspace 内，因此应把链接目标也视为会发送给模型的可信项目配置。
+每个发现目录至多选择一个指令文件，候选顺序为 `AGENTS.override.md`、`AGENTS.md`，然后按 `[rules].project_doc_fallback_filenames` 的配置顺序尝试 fallback basename；默认不配置 fallback，因此 canonical AGENTS 行为完全不变。项目层按 workspace root 到 startup cwd 收集各层。有效候选必须在解析符号链接后指向普通文件，且内容去掉开头的 UTF-8 BOM 后不能仅含空白；目录、FIFO、空白内容等会跳过。符号链接目标不要求位于 workspace 内，因此应把链接目标也视为会发送给模型的可信项目配置。
 
-候选顺序和“同目录至多一个”对齐 Codex；Codex 固定源码也明确允许符号链接。本项目进一步把“空白 override 回退 base”定义为稳定合同，而 Codex 的公开文档与项目级源码在这个边界上仍有差异。Claude Code 则会把 `CLAUDE.local.md` 追加在 `CLAUDE.md` 后，而不是替换 base。
+候选顺序和“同目录至多一个”对齐 Codex；Codex 固定源码也明确允许符号链接。本项目进一步把“空白 override 回退 base”定义为稳定合同，而 Codex 的公开文档与项目级源码在这个边界上仍有差异。fallback 只扩展项目层候选，不改变用户 home 的 AGENTS 二选一，也不实现 Claude Code 的 `CLAUDE.local.md` 追加语义。
 
 ## 4. 配置
 
@@ -73,6 +73,7 @@ summary.md         有界派生视图 · 供 system 注入
 ```toml
 [rules]
 enabled = true
+# project_doc_fallback_filenames = ["CLAUDE.md", "CONVENTIONS.md"]
 # max_tokens = 8000
 # global_max_tokens = 4000
 
@@ -90,6 +91,7 @@ generate = true             # 空闲自动抽取
 | `rules.enabled` | true | 是否选择并加载用户 home 与项目 AGENTS 指令 |
 | `rules.max_tokens` | 8000 | 规则注入 token 估算上限 |
 | `rules.global_max_tokens` | 4000 | 用户 home 指令注入 token 估算上限；独立于项目规则预算 |
+| `rules.project_doc_fallback_filenames` | 空列表 | 项目层 fallback basename；canonical AGENTS 候选无效后按顺序尝试，每个发现目录至多选择一个 |
 | `memory.enabled` | true | 是否注入 summary / 暴露读工具 |
 | `memory.generate` | true | 是否后台自动抽取 |
 | `memory.max_summary_tokens` | 2500 | summary 预算 |
@@ -137,7 +139,7 @@ system prompt 组装顺序：
 
 1. 用户 persona + 产品 tool policy（优先保留）
 2. 用户 home 的 AGENTS 指令块（≤ `rules.global_max_tokens`）
-3. workspace 到 startup cwd 的 AGENTS 指令块（≤ `rules.max_tokens`）
+3. workspace 到 startup cwd 的项目指令块（每层先尝试 canonical AGENTS，再按 `rules.project_doc_fallback_filenames` 尝试 fallback；≤ `rules.max_tokens`）
 4. 记忆 summary 块（≤ memory 预算；candidate 标 *unverified*）
 
 用户和项目指令预算独立计算；每一层使用 rune-safe 截断，不把用户块计入项目预算。
@@ -150,7 +152,7 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 | --- | --- |
 | `/new`、`/clear`、新建 session | 从磁盘重新选择 home 与项目 AGENTS 指令并组合 memory summary，写入 **新** thread 的 durable system |
 | **普通 turn** | 使用创建时冻结的 system；**不**每轮重读 AGENTS 指令 |
-| **只编辑磁盘上的 AGENTS 指令文件** | 当前 session **不生效**；下一次 fresh/new/clear 会重读 |
+| **只编辑磁盘上的项目指令文件** | 当前 session **不生效**；下一次 fresh/new/clear 会重读（包括 fallback 文件名配置） |
 | **`/resume`** | 沿用该 thread **创建时** durable system；不重组当前 home 或项目文件 |
 | **`/memory` 写入** | 落盘立即生效；`memory_*` 工具可见；**system 注入**等到 `/new` 或 `/clear` |
 | **`/compact`** | 只压缩对话历史；**不**重载 AGENTS/memory 进 system（与 Claude compact 重读 CLAUDE.md 不同：本仓库 ledger 无 durable system 修订事件） |

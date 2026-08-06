@@ -16,6 +16,9 @@ const (
 	ApprovalOnRequest ApprovalMode = "on_request"
 	// ApprovalNever auto-allows ask decisions (hard deny still applies).
 	ApprovalNever ApprovalMode = "never"
+	// ApprovalPlan is a read-only interactive phase. Tool-specific gates must
+	// enforce it; it is not an alias for either approval policy.
+	ApprovalPlan ApprovalMode = "plan"
 )
 
 // ApprovalState is the process-local approval mode shared by side-effecting
@@ -50,10 +53,14 @@ func (s *ApprovalState) Mode() ApprovalMode {
 
 // InteractiveMode returns the TUI-facing name for the current mode.
 func (s *ApprovalState) InteractiveMode() string {
-	if s.Mode() == ApprovalNever {
+	switch s.Mode() {
+	case ApprovalNever:
 		return "auto"
+	case ApprovalPlan:
+		return "plan"
+	default:
+		return "ask"
 	}
-	return "ask"
 }
 
 // Set updates the state using a canonical or TUI-facing mode name.
@@ -67,8 +74,10 @@ func (s *ApprovalState) Set(mode ApprovalMode) error {
 		normalized = string(ApprovalOnRequest)
 	case string(ApprovalNever), "auto":
 		normalized = string(ApprovalNever)
+	case string(ApprovalPlan):
+		normalized = string(ApprovalPlan)
 	default:
-		return fmt.Errorf("approval mode must be ask or auto, got %q", mode)
+		return fmt.Errorf("approval mode must be ask, auto, or plan, got %q", mode)
 	}
 	s.mu.Lock()
 	s.mode = ApprovalMode(normalized)
@@ -79,8 +88,8 @@ func (s *ApprovalState) Set(mode ApprovalMode) error {
 // SetInteractiveMode updates the state using only the supported TUI modes.
 func (s *ApprovalState) SetInteractiveMode(mode string) error {
 	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode != "ask" && mode != "auto" {
-		return fmt.Errorf("permission mode must be ask or auto, got %q", mode)
+	if mode != "ask" && mode != "auto" && mode != "plan" {
+		return fmt.Errorf("permission mode must be ask, auto, or plan, got %q", mode)
 	}
 	return s.Set(ApprovalMode(mode))
 }
@@ -99,6 +108,8 @@ func NormalizeApprovalMode(mode string) ApprovalMode {
 		return ApprovalOnRequest
 	case string(ApprovalNever):
 		return ApprovalNever
+	case string(ApprovalPlan):
+		return ApprovalPlan
 	default:
 		return ApprovalMode(strings.ToLower(strings.TrimSpace(mode)))
 	}
@@ -115,7 +126,10 @@ const (
 
 // Well-known deny / approval reasons (stable strings for models and tests).
 const (
-	ReasonPolicyDenied      = "policy_denied"
+	ReasonPolicyDenied = "policy_denied"
+	// ReasonPlanReadOnly is stable so a model and an auditor can distinguish a
+	// phase gate from an ordinary approval denial.
+	ReasonPlanReadOnly      = "plan_read_only"
 	ReasonUserDenied        = "user_denied"
 	ReasonUserDeniedSession = "user_denied_session"
 	ReasonApprovalTimedOut  = "approval_timed_out"

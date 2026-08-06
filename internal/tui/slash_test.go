@@ -34,6 +34,8 @@ func TestParseSlash(t *testing.T) {
 		{"/new", slashNew, ""},
 		{"/new my topic", slashNew, "my topic"},
 		{"/resume 20260715-120000-abc123", slashResume, "20260715-120000-abc123"},
+		{"/model gpt-5", slashModel, "gpt-5"},
+		{"/MODEL claude-sonnet", slashModel, "claude-sonnet"},
 		{"/fork", slashFork, ""},
 		{"/fork unexpected-argument", slashFork, "unexpected-argument"},
 		{"/title Hello World", slashTitle, "Hello World"},
@@ -87,6 +89,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/rules", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact",
 		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue",
+		"/model",
 		"/permissions", "/policy",
 	}
 	for _, tok := range tokens {
@@ -113,10 +116,10 @@ func catalogCoversToken(catalog []slashCommand, tok string) bool {
 func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
 		"/help": false, "/status": false, "/rules": false, "/context": false, "/sessions": false,
-		"/clear": false, "/exit": false, "/permissions": false,
+		"/clear": false, "/exit": false, "/permissions": true,
 		"/btw": true, "/steer": true,
 		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
-		"/delete": true, "/queue": true, "/memory": true,
+		"/delete": true, "/queue": true, "/model": true, "/memory": true,
 	}
 	for _, cmd := range slashCatalog() {
 		need, ok := want[cmd.Name]
@@ -139,6 +142,24 @@ func TestSlashCatalogQueueDescriptionIncludesControls(t *testing.T) {
 		}
 	}
 	t.Fatal("slash catalog is missing /queue")
+}
+
+func TestStatusHelpDocumentsReasoningVisibility(t *testing.T) {
+	var description string
+	for _, cmd := range slashCatalog() {
+		if cmd.Name == "/status" {
+			description = cmd.Description
+			break
+		}
+	}
+	if !strings.Contains(description, "reasoning effort (requested/default)") || !strings.Contains(description, "Ctrl+O details") {
+		t.Fatalf("status catalog description = %q", description)
+	}
+
+	help := helpText()
+	if !strings.Contains(help, "/status            model, session, tokens, cost, max_step, context, reasoning effort (requested/default); ctrl+o toggles details") {
+		t.Fatalf("status help line missing reasoning visibility details: %s", help)
+	}
 }
 
 func TestSlashMenuActive(t *testing.T) {

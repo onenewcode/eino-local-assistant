@@ -19,15 +19,23 @@ func TestOpenAIModelStreamsSSE(t *testing.T) {
 	tests := []struct {
 		name                    string
 		modelName               string
+		reasoningEffort         string
+		wantReasoningEffort     string
 		wantMaxCompletionTokens bool
 	}{
 		{name: "standard chat model", modelName: "test-model"},
 		{name: "o-series model", modelName: "o3-mini", wantMaxCompletionTokens: true},
 		{name: "versioned GPT-5 model", modelName: "gpt-5.1-codex", wantMaxCompletionTokens: true},
+		{
+			name:                "explicit provider value",
+			modelName:           "test-model",
+			reasoningEffort:     " high ",
+			wantReasoningEffort: "high",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			testOpenAIModelStreamsSSE(t, tt.modelName, tt.wantMaxCompletionTokens)
+			testOpenAIModelStreamsSSE(t, tt.modelName, tt.reasoningEffort, tt.wantReasoningEffort, tt.wantMaxCompletionTokens)
 		})
 	}
 }
@@ -52,7 +60,7 @@ func TestUsesMaxCompletionTokens(t *testing.T) {
 	}
 }
 
-func testOpenAIModelStreamsSSE(t *testing.T, modelName string, wantMaxCompletionTokens bool) {
+func testOpenAIModelStreamsSSE(t *testing.T, modelName, reasoningEffort, wantReasoningEffort string, wantMaxCompletionTokens bool) {
 	t.Helper()
 	requests := make(chan completionRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,10 +96,11 @@ func testOpenAIModelStreamsSSE(t *testing.T, modelName string, wantMaxCompletion
 	defer server.Close()
 
 	model, err := NewOpenAIModel(context.Background(), config.ModelConfig{
-		BaseURL:        server.URL + "/v1",
-		APIKey:         "test-key",
-		Name:           modelName,
-		TimeoutSeconds: 5,
+		BaseURL:         server.URL + "/v1",
+		APIKey:          "test-key",
+		Name:            modelName,
+		ReasoningEffort: reasoningEffort,
+		TimeoutSeconds:  5,
 		Context: config.ModelContextConfig{
 			WindowTokens:    1_000,
 			MaxOutputTokens: 321,
@@ -146,6 +155,17 @@ func testOpenAIModelStreamsSSE(t *testing.T, modelName string, wantMaxCompletion
 		if request.StreamOptions == nil || !request.StreamOptions.IncludeUsage {
 			t.Errorf("stream_options = %#v, want include_usage=true", request.StreamOptions)
 		}
+		if wantReasoningEffort == "" {
+			if request.ReasoningEffort != nil {
+				t.Errorf("reasoning_effort = %q, want omitted", *request.ReasoningEffort)
+			}
+		} else if request.ReasoningEffort == nil || *request.ReasoningEffort != wantReasoningEffort {
+			var got string
+			if request.ReasoningEffort != nil {
+				got = *request.ReasoningEffort
+			}
+			t.Errorf("reasoning_effort = %q, want %q", got, wantReasoningEffort)
+		}
 		if wantMaxCompletionTokens {
 			if request.MaxCompletionTokens == nil || *request.MaxCompletionTokens != 321 {
 				t.Errorf("max_completion_tokens = %v, want 321", request.MaxCompletionTokens)
@@ -175,8 +195,9 @@ type completionRequest struct {
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
-	MaxTokens           *int `json:"max_tokens"`
-	MaxCompletionTokens *int `json:"max_completion_tokens"`
+	MaxTokens           *int    `json:"max_tokens"`
+	MaxCompletionTokens *int    `json:"max_completion_tokens"`
+	ReasoningEffort     *string `json:"reasoning_effort"`
 	Messages            []struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`

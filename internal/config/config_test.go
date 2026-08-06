@@ -57,6 +57,133 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadNormalizesModelReasoningEffort(t *testing.T) {
+	doc := strings.Replace(validConfiguration, "[model]\n", "[model]\nreasoning_effort = \" high \"\n", 1)
+	got, err := Load(writeConfiguration(t, doc))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Model.ReasoningEffort != "high" {
+		t.Fatalf("reasoning effort = %q, want %q", got.Model.ReasoningEffort, "high")
+	}
+}
+
+func TestLoadNormalizesConfiguredModelCatalog(t *testing.T) {
+	doc := validConfiguration + `
+[[model.catalog]]
+name = "gpt-5.2-coding"
+display_name = "Coding 5.2"
+aliases = ["coding", " fast "]
+description = "general coding model"
+lifecycle = "ACTIVE"
+
+[model.catalog.capabilities]
+context_window_tokens = 128000
+max_output_tokens = 8192
+reasoning_efforts = ["low", " medium ", "low"]
+input_modalities = ["text", "image"]
+supports_tools = true
+supports_streaming = true
+
+[[model.catalog]]
+name = "legacy-coding"
+lifecycle = "retired"
+`
+	got, err := Load(writeConfiguration(t, doc))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(got.Model.Catalog) != 2 {
+		t.Fatalf("catalog length = %d, want 2", len(got.Model.Catalog))
+	}
+	entry := got.Model.Catalog[0]
+	if entry.DisplayName != "Coding 5.2" || entry.Lifecycle != "active" || entry.Aliases[1] != "fast" {
+		t.Fatalf("normalized entry = %#v", entry)
+	}
+	if got := entry.Capabilities.ReasoningEfforts; !reflect.DeepEqual(got, []string{"low", "medium"}) {
+		t.Fatalf("reasoning efforts = %#v", got)
+	}
+	if entry.Capabilities.SupportsReasoning == nil || !*entry.Capabilities.SupportsReasoning {
+		t.Fatal("reasoning efforts should declare reasoning support")
+	}
+	if got, ok := got.Model.ResolveCatalogName("FAST"); !ok || got != "gpt-5.2-coding" {
+		t.Fatalf("alias resolution = %q, %v", got, ok)
+	}
+	if got, ok := got.Model.ResolveCatalogName("custom-deployment"); ok || got != "custom-deployment" {
+		t.Fatalf("unknown model resolution = %q, %v", got, ok)
+	}
+	if got := got.Model.CatalogDisplayName("gpt-5.2-coding"); got != "Coding 5.2" {
+		t.Fatalf("catalog display name = %q", got)
+	}
+}
+
+func TestModelCatalogRejectsAmbiguousOrContradictoryMetadata(t *testing.T) {
+	falseValue := false
+	cases := []struct {
+		name    string
+		entries []ModelCatalogEntry
+		want    string
+	}{
+		{
+			name: "duplicate alias",
+			entries: []ModelCatalogEntry{
+				{Name: "one", Aliases: []string{"shared"}},
+				{Name: "two", Aliases: []string{"shared"}},
+			},
+			want: "duplicates",
+		},
+		{
+			name:    "invalid token",
+			entries: []ModelCatalogEntry{{Name: "two words"}},
+			want:    "single token",
+		},
+		{
+			name: "output exceeds context",
+			entries: []ModelCatalogEntry{{Name: "one", Capabilities: ModelCatalogCapabilities{
+				ContextWindowTokens: 100,
+				MaxOutputTokens:     100,
+			}}},
+			want: "smaller than context_window_tokens",
+		},
+		{
+			name: "reasoning contradiction",
+			entries: []ModelCatalogEntry{{Name: "one", Capabilities: ModelCatalogCapabilities{
+				SupportsReasoning: &falseValue,
+				ReasoningEfforts:  []string{"low"},
+			}}},
+			want: "conflicts with reasoning_efforts",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := normalizeModelCatalog(tc.entries)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("normalizeModelCatalog() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestModelValidateNormalizesBlankReasoningEffort(t *testing.T) {
+	model := ModelConfig{
+		BaseURL:         "https://api.example.test/v1",
+		APIKey:          "test-api-key",
+		Name:            "test-model",
+		ReasoningEffort: " \t",
+		TimeoutSeconds:  60,
+		Context: ModelContextConfig{
+			WindowTokens:    32_000,
+			MaxOutputTokens: 4_096,
+		},
+	}
+	if err := model.Validate(); err != nil {
+		t.Fatalf("ModelConfig.Validate() error = %v", err)
+	}
+	if model.ReasoningEffort != "" {
+		t.Fatalf("blank reasoning effort = %q, want empty", model.ReasoningEffort)
+	}
+}
+
 func TestLoadAcceptsCodexToolPermissions(t *testing.T) {
 	dir := t.TempDir()
 	doc := validConfiguration + `
@@ -135,6 +262,44 @@ func TestRulesValidateGlobalMaxTokens(t *testing.T) {
 	}
 	if err := (RulesConfig{GlobalMaxTokens: 100001}).Validate(); err == nil || !strings.Contains(err.Error(), "rules.global_max_tokens must be <= 100000") {
 		t.Fatalf("oversized global budget error = %v", err)
+	}
+}
+
+func TestLoadNormalizesProjectDocFallbackFilenames(t *testing.T) {
+	doc := validConfiguration + `
+[rules]
+project_doc_fallback_filenames = [" CLAUDE.md ", "CLAUDE.md", "CONVENTIONS.md"]
+`
+	got, err := Load(writeConfiguration(t, doc))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"CLAUDE.md", "CONVENTIONS.md"}
+	if !reflect.DeepEqual(got.Rules.ProjectDocFallbackFilenames, want) {
+		t.Fatalf("fallback filenames = %#v, want %#v", got.Rules.ProjectDocFallbackFilenames, want)
+	}
+}
+
+func TestRulesValidateProjectDocFallbackFilenames(t *testing.T) {
+	cases := []string{
+		"",
+		" \t",
+		"../CLAUDE.md",
+		"nested/CLAUDE.md",
+		filepath.Join(string(filepath.Separator), "CLAUDE.md"),
+		`..\CLAUDE.md`,
+		`C:\CLAUDE.md`,
+		".",
+		"..",
+	}
+	for _, name := range cases {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			err := (RulesConfig{ProjectDocFallbackFilenames: []string{name}}).Validate()
+			if err == nil || !strings.Contains(err.Error(), "rules.project_doc_fallback_filenames") {
+				t.Fatalf("error=%v, want fallback filename validation", err)
+			}
+		})
 	}
 }
 

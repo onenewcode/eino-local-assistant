@@ -52,6 +52,12 @@ var (
 	ErrForkSourceChanged = errors.New("thread fork source changed during fork")
 	// ErrForkDestinationExists means the requested child ID is already present.
 	ErrForkDestinationExists = errors.New("thread fork destination already exists")
+	// ErrModelChangeActiveTurn means a model identity cannot change while a
+	// durable turn still owns the thread.
+	ErrModelChangeActiveTurn = errors.New("cannot change thread model while a turn is active")
+	// ErrModelChangePendingCompaction means a model identity cannot change while
+	// a compaction operation may still reconcile provider usage or a checkpoint.
+	ErrModelChangePendingCompaction = errors.New("cannot change thread model while compaction is pending")
 )
 
 // EventKind is a durable journal event category.
@@ -66,6 +72,7 @@ const (
 	EventTurnCancelled EventKind = "turn.cancelled"
 	EventTurnFailed    EventKind = "turn.failed"
 	EventTitleChanged  EventKind = "title.changed"
+	EventModelChanged  EventKind = "model.changed"
 	EventUsageRecorded EventKind = "usage.recorded"
 	// EventTaskStateUpdated records the latest recoverable autonomous-task
 	// controller snapshot. The immutable tool and turn events remain the source
@@ -130,6 +137,12 @@ type ThreadState struct {
 	// recordedCompactionOperationIDs is rebuilt from compaction lifecycle events
 	// so a later transaction cannot reuse accounting correlation data.
 	recordedCompactionOperationIDs map[string]struct{}
+}
+
+// ModelChange is the durable payload for a model.changed event. An empty
+// Model means the caller selected the provider default identity.
+type ModelChange struct {
+	Model string `json:"model"`
 }
 
 // UsageOperation identifies the product operation that made a model request.

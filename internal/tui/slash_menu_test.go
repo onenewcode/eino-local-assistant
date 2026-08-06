@@ -229,6 +229,7 @@ func TestSlashMenuEnterArgCommandsDoNotSubmit(t *testing.T) {
 		{"/ti", "/title "},
 		{"/del", "/delete "},
 		{"/que", "/queue "},
+		{"/per", "/permissions "},
 	}
 	for _, tc := range cases {
 		setComposer(m, tc.prefix)

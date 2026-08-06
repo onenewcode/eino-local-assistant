@@ -45,6 +45,13 @@ var (
 	// ErrThreadHasPendingCompaction prevents a resume from silently retrying a
 	// provider operation that may have charged before the prior process stopped.
 	ErrThreadHasPendingCompaction = errors.New("thread has a pending compaction")
+	// ErrModelChangeBusy means this Session is already executing a turn or
+	// compaction (or another serialized operation). Model replacement never
+	// waits across that local operation.
+	ErrModelChangeBusy = errors.New("model change requires an idle session")
+	// ErrModelChangeUnsupported means the injected repository predates the
+	// optional idle model replacement extension.
+	ErrModelChangeUnsupported = errors.New("thread store does not support model replacement")
 )
 
 const (
@@ -66,6 +73,17 @@ type Stream interface {
 // Model is a chat model that returns a one-pass stream of assistant messages.
 type Model interface {
 	Stream(context.Context, []*schema.Message) (Stream, error)
+}
+
+// ModelBinding is the complete provider-side binding used by one Session.
+// ModelName may be empty to select the provider default identity. The
+// compactor and pricing travel with the primary model so a successful idle
+// replacement cannot leave auxiliary calls on the previous provider.
+type ModelBinding struct {
+	Model     Model
+	ModelName string
+	Compactor contextbuild.CheckpointCompactor
+	Pricing   usage.Pricing
 }
 
 // TurnEventKind identifies events emitted while a turn is running.
@@ -636,7 +654,60 @@ func (s *Session) CheckpointResetDuringOpen() bool {
 }
 
 // Model returns the chat model used for turns.
-func (s *Session) Model() Model { return s.model }
+func (s *Session) Model() Model {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.model
+}
+
+// ModelName returns the durable model identity associated with this session.
+// An empty name means the provider default identity.
+func (s *Session) ModelName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.modelName
+}
+
+// ReplaceModel atomically replaces the complete provider binding at an idle
+// boundary and records its identity in the thread journal. Provider
+// construction and any configuration validation happen before this method is
+// called.
+//
+// The local operation lock is deliberately acquired with TryLock: a model
+// switch must not silently wait for a running turn or compaction. The store
+// repeats the lifecycle check under its write lock and protects the mutation
+// with the session's observed revision against external writers.
+func (s *Session) ReplaceModel(ctx context.Context, binding ModelBinding) error {
+	if binding.Model == nil {
+		return errors.New("chat model is required")
+	}
+	if !s.opMu.TryLock() {
+		return ErrModelChangeBusy
+	}
+	defer s.opMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	repository, ok := s.threads.(store.ThreadModelRepository)
+	if !ok {
+		return ErrModelChangeUnsupported
+	}
+	s.mu.RLock()
+	threadID := s.id
+	expectedRevision := s.revision
+	s.mu.RUnlock()
+	state, err := repository.SetThreadModel(ctx, threadID, expectedRevision, strings.TrimSpace(binding.ModelName))
+	if err != nil {
+		return fmt.Errorf("replace session model: %w", err)
+	}
+	s.mu.Lock()
+	s.model = binding.Model
+	s.compactor = binding.Compactor
+	s.pricing = binding.Pricing
+	s.applyThreadStateLocked(state)
+	s.mu.Unlock()
+	return nil
+}
 
 // UsageSummary returns the durable API-usage projection for the current
 // session. It intentionally does not describe context-window occupancy.
@@ -1758,9 +1829,7 @@ func (s *Session) applyThreadStateLocked(state store.ThreadState) {
 		s.systemPrompt = state.SystemPrompt
 	}
 	s.title = state.Meta.Title
-	if state.Meta.Model != "" {
-		s.modelName = state.Meta.Model
-	}
+	s.modelName = state.Meta.Model
 	s.promptTokens = state.Meta.PromptTokens
 	s.completionTokens = state.Meta.CompletionTokens
 	s.totalTokens = state.Meta.TotalTokens

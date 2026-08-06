@@ -25,6 +25,9 @@ func NewOpenAIModel(ctx context.Context, cfg config.ModelConfig) (model.ToolCall
 		Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second,
 		ByAzure: false,
 	}
+	if cfg.ReasoningEffort != "" {
+		modelConfig.ReasoningEffort = openai.ReasoningEffortLevel(cfg.ReasoningEffort)
+	}
 	if usesMaxCompletionTokens(cfg.Name) {
 		modelConfig.MaxCompletionTokens = &cfg.Context.MaxOutputTokens
 	} else {
