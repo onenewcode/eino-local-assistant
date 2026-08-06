@@ -179,8 +179,11 @@ func normalizeShellOptions(opts ShellOptions) (ShellOptions, error) {
 	case ApprovalPlan:
 		// Plan is normally supplied through ApprovalState, but accepting the
 		// canonical value keeps direct tool construction consistent.
+	case ApprovalYolo:
+		// Yolo is only enabled by an explicit runtime or TUI entrypoint;
+		// configuration validation rejects it as a static policy value.
 	default:
-		return ShellOptions{}, fmt.Errorf("approval must be %q, %q, or %q", ApprovalOnRequest, ApprovalNever, ApprovalPlan)
+		return ShellOptions{}, fmt.Errorf("approval must be %q, %q, %q, or %q", ApprovalOnRequest, ApprovalNever, ApprovalPlan, ApprovalYolo)
 	}
 
 	root, err := ResolveWorkspaceRoot(opts.WorkspaceRoot)
@@ -224,9 +227,21 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 	if command == "" {
 		return ShellOutput{}, errors.New("command is required")
 	}
-	permissions, err := normalizeSandboxPermissions(input.SandboxPermissions, input.Justification)
-	if err != nil {
-		return ShellOutput{}, err
+	permissions := sandboxPermissionsDefault
+	if isYoloApprovalMode(approvalMode) {
+		// Explicit yolo already selects direct host execution. Accept the
+		// model's optional escalation spelling without invoking the ordinary
+		// justification/approval path; path and hard-policy checks still run.
+		raw := strings.ToLower(strings.TrimSpace(input.SandboxPermissions))
+		if raw != "" && raw != string(sandboxPermissionsDefault) && raw != string(sandboxPermissionsEscalated) {
+			return ShellOutput{}, fmt.Errorf("sandbox_permissions must be %q or %q", sandboxPermissionsDefault, sandboxPermissionsEscalated)
+		}
+	} else {
+		var err error
+		permissions, err = normalizeSandboxPermissions(input.SandboxPermissions, input.Justification)
+		if err != nil {
+			return ShellOutput{}, err
+		}
 	}
 
 	cwd, err := resolveWorkingDir(defaults.WorkingDir, input.WorkingDir)
@@ -268,7 +283,7 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
-	if defaults.Sandbox != nil && permissions == sandboxPermissionsDefault {
+	if defaults.Sandbox != nil && permissions == sandboxPermissionsDefault && !isYoloApprovalMode(approvalMode) {
 		return runSandboxShell(runCtx, defaults, command, cwd, timeoutSeconds, approvalMode == ApprovalPlan)
 	}
 	// authorizeShell rejects this path before execution. Keep a second guard at
@@ -287,7 +302,12 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 	if err != nil {
 		return ShellOutput{}, err
 	}
-	if forceHost {
+	if isYoloApprovalMode(approvalMode) {
+		out.Sandbox = func() *SandboxOutcome {
+			outcome := yoloSandboxOutcome()
+			return &outcome
+		}()
+	} else if forceHost {
 		out.Sandbox = &SandboxOutcome{
 			Mode:      "host",
 			Backend:   "host",
@@ -448,7 +468,7 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		return finishDeny(defaults, command, cwd, DecisionDeny, ReasonPolicyDenied+": host escalation command is required", ruleKey, true), true, nil
 	}
 
-	if !forceHost && defaults.WorkspaceOnly && !PathWithinWorkspace(defaults.WorkspaceRoot, cwd) {
+	if (!forceHost || isYoloApprovalMode(approvalMode)) && defaults.WorkspaceOnly && !PathWithinWorkspace(defaults.WorkspaceRoot, cwd) {
 		reason := fmt.Sprintf("%s: working_dir is outside workspace root %s", ReasonWorkspaceOnly, defaults.WorkspaceRoot)
 		if approvalMode == ApprovalPlan {
 			return softDeny(command, cwd, DecisionDeny, reason, false), true, nil
@@ -457,7 +477,7 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 	}
 
 	// Prior user deny for this rule_key: soft-deny without re-prompting.
-	if !forceHost && defaults.SessionDenies != nil && defaults.SessionDenies.Contains(ruleKey) {
+	if !forceHost && !isYoloApprovalMode(approvalMode) && defaults.SessionDenies != nil && defaults.SessionDenies.Contains(ruleKey) {
 		reason := fmt.Sprintf("%s: %s; %s", ReasonUserDeniedSession, ruleKey, ReasonUserDeniedNoRetry)
 		if approvalMode == ApprovalPlan {
 			return softDeny(command, cwd, DecisionDeny, reason, false), true, nil
@@ -484,11 +504,20 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 	}
 	if approvalMode == ApprovalPlan {
-		if forceHost || ev.Decision != DecisionAllow {
+		if forceHost || ev.Decision != DecisionAllow || !isPlanReadOnlyShellCommand(command) {
 			return softDeny(command, cwd, DecisionDeny, ReasonPlanReadOnly, true), true, nil
 		}
 		if defaults.Sandbox == nil {
 			return softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": plan mode requires an enforced read-only sandbox", true), true, nil
+		}
+		return ShellOutput{}, false, nil
+	}
+	// Yolo is an explicit process-local bypass of ordinary approval. The hard
+	// PermissionSet deny above still applies, and host/path validation already
+	// ran before this branch.
+	if isYoloApprovalMode(approvalMode) {
+		if defaults.DenyStreaks != nil {
+			defaults.DenyStreaks.Reset(ruleKey)
 		}
 		return ShellOutput{}, false, nil
 	}
@@ -524,7 +553,7 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 		return ShellOutput{}, false, nil
 	case DecisionAsk:
-		if effectiveApprovalMode(defaults.Approval, defaults.ApprovalState) == ApprovalNever {
+		if mode := effectiveApprovalMode(defaults.Approval, defaults.ApprovalState); mode == ApprovalNever || isYoloApprovalMode(mode) {
 			if defaults.DenyStreaks != nil {
 				defaults.DenyStreaks.Reset(ruleKey)
 			}
@@ -594,6 +623,49 @@ func authorizeShell(ctx context.Context, defaults ShellOptions, command, cwd str
 		}
 	default:
 		return finishDeny(defaults, command, cwd, DecisionDeny, "unknown policy decision", ruleKey, false), true, nil
+	}
+}
+
+// isPlanReadOnlyShellCommand is intentionally a small allowlist of commands
+// whose normal form is observational. Permission allow rules remain
+// authoritative; this second check prevents an explicit allow for a mutative
+// or ambiguous command from becoming executable in plan mode.
+func isPlanReadOnlyShellCommand(command string) bool {
+	fields := strings.Fields(strings.TrimSpace(command))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "pwd", "ls", "rg", "grep", "cat", "head", "tail":
+		return true
+	case "find":
+		for _, arg := range fields[1:] {
+			arg = strings.Trim(arg, "'\"")
+			for _, prefix := range []string{"-exec", "-ok", "-delete", "-fls", "-fprint"} {
+				if arg == prefix || strings.HasPrefix(arg, prefix+"=") {
+					return false
+				}
+			}
+		}
+		return true
+	case "git":
+		if len(fields) < 2 {
+			return false
+		}
+		switch fields[1] {
+		case "status", "diff", "log":
+			for _, arg := range fields[2:] {
+				trimmed := strings.TrimLeft(arg, "-")
+				if strings.HasPrefix(trimmed, "output") || arg == "-o" || (strings.HasPrefix(arg, "-o") && !strings.HasPrefix(arg, "--")) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
 	}
 }
 

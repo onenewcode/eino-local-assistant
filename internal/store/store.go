@@ -60,7 +60,7 @@ type ForkResult struct {
 	ChildState ThreadState `json:"child_state"`
 }
 
-// ThreadRepository is the complete durable v2 thread API.
+// ThreadRepository is the complete durable session-journal API.
 type ThreadRepository interface {
 	CreateThread(ctx context.Context, meta ThreadMeta, systemPrompt string) (ThreadState, error)
 	DeleteThread(ctx context.Context, id string) error
@@ -92,6 +92,18 @@ type ThreadRepository interface {
 	RecordCompactionFailure(ctx context.Context, id string, expectedRevision uint64, input CompactionFailure) (ThreadState, error)
 	FinishCompaction(ctx context.Context, id string, input CompactionFailure) (ThreadState, error)
 	ResetIncompatibleCheckpoint(ctx context.Context, id string, expectedRevision uint64, input CheckpointSchemaReset) (ThreadState, error)
+}
+
+// ThreadOpenSnapshot is a same-revision view used when resuming a session.
+type ThreadOpenSnapshot struct {
+	State      ThreadState
+	Transcript []*schema.Message
+	TurnGroups []TurnGroup
+}
+
+// ThreadOpenSnapshotRepository avoids stitching resume state from separate revisions.
+type ThreadOpenSnapshotRepository interface {
+	LoadThreadOpenSnapshot(ctx context.Context, id string, messageLimit int) (ThreadOpenSnapshot, error)
 }
 
 // ThreadModelRepository is an optional extension for idle model replacement.

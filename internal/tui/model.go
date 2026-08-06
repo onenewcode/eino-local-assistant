@@ -154,6 +154,11 @@ type Deps struct {
 	// RulesReport returns the active session's captured instruction metadata.
 	// It must be read-only: /rules never asks the callback to reload files.
 	RulesReport func() string
+	// WorkspaceDiff reads a bounded, read-only Git snapshot. The callback owns
+	// the Git process boundary; TUI never constructs or executes shell input.
+	WorkspaceDiff func(context.Context) (string, error)
+	// WorkspaceReview performs one display-only review of a bounded diff.
+	WorkspaceReview func(context.Context, string) (string, error)
 	// InvalidateRulesSnapshot marks provenance unavailable after /resume.
 	InvalidateRulesSnapshot func()
 	// SideQuestion answers a temporary side question without writing the main
@@ -225,6 +230,7 @@ const (
 	lineReasoning
 	// lineSide is display-only output from /btw and /side.
 	lineSide
+	lineReview
 	lineSep
 )
 
@@ -285,6 +291,8 @@ type model struct {
 	sideQuestions       int
 	sideQuestionPending map[uint64]struct{}
 	sideQuestionNextID  uint64
+	reviewInFlight      bool
+	reviewNextID        uint64
 
 	mode              mode
 	sessionMu         sync.RWMutex
@@ -775,6 +783,7 @@ func (m *model) resetSessionTransientState() {
 	m.sideQuestions = 0
 	m.sideQuestionPending = nil
 	m.sideLines = nil
+	m.reviewInFlight = false
 	m.queue = nil
 	m.queuePaused = false
 	m.modelPickerItems = nil
@@ -892,6 +901,10 @@ func newModel(deps Deps) *model {
 			{kind: lineSystem, text: "Eino local assistant · type /help for commands"},
 			{kind: lineSep, text: ""},
 		}
+	}
+	if deps.PolicyInfo.yoloActive() {
+		m.appendLine(lineError, tools.YoloModeWarning)
+		m.appendLine(lineSep, "")
 	}
 	m.refreshViewport()
 	return m
@@ -1015,6 +1028,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reasoningDetailsVisible = !m.reasoningDetailsVisible
 			m.refreshViewport()
 			return m, nil
+		case tea.KeyShiftTab:
+			return m.cyclePermissionMode()
 		case tea.KeyTab:
 			// Complete the selected slash command; never insert a literal tab.
 			if m.slashMenuOpen() {
@@ -1214,6 +1229,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.finishSideQuestion(msg)
 		return m, nil
 
+	case reviewDoneMsg:
+		if !m.reviewInFlight || msg.requestID != m.reviewNextID {
+			return m, nil
+		}
+		m.reviewInFlight = false
+		current, generation := m.activeSessionSnapshot()
+		if msg.sessionGeneration != generation || (msg.sessionID != "" && (current == nil || msg.sessionID != current.ID())) {
+			return m, nil
+		}
+		m.finishReview(msg)
+		return m, nil
+
 	case compactDoneMsg:
 		if msg.compactID != m.compactID {
 			return m, nil
@@ -1373,6 +1400,9 @@ func (m *model) statusLabel() string {
 }
 
 func (m *model) statusPolicyFragment() string {
+	if m.deps.PolicyInfo.yoloActive() {
+		return m.deps.PolicyInfo.StatusFragment()
+	}
 	fragments := make([]string, 0, 4)
 	command := ""
 	if m.deps.PolicyInfo.ApprovalState != nil {
@@ -1589,6 +1619,12 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case slashGoal:
 		return m.cmdGoal(arg)
+	case slashTasks:
+		return m.cmdTasks(arg)
+	case slashDiff:
+		return m.cmdDiff(arg)
+	case slashReview:
+		return m.cmdReview(arg)
 	case slashRules:
 		return m.cmdRules(arg)
 	case slashSide:
@@ -1674,8 +1710,17 @@ func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
 		return m, nil
 	}
+	if strings.EqualFold(arg, "yolo") {
+		if err := state.SetYolo(); err != nil {
+			m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
+			return m, nil
+		}
+		m.appendLine(lineError, tools.YoloModeWarning)
+		m.appendLine(lineSystem, "permission mode: yolo (explicit; not in Shift+Tab cycle)")
+		return m, nil
+	}
 	if err := state.SetInteractiveMode(arg); err != nil {
-		m.appendLine(lineError, "usage: /permissions [ask|auto|plan]")
+		m.appendLine(lineError, "usage: /permissions [ask|auto|plan|yolo]")
 		return m, nil
 	}
 	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
@@ -1683,11 +1728,48 @@ func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) permissionModeChangeUnavailable() bool {
-	if m.mode == modeIdle && !m.hasPendingApproval() {
-		return false
+	if m.mode != modeIdle || m.hasPendingApproval() {
+		m.appendLine(lineError, permissionModeBusyMessage)
+		return true
 	}
-	m.appendLine(lineError, permissionModeBusyMessage)
-	return true
+	if m.sideQuestions > 0 {
+		m.appendLine(lineError, permissionModeSideMessage)
+		return true
+	}
+	return false
+}
+
+func (m *model) cyclePermissionMode() (tea.Model, tea.Cmd) {
+	if m.permissionModeChangeUnavailable() {
+		return m, nil
+	}
+	state := m.deps.PolicyInfo.ApprovalState
+	if state == nil {
+		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
+		return m, nil
+	}
+	if state.InteractiveMode() == "yolo" {
+		m.appendLine(lineError, "YOLO mode is explicit; use /permissions ask|auto|plan to leave it")
+		return m, nil
+	}
+	target := nextPermissionMode(state.InteractiveMode())
+	if err := state.SetInteractiveMode(target); err != nil {
+		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
+		return m, nil
+	}
+	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
+	return m, nil
+}
+
+func nextPermissionMode(current string) string {
+	switch strings.ToLower(strings.TrimSpace(current)) {
+	case "ask":
+		return "auto"
+	case "auto":
+		return "plan"
+	default:
+		return "ask"
+	}
 }
 
 // cmdPlan keeps the plan phase temporary and explicit: only a non-reserved
@@ -2953,6 +3035,8 @@ func (m *model) refreshViewport() {
 			b.WriteString(renderError(line.text, m.viewport.Width))
 		case lineSystem, lineUsage:
 			// lineUsage shares system styling but is never part of model context.
+			b.WriteString(renderSystem(line.text))
+		case lineReview:
 			b.WriteString(renderSystem(line.text))
 		case lineSep:
 			b.WriteString(renderSeparator(m.viewport.Width))

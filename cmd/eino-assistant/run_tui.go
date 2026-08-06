@@ -33,6 +33,7 @@ type sessionStart struct {
 	modelName          string
 	reasoningEffort    string
 	reasoningEffortSet bool
+	yolo               bool
 }
 
 func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr error) {
@@ -48,6 +49,9 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 	runtime, err := newCommandRuntime(processCtx, configPath, start, approvalBridge)
 	if err != nil {
 		return err
+	}
+	if start.yolo {
+		fmt.Fprintln(stderr, tools.YoloModeWarning)
 	}
 	defer func() {
 		if closeErr := runtime.Close(); closeErr != nil {
@@ -110,8 +114,10 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		MaxToolCalls:   runtime.runtimeCfg.MaxToolCalls,
 	}
 	policyInfo := tui.CommandPolicyInfo{
-		Mode:          cmdMode,
-		Approval:      string(runtime.approvalMode),
+		Mode: cmdMode,
+		// Keep the static config policy separate from the process-local yolo
+		// override so /permissions does not mislabel yolo as a persisted policy.
+		Approval:      modelCfg.ApprovalPolicyNormalized(),
 		ApprovalState: runtime.approvalState,
 		Profile:       modelCfg.Permissions.PermissionsProfile(),
 		WorkspaceOnly: true,
@@ -132,7 +138,8 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		ComposeSystemPrompt: func() (string, error) {
 			return runtime.composePrompt()
 		},
-		SideQuestion: runtime.sideQuestion,
+		SideQuestion:    runtime.sideQuestion,
+		WorkspaceReview: runtime.workspaceReview,
 		SwitchModel: func(ctx context.Context, session *chat.Session, name string) (tui.ModelSwitchResult, error) {
 			bundle, switchErr := runtime.switchModel(ctx, session, name)
 			if switchErr != nil {
@@ -165,6 +172,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 			}, nil
 		},
 		RulesReport:             runtime.rulesReport,
+		WorkspaceDiff:           runtime.workspaceDiff,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
 		SessionOpts:             initialSessionOpts,
 		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, initialReactModel.MaxSteps(), sandboxInfo, runtimeInfo),

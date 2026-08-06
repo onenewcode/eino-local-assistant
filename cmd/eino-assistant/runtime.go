@@ -137,6 +137,7 @@ func selectLastExecSession(ctx context.Context, configPath string) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("open session store: %w", err)
 	}
+	defer threadStore.Close()
 	return selectNewestExecSession(ctx, threadStore)
 }
 
@@ -149,10 +150,11 @@ func selectLastEphemeralExecSession(ctx context.Context, configPath string) (str
 	if err != nil {
 		return "", err
 	}
-	threadStore, err := store.NewThreadStore(dataDir)
+	threadStore, err := store.OpenThreadStore(dataDir, store.ThreadStoreOptions{ReadOnly: true})
 	if err != nil {
 		return "", fmt.Errorf("open session store: %w", err)
 	}
+	defer threadStore.Close()
 	return selectNewestExecSession(ctx, readOnlyExecThreadLister{store: threadStore})
 }
 
@@ -233,6 +235,16 @@ func (r *commandRuntime) Close() error {
 	if r.sandboxRunner != nil {
 		if err := r.sandboxRunner.Close(); err != nil {
 			closeErrs = append(closeErrs, fmt.Errorf("close sandbox runner: %w", err))
+		}
+	}
+	if r.memStore != nil {
+		if err := r.memStore.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close memory store: %w", err))
+		}
+	}
+	if r.sessionStore != nil {
+		if err := r.sessionStore.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close session store: %w", err))
 		}
 	}
 	if err := joinEphemeralStoreCleanupError(nil, r.ephemeralStoreRoot); err != nil {
@@ -378,7 +390,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	sourceThreadPath := ""
 	var sourceStore *store.ThreadStore
 	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
-		sourceStore, err = store.NewThreadStore(sourceDataDir)
+		sourceStore, err = store.OpenThreadStore(sourceDataDir, store.ThreadStoreOptions{ReadOnly: true})
 		if err != nil {
 			return nil, fmt.Errorf("open durable source session store: %w", err)
 		}
@@ -401,6 +413,14 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, fmt.Errorf("open session store: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = sessionStore.Close()
+			if sourceStore != nil && sourceStore != sessionStore {
+				_ = sourceStore.Close()
+			}
+		}
+	}()
 	if start.resumeID != "" && !start.ephemeral {
 		sourceStore = sessionStore
 	}
@@ -413,6 +433,8 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		if err = sourceStore.SnapshotThread(ctx, start.resumeID, sessionStore); err != nil {
 			return nil, fmt.Errorf("snapshot durable resume session: %w", err)
 		}
+		_ = sourceStore.Close()
+		sourceStore = nil
 	}
 
 	perms, err := cfg.BuildPermissions()
@@ -466,6 +488,9 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	sessionAllows := tools.NewSessionAllowlist()
 	sessionDenies := tools.NewSessionDenylist()
 	approvalMode := tools.NormalizeApprovalMode(cfg.ApprovalPolicyNormalized())
+	if start.yolo {
+		approvalMode = tools.ApprovalYolo
+	}
 	approvalState, err := tools.NewApprovalState(approvalMode)
 	if err != nil {
 		return nil, fmt.Errorf("create approval state: %w", err)
@@ -482,6 +507,11 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, fmt.Errorf("open memory store: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = memStore.Close()
+		}
+	}()
 
 	registry, err := tools.DefaultWithOptions(tools.DefaultOptions{
 		Clock:       time.Now,

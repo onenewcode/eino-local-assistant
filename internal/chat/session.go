@@ -168,7 +168,7 @@ type EventAwareModel interface {
 
 // SessionOptions configures a new or opened session.
 type SessionOptions struct {
-	// Store persists the required v2 event ledger.
+	// Store persists the required session event ledger.
 	Store store.ThreadRepository
 	// ID is required when opening; for new sessions empty means auto-generate.
 	ID string
@@ -266,7 +266,7 @@ type UsageSummary struct {
 	Status           store.UsageStatus
 }
 
-// Session owns a model-visible projection. Its v2 ThreadRepository is the
+// Session owns a model-visible projection. Its ThreadRepository is the
 // source of truth; transcript is only a bounded, user-visible replay window.
 type Session struct {
 	model      Model
@@ -384,7 +384,7 @@ func NewSession(model Model, systemPrompt string, opts SessionOptions) (*Session
 }
 
 // OpenSession restores only the active checkpoint and recent visible tail for
-// a v2 thread.
+// a v4 session journal.
 func OpenSession(model Model, st store.ThreadRepository, id string, opts SessionOptions) (*Session, error) {
 	if model == nil {
 		return nil, errors.New("chat model is required")
@@ -397,13 +397,25 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		return nil, errors.New("thread id is required")
 	}
 
-	state, transcript, err := st.LoadThreadTranscript(context.Background(), id, recentTranscriptMessages)
-	if err != nil {
-		return nil, fmt.Errorf("load thread transcript: %w", err)
-	}
-	turns, err := st.LoadTurnGroups(context.Background(), id)
-	if err != nil {
-		return nil, fmt.Errorf("load thread lifecycle: %w", err)
+	var state store.ThreadState
+	var transcript []*schema.Message
+	var turns []store.TurnGroup
+	var err error
+	if snapshots, ok := st.(store.ThreadOpenSnapshotRepository); ok {
+		snapshot, loadErr := snapshots.LoadThreadOpenSnapshot(context.Background(), id, recentTranscriptMessages)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load thread open snapshot: %w", loadErr)
+		}
+		state, transcript, turns = snapshot.State, snapshot.Transcript, snapshot.TurnGroups
+	} else {
+		state, transcript, err = st.LoadThreadTranscript(context.Background(), id, recentTranscriptMessages)
+		if err != nil {
+			return nil, fmt.Errorf("load thread transcript: %w", err)
+		}
+		turns, err = st.LoadTurnGroups(context.Background(), id)
+		if err != nil {
+			return nil, fmt.Errorf("load thread lifecycle: %w", err)
+		}
 	}
 	if activeTurn := activeTurnID(turns); activeTurn != "" {
 		if !opts.RecoverInterrupted {
@@ -652,7 +664,7 @@ func (s *Session) SetTitle(ctx context.Context, title string) error {
 	return nil
 }
 
-// Store returns the v2 thread ledger backing this session.
+// Store returns the thread ledger backing this session.
 func (s *Session) Store() store.ThreadRepository { return s.threads }
 
 // CheckpointResetDuringOpen reports whether this Session's OpenSession call
@@ -828,7 +840,7 @@ func (s *Session) Ask(ctx context.Context, input string, onChunk func(string) er
 	return s.AskWithEvents(ctx, input, onChunk, nil)
 }
 
-// AskWithEvents persists a v2 turn lifecycle before and after model execution.
+// AskWithEvents persists a turn lifecycle before and after model execution.
 // Raw turn data and tool artifacts are retained even when a stream is cancelled;
 // only completed turns enter the future model prompt.
 func (s *Session) AskWithEvents(ctx context.Context, input string, onChunk func(string) error, emit EventEmitter) error {
@@ -1157,8 +1169,10 @@ func (s *Session) streamAnswer(ctx context.Context, view []*schema.Message, onCh
 		chunk, recvErr := stream.Recv()
 		if chunk != nil {
 			chunks = append(chunks, chunk)
-			if emitReasoningHere && chunk.ReasoningContent != "" && emit != nil {
-				emit(TurnEvent{Kind: TurnEventReasoning, Chunk: chunk.ReasoningContent})
+			if emitReasoningHere && emit != nil {
+				if reasoning := DisplayReasoningContent(chunk); reasoning != "" {
+					emit(TurnEvent{Kind: TurnEventReasoning, Chunk: reasoning})
+				}
 			}
 			if chunk.Content != "" {
 				if emit != nil {
@@ -1938,6 +1952,11 @@ type threadTurnRecorder struct {
 	failure   error
 }
 
+// Tool output stays inline while it is useful in the journal itself. Only
+// genuinely large results become artifacts, which keeps normal sessions both
+// readable and cheap to replay.
+const maxInlineToolOutputBytes = 16 << 10
+
 func newThreadTurnRecorder(repo store.ThreadRepository, threadID string, revision uint64, turnID string) *threadTurnRecorder {
 	return &threadTurnRecorder{
 		repo:      repo,
@@ -2014,23 +2033,27 @@ func (r *threadTurnRecorder) record(event TurnEvent) bool {
 		if event.Kind == TurnEventToolError && event.Err != nil {
 			output = "tool error: " + event.Err.Error()
 		}
-		artifact, err := r.repo.PutArtifact(context.Background(), r.threadID, store.ArtifactInput{
-			Kind:      "tool.output",
-			MediaType: "text/plain",
-			Data:      []byte(output),
-		})
-		if err != nil {
-			r.failure = err
-			return false
+		completed := store.ToolCompleted{
+			TurnID:     r.turnID,
+			ToolCallID: toolID,
+			ToolName:   event.Tool,
+			Output:     output,
+		}
+		if len(output) > maxInlineToolOutputBytes {
+			artifact, err := r.repo.PutArtifact(context.Background(), r.threadID, store.ArtifactInput{
+				Kind:      "tool.output",
+				MediaType: "text/plain",
+				Data:      []byte(output),
+			})
+			if err != nil {
+				r.failure = err
+				return false
+			}
+			completed.Output = artifactPrompt(artifact)
+			completed.Artifact = &artifact
 		}
 		state, err := r.mutateLocked(func(revision uint64) (store.ThreadState, error) {
-			return r.repo.ToolCompleted(context.Background(), r.threadID, revision, store.ToolCompleted{
-				TurnID:     r.turnID,
-				ToolCallID: toolID,
-				ToolName:   event.Tool,
-				Output:     artifactPrompt(artifact),
-				Artifact:   &artifact,
-			})
+			return r.repo.ToolCompleted(context.Background(), r.threadID, revision, completed)
 		})
 		if err != nil {
 			r.failure = err

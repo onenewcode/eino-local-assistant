@@ -1,6 +1,8 @@
 package chat
 
 import (
+	"strings"
+
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -34,11 +36,37 @@ func isReasoningExtraKey(key string) bool {
 	}
 }
 
+// DisplayReasoningContent returns provider-supplied reasoning text without
+// treating encrypted signatures or other metadata as visible content. Eino
+// adapters use more than one field, so the UI/event bridge must normalize them
+// before deciding whether a reasoning event exists.
+func DisplayReasoningContent(msg *schema.Message) string {
+	if msg == nil {
+		return ""
+	}
+	if msg.ReasoningContent != "" {
+		return msg.ReasoningContent
+	}
+	for _, key := range []string{extraKeyOpenAIReasoningContent, extraKeyClaudeThinking} {
+		if value, ok := msg.Extra[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	var b strings.Builder
+	for _, part := range msg.AssistantGenMultiContent {
+		if part.Type != schema.ChatMessagePartTypeReasoning || part.Reasoning == nil {
+			continue
+		}
+		b.WriteString(part.Reasoning.Text)
+	}
+	return b.String()
+}
+
 func hasDisplayReasoning(msg *schema.Message) bool {
 	if msg == nil {
 		return false
 	}
-	if msg.ReasoningContent != "" {
+	if DisplayReasoningContent(msg) != "" {
 		return true
 	}
 	if msg.Extra != nil {

@@ -67,8 +67,8 @@ func (m *model) cmdMemory(arg string) (tea.Model, tea.Cmd) {
 			last = rep.LastConsolidate.Format(time.RFC3339)
 		}
 		msg := fmt.Sprintf(
-			"memory status\n  root: %s\n  use: %v  generate: %v\n  user: %d  candidates: %d\n  last consolidate: %s",
-			rep.Root, rep.UseEnabled, rep.GenerateEnabled, rep.UserActive, rep.CandidateActive, last,
+			"memory status\n  database: %s (schema %d)\n  use: %v  generate: %v\n  user: %d  candidates: %d\n  extractions: %d running, %d failed\n  last consolidate: %s",
+			rep.DatabasePath, rep.SchemaVersion, rep.UseEnabled, rep.GenerateEnabled, rep.UserActive, rep.CandidateActive, rep.RunningExtractions, rep.FailedExtractions, last,
 		)
 		if rep.LastError != "" {
 			msg += "\n  last error: " + rep.LastError
@@ -172,14 +172,6 @@ func (m *model) cmdMemory(arg string) (tea.Model, tea.Cmd) {
 		}
 		m.appendLine(lineSep, "")
 		return m, nil
-	case "rebuild":
-		if err := m.deps.Memory.RebuildSummary(); err != nil {
-			m.appendLine(lineError, "memory rebuild: "+err.Error())
-			return m, nil
-		}
-		m.appendLine(lineSystem, "memory summary rebuilt on disk; "+projectContextRefreshHint)
-		m.appendLine(lineSep, "")
-		return m, nil
 	case "reset":
 		if rest != "--confirm" {
 			m.appendLine(lineError, memoryResetUsage)
@@ -193,7 +185,7 @@ func (m *model) cmdMemory(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSep, "")
 		return m, nil
 	default:
-		m.appendLine(lineError, "usage: /memory [list|add|update|delete|accept|on|off|generate|status|rebuild|reset --confirm]")
+		m.appendLine(lineError, "usage: /memory [list|add|update|delete|accept|on|off|generate|status|reset --confirm]")
 		return m, nil
 	}
 }

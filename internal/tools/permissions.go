@@ -140,6 +140,8 @@ func cautiousPermissionSeeds() (allow, deny []string) {
 		"Shell(rg *)",
 		"Shell(grep)",
 		"Shell(grep *)",
+		"Shell(find)",
+		"Shell(find *)",
 		"Shell(cat *)",
 		"Shell(head *)",
 		"Shell(tail *)",

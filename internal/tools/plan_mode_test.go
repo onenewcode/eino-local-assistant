@@ -151,7 +151,7 @@ func TestPlanShellAllowWithoutSandboxFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	permissions, err := BuildPermissionSet(ProfileCautious, []string{"Shell(echo *)"}, nil, nil)
+	permissions, err := BuildPermissionSet(ProfileCautious, []string{"Shell(ls *)"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestPlanShellAllowWithoutSandboxFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := planShellOutput(t, tool, `{"command":"echo plan-allow"}`)
+	out := planShellOutput(t, tool, `{"command":"ls -la"}`)
 	if !out.Denied || out.Decision != string(DecisionDeny) || !strings.Contains(out.Reason, ReasonSandboxUnavailable) {
 		t.Fatalf("plan allow without sandbox = %+v", out)
 	}
@@ -179,6 +179,99 @@ func TestPlanShellAllowWithoutSandboxFailsClosed(t *testing.T) {
 func TestPlanShellAllowUsesReadOnlySandbox(t *testing.T) {
 	workspace := t.TempDir()
 	runner := newPlanTestSandboxRunner(t, workspace, `{"shell":{"decision":"allow","exit_code":0,"stdout":"sandbox-ok"}}`)
+	state, err := NewApprovalState(ApprovalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissions, err := BuildPermissionSet(ProfileCautious, []string{"Shell(ls *)"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalNever,
+		ApprovalState: state,
+		WorkspaceRoot: workspace,
+		Permissions:   permissions,
+		Sandbox:       runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := planShellOutput(t, tool, `{"command":"ls -la"}`)
+	if out.Denied || out.Stdout != "sandbox-ok" {
+		t.Fatalf("plan sandbox output = %+v", out)
+	}
+	if out.Sandbox == nil || out.Sandbox.Mode != string(sandbox.ReadOnly) || !out.Sandbox.Enforced || out.Sandbox.Escalated {
+		t.Fatalf("plan sandbox outcome = %#v", out.Sandbox)
+	}
+}
+
+func TestPlanShellReadOnlyInspectionCommandsUseEnforcedSandbox(t *testing.T) {
+	workspace := t.TempDir()
+	runner := newPlanTestSandboxRunner(t, workspace, `{"shell":{"decision":"allow","exit_code":0,"stdout":"inspection-ok"}}`)
+	state, err := NewApprovalState(ApprovalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalNever,
+		ApprovalState: state,
+		WorkspaceRoot: workspace,
+		Sandbox:       runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, command := range []string{
+		"ls -la",
+		"find . -maxdepth 2 -type f",
+		"cat README.md",
+		"rg --files",
+	} {
+		t.Run(command, func(t *testing.T) {
+			out := planShellOutput(t, tool, `{"command":"`+command+`"}`)
+			if out.Denied || out.Decision != string(DecisionAllow) || out.Stdout != "inspection-ok" {
+				t.Fatalf("plan inspection output = %+v", out)
+			}
+			if out.Sandbox == nil || out.Sandbox.Mode != string(sandbox.ReadOnly) || !out.Sandbox.Enforced || out.Sandbox.Escalated {
+				t.Fatalf("plan inspection sandbox = %#v", out.Sandbox)
+			}
+		})
+	}
+}
+
+func TestPlanShellReadOnlyGateRejectsUnknownAndCompoundCommands(t *testing.T) {
+	workspace := t.TempDir()
+	runner := newPlanTestSandboxRunner(t, workspace, `{"shell":{"decision":"allow","exit_code":0}}`)
+	state, err := NewApprovalState(ApprovalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalNever,
+		ApprovalState: state,
+		WorkspaceRoot: workspace,
+		Sandbox:       runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, command := range []string{"echo plan", "find . -name '*.go'", "find . -exec touch marker +", "ls && cat README.md"} {
+		t.Run(command, func(t *testing.T) {
+			out := planShellOutput(t, tool, `{"command":"`+command+`"}`)
+			if !out.Denied || out.Decision != string(DecisionDeny) || out.Reason != ReasonPlanReadOnly {
+				t.Fatalf("plan rejected command = %+v", out)
+			}
+		})
+	}
+}
+
+func TestPlanShellExplicitAllowForNonReadOnlyCommandStillFailsClosed(t *testing.T) {
+	workspace := t.TempDir()
+	runner := newPlanTestSandboxRunner(t, workspace, `{"shell":{"decision":"allow","exit_code":0}}`)
 	state, err := NewApprovalState(ApprovalPlan)
 	if err != nil {
 		t.Fatal(err)
@@ -199,17 +292,14 @@ func TestPlanShellAllowUsesReadOnlySandbox(t *testing.T) {
 	}
 
 	out := planShellOutput(t, tool, `{"command":"echo plan-allow"}`)
-	if out.Denied || out.Stdout != "sandbox-ok" {
-		t.Fatalf("plan sandbox output = %+v", out)
-	}
-	if out.Sandbox == nil || out.Sandbox.Mode != string(sandbox.ReadOnly) || !out.Sandbox.Enforced || out.Sandbox.Escalated {
-		t.Fatalf("plan sandbox outcome = %#v", out.Sandbox)
+	if !out.Denied || out.Decision != string(DecisionDeny) || out.Reason != ReasonPlanReadOnly {
+		t.Fatalf("plan non-read-only allow = %+v", out)
 	}
 }
 
 func TestPlanShellClosedAndUnavailableSandboxFailClosed(t *testing.T) {
 	workspace := t.TempDir()
-	permissions, err := BuildPermissionSet(ProfileCautious, []string{"Shell(echo *)"}, nil, nil)
+	permissions, err := BuildPermissionSet(ProfileCautious, []string{"Shell(ls *)"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +331,7 @@ func TestPlanShellClosedAndUnavailableSandboxFailClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			out := planShellOutput(t, tool, `{"command":"echo plan-fail-closed"}`)
+			out := planShellOutput(t, tool, `{"command":"ls -la"}`)
 			if !out.Denied || !strings.Contains(out.Reason, ReasonSandboxUnavailable) {
 				t.Fatalf("%s output = %+v", test.name, out)
 			}

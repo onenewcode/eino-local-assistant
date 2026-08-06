@@ -162,7 +162,7 @@ func applyPatch(ctx context.Context, opts ApplyPatchOptions, input ApplyPatchInp
 	if len(input.Operations) > 32 {
 		return ApplyPatchOutput{}, errors.New("at most 32 operations per apply_patch call")
 	}
-	if opts.Sandbox != nil {
+	if opts.Sandbox != nil && !isYoloApprovalMode(effectiveApprovalMode(opts.Approval, opts.ApprovalState)) {
 		return applyPatchSandboxed(ctx, opts, input)
 	}
 
@@ -348,7 +348,12 @@ func applyPatch(ctx context.Context, opts ApplyPatchOptions, input ApplyPatchInp
 			results = append(results, PatchOpResult{Type: p.typ, Path: p.abs, Deleted: true})
 		}
 	}
-	return ApplyPatchOutput{Results: results, Decision: string(DecisionAllow)}, nil
+	out := ApplyPatchOutput{Results: results, Decision: string(DecisionAllow)}
+	if isYoloApprovalMode(effectiveApprovalMode(opts.Approval, opts.ApprovalState)) {
+		outcome := yoloSandboxOutcome()
+		out.Sandbox = &outcome
+	}
+	return out, nil
 }
 
 // applyPatchSandboxed performs only metadata validation in the parent, then
@@ -460,7 +465,7 @@ func authorizeApplyPatch(ctx context.Context, opts ApplyPatchOptions, paths []st
 	// Session deny on any path key.
 	for _, abs := range paths {
 		key := PathRuleKey("apply_patch", abs, opts.WorkspaceRoot)
-		if opts.SessionDenies != nil && opts.SessionDenies.Contains(key) {
+		if !isYoloApprovalMode(effectiveApprovalMode(opts.Approval, opts.ApprovalState)) && opts.SessionDenies != nil && opts.SessionDenies.Contains(key) {
 			reason := fmt.Sprintf("%s: %s; %s", ReasonUserDeniedSession, key, ReasonUserDeniedNoRetry)
 			return ApplyPatchOutput{Denied: true, Decision: string(DecisionDeny), Reason: reason, StopRetrying: true}, true
 		}
@@ -479,7 +484,8 @@ func authorizeApplyPatch(ctx context.Context, opts ApplyPatchOptions, paths []st
 		}
 	}
 
-	if !needAsk || effectiveApprovalMode(opts.Approval, opts.ApprovalState) == ApprovalNever {
+	mode := effectiveApprovalMode(opts.Approval, opts.ApprovalState)
+	if !needAsk || mode == ApprovalNever || isYoloApprovalMode(mode) {
 		return ApplyPatchOutput{}, false
 	}
 	if opts.Approver == nil {

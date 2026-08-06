@@ -91,6 +91,14 @@ type sideQuestionDoneMsg struct {
 	unavailable       bool
 }
 
+type reviewDoneMsg struct {
+	requestID         uint64
+	sessionID         string
+	sessionGeneration uint64
+	answer            string
+	err               error
+}
+
 // compactDoneMsg returns the outcome of a dedicated manual or automatic
 // compaction operation to the Bubble Tea state machine.
 type compactDoneMsg struct {

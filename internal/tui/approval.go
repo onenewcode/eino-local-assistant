@@ -480,6 +480,9 @@ type SandboxInfo struct {
 	AllowedDomains []string
 	// HostEscalation reports whether shell can request a one-time host escape.
 	HostEscalation bool
+	// Yolo reports that the configured worker boundary is deliberately bypassed
+	// by the explicit yolo mode. It is not inferred from backend availability.
+	Yolo bool
 }
 
 // Configured reports whether a caller supplied any sandbox state.
@@ -489,7 +492,8 @@ func (info SandboxInfo) Configured() bool {
 		len(info.ReadOnlyRoots) > 0 ||
 		len(info.ProtectedPaths) > 0 ||
 		len(info.AllowedDomains) > 0 ||
-		info.HostEscalation
+		info.HostEscalation ||
+		info.Yolo
 }
 
 func (info SandboxInfo) modeLabel() string {
@@ -506,6 +510,9 @@ func (info SandboxInfo) modeLabel() string {
 func (info SandboxInfo) statusFragments() []string {
 	if !info.Configured() {
 		return nil
+	}
+	if info.Yolo {
+		return []string{"YOLO=UNSAFE", "sb=off", "sb_backend=host", "net=host"}
 	}
 	fragments := make([]string, 0, 3)
 	if mode := info.modeLabel(); mode != "" {
@@ -537,7 +544,7 @@ func (info RuntimeInfo) Configured() bool {
 
 // CommandPolicyInfo is display-only policy state for /permissions and the status bar.
 type CommandPolicyInfo struct {
-	// Mode is "ask", "auto", or the process-local read-only "plan" mode.
+	// Mode is "ask", "auto", "plan", or the explicit dangerous "yolo" mode.
 	Mode string
 	// Approval is the raw config value (on_request|never).
 	Approval string
@@ -563,7 +570,7 @@ type CommandPolicyInfo struct {
 // FormatPermissions builds the /permissions report.
 func (info CommandPolicyInfo) FormatPermissions() string {
 	if info.Mode == "" && info.Approval == "" && info.ApprovalState == nil && info.Permissions == nil &&
-		!info.Sandbox.Configured() && !info.Runtime.Configured() {
+		!info.Sandbox.Configured() && !info.Runtime.Configured() && !info.yoloActive() {
 		return "tool permissions: (not configured)"
 	}
 	mode := info.Mode
@@ -580,6 +587,13 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "tool permissions (Codex subset)\n")
 	fmt.Fprintf(&b, "  mode: %s (%s)\n", mode, approvalPolicy)
+	if info.yoloActive() {
+		fmt.Fprintf(&b, "  !!! %s !!!\n", tools.YoloModeWarning)
+		fmt.Fprintf(&b, "  approval: bypassed (no interactive prompts)\n")
+		fmt.Fprintf(&b, "  sandbox: bypassed (direct host execution)\n")
+		fmt.Fprintf(&b, "  hard_denies: enforced\n")
+		fmt.Fprintf(&b, "  workspace_path_safety: enforced at tool boundary\n")
+	}
 	fmt.Fprintf(&b, "  profile: %s\n", info.Profile)
 	fmt.Fprintf(&b, "  workspace_only: %v\n", info.WorkspaceOnly)
 	if info.WorkspaceRoot != "" {
@@ -626,6 +640,11 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 }
 
 func (info CommandPolicyInfo) writeSandboxReport(b *strings.Builder) {
+	if info.yoloActive() {
+		fmt.Fprintln(b, "  sandbox: BYPASSED by YOLO (direct host execution)")
+		fmt.Fprintln(b, "    configured sandbox remains available after leaving yolo")
+		return
+	}
 	if !info.Sandbox.Configured() {
 		fmt.Fprintln(b, "  sandbox: (not configured)")
 		return
@@ -685,7 +704,13 @@ func (info CommandPolicyInfo) writeRuntimeReport(b *strings.Builder) {
 // CmdPolicyFragment returns the status-bar badge (cmd=ask|auto|plan).
 func (info CommandPolicyInfo) CmdPolicyFragment() string {
 	if info.ApprovalState != nil {
+		if info.yoloActive() {
+			return "cmd=yolo"
+		}
 		return "cmd=" + info.ApprovalState.InteractiveMode()
+	}
+	if info.yoloActive() {
+		return "cmd=yolo"
 	}
 	if info.Mode != "" {
 		return "cmd=" + info.Mode
@@ -701,10 +726,20 @@ func (info CommandPolicyInfo) CmdPolicyFragment() string {
 
 // StatusFragment returns compact policy and sandbox state for the status bar.
 func (info CommandPolicyInfo) StatusFragment() string {
+	if info.yoloActive() {
+		return strings.Join([]string{info.CmdPolicyFragment(), "YOLO=UNSAFE", "sb=off", "sb_backend=host", "net=host"}, " · ")
+	}
 	fragments := make([]string, 0, 4)
 	if cmd := info.CmdPolicyFragment(); cmd != "" {
 		fragments = append(fragments, cmd)
 	}
 	fragments = append(fragments, info.Sandbox.statusFragments()...)
 	return strings.Join(fragments, " · ")
+}
+
+func (info CommandPolicyInfo) yoloActive() bool {
+	if info.ApprovalState != nil && info.ApprovalState.Mode() == tools.ApprovalYolo {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(info.Mode), "yolo")
 }

@@ -304,11 +304,11 @@ func TestThreadStoreForkThreadBeforeFirstTurnRebuildsCreationAndReloads(t *testi
 	if err := json.Unmarshal(childEvents[0].Payload, &created); err != nil {
 		t.Fatal(err)
 	}
-	if created.Meta.ID != result.ChildID || created.Meta.ParentID != source.ID || created.Meta.Title != "current title" || created.Meta.ForkBoundaryTurnID != "" || created.Meta.ForkSourceHash != result.SourceHash || created.SystemPrompt != "system prompt" {
+	if created.Meta.ID != result.ChildID || created.Meta.ParentID != source.ID || created.Meta.Title != "current title" || created.Meta.ForkBoundaryTurnID != "" || created.Meta.ForkSourceHash != result.SourceHash || created.SystemPrompt.File != systemPromptFileName || created.SystemPrompt.SHA256 != sha256Hex([]byte("system prompt")) {
 		t.Fatalf("before-first thread.created payload = %#v", created)
 	}
-	if len(created.Messages) != 1 || created.Messages[0].Role != schema.System || created.Messages[0].Content != "system prompt" {
-		t.Fatalf("before-first creation messages = %#v", created.Messages)
+	if got, err := os.ReadFile(filepath.Join(childDir, systemPromptFileName)); err != nil || string(got) != "system prompt" {
+		t.Fatalf("before-first system prompt = %q, err=%v", got, err)
 	}
 	if entries, err := os.ReadDir(filepath.Join(childDir, artifactsDir)); err != nil {
 		t.Fatal(err)
@@ -728,8 +728,8 @@ func readForkTestEvents(t *testing.T, dir string) []ThreadEvent {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
-		var event ThreadEvent
-		if err := json.Unmarshal(line, &event); err != nil {
+		event, err := decodeThreadEvent(line, filepath.Base(dir))
+		if err != nil {
 			t.Fatalf("decode event: %v", err)
 		}
 		events = append(events, event)

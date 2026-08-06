@@ -97,3 +97,28 @@ func TestApprovalStateAcceptsCanonicalPlanConcurrently(t *testing.T) {
 		t.Fatalf("canonical plan mode = %q, want %q", got, ApprovalPlan)
 	}
 }
+
+func TestApprovalStateYoloRequiresExplicitSetter(t *testing.T) {
+	state, err := NewApprovalState(ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetInteractiveMode("yolo"); err == nil {
+		t.Fatal("SetInteractiveMode(yolo) unexpectedly succeeded")
+	}
+	if got := state.InteractiveMode(); got != "ask" {
+		t.Fatalf("rejected yolo changed interactive mode to %q", got)
+	}
+	if err := state.SetYolo(); err != nil {
+		t.Fatalf("SetYolo(): %v", err)
+	}
+	if got := state.Mode(); got != ApprovalYolo {
+		t.Fatalf("yolo mode = %q, want %q", got, ApprovalYolo)
+	}
+	if got := state.InteractiveMode(); got != "yolo" {
+		t.Fatalf("yolo interactive mode = %q, want yolo", got)
+	}
+	if got := NormalizeApprovalMode(" YOLO "); got != ApprovalYolo {
+		t.Fatalf("NormalizeApprovalMode(yolo) = %q, want %q", got, ApprovalYolo)
+	}
+}

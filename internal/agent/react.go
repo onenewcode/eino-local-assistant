@@ -282,11 +282,13 @@ func observeOneModelStream(stream *schema.StreamReader[*schema.Message], callID 
 				hasModelChunk = true
 				// Live-emit reasoning from every model call (including the final
 				// one). Session skips final-stream re-emit for ReasoningEventSource.
-				if emit != nil && message.ReasoningContent != "" {
-					emit(chat.TurnEvent{
-						Kind:  chat.TurnEventReasoning,
-						Chunk: message.ReasoningContent,
-					})
+				if emit != nil {
+					if reasoning := chat.DisplayReasoningContent(message); reasoning != "" {
+						emit(chat.TurnEvent{
+							Kind:  chat.TurnEventReasoning,
+							Chunk: reasoning,
+						})
+					}
 				}
 			}
 		}

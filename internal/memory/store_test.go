@@ -82,6 +82,55 @@ func TestStoreAddListDeleteAccept(t *testing.T) {
 	}
 }
 
+func TestMemoryUsesOnlyAuthoritativeSQLite(t *testing.T) {
+	ws := t.TempDir()
+	st, err := Open(Options{WorkspaceRoot: ws, UseEnabled: true, GenerateEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.AddUser("database", "Use SQLite"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(st.DatabasePath()); err != nil {
+		t.Fatalf("memory database: %v", err)
+	}
+	for _, name := range []string{"meta.json", "entries.jsonl", "summary.md"} {
+		if _, err := os.Stat(filepath.Join(st.Root(), name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy memory file %s exists: %v", name, err)
+		}
+	}
+	var entries int
+	if err := st.db.QueryRow(`SELECT count(*) FROM memory_entries`).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if entries != 1 {
+		t.Fatalf("entries = %d", entries)
+	}
+}
+
+func TestLegacyMemoryGateDoesNotCreateDatabase(t *testing.T) {
+	ws := t.TempDir()
+	root := filepath.Join(ws, ".eino", "memory")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(root, "summary.md")
+	if err := os.WriteFile(legacy, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(Options{WorkspaceRoot: ws}); err == nil {
+		t.Fatal("legacy memory store opened")
+	}
+	if _, err := os.Stat(filepath.Join(root, databaseFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy gate created database: %v", err)
+	}
+	data, err := os.ReadFile(legacy)
+	if err != nil || string(data) != "old" {
+		t.Fatalf("legacy data changed: %q %v", data, err)
+	}
+}
+
 func TestStoreLWWSameKey(t *testing.T) {
 	t.Parallel()
 	ws := t.TempDir()
@@ -259,12 +308,10 @@ func TestStoreResetClearsMemoryAndConsolidationState(t *testing.T) {
 	if len(active) != 0 {
 		t.Fatalf("active after reset = %+v", active)
 	}
-	entries, err := os.ReadFile(filepath.Join(st.Root(), entriesFile))
-	if err != nil {
-		t.Fatalf("read entries: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("entries after reset = %q", entries)
+	for _, legacy := range []string{"entries.jsonl", "meta.json", "summary.md"} {
+		if _, err := os.Stat(filepath.Join(st.Root(), legacy)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy memory file %s exists after reset: %v", legacy, err)
+		}
 	}
 	summary, err := st.Summary()
 	if err != nil {

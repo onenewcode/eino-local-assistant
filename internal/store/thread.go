@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,19 +22,22 @@ const (
 	// sessionsDirName is the on-disk directory for conversation sessions.
 	// Internally the store still uses "thread" terminology for the revisioned
 	// event ledger, but user-facing storage lives under sessions/.
-	sessionsDirName = "sessions"
-	journalFileName = "journal.jsonl"
-	stateFileName   = "state.json"
-	metaFileName    = "meta.json"
-	checkpointsDir  = "checkpoints"
-	artifactsDir    = "artifacts"
-	locksDir        = "locks"
-	writeLockName   = "write.lock"
+	sessionsDirName      = "sessions"
+	journalFileName      = "journal.jsonl"
+	systemPromptFileName = "system_prompt.txt"
+	stateFileName        = "state.json" // legacy v3 projection name; never written by v4
+	metaFileName         = "meta.json"  // legacy v3 projection name; never written by v4
+	checkpointsDir       = "checkpoints"
+	artifactsDir         = "artifacts"
+	locksDir             = "locks"
+	writeLockName        = "write.lock"
 )
 
 // ThreadStore persists revisioned, append-only local agent sessions.
 type ThreadStore struct {
 	root        string
+	db          *sql.DB
+	readOnly    bool
 	locks       sync.Map // map[string]*localThreadLock; serializes flock use in this process.
 	materialize func(string, ThreadState) error
 }
@@ -41,6 +45,7 @@ type ThreadStore struct {
 var _ ThreadRepository = (*ThreadStore)(nil)
 var _ ThreadModelRepository = (*ThreadStore)(nil)
 var _ ThreadModelBindingRepository = (*ThreadStore)(nil)
+var _ ThreadOpenSnapshotRepository = (*ThreadStore)(nil)
 
 type localThreadLock struct {
 	held chan struct{}
@@ -52,14 +57,47 @@ func newLocalThreadLock() *localThreadLock {
 
 // NewThreadStore creates the session store root under root/sessions.
 func NewThreadStore(root string) (*ThreadStore, error) {
+	return OpenThreadStore(root, ThreadStoreOptions{})
+}
+
+// ThreadStoreOptions controls whether opening may create or repair projections.
+type ThreadStoreOptions struct{ ReadOnly bool }
+
+// OpenThreadStore opens the canonical journals and their rebuildable SQLite view.
+func OpenThreadStore(root string, opts ThreadStoreOptions) (*ThreadStore, error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, errors.New("storage root is required")
 	}
+	if err := rejectLegacyThreadStore(root); err != nil {
+		return nil, err
+	}
+	if opts.ReadOnly {
+		if _, err := os.Stat(filepath.Join(root, sessionsDirName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		s := &ThreadStore{root: root, readOnly: true}
+		if err := s.openProjection(true); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		return s, nil
+	}
 	if err := os.MkdirAll(filepath.Join(root, sessionsDirName), 0o700); err != nil {
 		return nil, fmt.Errorf("create sessions directory: %w", err)
 	}
-	return &ThreadStore{root: root, materialize: writeMaterializedState}, nil
+	s := &ThreadStore{root: root}
+	if err := s.openProjection(false); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// Close releases the SQLite projection. Journals remain durable and authoritative.
+func (s *ThreadStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
 // Root returns the data directory containing the sessions directory.
@@ -111,8 +149,8 @@ func validateThreadID(id string) error {
 	return nil
 }
 
-// CreateThread creates a thread and records the system prompt in its canonical
-// thread.created event.
+// CreateThread creates a thread and stores the frozen system prompt separately
+// from the compact journal envelope.
 func (s *ThreadStore) CreateThread(ctx context.Context, meta ThreadMeta, systemPrompt string) (ThreadState, error) {
 	systemPrompt = strings.TrimSpace(systemPrompt)
 	if systemPrompt == "" {
@@ -175,7 +213,7 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	meta.MessageCount = 0
 
 	initial := ThreadState{
-		FormatVersion: ThreadFormatVersion,
+		FormatVersion: SessionJournalFormatVersion,
 		ID:            id,
 		CreatedAt:     meta.CreatedAt,
 		UpdatedAt:     meta.UpdatedAt,
@@ -186,8 +224,18 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 			return ThreadState{}, err
 		}
 	}
-	messages := []*schema.Message{schema.SystemMessage(systemPrompt)}
-	payload := threadCreatedPayload{Meta: meta, SystemPrompt: systemPrompt, Messages: messages}
+	promptBytes := []byte(systemPrompt)
+	if err := writeBytesAtomic(filepath.Join(dir, systemPromptFileName), promptBytes); err != nil {
+		return ThreadState{}, fmt.Errorf("write system prompt: %w", err)
+	}
+	payload := threadCreatedPayload{
+		Meta: meta,
+		SystemPrompt: systemPromptRef{
+			File:   systemPromptFileName,
+			SHA256: sha256Hex(promptBytes),
+			Bytes:  int64(len(promptBytes)),
+		},
+	}
 	event, err := newThreadEvent(initial, EventThreadCreated, id, "", initial.Revision, payload, time.Now().UTC())
 	if err != nil {
 		return ThreadState{}, err
@@ -199,9 +247,7 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	if err := applyThreadEvent(&state, event); err != nil {
 		return ThreadState{}, err
 	}
-	if err := writeMaterializedState(dir, state); err != nil {
-		return ThreadState{}, err
-	}
+	state.SystemPrompt = systemPrompt
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return ThreadState{}, err
@@ -218,11 +264,12 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	// directory sync failure must not report creation as failed and invite a
 	// duplicate retry, so this final durability hint is best effort.
 	_ = syncDirectory(parent)
+	_ = s.projectThread(finalDir, state, []ThreadEvent{event})
 	return state, nil
 }
 
 // DeleteThread removes an entire thread directory. The advisory lock prevents a
-// concurrent v2 writer from deleting a live journal underneath itself.
+// concurrent writer from deleting a live journal underneath itself.
 func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 	dir, unlock, err := s.lockThread(ctx, id)
 	if err != nil {
@@ -231,6 +278,9 @@ func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 	defer unlock()
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("delete thread: %w", err)
+	}
+	if s.db != nil {
+		_, _ = s.db.Exec(`DELETE FROM threads WHERE id=?`, id)
 	}
 	return nil
 }
@@ -250,7 +300,10 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 		if !entry.IsDir() || validateThreadID(entry.Name()) != nil {
 			continue
 		}
-		meta, loadErr := s.LoadThreadMeta(ctx, entry.Name())
+		meta, fresh, loadErr := s.projectedMetaIfFresh(entry.Name())
+		if loadErr == nil && !fresh {
+			meta, loadErr = s.LoadThreadMeta(ctx, entry.Name())
+		}
 		if loadErr != nil {
 			return nil, fmt.Errorf("load thread %q metadata: %w", entry.Name(), loadErr)
 		}
@@ -330,7 +383,7 @@ func (s *ThreadStore) LoadThreadMeta(ctx context.Context, id string) (ThreadMeta
 	return state.Meta, nil
 }
 
-// LoadThread replays the journal and repairs stale state/meta projections.
+// LoadThread uses a matching SQLite projection or replays the journal to repair it.
 func (s *ThreadStore) LoadThread(ctx context.Context, id string) (ThreadState, error) {
 	dir, unlock, err := s.lockThread(ctx, id)
 	if err != nil {
@@ -353,11 +406,32 @@ func (s *ThreadStore) LoadThreadTranscript(ctx context.Context, id string, limit
 	if err != nil {
 		return ThreadState{}, nil, err
 	}
-	messages, err := messagesFromEvents(events)
+	messages, err := messagesFromEvents(events, state.SystemPrompt)
 	if err != nil {
 		return ThreadState{}, nil, err
 	}
 	return state, recentMessages(messages, limit), nil
+}
+
+func (s *ThreadStore) LoadThreadOpenSnapshot(ctx context.Context, id string, limit int) (ThreadOpenSnapshot, error) {
+	dir, unlock, err := s.lockThread(ctx, id)
+	if err != nil {
+		return ThreadOpenSnapshot{}, err
+	}
+	defer unlock()
+	state, events, err := s.loadThreadLocked(dir, id)
+	if err != nil {
+		return ThreadOpenSnapshot{}, err
+	}
+	messages, err := messagesFromEvents(events, state.SystemPrompt)
+	if err != nil {
+		return ThreadOpenSnapshot{}, err
+	}
+	groups, err := turnGroupsFromEvents(events)
+	if err != nil {
+		return ThreadOpenSnapshot{}, err
+	}
+	return ThreadOpenSnapshot{State: state, Transcript: recentMessages(messages, limit), TurnGroups: groups}, nil
 }
 
 // LoadRecentMessages returns the system prompt plus at most limit latest
@@ -648,7 +722,7 @@ func (s *ThreadStore) appendLocked(dir string, state ThreadState, expectedRevisi
 	if err := applyThreadEvent(&state, event); err != nil {
 		return ThreadState{}, err
 	}
-	if err := s.materializeState(dir, state); err != nil {
+	if err := s.projectEvent(dir, state, event); err != nil {
 		// The fsynced journal is already committed. Treat projections as a
 		// repairable cache so callers retain the new revision and never retry the
 		// same lifecycle operation as though it had failed.
@@ -658,6 +732,11 @@ func (s *ThreadStore) appendLocked(dir string, state ThreadState, expectedRevisi
 }
 
 func (s *ThreadStore) loadThreadLocked(dir, id string) (ThreadState, []ThreadEvent, error) {
+	if state, events, fresh, err := s.loadProjectedThread(dir, id); err != nil {
+		return ThreadState{}, nil, err
+	} else if fresh {
+		return state, events, nil
+	}
 	state, events, _, err := replayJournal(filepath.Join(dir, journalFileName), id)
 	if err != nil {
 		return ThreadState{}, nil, err
@@ -665,17 +744,15 @@ func (s *ThreadStore) loadThreadLocked(dir, id string) (ThreadState, []ThreadEve
 	if state.ID != id {
 		return ThreadState{}, nil, fmt.Errorf("%w: journal thread id %q does not match %q", ErrJournalCorrupt, state.ID, id)
 	}
-	// state.json and meta.json are rebuildable projections. A later load or
-	// mutation retries this materialization; the verified journal stays usable.
-	_ = s.materializeState(dir, state)
+	_ = s.projectThread(dir, state, events)
 	return state, events, nil
 }
 
 func (s *ThreadStore) materializeState(dir string, state ThreadState) error {
-	if s.materialize == nil {
-		return writeMaterializedState(dir, state)
+	if s.materialize != nil {
+		return s.materialize(dir, state)
 	}
-	return s.materialize(dir, state)
+	return nil
 }
 
 func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func(), error) {

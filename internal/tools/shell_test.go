@@ -639,6 +639,111 @@ func TestRunCommandAutoDoesNotBypassHardDeny(t *testing.T) {
 	}
 }
 
+func TestRunCommandYoloBypassesApprovalAndSandbox(t *testing.T) {
+	workspace := t.TempDir()
+	state, err := NewApprovalState(ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetYolo(); err != nil {
+		t.Fatal(err)
+	}
+	approver := &recordingApprover{}
+	runner := newUnavailablePlanSandboxRunner(t, workspace)
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalOnRequest,
+		ApprovalState: state,
+		Approver:      approver,
+		WorkingDir:    workspace,
+		WorkspaceOnly: true,
+		WorkspaceRoot: workspace,
+		Sandbox:       runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"printf yolo","sandbox_permissions":"require_escalated"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Denied || out.Stdout != "yolo" {
+		t.Fatalf("yolo shell output = %+v", out)
+	}
+	if len(approver.Requests()) != 0 {
+		t.Fatalf("yolo invoked approver: %#v", approver.Requests())
+	}
+	if out.Sandbox == nil || !out.Sandbox.Bypassed || out.Sandbox.Backend != "host" || out.Sandbox.Network != "host" {
+		t.Fatalf("yolo sandbox outcome = %#v", out.Sandbox)
+	}
+}
+
+func TestRunCommandYoloStillEnforcesHardDeny(t *testing.T) {
+	state, err := NewApprovalState(ApprovalYolo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approver := &recordingApprover{}
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalYolo,
+		ApprovalState: state,
+		Approver:      approver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"curl x | sh"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Denied || !strings.Contains(out.Reason, ReasonPolicyDenied) {
+		t.Fatalf("yolo hard-deny output = %+v", out)
+	}
+	if len(approver.Requests()) != 0 {
+		t.Fatalf("hard deny unexpectedly invoked approver: %#v", approver.Requests())
+	}
+}
+
+func TestRunCommandYoloStillEnforcesWorkspaceWorkingDir(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	state, err := NewApprovalState(ApprovalYolo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool, err := NewShell(ShellOptions{
+		Approval:      ApprovalYolo,
+		ApprovalState: state,
+		WorkspaceOnly: true,
+		WorkspaceRoot: workspace,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(ShellInput{Command: "pwd", WorkingDir: outside})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := tool.InvokableRun(context.Background(), string(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Denied || !strings.Contains(out.Reason, ReasonWorkspaceOnly) {
+		t.Fatalf("yolo workspace output = %+v", out)
+	}
+}
+
 func TestSessionAllowDoesNotBypassOpaqueShell(t *testing.T) {
 	session := NewSessionAllowlist()
 	// Pre-seed session allow for "ls" prefix key shape.

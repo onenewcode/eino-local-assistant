@@ -42,6 +42,18 @@ type SandboxOutcome struct {
 	Network   string `json:"network,omitempty"`
 	Enforced  bool   `json:"enforced,omitempty"`
 	Escalated bool   `json:"escalated,omitempty"`
+	// Bypassed marks explicit yolo host execution. It is separate from
+	// Escalated, which means a single ordinary-mode host request.
+	Bypassed bool `json:"bypassed,omitempty"`
+}
+
+func yoloSandboxOutcome() SandboxOutcome {
+	return SandboxOutcome{
+		Mode:     string(ApprovalYolo),
+		Backend:  "host",
+		Network:  "host",
+		Bypassed: true,
+	}
 }
 
 type sandboxProxy interface {

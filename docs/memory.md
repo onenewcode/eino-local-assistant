@@ -35,7 +35,7 @@
 AGENTS.override.md / AGENTS.md  人工维护 · 团队文件或本地覆盖
 entries (user)     用户显式确认 · 高信任
 entries (candidate) 自动抽取 · 注入时标 unverified
-summary.md         有界派生视图 · 供 system 注入
+memory.sqlite3     权威结构化存储 · 查询后在内存中有界渲染
 ```
 
 规则与学习记忆分目录、分配置、分控制面，对齐 Claude Code / Codex 的主流拆法。
@@ -55,9 +55,7 @@ summary.md         有界派生视图 · 供 system 注入
   .eino/
     .gitignore              # 默认忽略 memory/
     memory/
-      meta.json
-      entries.jsonl         # 权威条目（含 tombstone）
-      summary.md            # 可重建的注入摘要
+      memory.sqlite3        # entries、sources、settings、extraction lease
 ```
 
 语义记忆目录默认 **不提交 git**。团队共识应写在 `AGENTS.md`，不要依赖个人 candidate；仅本地需要的项目指令可写 `AGENTS.override.md` 并由项目自行决定是否 gitignore。
@@ -99,7 +97,7 @@ generate = true             # 空闲自动抽取
 | `memory.max_rollouts_per_scan` | 2 | 每轮扫描最多处理几个 thread |
 | `memory.scan_max_age` | 10d | 忽略过旧 session |
 
-运行时也可用 `/memory off` 与 `/memory generate off` 覆盖开关（写入 `meta.json`）。
+运行时也可用 `/memory off` 与 `/memory generate off` 覆盖开关（写入数据库设置表）。
 
 ## 5. 斜杠命令
 
@@ -114,7 +112,6 @@ generate = true             # 空闲自动抽取
 | `/memory on` / `off` | 开/关注入与读工具 |
 | `/memory generate on` / `off` | 开/关自动抽取 |
 | `/memory status` | 路径、计数、上次 consolidate |
-| `/memory rebuild` | 重建 `summary.md` |
 | `/memory reset --confirm` | 清空当前项目语义记忆与抽取元数据；保留 session/thread 和开关 |
 
 ### 6.1 `/rules` source metadata view
@@ -165,8 +162,13 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 - 进程运行期间后台定时扫描 `storage.data_dir/sessions`
 - 仅处理：已空闲 `idle_after`、未超 `scan_max_age`、尚未 processed、非当前活动 thread 的会话
 - 用现有 chat model 做严格 JSON 抽取 → `trust=candidate`
-- 失败写入 `meta.last_error`；可用 `/memory status` 查看
+- 数据库 claim/lease 防止多进程重复抽取：lease 为 15 分钟；失败从 5 分钟指数退避，最多 6 小时
+- candidate batch 与 extraction `succeeded` 状态在同一个事务提交；任何一项失败都会整体回滚
+- session 的 `UpdatedAt` 变化后可重新抽取；reset 通过 generation fence 拒绝旧模型结果
+- 失败写入 extraction 与 settings 状态；可用 `/memory status` 查看 running/failed 数量
 - 关闭：`memory.generate = false` 或 `/memory generate off`
+
+数据库使用 WAL、`synchronous=FULL`、foreign keys 和 5 秒 busy timeout。`memory_entries` 以 `(key, version)` 唯一约束和 active-key partial unique index 保证 LWW 生命周期，source event 单独存入 `memory_entry_sources`。`Summary()` 直接查询 active entries 并在内存中按 token 上限渲染，不生成派生 Markdown 文件。
 
 ## 9. 信任、冲突、删除
 
@@ -186,7 +188,7 @@ Effective system prompt **始终等于** durable thread system（`thread.created
 
 确认后，命令会：
 
-- 清空当前 workspace 的全部语义记忆版本（包括 active、superseded 与 tombstone），并重建空 `summary.md`
+- 在一个事务中清空当前 workspace 的全部语义记忆版本（包括 active、superseded 与 tombstone）
 - 清空 processed/claimed thread、上次 consolidate 和错误等抽取元数据，使状态回到可重新抽取的起点
 - 保留 `/memory on|off` 与 `/memory generate on|off` 的当前值
 - 保留 session/thread journal；`/resume` 与会话审计不受影响

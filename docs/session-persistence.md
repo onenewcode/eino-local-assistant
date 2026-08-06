@@ -1,11 +1,11 @@
 # 会话账本、上下文压缩与恢复
 
-本文描述当前的 v2 thread 存储和模型工作上下文。它们是两个不同对象：
+本文描述当前的 v4 session journal、SQLite 历史投影和模型工作上下文。它们是不同对象：
 
 - 原始事件账本是可审计、可恢复的事实来源；不会因 compact 被改写。
 - checkpoint、热 turn 和 artifact digest 组成下一次模型调用的派生工作视图。
 
-持久化数据只写入 `<data_dir>/sessions/` 中的 v2 session 账本。
+权威账本写入 `<data_dir>/sessions/`；可重建投影写入 `<data_dir>/state.sqlite3`。
 
 **边界**：本文是会话恢复与压缩，**不是**跨会话语义记忆。项目规则（`AGENTS.md`）、`/memory` 与自动 candidate 见 [memory.md](./memory.md)。
 
@@ -23,7 +23,7 @@
 
 ## 模型身份与会话内切换（最小契约）
 
-thread 的模型身份是会话元数据，不等同于 provider 实例、凭据或全局配置。初始模型身份随 `thread.created` 记录；如果 `ThreadStore` 提供可选的 `ThreadModelRepository` 扩展，`ThreadStore.SetThreadModel` 通过正常的 revision/CAS mutation 追加 `model.changed`。journal 是身份变更的权威来源，物化 `meta.json` 可以展示最新身份；不支持该可选扩展的 store 不承诺持久化模型切换。
+thread 的模型身份是会话元数据，不等同于 provider 实例、凭据或全局配置。初始模型身份随 `thread.created` 记录；如果 `ThreadStore` 提供可选的 `ThreadModelRepository` 扩展，`ThreadStore.SetThreadModel` 通过正常的 revision/CAS mutation 追加 `model.changed`。journal 是身份变更的权威来源，SQLite `threads` 投影用于列表和展示；不支持该可选扩展的 store 不承诺持久化模型切换。
 
 `chat.Session.ReplaceModel` 是 session-level 的 idle-only 替换契约。provider 实例由上层先构造，再交给 `Session` 替换当前模型绑定；active turn 或 pending compaction 时必须拒绝，且拒绝不得部分修改 session。成功替换保留原 thread ID、冻结 system prompt、transcript、active checkpoint、context 和累计 usage；它不创建新 thread、不重放或截断 transcript、不清除 checkpoint/context/usage，也不写全局配置。当前生产 runtime 会把新的 provider、ReAct、compactor 和 `SessionOptions.ModelName` 作为一个 candidate bundle 完整构造后再提交；提交失败时旧 session binding、runtime snapshot 与 durable thread 都保持不变。provider 构造、模型身份持久化与替换调用之间的跨层编排由上层负责，store/chat 不承担 catalog 或 picker。
 
@@ -31,7 +31,7 @@ resume 的目标语义是从 `thread.created` 与之后的 `model.changed` 重�
 
 TUI live switch 的用户入口仍是 idle-only 的 `/model [name]`：带名称时名称必须是单个非空参数，provider、ReAct、compactor 全部构造成功后才提交；省略名称时打开显式配置的 picker，`Alt+P` / `Option+P` 也可打开或关闭 picker。busy、compacting、pending approval 或 side question in-flight 时拒绝且不进入 FIFO。`[model]` 下的 `[[model.catalog]]` 是当前 endpoint 的本地声明，区分 display label、canonical provider/deployment name、alias、lifecycle 与声明的 reasoning/context/tool/streaming/modality 能力；alias 在 provider 构造前解析为 canonical name，durable session 只保存 canonical identity。catalog 没有 live provider discovery、entitlement、health 或 refresh 语义，声明能力只用于选择时展示，不自动改写当前 context 配置；未知名称始终保留 free-form fallback，适配 custom endpoint。picker 不提供 reasoning effort 二级选择、价格兼容性检查或缓存确认，也不宣称与 Codex/Claude 的完整模型选择行为对齐。
 
-fresh `exec --ephemeral` 使用同一个 v2 `ThreadStore` API，但根目录是本次进程创建的空临时目录，runtime 关闭时整体删除。`exec resume <id> --ephemeral` 和 `exec resume --last --ephemeral` 则在 durable source thread 锁下复制选定 session 的 authoritative journal、materialized state/meta、checkpoints 与 artifacts 到该临时根目录，再由临时 store 承担整个 resumed turn；source session 不接收 turn、journal、state、checkpoint 或 artifact 写入，source `locks/` 也不复制。ephemeral `--last` 使用不修复 durable projections 的只读 session 列表；普通 durable `--last` 仍使用既有 `ListThreads` 路径。该能力只保证 session ledger 的本次运行生命周期，不宣称 fork 语义；工具已经造成的工作区、网络或其他外部副作用不会回滚，项目级 semantic memory 也不会被清除。
+fresh `exec --ephemeral` 使用同一个 v4 `ThreadStore` API，但根目录是本次进程创建的空临时目录，runtime 关闭时先关闭数据库再整体删除。`exec resume <id> --ephemeral` 和 `exec resume --last --ephemeral` 只复制目标 session 的 authoritative journal、system_prompt.txt、checkpoints 与 artifacts，并在临时根目录建立自己的 SQLite 投影；不复制 durable 全局数据库或 source `locks/`。source store 以只读模式打开，不创建、迁移、修复数据库或产生 WAL。
 
 Headless `exec --output-schema FILE` 在打开/创建 session 前读取并编译本地 JSON Schema；文件不存在、不可读、JSON 无效或 schema 无效都是 input error，不会调用模型。有效 schema 只用于最终 assistant Content：内容必须是 JSON 实例且匹配 schema，校验发生在 `turn.committed` 前。失败会沿用 turn failed lifecycle，不写入 assistant message，但已记录的 provider usage 保留；`--output-last-message` 也只在校验成功并提交后写入。该能力是本地最终响应校验，不是 provider-enforced structured output，不会把 `response_format` 注入 ReAct loop；相对 `$ref` 按 schema 文件所在路径解析。
 
@@ -45,7 +45,7 @@ TUI `/fork` 传入空 child ID 和空边界，因此由 store 选择 source 最�
 
 - **Child identity**：`childID` 可由调用方提供，或在为空时生成新的 thread ID；它必须不同于 `sourceID`，且目标目录必须不存在。源 thread 不会被改名或替换。
 - **Committed prefix and before-first boundary**：普通 `ForkThread` / `Session.Fork` 的 `lastTurnID` 为空时仍选择 source 中最新的 `turn.committed`；否则必须精确匹配一个完整的 committed turn。可见首个 committed user prompt 是合法的 backtrack target，但 TUI 对它使用显式 `ThreadForkBeforeFirstRepository` / `ForkThreadBeforeFirstTurn` / `Session.ForkBeforeFirstTurn`，child 只重建 `thread.created`。该 child 的 boundary turn 与 `ForkBoundaryTurnID` 为空，`ParentID` / `ForkSourceHash` 仍保留，且 child 没有任何 turn group。普通 empty-`lastTurnID` latest fork 与显式 before-first fork 是两个不能混用的语义；普通 fork 的 child 仍包含从 `thread.created` 到选定 commit（含）的完整 journal 事件前缀，不能从半个 turn 或任意消息位置切开。
-- **Journal rebuild**：child 不复用 source 的事件 envelope。每个 child event 生成新的 `event_id` 和 `thread_id`，`seq`、revision、`expected_revision` 从 child 重新编号，`payload_hash`、`previous_hash` 和 `hash` 重新计算。source boundary event 的原始 hash 只作为 provenance 保存，不是 child hash chain 的前置 hash。
+- **Journal rebuild**：child 不复用 source 的事件 envelope。每个 child event 生成新的 `event_id`，`seq` 从 child 重新编号，`previous_hash` 和 `hash` 重新计算；`thread_id`、revision 和 expected revision 由 child 目录/seq 派生。source boundary event 的原始 hash 只作为 provenance 保存，不是 child hash chain 的前置 hash。
 - **Parent provenance**：child 的 `thread.created` / `meta` 写入 `ParentID`、`ForkBoundaryTurnID` 和 `ForkSourceHash`；后者是 source 在边界事件上的 journal hash。其余前缀 payload 通过重放生成 child 的 state/meta，而不是直接把 source projection 当作 child 真相。
 - **Artifacts**：只复制边界前 `tool.completed` 事件实际引用的 content-addressed artifacts；非截断 artifact 同时复制 metadata `.json` 和原始 `.blob`，截断 artifact 不会伪造 blob。source 的 `locks/` 不复制，V1 也不复制 checkpoint 文件；child 的 checkpoint 目录保持为空。
 - **Source stability**：源 ledger 只读；已有写锁时使用共享读锁，没有写锁时用有界 fingerprint/retry 检查稳定性。源在读取或发布前发生变化会失败，不会把移动中的 source 静默分叉。child 先在 staging 目录完整重建并校验，再原子发布。
@@ -82,11 +82,11 @@ backtrack 不恢复或回滚 workspace 文件、Git working tree/index、进程�
 
 ```text
 <data_dir>/
+  state.sqlite3             # 可删除、可由 journal 重建的历史投影
   sessions/
     <session-id>/
       journal.jsonl
-      state.json
-      meta.json
+      system_prompt.txt
       checkpoints/
         <checkpoint-id>.json
       artifacts/
@@ -101,32 +101,32 @@ backtrack 不恢复或回滚 workspace 文件、Git working tree/index、进程�
 | 文件 | 角色 |
 | --- | --- |
 | `journal.jsonl` | 权威 append-only 事件链；恢复时优先重放它。 |
-| `state.json` | revision、活动 checkpoint、任务图投影、自动压缩熔断和 meta 的物化投影。 |
-| `meta.json` | 列表和 CLI 展示用投影：标题、时间、消息数、当前模型身份、API usage、最近 context 快照、本地费用估算，以及 source-preserving child 的 parent/boundary/hash provenance。 |
+| `system_prompt.txt` | 创建 session 时冻结的 system prompt 正文；journal 只保存文件名、字节数和 SHA-256。 |
+| `state.sqlite3` | `threads/events/turns/messages/usage_records/checkpoints/checkpoint_sources` 历史投影；不是事实来源，可删除重建。 |
 | `checkpoints/*.json` | 不可变的结构化 checkpoint；有对应 journal 事件后才成为活动 checkpoint。 |
 | `artifacts/*.json` | 内容地址、大小、摘要、截断状态和 head/tail 元数据。 |
 | `artifacts/*.blob` | 未截断 artifact 的原始字节；截断 artifact 没有 blob。 |
 
 ## 事件账本
 
-每条 `journal.jsonl` 事件都带有下列字段：
+每条 `journal.jsonl` 事件都使用紧凑的 JSONL envelope：
 
 ```text
-format_version, seq, event_id, thread_id,
-turn_id, correlation_id,
-expected_revision, revision, timestamp,
-previous_hash, payload_hash, payload, hash
+format_version, seq, event_id, timestamp,
+kind, turn_id, payload, previous_hash, hash
 ```
 
-`payload_hash` 校验 payload，`previous_hash` 和 `hash` 形成顺序链。每次 mutation 都要求调用方给出已观察到的 `expected_revision`，并通过 CAS 拒绝过期写入。
+`thread_id` 由 session 目录确定，`revision` 与 `expected_revision` 由 `seq` 派生，`correlation_id` 与 `turn_id` 相同，因此不再重复写入。`hash` 直接覆盖事件 envelope 的身份字段、payload 和前一事件 hash，形成顺序链；恢复时会重新推导省略字段并校验链。每次 mutation 仍要求调用方给出已观察到的 `expected_revision`，并通过 CAS 拒绝过期写入。
+
+当前 journal 格式为 `format_version: 4`，由 `SessionJournalFormatVersion` 命名；SQLite migration 使用独立的 `SessionProjectionSchemaVersion`。运行时不自动导入旧 v3：发现 v3 或 v3/v4 混合目录时，会在任何 mutation 前拒绝启动。
 
 当前主要事件类型：
 
 | 事件 | 含义 |
 | --- | --- |
-| `thread.created` | 创建 thread，包含 meta、system prompt 和初始模型身份；source-preserving child 还包含 parent、boundary turn 和 source hash provenance。 |
+| `thread.created` | 创建 thread，包含 meta、system prompt 文件引用和初始模型身份；prompt 正文不进入 JSONL；source-preserving child 还包含 parent、boundary turn 和 source hash provenance。 |
 | `turn.started` | 接受一个 user 输入、开始 agent 生命周期。 |
-| `tool.started` / `tool.completed` | 以稳定 tool call ID 保存工具参数、结束状态和 artifact 引用；同名并发调用不会混淆。 |
+| `tool.started` / `tool.completed` | 以稳定 tool call ID 保存工具生命周期；原始 tool 参数不写入 durable journal，短结果直接 inline，只有超过 16 KiB 的结果才保存 artifact 并在事件中引用；同名并发调用不会混淆。 |
 | `turn.committed` | 原子写入完整可见 user/assistant 消息。 |
 | `model.changed` | 记录 thread 模型身份的 revisioned 变更；不改写 system prompt、transcript、checkpoint、context 或既有 usage，也不是 provider 调用记录。 |
 | `usage.recorded` | 记录一个已完成模型调用的服务商 usage、调用类型和可用性；调用 ID 幂等，ReAct 中间调用与 compaction 调用均单独记账。 |
@@ -144,7 +144,7 @@ previous_hash, payload_hash, payload, hash
 
 一次 compaction 在开始前生成 operation ID。该 ID 关联其所有 compactor `usage.recorded`、成功的 `context.compacted` 或失败的 `context.compaction.failed`，供 `/context` 聚合显示。`cached_tokens` 只表示 provider 实际报告的 cache-read input tokens；本地 planner 的 token 估算、hash 或 artifact 命中都不能推断为 provider cache 命中。
 
-`meta.json` 的 usage 状态为 `exact` 或 `incomplete`：`exact` 表示每次已完成调用均返回 usage；任一调用未返回 usage 即为 `incomplete`，不会以本地估算补齐。没有逐调用 `usage.recorded` 事件的旧会话在展示层标为 `unavailable`，旧累计值不再作为 API usage 使用。调用 ID 去重使重放、重试和恢复不会重复累计。
+SQLite `threads` 投影中的 usage 状态为 `exact` 或 `incomplete`：`exact` 表示每次已完成调用均返回 usage；任一调用未返回 usage即为 `incomplete`，不会以本地估算补齐。调用 ID 去重使重放、重试和恢复不会重复累计。
 
 最近 context 快照是最后一次主对话模型请求的真实 prompt token 数，独立于会话累计 API usage。没有服务商 usage、首次请求前或成功 compaction 后均为未知。planner 的 token 数仅用于本地热窗口裁剪和自动压缩，不会写入 API usage 或费用。
 
@@ -157,16 +157,19 @@ previous_hash, payload_hash, payload, hash
 ```text
 获取 <thread>/locks/write.lock
   -> 重放 journal 并校验 expected_revision
-  -> 写入 artifact/checkpoint 临时文件，fsync 后 rename
+  -> 写入 system prompt / artifact / checkpoint 临时文件，fsync 后 rename
   -> append 一个 journal 事件并 fsync
-  -> 尝试原子写 state.json 和 meta.json（失败时下次从 journal 重建）
+  -> SQLite 短事务投影（失败时 mutation 仍成功，下次访问修复）
 释放锁
 ```
 
 恢复规则：
 
-- journal 是真相源。`state.json` 或 `meta.json` 过期、缺失时，从 journal 重建。
-- 新 session 先在 `sessions/.creating-*` 临时目录写入并 fsync 首个 `thread.created`，再原子发布到最终 ID；未发布临时目录不参与列表。
+- journal 是真相源；SQLite 不得领先于 journal。投影缺失、落后或 head 不匹配时从 journal 验证并修复。
+- `ThreadOpenSnapshotRepository` 在一个 revision 下返回 state、最近 transcript 与 turn groups，避免 resume 拼接不同 revision。
+- 只读 store 不创建、迁移或修复数据库；投影不可用时直接只读 replay journal。
+- 新 session 先在 `sessions/.creating-*` 临时目录写入并 fsync `system_prompt.txt` 与首个 `thread.created`，再原子发布到最终 ID；未发布临时目录不参与列表。
+- `system_prompt.txt` 与 `thread.created` 中的文件引用、字节数和 SHA-256 必须一致；缺失、替换或篡改 prompt 文件会使恢复显式失败，不会静默使用当前配置重新生成 prompt。
 - 已写入但没有被 journal 引用的 artifact/checkpoint 是 orphan，不会成为活动上下文。当前运行时不执行 TTL、自动 GC、加密或 secret scanning；既有保留行为保持不变。
 - journal 已有 checkpoint 事件而 checkpoint 文件缺失时，用事件 payload 重建文件。
 - 每个 v2 checkpoint 的 direct event IDs 与 source hash 都会重新从 immutable raw turn/artifact ledger 计算；payload 与 checkpoint metadata 彼此自洽但不对应 raw ledger 时，resume 显式失败，不会用它遮蔽 raw group。
@@ -178,7 +181,7 @@ previous_hash, payload_hash, payload, hash
 
 ## 工具 artifact
 
-工具回调先把完整参数/结果送到 session recorder，再让任务控制器记录观察；TUI 仅在 `formatToolCard` 渲染时限制字符和行数。任务完成或中断后才到达、且可能已修改工作区的工具结果会要求创建新计划，不能复用旧 proof。
+工具回调先把完整结果送到 session recorder，再让任务控制器记录观察；TUI 仅在 `formatToolCard` 渲染时限制字符和行数。短结果直接写入 `tool.completed.payload.output`，只有超过 16 KiB 才外置为 artifact；原始工具参数只在当前调用内使用，不进入 durable journal，也不会为每次调用创建 artifact。任务完成或中断后才到达、且可能已修改工作区的工具结果会要求创建新计划，不能复用旧 proof。
 
 默认保留上限：
 
@@ -294,4 +297,4 @@ checkpoint 必须是严格 JSON，并包含：
 
 `model.context` 的压缩策略数值设为 `0` 时采用产品默认值，并非禁用开关。例如 `keep_recent_turns: 0` 使用默认 12，`low_gain_threshold_percent: 0` 使用默认 15%，`max_low_gain_attempts: 0` 使用默认 2。窗口与输出上限必须明确配置。
 
-system prompt 在 `thread.created` 时写入并冻结；resume / compact 不会从磁盘重读项目规则。tools 与权限策略跟随**当前进程配置**。headless `exec resume` 也不会继承此前进程的 session allow/deny 决策，且没有交互 approver；需要审批的工具调用仍由当前进程的权限策略 fail closed。
+system prompt 在创建时写入 `system_prompt.txt`，并由 `thread.created` 的不可变引用冻结；resume / compact 不会从磁盘重读项目规则，也不会用当前配置覆盖它。tools 与权限策略跟随**当前进程配置**。headless `exec resume` 也不会继承此前进程的 session allow/deny 决策，且没有交互 approver；需要审批的工具调用仍由当前进程的权限策略 fail closed。

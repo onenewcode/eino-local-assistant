@@ -84,28 +84,30 @@ func (c *Consolidator) RunOnce(ctx context.Context) (int, error) {
 		if meta.MessageCount == 0 {
 			continue
 		}
-		done, err := c.Store.IsProcessed(meta.ID)
+		claimed, err := c.Store.claimExtraction(meta.ID, meta.UpdatedAt, generation)
 		if err != nil {
+			if errors.Is(err, errResetGenerationChanged) {
+				continue
+			}
 			return written, err
 		}
-		if done {
+		if !claimed {
 			continue
 		}
 		scanned++
-		n, err := c.processThread(ctx, extractor, meta.ID, generation)
+		drafts, err := c.processThread(ctx, extractor, meta.ID)
 		if err != nil {
 			if errors.Is(err, errResetGenerationChanged) {
 				continue
 			}
-			_ = c.Store.recordExtractErrorAtGeneration(generation, err)
-			// Do not mark processed — allow retry on a later scan.
+			_, _ = c.Store.finishExtraction(meta.ID, meta.UpdatedAt, generation, nil, err)
 			continue
 		}
-		if err := c.Store.markExtractedAtGeneration(generation, meta.ID); err != nil {
+		n, err := c.Store.finishExtraction(meta.ID, meta.UpdatedAt, generation, drafts, nil)
+		if err != nil {
 			if errors.Is(err, errResetGenerationChanged) {
 				continue
 			}
-			_ = c.Store.recordExtractErrorAtGeneration(generation, err)
 			continue
 		}
 		written += n
@@ -117,32 +119,20 @@ func (c *Consolidator) processThread(
 	ctx context.Context,
 	extractor *Extractor,
 	threadID string,
-	generation uint64,
-) (int, error) {
+) ([]Draft, error) {
 	msgs, err := c.Threads.LoadRecentMessages(ctx, threadID, 40)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	transcript := renderTranscript(msgs)
 	if strings.TrimSpace(transcript) == "" {
-		return 0, nil
+		return nil, nil
 	}
 	drafts, err := extractor.ExtractCandidates(ctx, transcript)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	n := 0
-	for _, d := range drafts {
-		if _, err := c.Store.addCandidateAtGeneration(generation, d.Key, d.Claim, threadID, nil); err != nil {
-			// Skip refused candidates (e.g. user owns key); other errors abort.
-			if strings.Contains(err.Error(), "candidate refused") {
-				continue
-			}
-			return n, err
-		}
-		n++
-	}
-	return n, nil
+	return drafts, nil
 }
 
 func renderTranscript(msgs []*schema.Message) string {

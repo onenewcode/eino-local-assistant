@@ -9,8 +9,10 @@ import (
 )
 
 const (
-	// ThreadFormatVersion is the on-disk format used by ThreadStore.
-	ThreadFormatVersion = 2
+	// SessionJournalFormatVersion is the on-disk format used by ThreadStore. Version 4
+	// keeps the journal envelope compact and stores the frozen system prompt in
+	// a sibling file instead of repeating it in the first JSONL record.
+	SessionJournalFormatVersion = 4
 
 	// MaxArtifactBytes bounds full payload retention for one artifact. Larger
 	// inputs are retained as digest plus head/tail metadata.
@@ -90,22 +92,22 @@ const (
 	EventContextCheckpointReset EventKind = "context.checkpoint.reset"
 )
 
-// ThreadEvent is one hash-chained entry in journal.jsonl. Payload is preserved
-// verbatim so future schema additions do not require rewriting old journals.
+// ThreadEvent is one hash-chained entry in journal.jsonl. Fields marked with
+// json:"-" are derived from the compact on-disk envelope during replay.
 type ThreadEvent struct {
 	Version          int             `json:"format_version"`
 	Sequence         uint64          `json:"seq"`
 	ID               string          `json:"event_id"`
-	ThreadID         string          `json:"thread_id"`
+	ThreadID         string          `json:"-"`
 	Timestamp        time.Time       `json:"timestamp"`
 	Kind             EventKind       `json:"kind"`
-	TurnID           string          `json:"turn_id"`
-	CorrelationID    string          `json:"correlation_id"`
-	ExpectedRevision uint64          `json:"expected_revision"`
-	Revision         uint64          `json:"revision"`
+	TurnID           string          `json:"turn_id,omitempty"`
+	CorrelationID    string          `json:"-"`
+	ExpectedRevision uint64          `json:"-"`
+	Revision         uint64          `json:"-"`
 	Payload          json.RawMessage `json:"payload"`
-	PayloadHash      string          `json:"payload_hash"`
-	PreviousHash     string          `json:"previous_hash"`
+	PayloadHash      string          `json:"-"`
+	PreviousHash     string          `json:"previous_hash,omitempty"`
 	Hash             string          `json:"hash"`
 }
 
@@ -238,7 +240,10 @@ type ToolStarted struct {
 	TurnID     string `json:"turn_id"`
 	ToolCallID string `json:"tool_call_id"`
 	ToolName   string `json:"tool_name"`
-	Input      string `json:"input,omitempty"`
+	// Input is used only while the current turn is running. Raw tool
+	// arguments are intentionally not durable telemetry; replay can rebuild a
+	// portable empty object for the tool-call/result pair.
+	Input string `json:"-"`
 }
 
 // ToolCompleted records the terminal result of a tool call. Large output can

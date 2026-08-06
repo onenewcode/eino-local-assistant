@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,9 +16,14 @@ import (
 )
 
 type threadCreatedPayload struct {
-	Meta         ThreadMeta        `json:"meta"`
-	SystemPrompt string            `json:"system_prompt,omitempty"`
-	Messages     []*schema.Message `json:"messages,omitempty"`
+	Meta         ThreadMeta      `json:"meta"`
+	SystemPrompt systemPromptRef `json:"system_prompt"`
+}
+
+type systemPromptRef struct {
+	File   string `json:"file"`
+	SHA256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
 }
 
 type titleUpdatedPayload struct {
@@ -53,7 +59,7 @@ func newThreadEvent(state ThreadState, kind EventKind, threadID, turnID string, 
 		now = time.Now().UTC()
 	}
 	event := ThreadEvent{
-		Version:          ThreadFormatVersion,
+		Version:          SessionJournalFormatVersion,
 		Sequence:         state.HeadSequence + 1,
 		ID:               newRandomID("evt"),
 		ThreadID:         threadID,
@@ -146,7 +152,7 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 			if len(line) == 0 {
 				break
 			}
-			event, parseErr := decodeThreadEvent(line)
+			event, parseErr := decodeThreadEvent(line, id)
 			if parseErr != nil {
 				tornTail = true
 				break
@@ -164,7 +170,7 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 			validEnd = offset
 			continue
 		}
-		event, parseErr := decodeThreadEvent(line)
+		event, parseErr := decodeThreadEvent(line, id)
 		if parseErr != nil {
 			return ThreadState{}, nil, false, fmt.Errorf("%w: journal record at byte %d: %v", ErrJournalCorrupt, validEnd, parseErr)
 		}
@@ -172,7 +178,7 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 		validEnd = offset
 	}
 
-	state := ThreadState{FormatVersion: ThreadFormatVersion, ID: id}
+	state := ThreadState{FormatVersion: SessionJournalFormatVersion, ID: id}
 	lifecycle := newLifecycleTracker()
 	for index := range events {
 		event := events[index]
@@ -189,6 +195,9 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 	if len(events) == 0 {
 		return ThreadState{}, nil, false, fmt.Errorf("%w: thread %q has no creation event", ErrJournalCorrupt, id)
 	}
+	if err := hydrateSystemPrompt(filepath.Dir(path), events[0], &state); err != nil {
+		return ThreadState{}, nil, false, err
+	}
 
 	if repair && tornTail {
 		if err := truncateJournal(path, int64(validEnd)); err != nil {
@@ -203,16 +212,25 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 	return state, events, tornTail, nil
 }
 
-func decodeThreadEvent(line []byte) (ThreadEvent, error) {
+func decodeThreadEvent(line []byte, threadID string) (ThreadEvent, error) {
 	var event ThreadEvent
 	if err := json.Unmarshal(line, &event); err != nil {
 		return ThreadEvent{}, err
 	}
+	// The compact envelope derives these invariant fields instead of writing
+	// the same sequence/revision/thread data on every line.
+	event.ThreadID = threadID
+	event.CorrelationID = event.TurnID
+	if event.Sequence > 0 {
+		event.Revision = event.Sequence
+		event.ExpectedRevision = event.Sequence - 1
+	}
+	event.PayloadHash = sha256Hex(event.Payload)
 	return event, nil
 }
 
 func validateThreadEvent(event ThreadEvent, previous ThreadState) error {
-	if event.Version != ThreadFormatVersion {
+	if event.Version != SessionJournalFormatVersion {
 		return fmt.Errorf("%w: unsupported event version %d", ErrJournalCorrupt, event.Version)
 	}
 	if event.Sequence != previous.HeadSequence+1 {
@@ -280,11 +298,13 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 		}
 		state.Meta.CreatedAt = state.Meta.CreatedAt.UTC()
 		state.CreatedAt = state.Meta.CreatedAt
-		state.SystemPrompt = payload.SystemPrompt
-		if state.SystemPrompt == "" {
-			state.SystemPrompt = firstSystemPrompt(payload.Messages)
+		if err := validateSystemPromptRef(payload.SystemPrompt); err != nil {
+			return fmt.Errorf("%w: invalid system prompt reference: %v", ErrJournalCorrupt, err)
 		}
-		state.Meta.MessageCount = len(payload.Messages)
+		// The system message is reconstructed from system_prompt.txt after the
+		// event chain has been verified. Keep it counted as visible context
+		// without embedding its body in the journal.
+		state.Meta.MessageCount = 1
 	case EventTurnCommitted:
 		var payload TurnCommit
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -534,7 +554,7 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 		return fmt.Errorf("%w: unknown event kind %q", ErrJournalCorrupt, event.Kind)
 	}
 
-	state.FormatVersion = ThreadFormatVersion
+	state.FormatVersion = SessionJournalFormatVersion
 	state.Revision = event.Sequence
 	state.HeadSequence = event.Sequence
 	state.LastHash = event.Hash
@@ -553,25 +573,59 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 	return nil
 }
 
-func firstSystemPrompt(messages []*schema.Message) string {
-	for _, message := range messages {
-		if message != nil && message.Role == schema.System {
-			return message.Content
-		}
+func validateSystemPromptRef(ref systemPromptRef) error {
+	if ref.File != systemPromptFileName {
+		return fmt.Errorf("unexpected system prompt file %q", ref.File)
 	}
-	return ""
+	if ref.Bytes <= 0 {
+		return errors.New("system prompt size must be positive")
+	}
+	if len(ref.SHA256) != 64 {
+		return errors.New("system prompt sha256 is required")
+	}
+	return nil
 }
 
-func messagesFromEvents(events []ThreadEvent) ([]*schema.Message, error) {
-	var messages []*schema.Message
+func hydrateSystemPrompt(dir string, created ThreadEvent, state *ThreadState) error {
+	if state == nil {
+		return errors.New("thread state is required")
+	}
+	var payload threadCreatedPayload
+	if err := json.Unmarshal(created.Payload, &payload); err != nil {
+		return fmt.Errorf("decode thread.created for system prompt: %w", err)
+	}
+	if err := validateSystemPromptRef(payload.SystemPrompt); err != nil {
+		return fmt.Errorf("%w: invalid system prompt reference: %v", ErrJournalCorrupt, err)
+	}
+	path := filepath.Join(dir, payload.SystemPrompt.File)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("read system prompt: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: system prompt is not a regular file", ErrJournalCorrupt)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read system prompt: %w", err)
+	}
+	if int64(len(data)) != payload.SystemPrompt.Bytes {
+		return fmt.Errorf("%w: system prompt size mismatch", ErrJournalCorrupt)
+	}
+	if digest := sha256Hex(data); digest != payload.SystemPrompt.SHA256 {
+		return fmt.Errorf("%w: system prompt hash mismatch", ErrJournalCorrupt)
+	}
+	state.SystemPrompt = string(data)
+	return nil
+}
+
+func messagesFromEvents(events []ThreadEvent, systemPrompt string) ([]*schema.Message, error) {
+	messages := make([]*schema.Message, 0, 1)
+	if systemPrompt != "" {
+		messages = append(messages, schema.SystemMessage(systemPrompt))
+	}
 	for _, event := range events {
 		switch event.Kind {
-		case EventThreadCreated:
-			var payload threadCreatedPayload
-			if err := json.Unmarshal(event.Payload, &payload); err != nil {
-				return nil, err
-			}
-			messages = append(messages, cloneMessages(payload.Messages)...)
 		case EventTurnCommitted:
 			var payload TurnCommit
 			if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -613,11 +667,7 @@ func messagesPageFromEvents(events []ThreadEvent, before, limit int) ([]*schema.
 func eventMessages(event ThreadEvent) ([]*schema.Message, error) {
 	switch event.Kind {
 	case EventThreadCreated:
-		var payload threadCreatedPayload
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
-			return nil, err
-		}
-		return payload.Messages, nil
+		return nil, nil
 	case EventTurnCommitted:
 		var payload TurnCommit
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {

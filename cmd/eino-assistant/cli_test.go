@@ -93,7 +93,7 @@ func TestInteractiveModelSelectionHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute(%v): %v", args, err)
 			}
-			for _, want := range []string{"-m", "--model", "startup-only"} {
+			for _, want := range []string{"-m", "--model", "startup-only", "--yolo", "DANGEROUS"} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("help for %v missing %q:\n%s", args, want, stdout)
 				}
@@ -110,9 +110,14 @@ func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
 		want sessionStart
 	}{
 		{name: "bare", args: []string{"--model", "bare-model"}, want: sessionStart{modelName: "bare-model"}},
+		{name: "bare yolo", args: []string{"--yolo"}, want: sessionStart{yolo: true}},
+		{name: "root yolo before chat", args: []string{"--yolo", "chat"}, want: sessionStart{yolo: true}},
 		{name: "chat", args: []string{"chat", "--model", "chat-model"}, want: sessionStart{modelName: "chat-model"}},
+		{name: "chat yolo", args: []string{"chat", "--yolo"}, want: sessionStart{yolo: true}},
 		{name: "new alias", args: []string{"new", "-m", "alias-model"}, want: sessionStart{modelName: "alias-model"}},
+		{name: "new alias yolo", args: []string{"new", "--yolo"}, want: sessionStart{yolo: true}},
 		{name: "resume", args: []string{"resume", "saved-session", "-m", "resume-model"}, want: sessionStart{resumeID: "saved-session", modelName: "resume-model"}},
+		{name: "resume yolo", args: []string{"resume", "saved-session", "--yolo"}, want: sessionStart{resumeID: "saved-session", yolo: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,6 +140,23 @@ func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("session start = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestYoloIsRejectedForHeadlessAndInformationalCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"--yolo", "exec", "inspect"},
+		{"--yolo", "sessions"},
+		{"--yolo", "version"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := newRootCommandWithDeps(commandDeps{})
+			root.SetArgs(args)
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), "only supported for interactive") {
+				t.Fatalf("execute(%v) error = %v, want explicit interactive-only rejection", args, err)
 			}
 		})
 	}

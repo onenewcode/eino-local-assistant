@@ -118,13 +118,72 @@ func TestThreadStoreJournalLifecycleAndCAS(t *testing.T) {
 	if err := json.Unmarshal([]byte(firstLine), &event); err != nil {
 		t.Fatal(err)
 	}
+	if strings.Contains(string(data), "system instructions") {
+		t.Fatalf("journal duplicated system prompt: %s", data)
+	}
+	prompt, err := os.ReadFile(filepath.Join(store.Root(), sessionsDirName, state.ID, systemPromptFileName))
+	if err != nil {
+		t.Fatalf("read system prompt file: %v", err)
+	}
+	if string(prompt) != "system instructions" {
+		t.Fatalf("system prompt file = %q", prompt)
+	}
 	for _, field := range []string{
-		"format_version", "seq", "event_id", "thread_id", "expected_revision", "revision",
-		"timestamp", "previous_hash", "payload_hash", "payload", "hash",
+		"format_version", "seq", "event_id", "timestamp", "kind", "payload", "hash",
 	} {
 		if _, ok := event[field]; !ok {
 			t.Errorf("journal event missing %q: %s", field, firstLine)
 		}
+	}
+	for _, field := range []string{"thread_id", "expected_revision", "revision", "correlation_id", "payload_hash"} {
+		if _, ok := event[field]; ok {
+			t.Errorf("compact journal event should omit %q: %s", field, firstLine)
+		}
+	}
+	var toolStart map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var candidate map[string]any
+		if err := json.Unmarshal([]byte(line), &candidate); err != nil {
+			t.Fatalf("decode journal line: %v", err)
+		}
+		if candidate["kind"] == string(EventToolStarted) {
+			toolStart = candidate
+			break
+		}
+	}
+	if toolStart == nil {
+		t.Fatal("tool.started event missing")
+	}
+	payload, ok := toolStart["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool.started payload = %#v", toolStart["payload"])
+	}
+	if _, ok := payload["input"]; ok {
+		t.Fatalf("tool input leaked into journal payload: %#v", payload)
+	}
+	var toolCompleted map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var candidate map[string]any
+		if err := json.Unmarshal([]byte(line), &candidate); err != nil {
+			t.Fatalf("decode journal line: %v", err)
+		}
+		if candidate["kind"] == string(EventToolCompleted) {
+			toolCompleted = candidate
+			break
+		}
+	}
+	if toolCompleted == nil {
+		t.Fatal("tool.completed event missing")
+	}
+	completion, ok := toolCompleted["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool.completed payload = %#v", toolCompleted["payload"])
+	}
+	if got, want := completion["output"], "2026-07-15T00:00:00Z"; got != want {
+		t.Fatalf("inline tool output = %#v, want %q", got, want)
+	}
+	if _, ok := completion["artifact"]; ok {
+		t.Fatalf("small tool output unexpectedly created artifact: %#v", completion)
 	}
 }
 
@@ -387,7 +446,7 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteString(`{"format_version":2,"seq":2`); err != nil {
+	if _, err := f.WriteString(`{"format_version":3,"seq":2`); err != nil {
 		_ = f.Close()
 		t.Fatal(err)
 	}
@@ -410,11 +469,11 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 		t.Fatalf("next revision = %d", next.Revision)
 	}
 	dir := filepath.Join(store.Root(), sessionsDirName, state.ID)
-	if err := os.Remove(filepath.Join(dir, stateFileName)); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(dir, stateFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy state projection exists: %v", err)
 	}
-	if err := os.Remove(filepath.Join(dir, metaFileName)); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(dir, metaFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy meta projection exists: %v", err)
 	}
 	rebuilt, err := store.LoadThread(ctx, state.ID)
 	if err != nil {
@@ -424,8 +483,8 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 		t.Fatalf("rebuilt revision = %d, want %d", rebuilt.Revision, next.Revision)
 	}
 	for _, name := range []string{stateFileName, metaFileName} {
-		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
-			t.Fatalf("replayed %s: %v", name, err)
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("replay created legacy %s: %v", name, err)
 		}
 	}
 	data, err := os.ReadFile(journal)

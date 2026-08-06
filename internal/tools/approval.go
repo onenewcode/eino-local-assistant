@@ -19,7 +19,15 @@ const (
 	// ApprovalPlan is a read-only interactive phase. Tool-specific gates must
 	// enforce it; it is not an alias for either approval policy.
 	ApprovalPlan ApprovalMode = "plan"
+	// ApprovalYolo is an explicitly selected dangerous mode. It bypasses
+	// approval prompts and the normal OS sandbox, while tool hard denies and
+	// path validation remain in force.
+	ApprovalYolo ApprovalMode = "yolo"
 )
+
+// YoloModeWarning is shown wherever the dangerous mode becomes active. Keep
+// the wording stable so logs and tests can identify the bypass unambiguously.
+const YoloModeWarning = "WARNING: YOLO MODE ACTIVE - approvals and the OS sandbox are bypassed; hard denies and tool path safety remain enforced"
 
 // ApprovalState is the process-local approval mode shared by side-effecting
 // tools. The mutex makes reads made by tool calls race-free while the TUI
@@ -58,6 +66,8 @@ func (s *ApprovalState) InteractiveMode() string {
 		return "auto"
 	case ApprovalPlan:
 		return "plan"
+	case ApprovalYolo:
+		return "yolo"
 	default:
 		return "ask"
 	}
@@ -76,8 +86,10 @@ func (s *ApprovalState) Set(mode ApprovalMode) error {
 		normalized = string(ApprovalNever)
 	case string(ApprovalPlan):
 		normalized = string(ApprovalPlan)
+	case string(ApprovalYolo):
+		normalized = string(ApprovalYolo)
 	default:
-		return fmt.Errorf("approval mode must be ask, auto, or plan, got %q", mode)
+		return fmt.Errorf("approval mode must be ask, auto, plan, or yolo, got %q", mode)
 	}
 	s.mu.Lock()
 	s.mode = ApprovalMode(normalized)
@@ -92,6 +104,17 @@ func (s *ApprovalState) SetInteractiveMode(mode string) error {
 		return fmt.Errorf("permission mode must be ask, auto, or plan, got %q", mode)
 	}
 	return s.Set(ApprovalMode(mode))
+}
+
+// SetYolo enables the dangerous mode through an explicit caller-owned path.
+// It is deliberately not accepted by SetInteractiveMode, so Shift+Tab cannot
+// enter yolo as part of the ordinary safe mode cycle.
+func (s *ApprovalState) SetYolo() error {
+	return s.Set(ApprovalYolo)
+}
+
+func isYoloApprovalMode(mode ApprovalMode) bool {
+	return NormalizeApprovalMode(string(mode)) == ApprovalYolo
 }
 
 func effectiveApprovalMode(static ApprovalMode, state *ApprovalState) ApprovalMode {
@@ -110,6 +133,8 @@ func NormalizeApprovalMode(mode string) ApprovalMode {
 		return ApprovalNever
 	case string(ApprovalPlan):
 		return ApprovalPlan
+	case string(ApprovalYolo):
+		return ApprovalYolo
 	default:
 		return ApprovalMode(strings.ToLower(strings.TrimSpace(mode)))
 	}

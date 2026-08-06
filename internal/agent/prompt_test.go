@@ -16,12 +16,18 @@ func TestComposeSystemPromptAppendsToolPolicy(t *testing.T) {
 		"apply_patch",
 		"get_current_time",
 		"user_denied",
-		"NEVER try applypatch",
-		"Never invent",
+		"never invent tool results",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("policy missing %q", want)
 		}
+	}
+}
+
+func TestComposeSystemPromptKeepsBuiltInPolicyCompact(t *testing.T) {
+	got := ComposeSystemPrompt("")
+	if len([]rune(got)) > 2600 {
+		t.Fatalf("built-in prompt is too large (%d runes)", len([]rune(got)))
 	}
 }
 

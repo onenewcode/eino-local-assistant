@@ -26,6 +26,7 @@ const appName = "eino-assistant"
 type rootOptions struct {
 	configPath string
 	modelName  string
+	yolo       bool
 }
 
 // commandDeps is immutable after construction. Tests create a fresh command
@@ -50,7 +51,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	root := &cobra.Command{
 		Use:   appName + " [command]",
 		Short: "Eino local coding assistant",
-		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat and resume.",
+		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat and resume. Use --yolo only when you explicitly accept host-side tool execution without approval prompts.",
 		Example: fmt.Sprintf(
 			"  %[1]s\n  %[1]s chat --config config.toml\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
 			appName,
@@ -60,11 +61,21 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		SilenceErrors: true,
 		// Bare invocation starts a new chat session.
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return deps.interactive(opts.configPath, sessionStart{modelName: opts.modelName}, cmd.ErrOrStderr())
+			return deps.interactive(opts.configPath, sessionStart{modelName: opts.modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
 		},
+	}
+	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		if !opts.yolo {
+			return nil
+		}
+		if cmd == cmd.Root() || (cmd.Parent() == cmd.Root() && (cmd.Name() == "chat" || cmd.Name() == "resume")) {
+			return nil
+		}
+		return errors.New("--yolo is only supported for interactive chat/new/resume; headless and informational commands cannot use it")
 	}
 
 	root.PersistentFlags().StringVar(&opts.configPath, "config", "config.toml", "path to the TOML configuration file")
+	root.PersistentFlags().BoolVar(&opts.yolo, "yolo", false, "DANGEROUS: interactive tools bypass approval prompts and the OS sandbox")
 	root.Flags().StringVarP(&opts.modelName, "model", "m", "", "model name for this interactive session (startup override)")
 
 	root.AddCommand(
@@ -91,7 +102,7 @@ func newChatCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 		Long:    "Start a new interactive chat session in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override.",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return interactive(opts.configPath, sessionStart{title: strings.TrimSpace(title), modelName: modelName}, cmd.ErrOrStderr())
+			return interactive(opts.configPath, sessionStart{title: strings.TrimSpace(title), modelName: modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&title, "title", "", "optional title for the new session")
@@ -116,7 +127,7 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return interactive(opts.configPath, sessionStart{resumeID: strings.TrimSpace(args[0]), recoverInterrupted: recoverInterrupted, modelName: modelName}, cmd.ErrOrStderr())
+			return interactive(opts.configPath, sessionStart{resumeID: strings.TrimSpace(args[0]), recoverInterrupted: recoverInterrupted, modelName: modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn or pending compaction before resuming")

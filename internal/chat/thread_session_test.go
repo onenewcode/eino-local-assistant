@@ -1558,7 +1558,7 @@ func TestThreadSessionPersistsRawToolArtifactsWithoutUITruncation(t *testing.T) 
 	if err != nil {
 		t.Fatalf("NewThreadStore: %v", err)
 	}
-	rawOutput := strings.Repeat("raw tool output ", 300)
+	rawOutput := strings.Repeat("raw tool output ", maxInlineToolOutputBytes/len("raw tool output ")+100)
 	model := &eventScriptedModel{
 		stream: &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("done", nil)}}},
 		raw:    rawOutput,
@@ -1646,14 +1646,10 @@ func TestThreadTurnRecorderCorrelatesSameNamedToolsByCallID(t *testing.T) {
 	}
 	outputs := map[string]string{}
 	for _, tool := range groups[0].Tools {
-		if tool.Completed == nil || tool.Completed.Artifact == nil {
-			t.Fatalf("tool completion missing artifact: %#v", tool)
+		if tool.Completed == nil || tool.Completed.Artifact != nil {
+			t.Fatalf("short tool completion should stay inline: %#v", tool)
 		}
-		read, readErr := st.ReadArtifact(ctx, state.ID, tool.Completed.Artifact.ID, 0, 64)
-		if readErr != nil {
-			t.Fatalf("ReadArtifact(%s): %v", tool.ToolCallID, readErr)
-		}
-		outputs[tool.ToolCallID] = string(read.Data)
+		outputs[tool.ToolCallID] = tool.Completed.Output
 	}
 	if outputs["call-a"] != "output A" || outputs["call-b"] != "output B" {
 		t.Fatalf("tool outputs were cross-wired: %#v", outputs)
@@ -1662,15 +1658,11 @@ func TestThreadTurnRecorderCorrelatesSameNamedToolsByCallID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("durableCompactionGroups: %v", err)
 	}
-	if len(compactionGroups) != 1 || len(compactionGroups[0].Artifacts) != 2 {
+	if len(compactionGroups) != 1 || len(compactionGroups[0].Artifacts) != 0 {
 		t.Fatalf("compaction artifacts = %#v", compactionGroups)
 	}
-	var hydrated strings.Builder
-	for _, artifact := range compactionGroups[0].Artifacts {
-		hydrated.WriteString(artifact.Digest)
-	}
-	if !strings.Contains(hydrated.String(), "output A") || !strings.Contains(hydrated.String(), "output B") {
-		t.Fatalf("compactor source omitted retained tool evidence: %q", hydrated.String())
+	if outputs["call-a"] != "output A" || outputs["call-b"] != "output B" {
+		t.Fatalf("compactor source omitted inline tool evidence: %#v", outputs)
 	}
 }
 

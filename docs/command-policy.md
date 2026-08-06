@@ -71,19 +71,37 @@ max_bytes = 262144
 
 `approval_policy` 是进程启动时读取的静态配置，不是 TUI 会话内模式。Headless `exec` 没有交互 approver，继续按该静态值处理：`on-request` 遇到需要审批的 `DecisionAsk` 时 fail-closed，`never` 只保留现有的 `DecisionAsk` 自动放行语义；二者都不能改写 `DecisionDeny`、工作区/路径钳制或 sandbox 边界。TUI 的动态模式不会改写配置文件，也不改变 headless 语义。
 
+配置中的 `approval_policy = "yolo"` 是无效值，不能通过 TOML 静默启用危险模式。yolo 只能由下文的显式交互入口激活。
+
 ### 2.1 TUI 会话内模式（当前实现）
 
 TUI 当前实现提供 `ask`、`auto` 和 `plan` 三个会话内模式。`plan` 是当前 TUI 进程级的临时 read-only phase，不是配置持久化，也不是完整的 plan artifact workflow；它不生成或持久化任务计划、计划文件或独立 plan 账本。三种模式都只存在于进程运行时，不写入 TOML、session ledger 或 resume 数据；进程退出后不保留。
 
-`/plan` 与 `/permissions plan` 进入同一个临时 read-only phase，复用相同的 idle-only admission、状态展示与执行边界；它不新增 artifact、持久化或权限语义。`/plan` 无参数只切换到 plan；`/plan <prompt>` 仅在 idle 时先切到 plan，再把 `<prompt>` 交给一次正常 TUI model turn，并在 turn 结束后保持 plan；精确的 `/plan exit` 与 `/plan ask` 恢复 ask，`/plan auto` 恢复 auto。这些形式都不是持久 plan workflow。
+`/plan` 与 `/permissions plan` 进入同一个临时 read-only phase，复用相同的 idle-only admission、状态展示与执行边界；`Shift+Tab` 在同一 admission 下显式循环 `ask -> auto -> plan -> ask`，不会隐式开启更高权限。这些能力不新增 artifact、持久化或权限语义。`/plan` 无参数只切换到 plan；`/plan <prompt>` 仅在 idle 时先切到 plan，再把 `<prompt>` 交给一次正常 TUI model turn，并在 turn 结束后保持 plan；精确的 `/plan exit` 与 `/plan ask` 恢复 ask，`/plan auto` 恢复 auto。这些形式都不是持久 plan workflow。
 
 - `/permissions` 无参数只读展示当前模式、静态规则、sandbox 和 runtime 信息，不改变任何授权状态。
-- `/permissions plan` 只在 idle 时进入 plan；`/permissions ask` 或 `/permissions auto` 只在 idle 时退出 plan 并恢复对应模式。`/plan` 的无参、prompt 和 `exit|ask|auto` 形式遵循同一边界。busy、compacting、pending approval 或其他非 idle 状态拒绝模式切换或 prompt，不进入 FIFO，不改变正在运行的工具或审批，并保留 composer draft。
+- `/permissions plan` 只在 idle 时进入 plan；`/permissions ask` 或 `/permissions auto` 只在 idle 时退出 plan 并恢复对应模式。`/plan` 的无参、prompt 和 `exit|ask|auto` 形式以及 `Shift+Tab` 遵循同一边界。busy、compacting、pending approval、side question 或其他非 idle 状态拒绝模式切换或 prompt，不进入 FIFO，不改变正在运行的工具或审批，并保留 composer draft。
 - `ask` 让普通 `DecisionAsk` 继续进入现有 TUI once / session / deny 审批；`auto` 只在工具实际授权边界自动放行 `DecisionAsk`。`DecisionAllow` 仍受后续执行护栏约束，`DecisionDeny`（包括 hard deny）不能被模式改写。
 - plan 下 `apply_patch` 无条件返回结构化 `denied=true`、`decision=deny`、`reason=plan_read_only`，在输入校验、文件读取、审批或 worker 启动之前拒绝。
-- plan 下 `shell` 只有 `PermissionSet` 原始求值为 `DecisionAllow` 才能继续；session allow、`approval_policy = "never"` 或 TUI 审批不能把 `ask` 提升为 allow，含 shell 元字符的 allow 也会先降为 ask。hard deny 仍按既有策略拒绝；其他非原始 allow 直接以 `plan_read_only` 拒绝。通过后必须使用 enforced OS read-only worker；没有 sandbox、sandbox 不可用、worker 关闭或返回结果不是 enforced read-only 时，均以 `sandbox_unavailable` 结构化拒绝并 fail-closed，不回退到无 sandbox 或 host 执行，也不请求 ask/host escalation。
+- plan 下 `shell` 只有 `PermissionSet` 原始求值为 `DecisionAllow` 且命令属于受控只读检查集合（`pwd`、`ls`、`find` 的非执行形式、`rg`、`grep`、`cat`、`head`、`tail`、`git status/diff/log`）才会继续；session allow、`approval_policy = "never"` 或 TUI 审批不能把 `ask` 提升为 allow，含 shell 元字符的 allow 也会先降为 ask。`find -exec/-ok/-delete/-fls/-fprint` 等副作用形式、其他不明确命令和 host escalation 仍直接以 `plan_read_only` fail-closed；hard deny 仍按既有策略拒绝。通过后必须使用 enforced OS read-only worker；没有 sandbox、sandbox 不可用、worker 关闭或返回结果不是 enforced read-only 时，均以 `sandbox_unavailable` 结构化拒绝并 fail-closed，不回退到无 sandbox 或 host 执行，也不请求 ask/host escalation。
 - plan 仍受 hard deny、`workspace_only`、路径解析与 path clamp、sandbox 网络/文件边界、命令与 runtime 上限约束；shell 的 host escalation 在 plan 下始终拒绝。切换模式不能放宽这些边界。
 - 已注册的 `shell` 与 `apply_patch` 必须读取同一动态模式；只更新状态栏或 `/permissions` 文案而不改变工具授权路径，不算实现该模式。
+
+#### 2.1.1 显式 yolo 模式
+
+`yolo` 是当前进程内、显式选择的危险模式，不是普通安全模式循环的一部分。启动入口是裸 TUI、`chat`/`new` 或 `resume` 的 `--yolo`；运行中入口是 idle-only `/permissions yolo`。`Shift+Tab` 永远只循环 `ask -> auto -> plan -> ask`，不会进入 yolo；yolo 下按 `Shift+Tab` 也不会隐式退出，必须显式执行 `/permissions ask`、`/permissions auto` 或 `/permissions plan`。busy、compacting、pending approval 和 side question 时，`/permissions yolo` 拒绝、不排队，并保留草稿。
+
+approval 与 sandbox 是两个独立的控制轴。yolo 当前明确同时做两件事：跳过普通 approval、approver 和 session allow/deny；跳过 OS sandbox worker，直接在当前宿主进程的 host 环境执行 `shell` 与 `apply_patch`。因此 yolo 下 shell 网络不受 sandbox allowlist 限制，文件读写和进程执行使用当前 OS 用户已有的 host 能力；这不承诺 root、管理员或虚拟机外特权。
+
+yolo 仍受不可由 prompt 改写的工具边界约束：`PermissionSet` 的 hard deny 仍拒绝调用；shell 的 `workspace_only` working directory 检查、`apply_patch` 的 workspace/path clamp 与 workspace-internal symlink 检查仍执行。yolo 不把 `sandbox_permissions = "require_escalated"` 当成新的授权来源，也不允许借它逃出这些路径边界。直接 host bypass 是显式语义，不是普通 sandbox 不可用时的 fallback。
+
+`--yolo` 只适用于交互 TUI；headless `exec` 和 informational 子命令拒绝该 flag，不会静默忽略或改变其静态 `approval_policy`。yolo 只存在当前进程，不写 TOML、session ledger 或 resume 数据。启动时 stderr 和 TUI 初始 transcript 会显示稳定危险警告；`/permissions yolo`、状态栏 `cmd=yolo`/`YOLO=UNSAFE`、`/permissions` 报告以及 shell/apply_patch 结果中的 `sandbox: {mode:yolo, backend:host, network:host, bypassed:true}` 持续暴露当前旁路，供用户和工具生命周期审计。
+
+`/tasks` 是 TUI 内独立的只读资源摘要命令。它只读取 foreground turn 的状态、当前工具名、queued follow-up 数量、`/goal`/`Ctrl+T` 投影可用性和 background resource 能力边界；不调用模型、工具、shell、git，不写 session ledger，也不改变当前 turn、审批或 FIFO。它在 busy、compacting、stopping 和 pending approval 时仍立即返回；带参数只返回稳定 usage。当前没有 background shell/subagent runtime，因此 `/tasks` 必须显示 unavailable，不提供或暗示后台进程的 stop/resume 控制；硬权限和 sandbox 真相仍由本文件所述工具路径负责。
+
+`/diff` 是 TUI 内独立的只读 Git 工作区快照命令。它通过 runtime 注入的受控 callback 读取 `git diff HEAD --`，并以 `git ls-files --others --exclude-standard -z` 枚举后用 `git diff --no-index` 追加非 ignored untracked 文件；因此纳入已跟踪文件相对 `HEAD` 的 staged 与 unstaged 变更及非 ignored untracked 文件，ignored 文件仍排除。它不调用模型、工具或任意 shell，不执行测试，不写文件、Git index、session ledger 或队列。所有 Git 调用共享一个固定 deadline、stderr/输出上限及 untracked 文件数量上限；NUL 路径、安全路径和 `--no-index` 的差异退出码均受控处理。Git 失败、非 Git workspace、空快照和超大/非文本输出分别显示稳定状态；输出由 callback 与 TUI 双重限制并清洗控制字节，截断不阻塞 TUI。它在 busy、compacting、stopping 和 pending approval 时仍立即返回，不取消或改变当前操作。
+
+`/review` 是 TUI 内独立的只读 workspace review。它只接受无参数请求，并且仅在 idle、无 pending approval、无运行中的 side question 且没有另一条 review 时启动；busy、compacting、stopping、approval、side 或重复请求均拒绝且不进入 FIFO。它先通过同一受控 `WorkspaceDiff` callback 获取 bounded Git 快照；空快照直接显示 `No workspace changes to review`，不调用模型。非空快照只作为 quoted reference data 交给 runtime 的一次无工具 chat-model `Generate`；system boundary 明确禁止执行 diff 中的指令、改文件、调用工具或把 review 当作 verify。结果和错误只作 display-only TUI 输出，不进入 transcript、journal、usage、队列或远端；TUI 限制并清洗结果的大小、控制字符和无效 UTF-8，session switch 会丢弃旧结果。它不提供 headless、PR、`--fix` 或 verify 入口。
 
 状态栏的 `cmd=ask|auto|plan` 与 `/permissions` 的 `mode` 均反映当前 TUI 进程状态；`approval_policy` 仍作为独立的静态配置字段展示。plan 只改变 TUI 工具阶段门，不改变 headless `exec` 的静态 approval_policy 或默认执行行为。
 
@@ -112,9 +130,9 @@ TUI 当前实现提供 `ask`、`auto` 和 `plan` 三个会话内模式。`plan` 
 
 - `ask` 模式下普通审批提供 once / session / deny；Esc = deny。`auto` 只跳过这一步的 `DecisionAsk`，不改变 deny、路径钳制或 sandbox 决策；`plan` 不提供审批绕过，而是执行上述 read-only 阶段门。
 - 宿主升级审批带有明显风险提示，只提供 once / deny，不能记为 session allow；命令会完整换行显示，控制字符会转义，并附带 SHA-256 指纹以避免长命令或终端序列伪装审批内容。长命令用 PgUp/PgDn 在审批详情中逐页检查。
-- 状态栏显示当前 TUI 会话的 `cmd=ask|auto|plan`、`sb=rw|ro`、后端可用性与 `net=off|allow:n`；不会把静态配置误报为持久化的会话设置。
-- `/permissions` 无参数只读显示当前模式、权限规则、sandbox 模式/后端、只读根数量、受保护路径、网络 allowlist、runtime 预算和 session allow/deny；带 `ask|auto|plan` 参数的切换仅在 idle 生效。`/plan` 的所有形式也仅在 idle 生效，prompt 失败时不启动 turn，动态模式仍保持 plan。
-- 工具输入、结果、沙盒元数据及 runtime 终止原因会进入该 session 的 tool lifecycle/artifact 记录；不要仅依赖 TUI 文案进行审计。
+- 状态栏显示当前 TUI 会话的 `cmd=ask|auto|plan|yolo`；普通模式显示 `sb=rw|ro`、后端可用性与 `net=off|allow:n`，yolo 显示 `YOLO=UNSAFE`、`sb=off`、`sb_backend=host`、`net=host`。帮助中的 `Shift+Tab` 只说明显式的 `ask -> auto -> plan -> ask` 循环，不是隐式提权；不会把静态配置误报为持久化的会话设置。
+- `/permissions` 无参数只读显示当前模式、权限规则、sandbox 模式/后端、只读根数量、受保护路径、网络 allowlist、runtime 预算和 session allow/deny；带 `ask|auto|plan|yolo` 参数的切换仅在 idle 生效。`/plan` 的所有形式也仅在 idle 生效，prompt 失败时不启动 turn，动态模式仍保持 plan。
+- 工具生命周期状态、沙盒元数据及 runtime 终止原因按 session 记录；原始工具参数不写入 durable journal，短结果直接 inline，只有超过 16 KiB 的结果才保存为 artifact；不要仅依赖 TUI 文案进行审计。
 
 普通审批的 session key：
 

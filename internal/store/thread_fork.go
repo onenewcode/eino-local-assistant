@@ -230,18 +230,13 @@ func readForkJournal(sourceDir, sourceID string) (ThreadState, []ThreadEvent, bo
 }
 
 func validateForkSourceLayout(sourceDir string) error {
-	for _, name := range []string{stateFileName, metaFileName} {
-		path := filepath.Join(sourceDir, name)
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("inspect fork source file %q: %w", name, err)
-		}
-		if err := validateSnapshotRegularFile(info, name); err != nil {
-			return err
-		}
+	promptPath := filepath.Join(sourceDir, systemPromptFileName)
+	promptInfo, err := os.Lstat(promptPath)
+	if err != nil {
+		return fmt.Errorf("inspect fork source system prompt: %w", err)
+	}
+	if err := validateSnapshotRegularFile(promptInfo, systemPromptFileName); err != nil {
+		return err
 	}
 	for _, name := range []string{checkpointsDir, artifactsDir, locksDir} {
 		path := filepath.Join(sourceDir, name)
@@ -272,10 +267,8 @@ func fingerprintForkSource(sourceDir string) (sourceFingerprint, bool, error) {
 	if err := fingerprintSourceFile(hashValue, journalFileName, filepath.Join(sourceDir, journalFileName), true); err != nil {
 		return sourceFingerprint{}, false, err
 	}
-	for _, name := range []string{stateFileName, metaFileName} {
-		if err := fingerprintSourceFile(hashValue, name, filepath.Join(sourceDir, name), false); err != nil {
-			return sourceFingerprint{}, false, err
-		}
+	if err := fingerprintSourceFile(hashValue, systemPromptFileName, filepath.Join(sourceDir, systemPromptFileName), true); err != nil {
+		return sourceFingerprint{}, false, err
 	}
 	for _, name := range []string{checkpointsDir, artifactsDir} {
 		if err := fingerprintSnapshotDirectory(hashValue, filepath.Join(sourceDir, name), name); err != nil {
@@ -446,6 +439,9 @@ func (s *ThreadStore) publishFork(ctx context.Context, sourceDir, childID string
 			return ForkResult{}, fmt.Errorf("create fork %s directory: %w", name, err)
 		}
 	}
+	if err := copySnapshotFileIfPresent(sourceDir, stagingDir, systemPromptFileName, true); err != nil {
+		return ForkResult{}, err
+	}
 	childEvents, childState, err := rebuildForkEvents(childID, source)
 	if err != nil {
 		return ForkResult{}, err
@@ -496,6 +492,7 @@ func (s *ThreadStore) publishFork(ctx context.Context, sourceDir, childID string
 	// the parent directory sync as a best-effort durability hint so a successful
 	// publication is not reported as a failed fork.
 	_ = syncDirectory(parent)
+	_ = s.projectThread(filepath.Join(parent, childID), childState, childEvents)
 	return ForkResult{
 		SourceID:   source.state.ID,
 		ChildID:    childID,
@@ -506,7 +503,11 @@ func (s *ThreadStore) publishFork(ctx context.Context, sourceDir, childID string
 }
 
 func rebuildForkEvents(childID string, source forkSource) ([]ThreadEvent, ThreadState, error) {
-	childState := ThreadState{FormatVersion: ThreadFormatVersion, ID: childID}
+	childState := ThreadState{
+		FormatVersion: SessionJournalFormatVersion,
+		ID:            childID,
+		SystemPrompt:  source.state.SystemPrompt,
+	}
 	childEvents := make([]ThreadEvent, 0, source.boundaryIndex+1)
 	tracker := newLifecycleTracker()
 	for index, sourceEvent := range source.events[:source.boundaryIndex+1] {
@@ -534,7 +535,7 @@ func rebuildForkEvents(childID string, source forkSource) ([]ThreadEvent, Thread
 			}
 		}
 		event := ThreadEvent{
-			Version:          ThreadFormatVersion,
+			Version:          SessionJournalFormatVersion,
 			Sequence:         uint64(index + 1),
 			ID:               newRandomID("evt"),
 			ThreadID:         childID,

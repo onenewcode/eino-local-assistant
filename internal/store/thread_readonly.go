@@ -162,6 +162,9 @@ func fingerprintJournalSource(dir string) (sourceFingerprint, bool, error) {
 	if err := fingerprintSourceFile(hashValue, journalFileName, filepath.Join(dir, journalFileName), true); err != nil {
 		return sourceFingerprint{}, false, err
 	}
+	if err := fingerprintSourceFile(hashValue, systemPromptFileName, filepath.Join(dir, systemPromptFileName), true); err != nil {
+		return sourceFingerprint{}, false, err
+	}
 	lockPresent, err := fingerprintSourceLock(hashValue, filepath.Join(dir, locksDir, writeLockName))
 	if err != nil {
 		return sourceFingerprint{}, false, err
@@ -175,10 +178,8 @@ func fingerprintSnapshotSource(dir string) (sourceFingerprint, bool, error) {
 	if err := fingerprintSourceFile(hashValue, journalFileName, filepath.Join(dir, journalFileName), true); err != nil {
 		return sourceFingerprint{}, false, err
 	}
-	for _, name := range []string{stateFileName, metaFileName} {
-		if err := fingerprintSourceFile(hashValue, name, filepath.Join(dir, name), false); err != nil {
-			return sourceFingerprint{}, false, err
-		}
+	if err := fingerprintSourceFile(hashValue, systemPromptFileName, filepath.Join(dir, systemPromptFileName), true); err != nil {
+		return sourceFingerprint{}, false, err
 	}
 	for _, name := range []string{checkpointsDir, artifactsDir} {
 		if err := fingerprintSnapshotDirectory(hashValue, filepath.Join(dir, name), name); err != nil {

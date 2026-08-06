@@ -57,6 +57,14 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsYoloAsStaticApprovalPolicy(t *testing.T) {
+	doc := strings.Replace(validConfiguration, `approval_policy = "on-request"`, `approval_policy = "yolo"`, 1)
+	_, err := Load(writeConfiguration(t, doc))
+	if err == nil || !strings.Contains(err.Error(), "approval_policy must be on-request or never") {
+		t.Fatalf("Load(yolo approval_policy) error = %v, want static-policy rejection", err)
+	}
+}
+
 func TestLoadNormalizesModelReasoningEffort(t *testing.T) {
 	doc := strings.Replace(validConfiguration, "[model]\n", "[model]\nreasoning_effort = \" high \"\n", 1)
 	got, err := Load(writeConfiguration(t, doc))

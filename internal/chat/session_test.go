@@ -181,6 +181,45 @@ func TestStripReasoningForStorage(t *testing.T) {
 	}
 }
 
+func TestDisplayReasoningContentNormalizesProviderFields(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  *schema.Message
+		want string
+	}{
+		{
+			name: "reasoning content",
+			msg:  &schema.Message{ReasoningContent: "summary"},
+			want: "summary",
+		},
+		{
+			name: "openai extra",
+			msg:  &schema.Message{Extra: map[string]any{extraKeyOpenAIReasoningContent: "openai"}},
+			want: "openai",
+		},
+		{
+			name: "claude extra",
+			msg:  &schema.Message{Extra: map[string]any{extraKeyClaudeThinking: "claude"}},
+			want: "claude",
+		},
+		{
+			name: "multi content",
+			msg: &schema.Message{AssistantGenMultiContent: []schema.MessageOutputPart{
+				{Type: schema.ChatMessagePartTypeReasoning, Reasoning: &schema.MessageOutputReasoning{Text: "one"}},
+				{Type: schema.ChatMessagePartTypeReasoning, Reasoning: &schema.MessageOutputReasoning{Text: "two"}},
+			}},
+			want: "onetwo",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DisplayReasoningContent(tc.msg); got != tc.want {
+				t.Fatalf("DisplayReasoningContent() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSessionStripsProviderExtraThinkingOnCommit(t *testing.T) {
 	stream := &scriptedStream{events: []streamEvent{
 		{message: &schema.Message{

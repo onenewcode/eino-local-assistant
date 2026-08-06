@@ -73,7 +73,7 @@ func (s *ThreadStore) PutArtifact(ctx context.Context, id string, input Artifact
 		Size:         originalSize,
 		OriginalSize: originalSize,
 	}
-	artifact := storedArtifact{FormatVersion: ThreadFormatVersion, Ref: ref}
+	artifact := storedArtifact{FormatVersion: SessionJournalFormatVersion, Ref: ref}
 	if originalSize <= fullLimit {
 		artifact.Ref.StoredSize = originalSize
 		if err := writeBytesAtomic(artifactBlobPath(dir, digest), input.Data); err != nil {

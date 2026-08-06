@@ -24,6 +24,7 @@ const (
 	queueEditAdmissionError   = "queue edit rejected: new text cannot be a mutative or immediately executable slash command"
 	queueResumeBusyMessage    = "queue resume unavailable: current operation is still running; queue and pause unchanged"
 	permissionModeBusyMessage = "permission mode changes are unavailable while busy; retry when idle"
+	permissionModeSideMessage = "permission mode changes are unavailable while a side question is pending; retry when it finishes"
 )
 
 // backtrackKeyInput is the internal representation used if a future input
@@ -86,8 +87,10 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 		// Steering targets the existing regular turn directly. It is never a
 		// FIFO follow-up, including when the core rejects the admission.
 		return busyInputSteer
-	case slashHelp, slashContext, slashStatus, slashGoal, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
+	case slashHelp, slashContext, slashStatus, slashGoal, slashTasks, slashDiff, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
 		return busyInputExecuteImmediately
+	case slashReview:
+		return busyInputReject
 	case slashPermissions:
 		if strings.TrimSpace(arg) == "" {
 			return busyInputExecuteImmediately

@@ -281,8 +281,8 @@ func TestConsolidatorResetFenceInvalidatesWholeRunOnce(t *testing.T) {
 	}
 	select {
 	case <-blockingModel.started:
+		t.Fatal("reset generation must prevent the stale scan from reaching the model")
 	default:
-		t.Fatal("expected old RunOnce to reach the model with its original generation")
 	}
 
 	active, err := resetStore.ListActive()

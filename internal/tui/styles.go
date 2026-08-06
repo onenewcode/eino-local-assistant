@@ -114,6 +114,9 @@ func renderReasoning(text string, folded, streaming, detailsVisible bool, reason
 		return reasoningStyle.Render(formatCompactReasoning(body, streaming))
 	}
 	if folded {
+		if body := strings.TrimRight(reasoningBody, "\n"); body != "" {
+			return renderReasoningBody("thinking", body)
+		}
 		return reasoningStyle.Render("·· " + text)
 	}
 	prefix := "thinking"
@@ -124,6 +127,10 @@ func renderReasoning(text string, folded, streaming, detailsVisible bool, reason
 	if body == "" {
 		return reasoningStyle.Render(prefix)
 	}
+	return renderReasoningBody(prefix, body)
+}
+
+func renderReasoningBody(prefix, body string) string {
 	lines := strings.Split(body, "\n")
 	var b strings.Builder
 	b.WriteString(reasoningStyle.Render(prefix))

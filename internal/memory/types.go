@@ -4,9 +4,6 @@ package memory
 import "time"
 
 const (
-	// SchemaVersion is the on-disk meta schema.
-	SchemaVersion = 1
-
 	// TrustUser is an explicit user-confirmed memory.
 	TrustUser Trust = "user"
 	// TrustCandidate is auto-extracted and unverified.
@@ -42,7 +39,7 @@ type Entry struct {
 	ExtractedFromID string    `json:"extracted_from_id,omitempty"`
 }
 
-// Meta is store metadata under .eino/memory/meta.json.
+// Meta is a compatibility-shaped snapshot of database settings and extraction state.
 type Meta struct {
 	SchemaVersion    int        `json:"schema_version"`
 	WorkspaceRoot    string     `json:"workspace_root,omitempty"`
@@ -66,11 +63,15 @@ type SummaryBundle struct {
 
 // StatusReport is a human-readable snapshot for /memory status.
 type StatusReport struct {
-	Root            string
-	UseEnabled      bool
-	GenerateEnabled bool
-	UserActive      int
-	CandidateActive int
-	LastConsolidate *time.Time
-	LastError       string
+	Root               string
+	DatabasePath       string
+	SchemaVersion      int
+	UseEnabled         bool
+	GenerateEnabled    bool
+	UserActive         int
+	CandidateActive    int
+	LastConsolidate    *time.Time
+	LastError          string
+	RunningExtractions int
+	FailedExtractions  int
 }

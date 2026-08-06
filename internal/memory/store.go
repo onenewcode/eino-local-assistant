@@ -1,9 +1,10 @@
 package memory
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,32 +17,28 @@ import (
 
 	"eino-local-assistant/internal/usage"
 
-	"github.com/gofrs/flock"
+	_ "modernc.org/sqlite" // Register the pure-Go database/sql driver.
 )
 
 const (
-	dirName       = ".eino"
-	memoryDirName = "memory"
-	metaFile      = "meta.json"
-	entriesFile   = "entries.jsonl"
-	summaryFile   = "summary.md"
-	lockFile      = "write.lock"
+	dirName             = ".eino"
+	memoryDirName       = "memory"
+	databaseFile        = "memory.sqlite3"
+	MemorySchemaVersion = 1
 )
 
 var errResetGenerationChanged = errors.New("memory reset generation changed")
 
-// Store is a project-scoped memory store under <workspace>/.eino/memory/.
+// Store is the authoritative, project-scoped semantic-memory database.
 type Store struct {
-	root   string // .eino/memory absolute path
+	root   string
 	wsRoot string
-	mu     sync.Mutex // serializes flock acquisition in this process
+	db     *sql.DB
+	mu     sync.Mutex
 	maxSum int
-	useOn  bool
-	genOn  bool
 	now    func() time.Time
 }
 
-// Options configures a Store.
 type Options struct {
 	WorkspaceRoot    string
 	MaxSummaryTokens int
@@ -50,487 +47,368 @@ type Options struct {
 	Now              func() time.Time
 }
 
-// Open bootstraps and opens a memory store for the workspace.
 func Open(opts Options) (*Store, error) {
 	ws, err := filepath.Abs(strings.TrimSpace(opts.WorkspaceRoot))
 	if err != nil {
 		return nil, fmt.Errorf("memory workspace: %w", err)
 	}
 	info, err := os.Stat(ws)
-	if err != nil {
-		return nil, fmt.Errorf("memory workspace: %w", err)
-	}
-	if !info.IsDir() {
+	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("memory workspace %q is not a directory", ws)
 	}
-	maxSum := opts.MaxSummaryTokens
-	if maxSum <= 0 {
-		maxSum = 2500
-	}
-	now := opts.Now
-	if now == nil {
-		now = time.Now
-	}
 	root := filepath.Join(ws, dirName, memoryDirName)
-	s := &Store{
-		root:   root,
-		wsRoot: ws,
-		maxSum: maxSum,
-		useOn:  opts.UseEnabled,
-		genOn:  opts.GenerateEnabled,
-		now:    now,
-	}
-	if err := s.bootstrap(); err != nil {
+	if err := rejectLegacyMemory(root); err != nil {
 		return nil, err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return nil, fmt.Errorf("create memory directory: %w", err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return nil, fmt.Errorf("set memory directory permissions: %w", err)
+	}
+	if err := ensureMemoryGitignore(ws); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", filepath.Join(root, databaseFile))
+	if err != nil {
+		return nil, fmt.Errorf("open memory database: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	s := &Store{root: root, wsRoot: ws, db: db, maxSum: opts.MaxSummaryTokens, now: opts.Now}
+	if s.maxSum <= 0 {
+		s.maxSum = 2500
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if err := s.bootstrap(opts.UseEnabled, opts.GenerateEnabled); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := os.Chmod(filepath.Join(root, databaseFile), 0o600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set memory database permissions: %w", err)
 	}
 	return s, nil
 }
 
-// Root returns the absolute memory directory.
+func rejectLegacyMemory(root string) error {
+	for _, name := range []string{"meta.json", "entries.jsonl", "summary.md"} {
+		if _, err := os.Lstat(filepath.Join(root, name)); err == nil {
+			return fmt.Errorf("legacy memory format detected at %s; move or remove it before starting", root)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect legacy memory: %w", err)
+		}
+	}
+	return nil
+}
+
+func ensureMemoryGitignore(ws string) error {
+	dir := filepath.Join(ws, dirName)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, ".gitignore")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return os.WriteFile(path, []byte("memory/\n"), 0o600)
+	}
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "memory/" {
+			return os.Chmod(path, 0o600)
+		}
+	}
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	data = append(data, []byte("memory/\n")...)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func (s *Store) bootstrap(useOn, genOn bool) error {
+	for _, pragma := range []string{
+		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000",
+	} {
+		if _, err := s.db.Exec(pragma); err != nil {
+			return fmt.Errorf("configure memory database: %w", err)
+		}
+	}
+	schema := `
+CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_settings(
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1), workspace_root TEXT NOT NULL,
+  use_enabled INTEGER NOT NULL CHECK(use_enabled IN (0,1)), generate_enabled INTEGER NOT NULL CHECK(generate_enabled IN (0,1)),
+  reset_generation INTEGER NOT NULL DEFAULT 0, last_consolidate_at TEXT, last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS memory_entries(
+  id TEXT PRIMARY KEY, key TEXT NOT NULL, claim TEXT NOT NULL,
+  trust TEXT NOT NULL CHECK(trust IN ('user','candidate')),
+  status TEXT NOT NULL CHECK(status IN ('active','superseded','deleted')),
+  version INTEGER NOT NULL CHECK(version > 0), source_thread_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, supersedes TEXT NOT NULL DEFAULT '', extracted_from_id TEXT NOT NULL DEFAULT '',
+  UNIQUE(key, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_entries_active_key ON memory_entries(key) WHERE status='active';
+CREATE TABLE IF NOT EXISTS memory_entry_sources(
+  entry_id TEXT NOT NULL REFERENCES memory_entries(id) ON DELETE CASCADE,
+  event_id TEXT NOT NULL, ordinal INTEGER NOT NULL, PRIMARY KEY(entry_id, event_id)
+);
+CREATE TABLE IF NOT EXISTS memory_extractions(
+  thread_id TEXT PRIMARY KEY, source_updated_at TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+  lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+);`
+	if _, err := s.db.Exec(schema); err != nil {
+		return fmt.Errorf("create memory schema: %w", err)
+	}
+	now := s.now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)`, MemorySchemaVersion, now); err != nil {
+		return err
+	}
+	// Startup configuration intentionally overrides persisted switches.
+	_, err := s.db.Exec(`INSERT INTO memory_settings(singleton,workspace_root,use_enabled,generate_enabled)
+VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET workspace_root=excluded.workspace_root,use_enabled=excluded.use_enabled,generate_enabled=excluded.generate_enabled`,
+		s.wsRoot, boolInt(useOn), boolInt(genOn))
+	return err
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
 func (s *Store) Root() string {
 	if s == nil {
 		return ""
 	}
 	return s.root
 }
-
-// WorkspaceRoot returns the workspace absolute path.
 func (s *Store) WorkspaceRoot() string {
 	if s == nil {
 		return ""
 	}
 	return s.wsRoot
 }
-
-// UseEnabled reports whether injection/tools are allowed.
-func (s *Store) UseEnabled() bool {
+func (s *Store) DatabasePath() string {
 	if s == nil {
-		return false
+		return ""
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.useOn
+	return filepath.Join(s.root, databaseFile)
 }
 
-// GenerateEnabled reports whether auto extraction is allowed.
-func (s *Store) GenerateEnabled() bool {
-	if s == nil {
+func (s *Store) UseEnabled() bool      { return s.settingBool("use_enabled") }
+func (s *Store) GenerateEnabled() bool { return s.settingBool("generate_enabled") }
+
+func (s *Store) settingBool(column string) bool {
+	if s == nil || s.db == nil {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.genOn
+	var value int
+	if err := s.db.QueryRow("SELECT " + column + " FROM memory_settings WHERE singleton=1").Scan(&value); err != nil {
+		return false
+	}
+	return value != 0
 }
 
-// SetUseEnabled updates the runtime use flag and meta.
 func (s *Store) SetUseEnabled(on bool) error {
-	return s.withFileLock(func() error {
-		s.useOn = on
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		meta.UseEnabled = on
-		return s.writeMetaUnlocked(meta)
-	})
+	_, err := s.db.Exec(`UPDATE memory_settings SET use_enabled=? WHERE singleton=1`, boolInt(on))
+	return err
 }
-
-// SetGenerateEnabled updates the runtime generate flag and meta.
 func (s *Store) SetGenerateEnabled(on bool) error {
-	return s.withFileLock(func() error {
-		s.genOn = on
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		meta.GenerateEnabled = on
-		return s.writeMetaUnlocked(meta)
-	})
+	_, err := s.db.Exec(`UPDATE memory_settings SET generate_enabled=? WHERE singleton=1`, boolInt(on))
+	return err
 }
 
-// Reset clears all stored memories and consolidation bookkeeping while
-// preserving the store's project identity and runtime configuration. Advancing
-// ResetGeneration fences consolidator work that started before this reset.
 func (s *Store) Reset() error {
-	return s.withFileLock(func() error {
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
+	return s.transaction(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE memory_settings SET reset_generation=reset_generation+1,last_consolidate_at=NULL,last_error='' WHERE singleton=1`); err != nil {
 			return err
 		}
-		meta.ResetGeneration++
-		meta.LastConsolidate = nil
-		meta.LastError = ""
-		meta.ClaimedThreads = nil
-		meta.ProcessedThreads = nil
-
-		if err := s.writeEntriesUnlocked(nil); err != nil {
+		if _, err := tx.Exec(`DELETE FROM memory_entry_sources`); err != nil {
 			return err
 		}
-		if err := s.rebuildSummaryUnlocked(); err != nil {
+		if _, err := tx.Exec(`DELETE FROM memory_entries`); err != nil {
 			return err
 		}
-		return s.writeMetaUnlocked(meta)
-	})
-}
-
-func (s *Store) bootstrap() error {
-	if err := os.MkdirAll(s.root, 0o755); err != nil {
-		return fmt.Errorf("create memory dir: %w", err)
-	}
-	gitignore := filepath.Join(s.wsRoot, dirName, ".gitignore")
-	if _, err := os.Stat(gitignore); errors.Is(err, os.ErrNotExist) {
-		if err := os.WriteFile(gitignore, []byte("memory/\n"), 0o644); err != nil {
-			return fmt.Errorf("write .eino/.gitignore: %w", err)
-		}
-	} else if err != nil {
+		_, err := tx.Exec(`DELETE FROM memory_extractions`)
 		return err
-	}
-	return s.withFileLock(func() error {
-		metaPath := filepath.Join(s.root, metaFile)
-		if _, err := os.Stat(metaPath); errors.Is(err, os.ErrNotExist) {
-			meta := Meta{
-				SchemaVersion:   SchemaVersion,
-				WorkspaceRoot:   s.wsRoot,
-				UseEnabled:      s.useOn,
-				GenerateEnabled: s.genOn,
-			}
-			if err := s.writeMetaUnlocked(meta); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		} else {
-			meta, err := s.readMetaUnlocked()
-			if err != nil {
-				return err
-			}
-			// Runtime flags from Open options win on process start.
-			meta.UseEnabled = s.useOn
-			meta.GenerateEnabled = s.genOn
-			meta.WorkspaceRoot = s.wsRoot
-			if err := s.writeMetaUnlocked(meta); err != nil {
-				return err
-			}
-		}
-		entriesPath := filepath.Join(s.root, entriesFile)
-		if _, err := os.Stat(entriesPath); errors.Is(err, os.ErrNotExist) {
-			if err := os.WriteFile(entriesPath, nil, 0o644); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		}
-		return s.rebuildSummaryUnlocked()
 	})
 }
 
-// AddUser writes a user-trusted memory (LWW among user keys; supersedes candidates).
 func (s *Store) AddUser(key, claim string) (Entry, error) {
-	return s.add(key, claim, TrustUser, "", nil)
+	return s.add(key, claim, TrustUser, "", nil, nil)
+}
+func (s *Store) AddCandidate(key, claim, threadID string, ids []string) (Entry, error) {
+	return s.add(key, claim, TrustCandidate, threadID, ids, nil)
+}
+func (s *Store) addCandidateAtGeneration(g uint64, key, claim, threadID string, ids []string) (Entry, error) {
+	return s.add(key, claim, TrustCandidate, threadID, ids, &g)
 }
 
-// AddCandidate writes an auto-extracted candidate.
-// It never supersedes an active user-trusted entry for the same key.
-func (s *Store) AddCandidate(key, claim, threadID string, sourceEventIDs []string) (Entry, error) {
-	return s.add(key, claim, TrustCandidate, threadID, sourceEventIDs)
-}
-
-func (s *Store) addCandidateAtGeneration(
-	generation uint64,
-	key, claim, threadID string,
-	sourceEventIDs []string,
-) (Entry, error) {
+func (s *Store) add(key, claim string, trust Trust, threadID string, ids []string, generation *uint64) (Entry, error) {
 	claim = strings.TrimSpace(claim)
 	if claim == "" {
 		return Entry{}, errors.New("memory claim is required")
 	}
 	key = normalizeKey(key, claim)
 	var out Entry
-	err := s.withFileLock(func() error {
-		if err := s.requireGenerationUnlocked(generation); err != nil {
+	err := s.transaction(func(tx *sql.Tx) error {
+		if err := requireGeneration(tx, generation); err != nil {
 			return err
 		}
-		var err error
-		out, err = s.addUnlocked(key, claim, TrustCandidate, threadID, sourceEventIDs)
-		return err
+		if trust == TrustCandidate {
+			var count int
+			if err := tx.QueryRow(`SELECT count(*) FROM memory_entries WHERE key=? AND status='active' AND trust='user'`, key).Scan(&count); err != nil {
+				return err
+			}
+			if count > 0 {
+				return fmt.Errorf("candidate refused: key %q has active user memory", key)
+			}
+		}
+		return insertVersion(tx, &out, key, claim, trust, threadID, ids, s.now().UTC())
 	})
 	return out, err
 }
 
-// UpdateUser replaces an active memory selected by id or key with a
-// user-confirmed version under the same key.
+func insertVersion(tx *sql.Tx, out *Entry, key, claim string, trust Trust, threadID string, ids []string, now time.Time) error {
+	var version int
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(version),0)+1 FROM memory_entries WHERE key=?`, key).Scan(&version); err != nil {
+		return err
+	}
+	var supersedes string
+	err := tx.QueryRow(`SELECT id FROM memory_entries WHERE key=? AND status='active'`, key).Scan(&supersedes)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if supersedes != "" {
+		if _, err := tx.Exec(`UPDATE memory_entries SET status='superseded',updated_at=? WHERE id=?`, dbTime(now), supersedes); err != nil {
+			return err
+		}
+	}
+	*out = Entry{ID: newID(), Key: key, Claim: claim, Trust: trust, Status: StatusActive, Version: version, SourceThreadID: threadID, SourceEventIDs: append([]string(nil), ids...), CreatedAt: now, UpdatedAt: now, Supersedes: supersedes}
+	_, err = tx.Exec(`INSERT INTO memory_entries(id,key,claim,trust,status,version,source_thread_id,created_at,updated_at,supersedes,extracted_from_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, out.ID, out.Key, out.Claim, out.Trust, out.Status, out.Version, out.SourceThreadID, dbTime(out.CreatedAt), dbTime(out.UpdatedAt), out.Supersedes, out.ExtractedFromID)
+	if err != nil {
+		return err
+	}
+	for i, id := range ids {
+		if _, err := tx.Exec(`INSERT INTO memory_entry_sources(entry_id,event_id,ordinal) VALUES(?,?,?)`, out.ID, id, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) UpdateUser(idOrKey, claim string) (Entry, error) {
-	idOrKey = strings.TrimSpace(idOrKey)
+	idOrKey, claim = strings.TrimSpace(idOrKey), strings.TrimSpace(claim)
 	if idOrKey == "" {
 		return Entry{}, errors.New("id or key is required")
 	}
-	claim = strings.TrimSpace(claim)
 	if claim == "" {
 		return Entry{}, errors.New("memory claim is required")
 	}
-
 	var out Entry
-	err := s.withFileLock(func() error {
-		entries, err := s.loadEntriesUnlocked()
-		if err != nil {
+	err := s.transaction(func(tx *sql.Tx) error {
+		var key string
+		if err := tx.QueryRow(`SELECT key FROM memory_entries WHERE status='active' AND (id=? OR key=?)`, idOrKey, idOrKey).Scan(&key); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("memory not found: %s", idOrKey)
+			}
 			return err
 		}
-
-		target := -1
-		for i := range entries {
-			if entries[i].Status == StatusActive && entries[i].ID == idOrKey {
-				target = i
-				break
-			}
-		}
-		if target < 0 {
-			for i := range entries {
-				if entries[i].Status == StatusActive && entries[i].Key == idOrKey {
-					target = i
-					break
-				}
-			}
-		}
-		if target < 0 {
-			return fmt.Errorf("memory not found: %s", idOrKey)
-		}
-
-		now := s.now().UTC()
-		key := entries[target].Key
-		supersedes := entries[target].ID
-		version := entries[target].Version + 1
-		for i := range entries {
-			e := &entries[i]
-			if e.Status != StatusActive || e.Key != key {
-				continue
-			}
-			e.Status = StatusSuperseded
-			e.UpdatedAt = now
-			if e.Version >= version {
-				version = e.Version + 1
-			}
-		}
-
-		out = Entry{
-			ID:         newID(),
-			Key:        key,
-			Claim:      claim,
-			Trust:      TrustUser,
-			Status:     StatusActive,
-			Version:    version,
-			CreatedAt:  now,
-			UpdatedAt:  now,
-			Supersedes: supersedes,
-		}
-		entries = append(entries, out)
-		if err := s.writeEntriesUnlocked(entries); err != nil {
-			return err
-		}
-		return s.rebuildSummaryUnlocked()
+		return insertVersion(tx, &out, key, claim, TrustUser, "", nil, s.now().UTC())
 	})
 	return out, err
 }
 
-func (s *Store) add(key, claim string, trust Trust, threadID string, sourceEventIDs []string) (Entry, error) {
-	claim = strings.TrimSpace(claim)
-	if claim == "" {
-		return Entry{}, errors.New("memory claim is required")
-	}
-	key = normalizeKey(key, claim)
-	var out Entry
-	err := s.withFileLock(func() error {
-		var err error
-		out, err = s.addUnlocked(key, claim, trust, threadID, sourceEventIDs)
-		return err
-	})
-	return out, err
-}
-
-func (s *Store) addUnlocked(
-	key, claim string,
-	trust Trust,
-	threadID string,
-	sourceEventIDs []string,
-) (Entry, error) {
-	entries, err := s.loadEntriesUnlocked()
-	if err != nil {
-		return Entry{}, err
-	}
-	now := s.now().UTC()
-	version := 1
-	var supersedes string
-
-	if trust == TrustCandidate {
-		// Do not overwrite user-confirmed facts for the same key.
-		for _, e := range entries {
-			if e.Key == key && e.Status == StatusActive && e.Trust == TrustUser {
-				return Entry{}, fmt.Errorf("candidate refused: key %q has active user memory", key)
-			}
-		}
-	}
-
-	for i := range entries {
-		e := &entries[i]
-		if e.Key != key || e.Status != StatusActive {
-			continue
-		}
-		// User write supersedes any active (user or candidate).
-		// Candidate write supersedes only other candidates (user blocked above).
-		if trust == TrustUser || e.Trust == TrustCandidate {
-			e.Status = StatusSuperseded
-			e.UpdatedAt = now
-			if e.Version >= version {
-				version = e.Version + 1
-			}
-			supersedes = e.ID
-		}
-	}
-	out := Entry{
-		ID:             newID(),
-		Key:            key,
-		Claim:          claim,
-		Trust:          trust,
-		Status:         StatusActive,
-		Version:        version,
-		SourceEventIDs: append([]string(nil), sourceEventIDs...),
-		SourceThreadID: threadID,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Supersedes:     supersedes,
-	}
-	entries = append(entries, out)
-	if err := s.writeEntriesUnlocked(entries); err != nil {
-		return Entry{}, err
-	}
-	if err := s.rebuildSummaryUnlocked(); err != nil {
-		return Entry{}, err
-	}
-	return out, nil
-}
-
-// Delete marks an active entry deleted by id or key.
 func (s *Store) Delete(idOrKey string) (Entry, error) {
 	idOrKey = strings.TrimSpace(idOrKey)
 	if idOrKey == "" {
 		return Entry{}, errors.New("id or key is required")
 	}
 	var out Entry
-	err := s.withFileLock(func() error {
-		entries, err := s.loadEntriesUnlocked()
+	err := s.transaction(func(tx *sql.Tx) error {
+		e, err := queryOne(tx, `WHERE status='active' AND (id=? OR key=?)`, idOrKey, idOrKey)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("memory not found: %s", idOrKey)
+			}
 			return err
 		}
-		now := s.now().UTC()
-		found := false
-		for i := range entries {
-			e := &entries[i]
-			if e.Status != StatusActive {
-				continue
-			}
-			if e.ID == idOrKey || e.Key == idOrKey {
-				e.Status = StatusDeleted
-				e.UpdatedAt = now
-				out = *e
-				found = true
-			}
-		}
-		if !found {
-			return fmt.Errorf("memory not found: %s", idOrKey)
-		}
-		if err := s.writeEntriesUnlocked(entries); err != nil {
+		e.Status, e.UpdatedAt = StatusDeleted, s.now().UTC()
+		if _, err := tx.Exec(`UPDATE memory_entries SET status='deleted',updated_at=? WHERE id=?`, dbTime(e.UpdatedAt), e.ID); err != nil {
 			return err
 		}
-		return s.rebuildSummaryUnlocked()
+		out = e
+		return nil
 	})
 	return out, err
 }
 
-// Accept promotes a candidate to user trust.
 func (s *Store) Accept(id string) (Entry, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return Entry{}, errors.New("id is required")
 	}
 	var out Entry
-	err := s.withFileLock(func() error {
-		entries, err := s.loadEntriesUnlocked()
+	err := s.transaction(func(tx *sql.Tx) error {
+		e, err := queryOne(tx, `WHERE id=? AND status='active'`, id)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("active memory not found: %s", id)
+			}
 			return err
 		}
-		var cand *Entry
-		for i := range entries {
-			if entries[i].ID == id && entries[i].Status == StatusActive {
-				cand = &entries[i]
-				break
-			}
-		}
-		if cand == nil {
-			return fmt.Errorf("active memory not found: %s", id)
-		}
-		if cand.Trust == TrustUser {
-			out = *cand
+		if e.Trust == TrustUser {
+			out = e
 			return nil
 		}
-		// Supersede any other active candidate with the same key; refuse if a
-		// different user entry already owns the key (should not happen).
-		now := s.now().UTC()
-		for i := range entries {
-			e := &entries[i]
-			if e.ID == cand.ID || e.Status != StatusActive || e.Key != cand.Key {
-				continue
-			}
-			if e.Trust == TrustUser {
-				return fmt.Errorf("cannot accept: key %q already has user memory %s", cand.Key, e.ID)
-			}
-			e.Status = StatusSuperseded
-			e.UpdatedAt = now
-		}
-		cand.Trust = TrustUser
-		cand.UpdatedAt = now
-		out = *cand
-		if err := s.writeEntriesUnlocked(entries); err != nil {
-			return err
-		}
-		return s.rebuildSummaryUnlocked()
+		e.Trust = TrustUser
+		e.UpdatedAt = s.now().UTC()
+		_, err = tx.Exec(`UPDATE memory_entries SET trust='user',updated_at=? WHERE id=?`, dbTime(e.UpdatedAt), e.ID)
+		out = e
+		return err
 	})
 	return out, err
 }
 
-// ListActive returns active entries, users first.
-func (s *Store) ListActive() ([]Entry, error) {
-	var out []Entry
-	err := s.withFileLock(func() error {
-		entries, err := s.loadEntriesUnlocked()
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			if e.Status == StatusActive {
-				out = append(out, e)
-			}
-		}
-		return nil
-	})
-	sortEntries(out)
-	return out, err
+type rowQuery interface {
+	QueryRow(query string, args ...any) *sql.Row
 }
 
-// Get returns an active entry by id or key.
-func (s *Store) Get(idOrKey string) (Entry, error) {
-	idOrKey = strings.TrimSpace(idOrKey)
-	entries, err := s.ListActive()
+func queryOne(q rowQuery, where string, args ...any) (Entry, error) {
+	var e Entry
+	var created, updated string
+	err := q.QueryRow(`SELECT id,key,claim,trust,status,version,source_thread_id,created_at,updated_at,supersedes,extracted_from_id FROM memory_entries `+where, args...).Scan(&e.ID, &e.Key, &e.Claim, &e.Trust, &e.Status, &e.Version, &e.SourceThreadID, &created, &updated, &e.Supersedes, &e.ExtractedFromID)
 	if err != nil {
 		return Entry{}, err
 	}
-	for _, e := range entries {
-		if e.ID == idOrKey || e.Key == idOrKey {
-			return e, nil
-		}
-	}
-	return Entry{}, fmt.Errorf("memory not found: %s", idOrKey)
+	e.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	e.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return e, nil
 }
 
-// Search returns active entries whose key or claim contains query (case-insensitive).
+func (s *Store) ListActive() ([]Entry, error) {
+	return s.queryEntries(`WHERE status='active' ORDER BY CASE trust WHEN 'user' THEN 0 ELSE 1 END,key,updated_at DESC`)
+}
+func (s *Store) Get(idOrKey string) (Entry, error) {
+	e, err := queryOne(s.db, `WHERE status='active' AND (id=? OR key=?)`, strings.TrimSpace(idOrKey), strings.TrimSpace(idOrKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Entry{}, fmt.Errorf("memory not found: %s", idOrKey)
+	}
+	return e, err
+}
 func (s *Store) Search(query string) ([]Entry, error) {
 	query = strings.ToLower(strings.TrimSpace(query))
 	if query == "" {
@@ -542,216 +420,84 @@ func (s *Store) Search(query string) ([]Entry, error) {
 	}
 	out := make([]Entry, 0)
 	for _, e := range all {
-		if strings.Contains(strings.ToLower(e.Key), query) ||
-			strings.Contains(strings.ToLower(e.Claim), query) {
+		if strings.Contains(strings.ToLower(e.Key), query) || strings.Contains(strings.ToLower(e.Claim), query) {
 			out = append(out, e)
 		}
 	}
 	return out, nil
 }
 
-// Summary returns the bounded injection text (rebuilds if missing).
+func (s *Store) queryEntries(suffix string, args ...any) ([]Entry, error) {
+	rows, err := s.db.Query(`SELECT id,key,claim,trust,status,version,source_thread_id,created_at,updated_at,supersedes,extracted_from_id FROM memory_entries `+suffix, args...)
+	if err != nil {
+		return nil, err
+	}
+	out := []Entry{}
+	for rows.Next() {
+		var e Entry
+		var c, u string
+		if err := rows.Scan(&e.ID, &e.Key, &e.Claim, &e.Trust, &e.Status, &e.Version, &e.SourceThreadID, &c, &u, &e.Supersedes, &e.ExtractedFromID); err != nil {
+			return nil, err
+		}
+		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, c)
+		e.UpdatedAt, _ = time.Parse(time.RFC3339Nano, u)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		src, err := s.entrySources(out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		out[i].SourceEventIDs = src
+	}
+	return out, nil
+}
+func (s *Store) entrySources(id string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT event_id FROM memory_entry_sources WHERE entry_id=? ORDER BY ordinal`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Summary() (SummaryBundle, error) {
-	var bundle SummaryBundle
-	err := s.withFileLock(func() error {
-		path := filepath.Join(s.root, summaryFile)
-		data, err := os.ReadFile(path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		if len(data) == 0 {
-			if err := s.rebuildSummaryUnlocked(); err != nil {
-				return err
-			}
-			data, err = os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-		}
-		text := string(data)
-		entries, err := s.loadEntriesUnlocked()
-		if err != nil {
-			return err
-		}
-		users, cands := 0, 0
-		for _, e := range entries {
-			if e.Status != StatusActive {
-				continue
-			}
-			if e.Trust == TrustUser {
-				users++
-			} else {
-				cands++
-			}
-		}
-		tokens := usage.EstimateText(text)
-		bundle = SummaryBundle{
-			Text:      text,
-			Tokens:    tokens,
-			Truncated: tokens >= s.maxSum,
-			UserCount: users,
-			CandCount: cands,
-		}
-		return nil
-	})
-	return bundle, err
-}
-
-// RebuildSummary forces summary.md regeneration.
-func (s *Store) RebuildSummary() error {
-	return s.withFileLock(s.rebuildSummaryUnlocked)
-}
-
-// Report returns status for /memory status.
-func (s *Store) Report() (StatusReport, error) {
-	var rep StatusReport
-	err := s.withFileLock(func() error {
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		entries, err := s.loadEntriesUnlocked()
-		if err != nil {
-			return err
-		}
-		users, cands := 0, 0
-		for _, e := range entries {
-			if e.Status != StatusActive {
-				continue
-			}
-			if e.Trust == TrustUser {
-				users++
-			} else {
-				cands++
-			}
-		}
-		rep = StatusReport{
-			Root:            s.root,
-			UseEnabled:      s.useOn,
-			GenerateEnabled: s.genOn,
-			UserActive:      users,
-			CandidateActive: cands,
-			LastConsolidate: meta.LastConsolidate,
-			LastError:       meta.LastError,
-		}
-		return nil
-	})
-	return rep, err
-}
-
-// MarkExtracted records a successful extraction so the thread is not rescanned.
-func (s *Store) MarkExtracted(threadID string) error {
-	return s.markExtracted(threadID, nil)
-}
-
-func (s *Store) markExtractedAtGeneration(generation uint64, threadID string) error {
-	return s.markExtracted(threadID, &generation)
-}
-
-func (s *Store) markExtracted(threadID string, generation *uint64) error {
-	return s.withFileLock(func() error {
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		if generation != nil && meta.ResetGeneration != *generation {
-			return errResetGenerationChanged
-		}
-		now := s.now().UTC()
-		meta.LastConsolidate = &now
-		meta.LastError = ""
-		if threadID != "" && !containsString(meta.ProcessedThreads, threadID) {
-			meta.ProcessedThreads = append(meta.ProcessedThreads, threadID)
-			if len(meta.ProcessedThreads) > 500 {
-				meta.ProcessedThreads = meta.ProcessedThreads[len(meta.ProcessedThreads)-500:]
-			}
-		}
-		return s.writeMetaUnlocked(meta)
-	})
-}
-
-// RecordExtractError stores the last failure without marking the thread processed.
-func (s *Store) RecordExtractError(extractErr error) error {
-	return s.recordExtractError(extractErr, nil)
-}
-
-func (s *Store) recordExtractErrorAtGeneration(generation uint64, extractErr error) error {
-	return s.recordExtractError(extractErr, &generation)
-}
-
-func (s *Store) recordExtractError(extractErr error, generation *uint64) error {
-	return s.withFileLock(func() error {
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		if generation != nil && meta.ResetGeneration != *generation {
-			return errResetGenerationChanged
-		}
-		now := s.now().UTC()
-		meta.LastConsolidate = &now
-		if extractErr != nil {
-			meta.LastError = extractErr.Error()
-		}
-		return s.writeMetaUnlocked(meta)
-	})
-}
-
-// IsProcessed reports whether a thread was successfully extracted.
-func (s *Store) IsProcessed(threadID string) (bool, error) {
-	var ok bool
-	err := s.withFileLock(func() error {
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		ok = containsString(meta.ProcessedThreads, threadID)
-		return nil
-	})
-	return ok, err
-}
-
-func (s *Store) resetGeneration() (uint64, error) {
-	var generation uint64
-	err := s.withFileLock(func() error {
-		meta, err := s.readMetaUnlocked()
-		if err != nil {
-			return err
-		}
-		generation = meta.ResetGeneration
-		return nil
-	})
-	return generation, err
-}
-
-func (s *Store) requireGenerationUnlocked(generation uint64) error {
-	meta, err := s.readMetaUnlocked()
+	entries, err := s.ListActive()
 	if err != nil {
-		return err
+		return SummaryBundle{}, err
 	}
-	if meta.ResetGeneration != generation {
-		return errResetGenerationChanged
-	}
-	return nil
-}
-
-func (s *Store) rebuildSummaryUnlocked() error {
-	entries, err := s.loadEntriesUnlocked()
-	if err != nil {
-		return err
-	}
-	active := make([]Entry, 0)
+	text, truncated := renderSummary(entries, s.maxSum)
+	users, cands := 0, 0
 	for _, e := range entries {
-		if e.Status == StatusActive {
-			active = append(active, e)
+		if e.Trust == TrustUser {
+			users++
+		} else {
+			cands++
 		}
 	}
-	sortEntries(active)
+	return SummaryBundle{Text: text, Tokens: usage.EstimateText(text), Truncated: truncated, UserCount: users, CandCount: cands}, nil
+}
+func renderSummary(entries []Entry, maxTokens int) (string, bool) {
+	sortEntries(entries)
 	var b strings.Builder
 	b.WriteString("# Persistent memory (project-scoped)\n\n")
-	users := make([]Entry, 0)
-	cands := make([]Entry, 0)
-	for _, e := range active {
+	users, cands := []Entry{}, []Entry{}
+	for _, e := range entries {
 		if e.Trust == TrustUser {
 			users = append(users, e)
 		} else {
@@ -763,123 +509,308 @@ func (s *Store) rebuildSummaryUnlocked() error {
 		for _, e := range users {
 			fmt.Fprintf(&b, "- **%s**: %s\n", e.Key, e.Claim)
 		}
-		b.WriteString("\n")
+		b.WriteByte('\n')
 	}
 	if len(cands) > 0 {
-		b.WriteString("## Candidates (unverified — do not treat as ground truth)\n\n")
+		b.WriteString("## Candidates (unverified - do not treat as ground truth)\n\n")
 		for _, e := range cands {
 			fmt.Fprintf(&b, "- **%s**: %s _(unverified)_\n", e.Key, e.Claim)
 		}
-		b.WriteString("\n")
+		b.WriteByte('\n')
 	}
-	if len(users) == 0 && len(cands) == 0 {
+	if len(entries) == 0 {
 		b.WriteString("_No memories stored yet._\n")
 	}
 	text := b.String()
-	const notice = "\n\n…(truncated)\n"
-	if usage.EstimateText(text) > s.maxSum {
-		runes := []rune(text)
-		lo, hi := 0, len(runes)
-		for lo < hi {
-			mid := (lo + hi + 1) / 2
-			candidate := string(runes[:mid]) + notice
-			if usage.EstimateText(candidate) <= s.maxSum {
-				lo = mid
-			} else {
-				hi = mid - 1
-			}
-		}
-		if lo < 1 {
-			lo = 1
-		}
-		text = string(runes[:lo]) + notice
+	if usage.EstimateText(text) <= maxTokens {
+		return text, false
 	}
-	return os.WriteFile(filepath.Join(s.root, summaryFile), []byte(text), 0o644)
+	notice := "\n\n...(truncated)\n"
+	r := []rune(text)
+	lo, hi := 0, len(r)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if usage.EstimateText(string(r[:mid])+notice) <= maxTokens {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return string(r[:lo]) + notice, true
 }
 
-func (s *Store) loadEntriesUnlocked() ([]Entry, error) {
-	path := filepath.Join(s.root, entriesFile)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
+func (s *Store) Report() (StatusReport, error) {
+	var rep StatusReport
+	var use, gen int
+	var last sql.NullString
+	if err := s.db.QueryRow(`SELECT use_enabled,generate_enabled,last_consolidate_at,last_error FROM memory_settings WHERE singleton=1`).Scan(&use, &gen, &last, &rep.LastError); err != nil {
+		return rep, err
 	}
-	lines := strings.Split(string(data), "\n")
-	out := make([]Entry, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var e Entry
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			return nil, fmt.Errorf("parse entries.jsonl: %w", err)
-		}
-		out = append(out, e)
+	rep.Root = s.root
+	rep.DatabasePath = s.DatabasePath()
+	rep.SchemaVersion = MemorySchemaVersion
+	rep.UseEnabled = use != 0
+	rep.GenerateEnabled = gen != 0
+	if last.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, last.String)
+		rep.LastConsolidate = &t
 	}
-	return out, nil
+	if err := s.db.QueryRow(`SELECT count(*) FROM memory_entries WHERE status='active' AND trust='user'`).Scan(&rep.UserActive); err != nil {
+		return rep, err
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM memory_entries WHERE status='active' AND trust='candidate'`).Scan(&rep.CandidateActive); err != nil {
+		return rep, err
+	}
+	_ = s.db.QueryRow(`SELECT count(*) FROM memory_extractions WHERE status='running'`).Scan(&rep.RunningExtractions)
+	_ = s.db.QueryRow(`SELECT count(*) FROM memory_extractions WHERE status='failed'`).Scan(&rep.FailedExtractions)
+	return rep, nil
 }
 
-func (s *Store) writeEntriesUnlocked(entries []Entry) error {
-	var b strings.Builder
-	for _, e := range entries {
-		raw, err := json.Marshal(e)
-		if err != nil {
+func (s *Store) MarkExtracted(threadID string) error { return s.markExtracted(threadID, nil) }
+func (s *Store) markExtractedAtGeneration(g uint64, threadID string) error {
+	return s.markExtracted(threadID, &g)
+}
+func (s *Store) markExtracted(threadID string, g *uint64) error {
+	return s.transaction(func(tx *sql.Tx) error {
+		if err := requireGeneration(tx, g); err != nil {
 			return err
 		}
-		b.Write(raw)
-		b.WriteByte('\n')
+		now := s.now().UTC()
+		if _, err := tx.Exec(`UPDATE memory_settings SET last_consolidate_at=?,last_error='' WHERE singleton=1`, dbTime(now)); err != nil {
+			return err
+		}
+		if threadID != "" {
+			var generation uint64
+			if err := tx.QueryRow(`SELECT reset_generation FROM memory_settings WHERE singleton=1`).Scan(&generation); err != nil {
+				return err
+			}
+			_, err := tx.Exec(`INSERT INTO memory_extractions(thread_id,generation,status,updated_at) VALUES(?,?,'succeeded',?) ON CONFLICT(thread_id) DO UPDATE SET generation=excluded.generation,status='succeeded',lease_until=NULL,next_attempt_at=NULL,last_error='',updated_at=excluded.updated_at`, threadID, generation, dbTime(now))
+			return err
+		}
+		return nil
+	})
+}
+func (s *Store) RecordExtractError(err error) error { return s.recordExtractError(err, nil) }
+func (s *Store) recordExtractErrorAtGeneration(g uint64, err error) error {
+	return s.recordExtractError(err, &g)
+}
+func (s *Store) recordExtractError(extractErr error, g *uint64) error {
+	return s.transaction(func(tx *sql.Tx) error {
+		if err := requireGeneration(tx, g); err != nil {
+			return err
+		}
+		msg := ""
+		if extractErr != nil {
+			msg = extractErr.Error()
+		}
+		_, err := tx.Exec(`UPDATE memory_settings SET last_consolidate_at=?,last_error=? WHERE singleton=1`, dbTime(s.now().UTC()), msg)
+		return err
+	})
+}
+func (s *Store) IsProcessed(threadID string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT count(*) FROM memory_extractions WHERE thread_id=? AND status='succeeded'`, threadID).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) claimExtraction(threadID string, sourceUpdatedAt time.Time, generation uint64) (bool, error) {
+	now := s.now().UTC()
+	claimed := false
+	err := s.transaction(func(tx *sql.Tx) error {
+		if err := requireGeneration(tx, &generation); err != nil {
+			return err
+		}
+		var status, source string
+		var lease, next sql.NullString
+		err := tx.QueryRow(`SELECT status,source_updated_at,lease_until,next_attempt_at FROM memory_extractions WHERE thread_id=?`, threadID).Scan(&status, &source, &lease, &next)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		stamp := dbTime(sourceUpdatedAt)
+		if err == nil && source == stamp && status == "succeeded" {
+			return nil
+		}
+		if err == nil && source == stamp && status == "running" && lease.Valid {
+			until, _ := time.Parse(time.RFC3339Nano, lease.String)
+			if until.After(now) {
+				return nil
+			}
+		}
+		if err == nil && source == stamp && next.Valid {
+			retry, _ := time.Parse(time.RFC3339Nano, next.String)
+			if retry.After(now) {
+				return nil
+			}
+		}
+		_, err = tx.Exec(`INSERT INTO memory_extractions(thread_id,source_updated_at,generation,status,lease_until,attempts,updated_at) VALUES(?,?,?,'running',?,1,?) ON CONFLICT(thread_id) DO UPDATE SET source_updated_at=excluded.source_updated_at,generation=excluded.generation,status='running',lease_until=excluded.lease_until,attempts=CASE WHEN memory_extractions.source_updated_at=excluded.source_updated_at THEN memory_extractions.attempts+1 ELSE 1 END,next_attempt_at=NULL,last_error='',updated_at=excluded.updated_at`, threadID, stamp, generation, dbTime(now.Add(15*time.Minute)), dbTime(now))
+		if err == nil {
+			claimed = true
+		}
+		return err
+	})
+	return claimed, err
+}
+
+func (s *Store) finishExtraction(threadID string, sourceUpdatedAt time.Time, generation uint64, drafts []Draft, extractErr error) (int, error) {
+	written := 0
+	err := s.transaction(func(tx *sql.Tx) error {
+		if err := requireGeneration(tx, &generation); err != nil {
+			return err
+		}
+		var status, source string
+		if err := tx.QueryRow(`SELECT status,source_updated_at FROM memory_extractions WHERE thread_id=?`, threadID).Scan(&status, &source); err != nil {
+			return err
+		}
+		if status != "running" || source != dbTime(sourceUpdatedAt) {
+			return errors.New("memory extraction lease changed")
+		}
+		now := s.now().UTC()
+		if extractErr != nil {
+			var attempts int
+			_ = tx.QueryRow(`SELECT attempts FROM memory_extractions WHERE thread_id=?`, threadID).Scan(&attempts)
+			delay := 5 * time.Minute
+			if attempts > 1 {
+				delay <<= min(attempts-1, 6)
+			}
+			if delay > 6*time.Hour {
+				delay = 6 * time.Hour
+			}
+			_, err := tx.Exec(`UPDATE memory_extractions SET status='failed',lease_until=NULL,next_attempt_at=?,last_error=?,updated_at=? WHERE thread_id=?`, dbTime(now.Add(delay)), extractErr.Error(), dbTime(now), threadID)
+			if err != nil {
+				return err
+			}
+			_, err = tx.Exec(`UPDATE memory_settings SET last_consolidate_at=?,last_error=? WHERE singleton=1`, dbTime(now), extractErr.Error())
+			return err
+		}
+		for _, d := range drafts {
+			claim := strings.TrimSpace(d.Claim)
+			if claim == "" {
+				continue
+			}
+			key := normalizeKey(d.Key, claim)
+			var users int
+			if err := tx.QueryRow(`SELECT count(*) FROM memory_entries WHERE key=? AND status='active' AND trust='user'`, key).Scan(&users); err != nil {
+				return err
+			}
+			if users > 0 {
+				continue
+			}
+			var out Entry
+			if err := insertVersion(tx, &out, key, claim, TrustCandidate, threadID, nil, now); err != nil {
+				return err
+			}
+			written++
+		}
+		if _, err := tx.Exec(`UPDATE memory_extractions SET status='succeeded',lease_until=NULL,next_attempt_at=NULL,last_error='',updated_at=? WHERE thread_id=?`, dbTime(now), threadID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE memory_settings SET last_consolidate_at=?,last_error='' WHERE singleton=1`, dbTime(now))
+		return err
+	})
+	return written, err
+}
+func (s *Store) resetGeneration() (uint64, error) {
+	var g uint64
+	err := s.db.QueryRow(`SELECT reset_generation FROM memory_settings WHERE singleton=1`).Scan(&g)
+	return g, err
+}
+
+func requireGeneration(tx *sql.Tx, g *uint64) error {
+	if g == nil {
+		return nil
 	}
-	tmp := filepath.Join(s.root, entriesFile+".tmp")
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
+	var current uint64
+	if err := tx.QueryRow(`SELECT reset_generation FROM memory_settings WHERE singleton=1`).Scan(&current); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.root, entriesFile))
+	if current != *g {
+		return errResetGenerationChanged
+	}
+	return nil
+}
+func (s *Store) transaction(fn func(*sql.Tx) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// The following helpers keep package-internal callers source-compatible while
+// the storage implementation is SQLite-backed. They do not create legacy
+// files and should not be used by production code.
+func (s *Store) withFileLock(fn func() error) error { return fn() }
+
+func (s *Store) loadEntriesUnlocked() ([]Entry, error) {
+	return s.queryEntries(`ORDER BY created_at,id`)
 }
 
 func (s *Store) readMetaUnlocked() (Meta, error) {
-	data, err := os.ReadFile(filepath.Join(s.root, metaFile))
+	var meta Meta
+	var useOn, genOn int
+	var last sql.NullString
+	err := s.db.QueryRow(`SELECT workspace_root,use_enabled,generate_enabled,reset_generation,last_consolidate_at,last_error FROM memory_settings WHERE singleton=1`).Scan(
+		&meta.WorkspaceRoot, &useOn, &genOn, &meta.ResetGeneration, &last, &meta.LastError,
+	)
 	if err != nil {
 		return Meta{}, err
 	}
-	var meta Meta
-	if err := json.Unmarshal(data, &meta); err != nil {
+	meta.SchemaVersion = MemorySchemaVersion
+	meta.UseEnabled, meta.GenerateEnabled = useOn != 0, genOn != 0
+	if last.Valid {
+		t, _ := time.Parse(time.RFC3339Nano, last.String)
+		meta.LastConsolidate = &t
+	}
+	rows, err := s.db.Query(`SELECT thread_id,status FROM memory_extractions`)
+	if err != nil {
 		return Meta{}, err
 	}
-	return meta, nil
+	defer rows.Close()
+	for rows.Next() {
+		var id, status string
+		if err := rows.Scan(&id, &status); err != nil {
+			return Meta{}, err
+		}
+		if status == "succeeded" {
+			meta.ProcessedThreads = append(meta.ProcessedThreads, id)
+		} else if status == "running" {
+			meta.ClaimedThreads = append(meta.ClaimedThreads, id)
+		}
+	}
+	return meta, rows.Err()
 }
 
 func (s *Store) writeMetaUnlocked(meta Meta) error {
-	meta.SchemaVersion = SchemaVersion
-	raw, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return err
-	}
-	raw = append(raw, '\n')
-	tmp := filepath.Join(s.root, metaFile+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(s.root, metaFile))
+	return s.transaction(func(tx *sql.Tx) error {
+		var last any
+		if meta.LastConsolidate != nil {
+			last = dbTime(*meta.LastConsolidate)
+		}
+		if _, err := tx.Exec(`UPDATE memory_settings SET workspace_root=?,use_enabled=?,generate_enabled=?,reset_generation=?,last_consolidate_at=?,last_error=? WHERE singleton=1`,
+			meta.WorkspaceRoot, boolInt(meta.UseEnabled), boolInt(meta.GenerateEnabled), meta.ResetGeneration, last, meta.LastError); err != nil {
+			return err
+		}
+		for _, id := range meta.ClaimedThreads {
+			if _, err := tx.Exec(`INSERT INTO memory_extractions(thread_id,generation,status,updated_at) VALUES(?,?,'running',?) ON CONFLICT(thread_id) DO UPDATE SET status='running',updated_at=excluded.updated_at`, id, meta.ResetGeneration, dbTime(s.now().UTC())); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
-
-// withFileLock acquires a process-local mutex and an OS file lock for cross-process safety.
-func (s *Store) withFileLock(fn func() error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	lockPath := filepath.Join(s.root, lockFile)
-	fileLock := flock.New(lockPath)
-	if err := fileLock.Lock(); err != nil {
-		return fmt.Errorf("memory lock: %w", err)
+func boolInt(v bool) int {
+	if v {
+		return 1
 	}
-	defer func() {
-		_ = fileLock.Unlock()
-		_ = fileLock.Close()
-	}()
-	return fn()
+	return 0
 }
+func dbTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
 func normalizeKey(key, claim string) string {
 	key = strings.TrimSpace(key)
@@ -888,20 +819,17 @@ func normalizeKey(key, claim string) string {
 	}
 	return slugify(claim)
 }
-
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
+func slugify(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
 	var b strings.Builder
-	lastDash := false
-	for _, r := range s {
+	dash := false
+	for _, r := range v {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			b.WriteRune(r)
-			lastDash = false
-			continue
-		}
-		if !lastDash && b.Len() > 0 {
+			dash = false
+		} else if !dash && b.Len() > 0 {
 			b.WriteByte('-')
-			lastDash = true
+			dash = true
 		}
 		if b.Len() >= 48 {
 			break
@@ -912,23 +840,14 @@ func slugify(s string) string {
 		return "note"
 	}
 	if len(out) > 48 {
-		out = out[:48]
+		return out[:48]
 	}
 	return out
 }
-
-func newID() string {
-	var buf [8]byte
-	_, _ = rand.Read(buf[:])
-	return "mem_" + hex.EncodeToString(buf[:])
-}
-
+func newID() string { var b [8]byte; _, _ = rand.Read(b[:]); return "mem_" + hex.EncodeToString(b[:]) }
 func sortEntries(entries []Entry) {
-	sort.SliceStable(entries, func(i, j int) bool {
-		return lessEntry(entries[i], entries[j])
-	})
+	sort.SliceStable(entries, func(i, j int) bool { return lessEntry(entries[i], entries[j]) })
 }
-
 func lessEntry(a, b Entry) bool {
 	if a.Trust != b.Trust {
 		return a.Trust == TrustUser
@@ -937,13 +856,4 @@ func lessEntry(a, b Entry) bool {
 		return a.Key < b.Key
 	}
 	return a.UpdatedAt.After(b.UpdatedAt)
-}
-
-func containsString(list []string, v string) bool {
-	for _, s := range list {
-		if s == v {
-			return true
-		}
-	}
-	return false
 }

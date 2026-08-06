@@ -81,6 +81,208 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 	}
 }
 
+func TestPermissionsYoloIsExplicitAndVisible(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(Deps{
+		Ctx: context.Background(),
+		PolicyInfo: CommandPolicyInfo{
+			Mode:          "ask",
+			Approval:      string(tools.ApprovalOnRequest),
+			ApprovalState: state,
+			Sandbox:       SandboxInfo{Mode: "workspace-write", Backend: "seatbelt"},
+		},
+	})
+
+	next, cmd := m.submit("/permissions yolo")
+	if cmd != nil {
+		t.Fatal("yolo switch should not start a turn")
+	}
+	m = next.(*model)
+	if got := state.Mode(); got != tools.ApprovalYolo {
+		t.Fatalf("state mode = %q, want yolo", got)
+	}
+	if got, want := m.statusPolicyFragment(), "cmd=yolo · YOLO=UNSAFE · sb=off · sb_backend=host · net=host"; got != want {
+		t.Fatalf("yolo status = %q, want %q", got, want)
+	}
+	if !hasLineContaining(m.lines, lineError, tools.YoloModeWarning) {
+		t.Fatalf("yolo warning missing: %#v", m.lines)
+	}
+
+	next, _ = m.submit("/permissions")
+	m = next.(*model)
+	var report string
+	for _, line := range m.lines {
+		if line.kind == lineSystem && strings.Contains(line.text, "tool permissions") {
+			report = line.text
+		}
+	}
+	if !containsAll(report, "mode: yolo (on_request)", "approval: bypassed", "sandbox: BYPASSED by YOLO", "hard_denies: enforced", "workspace_path_safety: enforced") {
+		t.Fatalf("yolo permissions report = %q", report)
+	}
+	if err := state.SetInteractiveMode("ask"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := m.statusPolicyFragment(), "cmd=ask · sb=rw · sb_backend=seatbelt · net=off"; got != want {
+		t.Fatalf("status after leaving yolo = %q, want %q", got, want)
+	}
+	report = m.deps.PolicyInfo.FormatPermissions()
+	if strings.Contains(report, "BYPASSED by YOLO") || strings.Contains(report, "mode: yolo") {
+		t.Fatalf("yolo state persisted after explicit exit: %q", report)
+	}
+}
+
+func TestYoloDoesNotEnterShiftTabCycleAndStartupWarningIsVisible(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalYolo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(Deps{
+		Ctx: context.Background(),
+		PolicyInfo: CommandPolicyInfo{
+			Mode:          "yolo",
+			Approval:      string(tools.ApprovalOnRequest),
+			ApprovalState: state,
+		},
+	})
+	if !hasLineContaining(m.lines, lineError, tools.YoloModeWarning) {
+		t.Fatalf("startup yolo warning missing: %#v", m.lines)
+	}
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	if cmd != nil {
+		t.Fatal("Shift+Tab in yolo returned a command")
+	}
+	m = next.(*model)
+	if got := state.InteractiveMode(); got != "yolo" {
+		t.Fatalf("Shift+Tab left yolo mode as %q", got)
+	}
+	if !hasLineContaining(m.lines, lineError, "YOLO mode is explicit") {
+		t.Fatalf("Shift+Tab yolo guard missing: %#v", m.lines)
+	}
+}
+
+func TestPermissionsYoloChangeIsRejectedOutsideIdleWithoutDroppingDraft(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mode          mode
+		pending       bool
+		sideQuestions int
+	}{
+		{name: "busy", mode: modeBusy},
+		{name: "compacting", mode: modeCompacting},
+		{name: "pending approval", mode: modeIdle, pending: true},
+		{name: "side question", mode: modeIdle, sideQuestions: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := newModel(Deps{Ctx: context.Background(), PolicyInfo: CommandPolicyInfo{
+				Approval:      string(tools.ApprovalOnRequest),
+				ApprovalState: state,
+			}})
+			m.mode = tc.mode
+			m.sideQuestions = tc.sideQuestions
+			m.textarea.SetValue("/permissions yolo")
+			if tc.pending {
+				m.pendingApproval = &approvalRequestMsg{ID: "yolo-approval"}
+			}
+
+			next, cmd := m.queueWhileBusy(m.textarea.Value())
+			if cmd != nil {
+				t.Fatal("rejected yolo switch returned a command")
+			}
+			m = next.(*model)
+			if got := state.InteractiveMode(); got != "ask" {
+				t.Fatalf("rejected yolo switch changed mode to %q", got)
+			}
+			if got := m.textarea.Value(); got != "/permissions yolo" {
+				t.Fatalf("rejected yolo switch changed draft to %q", got)
+			}
+		})
+	}
+}
+
+func TestShiftTabCyclesPermissionModesWithoutStartingTurn(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(Deps{
+		Ctx: context.Background(),
+		PolicyInfo: CommandPolicyInfo{
+			Approval:      string(tools.ApprovalOnRequest),
+			ApprovalState: state,
+		},
+	})
+	m.textarea.SetValue("keep this draft")
+	for _, want := range []string{"auto", "plan", "ask", "auto"} {
+		next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+		if cmd != nil {
+			t.Fatalf("Shift+Tab %q returned a command", want)
+		}
+		m = next.(*model)
+		if got := state.InteractiveMode(); got != want {
+			t.Fatalf("Shift+Tab mode = %q, want %q", got, want)
+		}
+		if got := m.textarea.Value(); got != "keep this draft" {
+			t.Fatalf("Shift+Tab dropped draft: %q", got)
+		}
+		if !hasLineContaining(m.lines, lineSystem, "permission mode: "+want) {
+			t.Fatalf("Shift+Tab confirmation for %q missing: %#v", want, m.lines)
+		}
+	}
+}
+
+func TestShiftTabDoesNotChangeModeOutsideIdleAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		mode          mode
+		pending       bool
+		sideQuestions int
+	}{
+		{name: "busy", mode: modeBusy},
+		{name: "compacting", mode: modeCompacting},
+		{name: "pending approval", mode: modeIdle, pending: true},
+		{name: "side question", mode: modeIdle, sideQuestions: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := newModel(Deps{
+				Ctx: context.Background(),
+				PolicyInfo: CommandPolicyInfo{
+					Approval:      string(tools.ApprovalOnRequest),
+					ApprovalState: state,
+				},
+			})
+			m.mode = tc.mode
+			m.sideQuestions = tc.sideQuestions
+			m.textarea.SetValue("keep this draft")
+			if tc.pending {
+				m.pendingApproval = &approvalRequestMsg{ID: "shift-tab-approval"}
+			}
+
+			next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+			if cmd != nil {
+				t.Fatalf("blocked Shift+Tab returned a command")
+			}
+			m = next.(*model)
+			if got := state.InteractiveMode(); got != "ask" {
+				t.Fatalf("blocked Shift+Tab changed mode to %q", got)
+			}
+			if got := m.textarea.Value(); got != "keep this draft" {
+				t.Fatalf("blocked Shift+Tab dropped draft: %q", got)
+			}
+		})
+	}
+}
+
 func TestPlanAliasSwitchesIdleModeAndPreservesStatus(t *testing.T) {
 	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
 	if err != nil {
@@ -226,6 +428,12 @@ func TestPermissionsPlanIsDocumentedInHelpAndSlashMenu(t *testing.T) {
 	if !strings.Contains(helpText(), "/plan") {
 		t.Fatalf("help does not document the direct plan alias: %s", helpText())
 	}
+	if !strings.Contains(helpText(), "shift+tab cycle permission mode: ask -> auto -> plan -> ask") {
+		t.Fatalf("help does not document Shift+Tab mode cycle: %s", helpText())
+	}
+	if !strings.Contains(helpText(), "/permissions yolo") || !strings.Contains(helpText(), "hard denies/path checks") {
+		t.Fatalf("help does not document yolo safety boundary: %s", helpText())
+	}
 	planRow := false
 	for _, command := range slashCatalog() {
 		if command.Name == "/plan" {
@@ -238,7 +446,7 @@ func TestPermissionsPlanIsDocumentedInHelpAndSlashMenu(t *testing.T) {
 			}
 		}
 		if command.Name == "/permissions" {
-			if !strings.Contains(command.Description, "ask|auto|plan") {
+			if !strings.Contains(command.Description, "ask|auto|plan") || !strings.Contains(command.Description, "yolo") || !strings.Contains(command.Description, "Shift+Tab") {
 				t.Fatalf("permissions menu description = %q", command.Description)
 			}
 		}
@@ -438,6 +646,7 @@ func TestPermissionsParseAndBusyClassification(t *testing.T) {
 		{input: "/permissions ask", action: slashPermissions, arg: "ask", busy: busyInputReject},
 		{input: "/permissions auto", action: slashPermissions, arg: "auto", busy: busyInputReject},
 		{input: "/permissions plan", action: slashPermissions, arg: "plan", busy: busyInputReject},
+		{input: "/permissions yolo", action: slashPermissions, arg: "yolo", busy: busyInputReject},
 		{input: "/plan", action: slashPlan, busy: busyInputReject},
 		{input: "/plan inspect files", action: slashPlan, arg: "inspect files", busy: busyInputReject},
 		{input: "/plan exit", action: slashPlan, arg: "exit", busy: busyInputReject},

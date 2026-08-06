@@ -30,6 +30,24 @@ func TestPermissionSetShellClaudeOrder(t *testing.T) {
 	}
 }
 
+func TestPermissionSetCautiousReadOnlyInspectionCommands(t *testing.T) {
+	set, err := BuildPermissionSet(ProfileCautious, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{
+		"ls -la",
+		"find . -maxdepth 2 -type f",
+		"cat README.md",
+		"rg --files",
+	} {
+		ev := set.EvaluateBash(command)
+		if ev.Decision != DecisionAllow {
+			t.Errorf("%q = %+v, want allow", command, ev)
+		}
+	}
+}
+
 func TestPermissionSetApplyPatchPath(t *testing.T) {
 	root := t.TempDir()
 	set, err := BuildPermissionSet(ProfileCautious, []string{"ApplyPatch(**)"}, nil, []string{"ApplyPatch(.env)"})

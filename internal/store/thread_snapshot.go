@@ -11,8 +11,7 @@ import (
 )
 
 // SnapshotThread copies one locked thread into another store. The source
-// journal is authoritative; projections and immutable support files are copied
-// only as materialized inputs for the destination's normal replay path.
+// journal is authoritative; immutable support files are copied for replay.
 // Source locks are deliberately not copied.
 func (s *ThreadStore) SnapshotThread(ctx context.Context, id string, destination *ThreadStore) error {
 	if s == nil {
@@ -158,10 +157,8 @@ func (s *ThreadStore) snapshotThreadToDestination(sourceDir, destinationDir stri
 	if err := copySnapshotFileIfPresent(sourceDir, stagingDir, journalFileName, true); err != nil {
 		return err
 	}
-	for _, name := range []string{stateFileName, metaFileName} {
-		if err := copySnapshotFileIfPresent(sourceDir, stagingDir, name, false); err != nil {
-			return err
-		}
+	if err := copySnapshotFileIfPresent(sourceDir, stagingDir, systemPromptFileName, true); err != nil {
+		return err
 	}
 	for _, name := range []string{checkpointsDir, artifactsDir} {
 		if err := copySnapshotDirectory(filepath.Join(sourceDir, name), filepath.Join(stagingDir, name)); err != nil {
@@ -180,6 +177,14 @@ func (s *ThreadStore) snapshotThreadToDestination(sourceDir, destinationDir stri
 	cleanup = false
 	if err := syncDirectory(parent); err != nil {
 		return fmt.Errorf("sync snapshot sessions directory: %w", err)
+	}
+	id := filepath.Base(destinationDir)
+	state, events, _, err := replayJournalReadOnly(filepath.Join(destinationDir, journalFileName), id)
+	if err != nil {
+		return fmt.Errorf("replay snapshot projection: %w", err)
+	}
+	if err := s.projectThread(destinationDir, state, events); err != nil {
+		return fmt.Errorf("project snapshot: %w", err)
 	}
 	return nil
 }

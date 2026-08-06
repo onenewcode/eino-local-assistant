@@ -29,7 +29,7 @@ func TestSlashMenuOpenRefilterClose(t *testing.T) {
 	}
 
 	setComposer(m, "/re")
-	if got := namesOf(m.slashItems); !equalStrings(got, []string{"/resume"}) {
+	if got := namesOf(m.slashItems); !equalStrings(got, []string{"/review", "/resume"}) {
 		t.Fatalf("/re => %v", got)
 	}
 
@@ -154,6 +154,13 @@ func TestSlashMenuTabCompleteNeedsArgClasses(t *testing.T) {
 	setComposer(mm, "/re")
 	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyTab})
 	mm = next.(*model)
+	if mm.textarea.Value() != "/review" {
+		t.Fatalf("tab /re = %q", mm.textarea.Value())
+	}
+
+	setComposer(mm, "/res")
+	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyTab})
+	mm = next.(*model)
 	if mm.textarea.Value() != "/resume " {
 		t.Fatalf("tab /resume = %q", mm.textarea.Value())
 	}
@@ -235,7 +242,7 @@ func TestSlashMenuEnterArgCommandsDoNotSubmit(t *testing.T) {
 		want   string
 	}{
 		{"/n", "/new "},
-		{"/re", "/resume "},
+		{"/res", "/resume "},
 		{"/ti", "/title "},
 		{"/del", "/delete "},
 		{"/que", "/queue "},

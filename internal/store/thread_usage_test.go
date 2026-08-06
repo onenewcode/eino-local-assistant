@@ -552,8 +552,8 @@ func rewriteThreadCreationWithoutUsageStatus(t *testing.T, threadStore *ThreadSt
 	if len(lines) != 1 {
 		t.Fatalf("initial journal lines = %d, want 1", len(lines))
 	}
-	var event ThreadEvent
-	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+	event, err := decodeThreadEvent([]byte(lines[0]), threadID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	var payload map[string]any

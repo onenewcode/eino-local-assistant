@@ -14,6 +14,7 @@ import (
 	"eino-local-assistant/internal/usage"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -325,6 +326,31 @@ func TestCtrlOHidesFoldedReasoningPreview(t *testing.T) {
 	m = next.(*model)
 	if !strings.Contains(m.View(), "consider options") {
 		t.Fatalf("visible folded reasoning should reveal its retained preview:\n%s", m.View())
+	}
+}
+
+func TestVisibleFoldedReasoningRevealsFullProviderContent(t *testing.T) {
+	m := newTestModel(t)
+	m.turnID = 1
+	m.mode = modeBusy
+	body := "a provider reasoning summary that is longer than the compact preview limit and must remain available when details are visible"
+	next, _ := m.Update(turnReasoningMsg{turnID: 1, chunk: body})
+	m = next.(*model)
+	next, _ = m.Update(turnToolStartMsg{turnID: 1, tool: "search", callID: "full-reasoning", input: "{}"})
+	m = next.(*model)
+	var reasoning transcriptLine
+	for _, line := range m.lines {
+		if line.kind == lineReasoning {
+			reasoning = line
+			break
+		}
+	}
+	rendered := ansi.Strip(renderReasoning(reasoning.text, reasoning.folded, false, m.reasoningDetailsVisible, reasoning.reasoningBody))
+	if !strings.Contains(rendered, "longer than the compact preview limit") || !strings.Contains(rendered, "remain available") {
+		t.Fatalf("visible folded reasoning lost full content: %q", rendered)
+	}
+	if !hasLineContaining(m.lines, lineTool, "search") {
+		t.Fatalf("tool card missing after reasoning fold: %#v", m.lines)
 	}
 }
 
