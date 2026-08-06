@@ -27,6 +27,8 @@ TUI 的 `/model` 与 `Alt+P` picker 只在 idle、无 pending approval、无运�
 
 TUI 会话内权限模式为 `ask`、`auto` 和 `plan`。`plan` 是 TUI 进程级临时 read-only phase，不是配置持久化，也不是完整的 plan artifact workflow；它不生成或持久化任务计划、计划文件或独立 plan 账本。`/permissions` 无参数是只读报告；`/permissions plan` 只在 idle 时进入，`/permissions ask` 与 `/permissions auto` 只在 idle 时退出 plan，busy、compacting 或其他非 idle 状态拒绝且不进入 FIFO，并保留 composer draft。`auto` 只在 `internal/tools` 的实际授权边界自动处理 `DecisionAsk`。plan 下 `apply_patch` 无条件返回结构化 `plan_read_only` 拒绝；shell 只有 `PermissionSet` 原始 `DecisionAllow` 才能进入 enforced OS read-only worker，hard deny 仍按既有策略拒绝，其他非原始 allow 不进入 ask；缺少或无法证明该 sandbox 时 fail-closed，不无 sandbox 执行，也不请求 host escalation。所有模式仍受硬 deny、workspace/path clamp、sandbox 与 host escalation 上限约束。模式不写配置、session ledger 或 resume 数据。
 
+`/plan` 与 `/permissions plan` 进入同一个临时 read-only phase，复用相同的 idle-only admission、状态展示与执行边界；它不新增 artifact、持久化或权限语义。`/plan` 无参数只切换到 plan；`/plan <prompt>` 仅在 idle 时先切到 plan，再通过同一正常 TUI turn 路径执行一次 prompt，并在 turn 结束后保持 plan；精确的 `/plan exit` 与 `/plan ask` 恢复 ask，`/plan auto` 恢复 auto。所有 `/plan` 形式在 busy、compacting 或 pending approval 时立即拒绝、不排队、不取消当前操作并保留 composer draft；prompt 启动失败时不启动 turn，模式仍保持 plan。这仍不是持久 plan workflow。
+
 Headless `exec` 不使用该 TUI 状态，也没有 `/permissions` 交互命令；其 `approval_policy` 继续是启动时静态语义，默认 execute 行为不变。`on-request` 在没有交互 approver 时对需要审批的请求 fail-closed，`never` 仅保留既有的 `DecisionAsk` 自动处理，不能绕过硬权限、路径钳制或 sandbox。该 TUI 切换不改变 headless 行为。
 
 TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并通过 `cmd/eino-assistant` 的 `SideQuestion` callback 发起一次旁路模型请求。它是本仓库的安全子集：主 turn 不被打断，旁路问题不进入 FIFO queue，多个问题可并发。请求使用当前 active session 的 frozen system prompt 和 transcript 作为 reference-only；不调用 tools 或 subagents，不写主 ledger、`usage` 或 `journal`，不修改文件、git state、configuration 或 permissions。结果只进入 TUI 的 side-only display，错误和空回答也可见；没有 callback 的嵌入调用方显示 unavailable。它不是完整持久 fork，也不提供独立 session、ledger 或 resume；Codex/Claude 的行为只作为研究参考，不宣称完全等价。
@@ -45,7 +47,7 @@ TUI `/btw <question>`（别名 `/side <question>`）由 `internal/tui` 接收并
 | `internal/tools` | shell、apply_patch、artifact、memory 只读工具；权限规则求值及 ask/auto/plan 在工具授权边界的应用 | TUI 策略展示；配置与 TUI 命令编排 |
 | `internal/sandbox` | 工具的 OS 隔离边界 | prompt 规则 |
 | `internal/config` | TOML 读取、默认值与校验；静态 `approval_policy`；`model.catalog` 的显式 label/alias/lifecycle/capability 声明；可选的 provider/model-specific opaque `model.reasoning_effort` | TUI 会话运行时状态；provider discovery/health；会话内模型切换不重写全局配置 |
-| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、idle-only `/permissions ask|auto|plan` 命令入口、idle-only `/model [name]` 命令入口、显式 catalog picker 与 `Alt+P`、状态栏与权限模式展示、只读任务进度、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、provider 构造、工具授权真相、旁路请求的模型调用、provider discovery/health/capability enforcement、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
+| `internal/tui` | 交互、slash、本地 FIFO 队列（列表、`drop`、`edit`、`clear`、`resume`）、显式 `/steer` 命令入口、审批桥、idle-only `/permissions ask|auto|plan` 与 `/plan [<prompt>|exit|ask|auto]` 命令入口、idle-only `/model [name]` 命令入口、显式 catalog picker 与 `Alt+P`、状态栏与权限模式展示、只读任务进度与 `/goal` 投影、side-only 旁路结果展示/并发调度、idle-only `/fork` session 切换，以及 Esc backtrack selector/session 切换 | 模型协议、provider 构造、工具授权真相、旁路请求的模型调用、provider discovery/health/capability enforcement、workspace/Git 回滚；队列不持久化，steer 核心语义由 `chat` / `agent` 负责 |
 | `cmd/eino-assistant` runtime / headless output | 共享 runtime 接线（包括 TUI 与 side-effecting tools 的同一会话模式状态）、provider 构造、启动时模型 override、catalog alias 解析、TUI idle model replacement 与 runtime-owned resume 的模型身份选择、picker DTO 接线、旁路问题的一次性只读模型调用，以及 `exec` 的 text/json/stream-json 投影、`--output-schema` 文件预加载与最终响应 delivery | provider structured-output 请求、ReAct 中间响应 schema、session/store schema、provider discovery/health、headless 的动态 TUI 模式 |
 | `internal/provider` | OpenAI / Anthropic 模型适配；将规范化后的非空 `model.reasoning_effort` 交给各自 provider 请求字段，空值保留 provider 默认 | 产品流程；跨 provider effort 值校验 |
 | `internal/runtimeguard` / `usage` | 单轮预算；token/费用投影 | 权限或账单真相 |
@@ -86,7 +88,7 @@ System prompt 由 `agent.ComposeWithLayers` 组装：persona、工具/任务 pol
 - proof 必须绑定精确匹配且成功的真实 `shell` 结果；图快照只保留引用和少量恢复上下文，完整证据仍在账本。
 - 未计划且实际执行的 `shell` / `apply_patch`，以及任务完成或中断后迟到且可能改动工作区的工具结果，都会开启“必须先建计划”的 gate；模型不能直接交付该改动。
 - `task_complete` 只是在当前 turn 内的暂定批准；`chat.Session` 在提交最终消息前复查 gate。取消、失败或恢复发现未提交批准、或快照后的 shell/patch 生命周期时，都会关闭交付并要求重规划。
-- 任务图不增加专用 slash 命令；状态栏显示紧凑进度，`Ctrl+T` 展开只读任务面板。
+- 任务图不增加修改、取消或完整 DAG slash 命令；`/goal` 只读显示有限的目标/状态/计数/进度/当前任务/PlanRequired/gaps 投影，状态栏显示紧凑进度，`Ctrl+T` 展开只读任务面板。
 - `Esc` / `Ctrl+C` 留下可恢复且不可交付的 `interrupted` 状态；普通后续输入沿用原始需求和未变范围的 proof。只有 `task_plan` 把当前用户原文显式写为 `user-request` 才替换范围；恢复中的 `working` 节点先转为 `needs_replan`，下一次执行时重新收集其 proof。
 
 ## 依赖方向

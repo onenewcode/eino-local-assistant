@@ -111,6 +111,88 @@ func TestStatusFromCarriesRequestedReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestModelCatalogFromConfigCarriesDeclaredDefaultReasoningEffort(t *testing.T) {
+	entries := modelCatalogFromConfig([]config.ModelCatalogEntry{{
+		Name: "reasoning-model",
+		Capabilities: config.ModelCatalogCapabilities{
+			ReasoningEfforts:       []string{"low", "high"},
+			DefaultReasoningEffort: "high",
+		},
+	}})
+	if len(entries) != 1 {
+		t.Fatalf("catalog entries = %d, want 1", len(entries))
+	}
+	if got := entries[0].Capabilities.DefaultReasoningEffort; got != "high" {
+		t.Fatalf("default reasoning effort = %q, want high", got)
+	}
+}
+
+func TestStatusFromConfigMapsDeclaredCapabilitiesForCanonicalModelOnly(t *testing.T) {
+	cfg := config.Config{Model: config.ModelConfig{
+		Provider: config.ProviderOpenAI,
+		Name:     "GPT-5.2-CODING",
+		Catalog: []config.ModelCatalogEntry{
+			{
+				Name:    "gpt-5.2-coding",
+				Aliases: []string{"coding"},
+				Capabilities: config.ModelCatalogCapabilities{
+					ReasoningEfforts:       []string{"low", "high"},
+					DefaultReasoningEffort: "high",
+				},
+			},
+		},
+	}}
+	status := statusFromConfig(cfg, nil, "ask", 0, tui.SandboxInfo{}, tui.RuntimeInfo{})
+	if !reflect.DeepEqual(status.DeclaredReasoningEfforts, []string{"low", "high"}) || status.DeclaredReasoningEffortDefault != "high" {
+		t.Fatalf("declared capabilities = %#v/%q", status.DeclaredReasoningEfforts, status.DeclaredReasoningEffortDefault)
+	}
+	cfg.Model.Catalog[0].Capabilities.ReasoningEfforts[0] = "changed"
+	if status.DeclaredReasoningEfforts[0] != "low" {
+		t.Fatalf("status capabilities share catalog storage: %#v", status.DeclaredReasoningEfforts)
+	}
+	status.DeclaredReasoningEfforts[0] = "status-mutated"
+	if cfg.Model.Catalog[0].Capabilities.ReasoningEfforts[0] != "changed" {
+		t.Fatalf("catalog capabilities share status storage: %#v", cfg.Model.Catalog[0].Capabilities.ReasoningEfforts)
+	}
+
+	for _, name := range []string{"coding", "custom-endpoint"} {
+		cfg.Model.Name = name
+		status = statusFromConfig(cfg, nil, "ask", 0, tui.SandboxInfo{}, tui.RuntimeInfo{})
+		if len(status.DeclaredReasoningEfforts) != 0 || status.DeclaredReasoningEffortDefault != "" {
+			t.Fatalf("non-canonical model %q received declarations: %#v/%q", name, status.DeclaredReasoningEfforts, status.DeclaredReasoningEffortDefault)
+		}
+	}
+}
+
+func TestStatusFromConfigMapsDeclaredCatalogLifecycleForCanonicalNameOnly(t *testing.T) {
+	cfg := config.Config{Model: config.ModelConfig{
+		Provider: config.ProviderOpenAI,
+		Name:     "GPT-5.2-CODING",
+		Catalog: []config.ModelCatalogEntry{
+			{Name: "gpt-5.2-coding", Lifecycle: "DEPRECATED"},
+		},
+	}}
+	status := statusFromConfig(cfg, nil, "ask", 0, tui.SandboxInfo{}, tui.RuntimeInfo{})
+	if status.DeclaredCatalogLifecycle != "deprecated" {
+		t.Fatalf("declared catalog lifecycle = %q, want deprecated", status.DeclaredCatalogLifecycle)
+	}
+
+	for _, name := range []string{"coding", "custom-endpoint"} {
+		cfg.Model.Name = name
+		status = statusFromConfig(cfg, nil, "ask", 0, tui.SandboxInfo{}, tui.RuntimeInfo{})
+		if status.DeclaredCatalogLifecycle != "" {
+			t.Fatalf("non-canonical model %q received lifecycle declaration %q", name, status.DeclaredCatalogLifecycle)
+		}
+	}
+
+	cfg.Model.Name = "gpt-5.2-coding"
+	cfg.Model.Catalog[0].Lifecycle = ""
+	status = statusFromConfig(cfg, nil, "ask", 0, tui.SandboxInfo{}, tui.RuntimeInfo{})
+	if status.DeclaredCatalogLifecycle != "active" {
+		t.Fatalf("blank lifecycle = %q, want normalized active", status.DeclaredCatalogLifecycle)
+	}
+}
+
 func TestEffectiveSandboxProtectedPathsRejectsSessionStoreContainingWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	configPath := filepath.Join(workspace, "config.toml")

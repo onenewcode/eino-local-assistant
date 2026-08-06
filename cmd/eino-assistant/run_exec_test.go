@@ -1183,6 +1183,123 @@ func TestExecModelOverrideDispatchesAcrossFreshResumeAndEphemeral(t *testing.T) 
 	}
 }
 
+func TestExecReasoningEffortDispatchesAcrossHeadlessPaths(t *testing.T) {
+	const wantEffort = "high"
+	cases := []struct {
+		name string
+		args []string
+		deps func(*fakeExecSession, *string, *string) execCommandDeps
+	}{
+		{name: "fresh", args: []string{"exec", "--model", "model", "--reasoning-effort", wantEffort, "run"}, deps: func(s *fakeExecSession, gotModel, gotEffort *string) execCommandDeps {
+			return execCommandDeps{newSessionWithModelEffort: func(_ context.Context, _ string, model, effort string) (execSession, io.Closer, error) {
+				*gotModel, *gotEffort = model, effort
+				return s, nil, nil
+			}}
+		}},
+		{name: "fresh ephemeral", args: []string{"exec", "--ephemeral", "--reasoning-effort", wantEffort, "run"}, deps: func(s *fakeExecSession, _, gotEffort *string) execCommandDeps {
+			return execCommandDeps{newEphemeralWithModelEffort: func(_ context.Context, _ string, model, effort string) (execSession, io.Closer, error) {
+				*gotEffort = effort
+				if model != "" {
+					return nil, nil, errors.New("model should be empty")
+				}
+				return s, nil, nil
+			}}
+		}},
+		{name: "resume", args: []string{"exec", "resume", "thread", "--reasoning-effort", wantEffort, "run"}, deps: func(s *fakeExecSession, gotModel, gotEffort *string) execCommandDeps {
+			return execCommandDeps{openSessionWithModelEffort: func(_ context.Context, _ string, id string, _ bool, model, effort string) (execSession, io.Closer, error) {
+				*gotModel, *gotEffort = id, effort
+				return s, nil, nil
+			}}
+		}},
+		{name: "resume last", args: []string{"exec", "resume", "--last", "--reasoning-effort", wantEffort, "run"}, deps: func(s *fakeExecSession, gotModel, gotEffort *string) execCommandDeps {
+			return execCommandDeps{selectLastSession: func(context.Context, string) (string, error) { return "last-thread", nil }, openSessionWithModelEffort: func(_ context.Context, _ string, id string, _ bool, model, effort string) (execSession, io.Closer, error) {
+				*gotModel, *gotEffort = id, effort
+				return s, nil, nil
+			}}
+		}},
+		{name: "resume ephemeral", args: []string{"exec", "resume", "--ephemeral", "thread", "--reasoning-effort", wantEffort, "run"}, deps: func(s *fakeExecSession, gotModel, gotEffort *string) execCommandDeps {
+			return execCommandDeps{openEphemeralWithModelEffort: func(_ context.Context, _ string, id string, _ bool, model, effort string) (execSession, io.Closer, error) {
+				*gotModel, *gotEffort = id, effort
+				return s, nil, nil
+			}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &fakeExecSession{id: "effort-session", chunks: []string{"done"}}
+			var gotModel, gotEffort string
+			if _, _, err := executeExecForTest(strings.NewReader(""), tc.deps(session, &gotModel, &gotEffort), tc.args...); err != nil {
+				t.Fatalf("exec: %v", err)
+			}
+			if gotEffort != wantEffort {
+				t.Fatalf("effort = %q, want %q", gotEffort, wantEffort)
+			}
+		})
+	}
+}
+
+func TestExecReasoningEffortAutoNormalizesAndBlankIsRejected(t *testing.T) {
+	session := &fakeExecSession{id: "auto-session", chunks: []string{"done"}}
+	var got string
+	deps := execCommandDeps{newSessionWithModelEffort: func(_ context.Context, _ string, _, effort string) (execSession, io.Closer, error) {
+		got = effort
+		return session, nil, nil
+	}}
+	if _, _, err := executeExecForTest(strings.NewReader(""), deps, "exec", "--reasoning-effort", "auto", "run"); err != nil {
+		t.Fatalf("auto: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("auto effort = %q, want empty requested effort", got)
+	}
+	got = "not-normalized"
+	if _, _, err := executeExecForTest(strings.NewReader(""), deps, "exec", "--reasoning-effort", "AUTO", "run"); err != nil {
+		t.Fatalf("AUTO: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("case-insensitive auto effort = %q, want empty requested effort", got)
+	}
+	_, _, err := executeExecForTest(strings.NewReader(""), deps, "exec", "--reasoning-effort", " ", "run")
+	if err == nil || !strings.Contains(err.Error(), "cannot be blank") {
+		t.Fatalf("blank effort error = %v", err)
+	}
+}
+
+func TestExecReasoningEffortFactoryRequiresEffortAwareFactory(t *testing.T) {
+	legacyCalled := false
+	legacy := func(context.Context, string) (execSession, io.Closer, error) {
+		legacyCalled = true
+		return &fakeExecSession{}, nil, nil
+	}
+	factory := execSessionFactoryForModelEffort(legacy, nil, nil, "", "high", true)
+	if _, _, err := factory(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "effort-aware exec session factory") {
+		t.Fatalf("explicit effort error = %v", err)
+	}
+	if legacyCalled {
+		t.Fatal("explicit effort fell back to legacy factory")
+	}
+
+	openLegacyCalled := false
+	openLegacy := func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+		openLegacyCalled = true
+		return &fakeExecSession{}, nil, nil
+	}
+	openFactory := execOpenSessionFactoryForModelEffort(openLegacy, nil, nil, "", "high", true)
+	if _, _, err := openFactory(context.Background(), "", "thread", false); err == nil || !strings.Contains(err.Error(), "effort-aware exec resume session factory") {
+		t.Fatalf("explicit resume effort error = %v", err)
+	}
+	if openLegacyCalled {
+		t.Fatal("explicit resume effort fell back to legacy factory")
+	}
+
+	legacyCalled = false
+	if _, _, err := execSessionFactoryForModelEffort(legacy, nil, nil, "", "", false)(context.Background(), ""); err != nil {
+		t.Fatalf("no-flag legacy factory: %v", err)
+	}
+	if !legacyCalled {
+		t.Fatal("no-flag path did not select legacy factory")
+	}
+}
+
 func TestCommandRuntimeCloseRemovesEphemeralStore(t *testing.T) {
 	root := t.TempDir()
 	threadStore, err := store.NewThreadStore(root)

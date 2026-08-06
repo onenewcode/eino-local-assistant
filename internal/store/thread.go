@@ -40,6 +40,7 @@ type ThreadStore struct {
 
 var _ ThreadRepository = (*ThreadStore)(nil)
 var _ ThreadModelRepository = (*ThreadStore)(nil)
+var _ ThreadModelBindingRepository = (*ThreadStore)(nil)
 
 type localThreadLock struct {
 	held chan struct{}
@@ -156,6 +157,7 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	now := time.Now().UTC()
 	meta.ID = id
 	meta.Title = strings.TrimSpace(meta.Title)
+	meta.ReasoningEffort = strings.TrimSpace(meta.ReasoningEffort)
 	// A thread starts with an empty ledger. Only usage.recorded events may
 	// populate token, cost, or context projections after creation.
 	clearUsageProjection(&meta)
@@ -552,8 +554,23 @@ func (s *ThreadStore) SetThreadTitle(ctx context.Context, id string, expectedRev
 // SetThreadModel emits model.changed after checking the full durable lifecycle
 // under the write lock. The caller supplies a constructed provider separately;
 // this method only records the selected identity and never constructs one.
+// Its empty-model behavior remains the legacy provider-default selection.
 func (s *ThreadStore) SetThreadModel(ctx context.Context, id string, expectedRevision uint64, model string) (ThreadState, error) {
+	return s.setThreadModelBinding(ctx, id, expectedRevision, model, "", false)
+}
+
+// SetThreadModelBinding emits one model.changed event for the complete model
+// selection tuple. An empty model retains the current identity so callers can
+// update only reasoning effort; an empty effort clears the requested value.
+// This method only records opaque selection data and performs no provider or
+// catalog validation.
+func (s *ThreadStore) SetThreadModelBinding(ctx context.Context, id string, expectedRevision uint64, model, reasoningEffort string) (ThreadState, error) {
+	return s.setThreadModelBinding(ctx, id, expectedRevision, model, reasoningEffort, true)
+}
+
+func (s *ThreadStore) setThreadModelBinding(ctx context.Context, id string, expectedRevision uint64, model, reasoningEffort string, preserveEmptyModel bool) (ThreadState, error) {
 	model = strings.TrimSpace(model)
+	reasoningEffort = strings.TrimSpace(reasoningEffort)
 	dir, unlock, err := s.lockThread(ctx, id)
 	if err != nil {
 		return ThreadState{}, err
@@ -566,6 +583,9 @@ func (s *ThreadStore) SetThreadModel(ctx context.Context, id string, expectedRev
 	if err := checkExpectedRevision(state, expectedRevision); err != nil {
 		return ThreadState{}, err
 	}
+	if preserveEmptyModel && model == "" {
+		model = state.Meta.Model
+	}
 	tracker, err := lifecycleFromEvents(events)
 	if err != nil {
 		return ThreadState{}, err
@@ -576,7 +596,10 @@ func (s *ThreadStore) SetThreadModel(ctx context.Context, id string, expectedRev
 	if state.PendingCompaction != nil {
 		return ThreadState{}, fmt.Errorf("%w: %q", ErrModelChangePendingCompaction, state.PendingCompaction.OperationID)
 	}
-	return s.appendLocked(dir, state, expectedRevision, EventModelChanged, "", ModelChange{Model: model})
+	return s.appendLocked(dir, state, expectedRevision, EventModelChanged, "", ModelChange{
+		Model:           model,
+		ReasoningEffort: reasoningEffort,
+	})
 }
 
 func (s *ThreadStore) mutate(ctx context.Context, id string, expectedRevision uint64, kind EventKind, turnID string, payload any) (ThreadState, error) {

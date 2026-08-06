@@ -19,6 +19,8 @@ func TestParseSlash(t *testing.T) {
 		{"/quit", slashExit, ""},
 		{"/clear", slashClear, ""},
 		{"/status", slashStatus, ""},
+		{"/goal", slashGoal, ""},
+		{"/goal extra", slashGoal, "extra"},
 		{"/rules", slashRules, ""},
 		{"/btw what changed?", slashSide, "what changed?"},
 		{"/side what changed?", slashSide, "what changed?"},
@@ -44,6 +46,9 @@ func TestParseSlash(t *testing.T) {
 		{"/queue clear", slashQueue, "clear"},
 		{"/queue drop 2", slashQueue, "drop 2"},
 		{"/queue edit 2 replacement text", slashQueue, "edit 2 replacement text"},
+		{"/plan", slashPlan, ""},
+		{"/plan extra", slashPlan, "extra"},
+		{"/plan exit", slashPlan, "exit"},
 		{"/permissions", slashPermissions, ""},
 		{"/policy", slashPermissions, ""},
 		{"/memory", slashMemory, ""},
@@ -86,9 +91,9 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/rules", "/btw", "/side", "/steer", "/usage",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/goal", "/rules", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact",
-		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue",
+		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue", "/plan",
 		"/model",
 		"/permissions", "/policy",
 	}
@@ -115,8 +120,8 @@ func catalogCoversToken(catalog []slashCommand, tok string) bool {
 
 func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
-		"/help": false, "/status": false, "/rules": false, "/context": false, "/sessions": false,
-		"/clear": false, "/exit": false, "/permissions": true,
+		"/help": false, "/status": false, "/goal": false, "/rules": false, "/context": false, "/sessions": false,
+		"/clear": false, "/exit": false, "/plan": false, "/permissions": true,
 		"/btw": true, "/steer": true,
 		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
 		"/delete": true, "/queue": true, "/model": true, "/memory": true,
@@ -152,12 +157,12 @@ func TestStatusHelpDocumentsReasoningVisibility(t *testing.T) {
 			break
 		}
 	}
-	if !strings.Contains(description, "reasoning effort (requested/default)") || !strings.Contains(description, "Ctrl+O details") {
+	if !strings.Contains(description, "declared catalog lifecycle") || !strings.Contains(description, "reasoning effort (requested/default)") || !strings.Contains(description, "declared catalog effort options/default") || !strings.Contains(description, "Ctrl+O details") {
 		t.Fatalf("status catalog description = %q", description)
 	}
 
 	help := helpText()
-	if !strings.Contains(help, "/status            model, session, tokens, cost, max_step, context, reasoning effort (requested/default); ctrl+o toggles details") {
+	if !strings.Contains(help, "/status            model, session, tokens, cost, max_step, context, declared catalog lifecycle, reasoning effort (requested/default); declared catalog effort options/default; ctrl+o toggles details") {
 		t.Fatalf("status help line missing reasoning visibility details: %s", help)
 	}
 }

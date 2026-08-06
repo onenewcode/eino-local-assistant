@@ -172,6 +172,16 @@ func TestSlashMenuTabCompleteNeedsArgClasses(t *testing.T) {
 		t.Fatalf("tab /help = %q", mm.textarea.Value())
 	}
 
+	setComposer(mm, "/pl")
+	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyTab})
+	mm = next.(*model)
+	if mm.textarea.Value() != "/plan" {
+		t.Fatalf("tab /plan alias = %q", mm.textarea.Value())
+	}
+	if !mm.slashMenuOpen() {
+		t.Fatal("exact /plan should keep its no-argument menu row")
+	}
+
 	setComposer(mm, "/q")
 	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyDown})
 	mm = next.(*model)

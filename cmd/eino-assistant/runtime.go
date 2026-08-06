@@ -178,7 +178,7 @@ func selectNewestExecSession(ctx context.Context, lister execThreadLister) (stri
 // fresh session uses config, an explicit override wins for every start mode,
 // and an unqualified resume inherits the target thread's durable identity
 // only when that identity is non-empty. Legacy threads without one keep the
-// current config model.
+// current config model and effort.
 func resolveStartupModelConfig(
 	ctx context.Context,
 	cfg config.Config,
@@ -188,26 +188,38 @@ func resolveStartupModelConfig(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if modelName := strings.TrimSpace(start.modelName); modelName != "" {
-		if err := applyModelOverride(&cfg, modelName); err != nil {
+	explicitModel := strings.TrimSpace(start.modelName)
+	if explicitModel != "" {
+		if err := applyModelOverride(&cfg, explicitModel); err != nil {
 			return config.Config{}, err
 		}
-		return cfg, nil
 	}
 	if strings.TrimSpace(start.resumeID) == "" {
+		if start.reasoningEffortSet {
+			cfg.Model.ReasoningEffort = strings.TrimSpace(start.reasoningEffort)
+		}
 		return cfg, nil
 	}
-	if source == nil {
+	if explicitModel == "" && source == nil {
 		return config.Config{}, errors.New("resume model source is unavailable")
 	}
-	meta, err := source.LoadThreadMeta(ctx, strings.TrimSpace(start.resumeID))
-	if err != nil {
-		return config.Config{}, fmt.Errorf("load resume session metadata: %w", err)
-	}
-	if modelName := strings.TrimSpace(meta.Model); modelName != "" {
-		if err := applyModelOverride(&cfg, modelName); err != nil {
-			return config.Config{}, fmt.Errorf("validate resume session model: %w", err)
+	if explicitModel == "" {
+		meta, err := source.LoadThreadMeta(ctx, strings.TrimSpace(start.resumeID))
+		if err != nil {
+			return config.Config{}, fmt.Errorf("load resume session metadata: %w", err)
 		}
+		if modelName := strings.TrimSpace(meta.Model); modelName != "" {
+			if err := applyModelOverride(&cfg, modelName); err != nil {
+				return config.Config{}, fmt.Errorf("validate resume session model: %w", err)
+			}
+			if !start.reasoningEffortSet {
+				// An empty durable effort intentionally restores provider/model-default semantics.
+				cfg.Model.ReasoningEffort = strings.TrimSpace(meta.ReasoningEffort)
+			}
+		}
+	}
+	if start.reasoningEffortSet {
+		cfg.Model.ReasoningEffort = strings.TrimSpace(start.reasoningEffort)
 	}
 	return cfg, nil
 }
@@ -664,8 +676,9 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 		reactModel: reactModel,
 		compactor:  compactor,
 		sessionOpts: chat.SessionOptions{
-			Store:     r.sessionStore,
-			ModelName: strings.TrimSpace(cfg.Model.Name),
+			Store:           r.sessionStore,
+			ModelName:       strings.TrimSpace(cfg.Model.Name),
+			ReasoningEffort: strings.TrimSpace(cfg.Model.ReasoningEffort),
 			Pricing: usage.Pricing{
 				InputPerMillion:  cfg.Model.Pricing.InputPerMillion,
 				OutputPerMillion: cfg.Model.Pricing.OutputPerMillion,
@@ -694,6 +707,29 @@ func (r *commandRuntime) switchModel(ctx context.Context, session *chat.Session,
 	if session == nil {
 		return runtimeModelBundle{}, errors.New("active session is required")
 	}
+	return r.switchModelBinding(ctx, session, requestedName, session.ReasoningEffort(), false)
+}
+
+// switchModelWithOptions replaces the complete requested model tuple. The
+// candidate is built before the session changes, and runtime state is
+// published only after the durable replacement succeeds.
+func (r *commandRuntime) switchModelWithOptions(ctx context.Context, session *chat.Session, requestedName, requestedEffort string) (runtimeModelBundle, error) {
+	if r == nil {
+		return runtimeModelBundle{}, errors.New("runtime is required")
+	}
+	if session == nil {
+		return runtimeModelBundle{}, errors.New("active session is required")
+	}
+	return r.switchModelBinding(ctx, session, requestedName, requestedEffort, true)
+}
+
+func (r *commandRuntime) switchModelBinding(ctx context.Context, session *chat.Session, requestedName, requestedEffort string, withOptions bool) (runtimeModelBundle, error) {
+	if r == nil {
+		return runtimeModelBundle{}, errors.New("runtime is required")
+	}
+	if session == nil {
+		return runtimeModelBundle{}, errors.New("active session is required")
+	}
 	requestedName = strings.TrimSpace(requestedName)
 	if requestedName == "" {
 		return runtimeModelBundle{}, errors.New("model name is required")
@@ -702,17 +738,30 @@ func (r *commandRuntime) switchModel(ctx context.Context, session *chat.Session,
 	if err := applyModelOverride(&cfg, requestedName); err != nil {
 		return runtimeModelBundle{}, err
 	}
+	if withOptions {
+		cfg.Model.ReasoningEffort = strings.TrimSpace(requestedEffort)
+	}
 	candidate, err := r.buildModelBundle(ctx, cfg, false)
 	if err != nil {
 		return runtimeModelBundle{}, err
 	}
-	if err := session.ReplaceModel(ctx, chat.ModelBinding{
+	binding := chat.ModelBinding{
 		Model:     candidate.reactModel,
 		ModelName: candidate.sessionOpts.ModelName,
 		Compactor: candidate.compactor,
 		Pricing:   candidate.sessionOpts.Pricing,
-	}); err != nil {
-		return runtimeModelBundle{}, err
+	}
+	if withOptions {
+		binding.ReasoningEffort = candidate.sessionOpts.ReasoningEffort
+	}
+	var replaceErr error
+	if withOptions {
+		replaceErr = session.ReplaceModelWithOptions(ctx, binding)
+	} else {
+		replaceErr = session.ReplaceModel(ctx, binding)
+	}
+	if replaceErr != nil {
+		return runtimeModelBundle{}, replaceErr
 	}
 	r.modelMu.Lock()
 	r.cfg = candidate.cfg
@@ -740,10 +789,12 @@ func (r *commandRuntime) openSession(ctx context.Context, id string, recoverInte
 		return runtimeSessionOpenResult{}, fmt.Errorf("load session metadata: %w", err)
 	}
 	cfg, _, _, _ := r.modelSnapshot()
-	if durableName := strings.TrimSpace(meta.Model); durableName != "" && durableName != strings.TrimSpace(cfg.Model.Name) {
+	if durableName := strings.TrimSpace(meta.Model); durableName != "" {
 		if err := applyModelOverride(&cfg, durableName); err != nil {
 			return runtimeSessionOpenResult{}, err
 		}
+		// Restore the stored request, including empty provider-default semantics.
+		cfg.Model.ReasoningEffort = strings.TrimSpace(meta.ReasoningEffort)
 	}
 	candidate, err := r.buildModelBundle(ctx, cfg, recoverInterrupted)
 	if err != nil {

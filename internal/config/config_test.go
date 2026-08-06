@@ -81,6 +81,7 @@ lifecycle = "ACTIVE"
 context_window_tokens = 128000
 max_output_tokens = 8192
 reasoning_efforts = ["low", " medium ", "low"]
+default_reasoning_effort = " custom-effort "
 input_modalities = ["text", "image"]
 supports_tools = true
 supports_streaming = true
@@ -102,6 +103,9 @@ lifecycle = "retired"
 	}
 	if got := entry.Capabilities.ReasoningEfforts; !reflect.DeepEqual(got, []string{"low", "medium"}) {
 		t.Fatalf("reasoning efforts = %#v", got)
+	}
+	if got := entry.Capabilities.DefaultReasoningEffort; got != "custom-effort" {
+		t.Fatalf("default reasoning effort = %q, want %q", got, "custom-effort")
 	}
 	if entry.Capabilities.SupportsReasoning == nil || !*entry.Capabilities.SupportsReasoning {
 		t.Fatal("reasoning efforts should declare reasoning support")
@@ -153,6 +157,20 @@ func TestModelCatalogRejectsAmbiguousOrContradictoryMetadata(t *testing.T) {
 			}}},
 			want: "conflicts with reasoning_efforts",
 		},
+		{
+			name: "default reasoning effort is one token",
+			entries: []ModelCatalogEntry{{Name: "one", Capabilities: ModelCatalogCapabilities{
+				DefaultReasoningEffort: "low medium",
+			}}},
+			want: "single token",
+		},
+		{
+			name: "default reasoning effort rejects control characters",
+			entries: []ModelCatalogEntry{{Name: "one", Capabilities: ModelCatalogCapabilities{
+				DefaultReasoningEffort: "lo\x00w",
+			}}},
+			want: "single token",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -161,6 +179,55 @@ func TestModelCatalogRejectsAmbiguousOrContradictoryMetadata(t *testing.T) {
 				t.Fatalf("normalizeModelCatalog() error = %v, want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestModelCatalogNormalizesBlankDefaultReasoningEffort(t *testing.T) {
+	entries, err := normalizeModelCatalog([]ModelCatalogEntry{{
+		Name: "catalog-model",
+		Capabilities: ModelCatalogCapabilities{
+			DefaultReasoningEffort: " \t",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("normalizeModelCatalog() error = %v", err)
+	}
+	if got := entries[0].Capabilities.DefaultReasoningEffort; got != "" {
+		t.Fatalf("blank default reasoning effort = %q, want empty", got)
+	}
+}
+
+func TestModelCatalogEntriesReturnsDefensiveCopy(t *testing.T) {
+	model := ModelConfig{
+		Catalog: []ModelCatalogEntry{{
+			Name: "catalog-model",
+			Capabilities: ModelCatalogCapabilities{
+				DefaultReasoningEffort: "custom-effort",
+				ReasoningEfforts:       []string{"low"},
+				InputModalities:        []string{"text"},
+			},
+		}},
+	}
+
+	entries := model.CatalogEntries()
+	if len(entries) != 1 {
+		t.Fatalf("catalog entries length = %d, want 1", len(entries))
+	}
+	if got := entries[0].Capabilities.DefaultReasoningEffort; got != "custom-effort" {
+		t.Fatalf("default reasoning effort = %q, want %q", got, "custom-effort")
+	}
+
+	entries[0].Capabilities.DefaultReasoningEffort = "changed"
+	entries[0].Capabilities.ReasoningEfforts[0] = "changed"
+	entries[0].Capabilities.InputModalities[0] = "changed"
+	if got := model.Catalog[0].Capabilities.DefaultReasoningEffort; got != "custom-effort" {
+		t.Fatalf("source default reasoning effort = %q, want %q", got, "custom-effort")
+	}
+	if got := model.Catalog[0].Capabilities.ReasoningEfforts[0]; got != "low" {
+		t.Fatalf("source reasoning effort = %q, want %q", got, "low")
+	}
+	if got := model.Catalog[0].Capabilities.InputModalities[0]; got != "text" {
+		t.Fatalf("source input modality = %q, want %q", got, "text")
 	}
 }
 

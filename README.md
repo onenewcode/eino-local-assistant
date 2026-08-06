@@ -89,7 +89,7 @@ profile = "cautious"
 data_dir = ""
 ```
 
-权限状态栏显示 `cmd=ask|auto`，并在已配置时显示 `sb=rw|ro`、沙盒后端与 `net=off|allow:n`；`/permissions` 可查看 Claude 风格规则、sandbox 和 runtime 预算、session allow/deny。
+权限状态栏显示 `cmd=ask|auto|plan`，并在已配置时显示 `sb=rw|ro`、沙盒后端与 `net=off|allow:n`；`/permissions` 可查看 Claude 风格规则、sandbox 和 runtime 预算、session allow/deny。`plan` 只属于当前 TUI 进程的临时 read-only phase，不写配置或 session ledger。
 
 `model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。模型的 token 边界和压缩策略统一位于 `model.context`：`window_tokens` 与 `max_output_tokens` 都是必填正整数，且后者必须小于前者。输入 prompt 的可用预算固定为 `window_tokens - max_output_tokens`，因此不存在第二个 reserve 配置可以与实际输出上限漂移。
 
@@ -243,10 +243,12 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 | Ctrl+C | busy 时中断；idle 时退出 |
 | Ctrl+D | idle 且输入为空时退出 |
 | `/help` | 帮助 |
-| `/status` | 模型 / 会话 / API usage / context 快照 / 费用估算 / ReAct、sandbox 与 runtime 护栏 |
+| `/status` | 模型 / config catalog 声明生命周期 / 会话 / API usage / context 快照 / 费用估算 / ReAct、sandbox 与 runtime 护栏 |
+| `/goal` | 当前 autonomous task 的紧凑只读目标、状态、计数、进度、当前任务、PlanRequired 与有限 gaps；无 task runtime 时显示 unavailable |
 | `/rules` | 当前 session 捕获的用户/项目 instruction source、预算、tokens、truncated 与生命周期；只读，不 reload |
 | `/btw <question>` / `/side <question>` | 旁路只读问题；不打断、不排队主 turn（多个问题可并发）；结果只显示在 side-only 区域 |
-| `/permissions` | 权限规则、sandbox 模式/后端/网络、运行时预算与本 session 决策 |
+| `/plan [<prompt>\|exit\|ask\|auto]` | `/plan` 无参进入临时 plan read-only phase；`<prompt>` 只在 idle 时先切 plan 再启动一次普通 TUI model turn，并保持 plan；`exit` / `ask` 恢复 ask，`auto` 恢复 auto；不生成或持久化 plan artifact |
+| `/permissions [ask\|auto\|plan]` | 权限规则、sandbox 模式/后端/网络、运行时预算与本 session 决策；模式切换只在 idle 生效 |
 | `/memory` | 项目持久记忆：list / add / update / delete / accept / on\|off / generate / status / reset（见 [docs/memory.md](docs/memory.md)） |
 | `/context` | 最近 API context 快照、规划输入预算、活动 checkpoint、热 turn、fallback 与自动压缩熔断状态 |
 | `/compact [focus]` | 在稳定 turn 边界生成带来源的结构化 checkpoint；原始 turn 不删除 |
@@ -263,7 +265,7 @@ JSONL 不暴露 assistant text delta、reasoning、tool name/call ID、参数、
 
 工具调用显示为 Claude/Codex 风格卡片（`⚙ name` + 缩进 `⎿` 结果，JSON 会 pretty-print）；assistant 回复在完成后对 markdown/代码块做终端渲染（流式阶段为纯文本）。idle 状态栏显示 `provider/model` / 短 session id / API usage / `cost~` / 可选 context 快照；复杂任务显示紧凑的 `task:n/m` 进度，`Ctrl+T` 可展开只读的状态、目标、范围、当前工作与 gap，busy 状态栏还会显示当前工具名与 `queued:N`。上滚离开底部时状态栏提示 `↑ End to follow`。每轮完成后会显示该轮的 `API usage: prompt / generation / total / calls`，不会把 API 请求输入误称为用户输入。
 
-生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/rules`、`/btw`、`/side`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；旁路问题不进入该队列，也不打断当前 turn，多个旁路问题可以并发执行。busy 时 `Esc` / `Ctrl+C` 中断当前 turn；backtrack requires an empty composer，idle 且 composer 非空时 `Esc` 保持草稿且不 arm/open，composer 为空时连续两次 `Esc` 进入 backtrack 选择。`/compact`、`/clear`、`/new`、`/resume`、`/fork`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle；`/fork` 也不会进入 FIFO。
+生成或压缩中可立即运行 `/help`、`/context`、`/status`、`/goal`、`/rules`、`/btw`、`/side`、`/sessions`、`/queue`、`/permissions` 与只读 `/memory` 操作；`/plan` 的无参、prompt 和 `exit|ask|auto` 形式，以及 `/permissions ask|auto|plan`，在 busy、compacting 或 pending approval 时立即拒绝、不排队、不取消当前操作并保留 composer draft。`/queue clear` 会立刻丢弃未开始的 follow-up。自然语言仍按 FIFO 排队；旁路问题不进入该队列，也不打断当前 turn，多个旁路问题可以并发执行。busy 时 `Esc` / `Ctrl+C` 中断当前 turn；backtrack requires an empty composer，idle 且 composer 非空时 `Esc` 保持草稿且不 arm/open，composer 为空时连续两次 `Esc` 进入 backtrack 选择。`/compact`、`/clear`、`/new`、`/resume`、`/fork`、`/title`、`/delete`、`/exit` 等变更性命令须等 idle；`/fork` 也不会进入 FIFO。
 
 Idle backtrack 展示 source 中有可见 user prompt 的 committed turn，包括首个 committed turn。backtrack requires an empty composer；idle 时普通非空草稿按 `Esc` 保持原样，既不 arm 也不打开 selector，slash menu 仍先由 `Esc` 关闭。确认首个 prompt 时，TUI 通过显式 before-first fork 创建空 committed prefix 的 source-preserving child；普通 `Session.Fork` 的空边界仍表示 latest，不能混用。确认选择后，TUI 在该 prompt 之前创建 child，source 保持不变，并把选中的 prompt 放回 child composer 供编辑；它不会把选中的 prompt 预写入 child transcript。fork 失败时 selector 关闭、source 仍 active、prompt 保留在 composer 并显示错误。busy、compacting、pending approval 或 side question in-flight 时拒绝 backtrack。该能力不回滚 workspace、Git、网络请求、进程、provider usage、权限、semantic memory 或其他外部副作用；它不是 destructive rewind，也不是 OpenCode/Gemini CLI 的文件恢复 checkpoint。
 

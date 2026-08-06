@@ -362,6 +362,7 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 			return fmt.Errorf("decode model change: %w", err)
 		}
 		state.Meta.Model = strings.TrimSpace(payload.Model)
+		state.Meta.ReasoningEffort = strings.TrimSpace(payload.ReasoningEffort)
 	case EventContextCompactionStarted:
 		var payload CompactionStart
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {

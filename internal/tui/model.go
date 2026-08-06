@@ -30,10 +30,21 @@ type StatusInfo struct {
 	// ModelDisplayName is an optional configured catalog label. Model remains
 	// the provider/canonical identity used for diagnostics and persistence.
 	ModelDisplayName string
-	Tools            []string
+	// DeclaredCatalogLifecycle is the lifecycle declared by the local config
+	// catalog for the current canonical model. It is not provider health,
+	// entitlement, discovery, or an observed provider-effective state.
+	DeclaredCatalogLifecycle string
+	Tools                    []string
 	// ReasoningEffort is the configured/requested model reasoning effort.
 	// An empty value means the provider default is requested.
 	ReasoningEffort string
+	// DeclaredReasoningEfforts contains the current canonical model's
+	// catalog-declared effort options. It does not establish provider support
+	// or the effective effort used by a request.
+	DeclaredReasoningEfforts []string
+	// DeclaredReasoningEffortDefault is the catalog-declared default for the
+	// current model. It is not an observed provider-effective value.
+	DeclaredReasoningEffortDefault string
 	// MaxStep is the ReAct step budget (0 omits from /status).
 	MaxStep int
 	// CmdPolicy is the status-bar fragment like "cmd=ask" or "cmd=auto".
@@ -44,6 +55,14 @@ type StatusInfo struct {
 	Runtime RuntimeInfo
 }
 
+// cloneStatusInfo gives the TUI ownership of mutable status slices supplied by
+// runtime callbacks or embedding callers.
+func cloneStatusInfo(info StatusInfo) StatusInfo {
+	info.Tools = append([]string(nil), info.Tools...)
+	info.DeclaredReasoningEfforts = append([]string(nil), info.DeclaredReasoningEfforts...)
+	return info
+}
+
 // ModelCatalogCapabilities is the picker-facing copy of declared model
 // metadata. Unknown values are omitted rather than inferred from the provider.
 type ModelCatalogCapabilities struct {
@@ -51,9 +70,12 @@ type ModelCatalogCapabilities struct {
 	MaxOutputTokens     int
 	SupportsReasoning   *bool
 	ReasoningEfforts    []string
-	InputModalities     []string
-	SupportsTools       *bool
-	SupportsStreaming   *bool
+	// DefaultReasoningEffort is a catalog-declared default requested effort.
+	// It is not an observed provider-effective value.
+	DefaultReasoningEffort string
+	InputModalities        []string
+	SupportsTools          *bool
+	SupportsStreaming      *bool
 }
 
 // ModelCatalogEntry describes one explicitly configured picker option.
@@ -78,6 +100,18 @@ type ModelSwitchResult struct {
 // ModelSwitchCallback builds and commits a new provider binding for the active
 // session. It is called only after TUI idle/approval/side-question admission.
 type ModelSwitchCallback func(context.Context, *chat.Session, string) (ModelSwitchResult, error)
+
+// ModelSelection is the complete picker selection. An empty ReasoningEffort
+// explicitly requests the provider/model default rather than a named effort.
+type ModelSelection struct {
+	ModelName       string
+	ReasoningEffort string
+}
+
+// ModelSwitchWithOptionsCallback replaces the active binding using a model and
+// its requested reasoning effort. The callback must return requested effort in
+// ModelSwitchResult.Status; no provider-effective effort is implied here.
+type ModelSwitchWithOptionsCallback func(context.Context, *chat.Session, ModelSelection) (ModelSwitchResult, error)
 
 // SessionOpenResult carries the complete runtime snapshot for a resumed
 // session. Unlike ModelSwitchResult, opening a session intentionally changes
@@ -128,6 +162,9 @@ type Deps struct {
 	// SwitchModel replaces the active session's provider binding in place. It
 	// never creates a new session or clears TUI transient state.
 	SwitchModel ModelSwitchCallback
+	// SwitchModelWithOptions is the picker callback for model+effort choices.
+	// It is optional so older embedders can keep using SwitchModel.
+	SwitchModelWithOptions ModelSwitchWithOptionsCallback
 	// ModelCatalog is an explicitly configured picker catalog. An empty catalog
 	// keeps /model <name> available but leaves the Alt+P picker unavailable.
 	ModelCatalog []ModelCatalogEntry
@@ -231,8 +268,10 @@ type model struct {
 	slashSel   int
 	// modelPicker is a local, non-durable selection overlay. It never changes
 	// the active binding until the user confirms an entry.
-	modelPickerItems []ModelCatalogEntry
-	modelPickerSel   int
+	modelPickerItems     []ModelCatalogEntry
+	modelPickerSel       int
+	modelPickerEfforts   []string
+	modelPickerEffortSel int
 	// taskPaneOpen exposes a compact, read-only task projection without making
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
@@ -643,6 +682,16 @@ func (m *model) acceptSlashSelection() (tea.Model, tea.Cmd) {
 	// queue / immediate / reject policy stays centralized.
 	text := completeSlashCommand(cmd)
 	m.clearSlashMenu()
+	if m.mode != modeIdle {
+		disposition := classifyBusyInput(text)
+		if disposition == busyInputReject {
+			// Rejected transitions leave the composer untouched, even when
+			// Enter came from the slash menu.
+			m.layout()
+			m.refreshViewport()
+			return m.queueWhileBusy(text)
+		}
+	}
 	m.textarea.Reset()
 	m.syncComposerHeight()
 	m.layout()
@@ -730,6 +779,8 @@ func (m *model) resetSessionTransientState() {
 	m.queuePaused = false
 	m.modelPickerItems = nil
 	m.modelPickerSel = 0
+	m.modelPickerEfforts = nil
+	m.modelPickerEffortSel = 0
 	m.clearBacktrack()
 	m.clearSlashMenu()
 	m.closeTaskPane()
@@ -776,6 +827,7 @@ func newModel(deps Deps) *model {
 	if deps.SessionOpts.Store == nil {
 		deps.SessionOpts.Store = deps.Store
 	}
+	deps.Status = cloneStatusInfo(deps.Status)
 	ta := textarea.New()
 	ta.Placeholder = "Message the assistant…  (/help)"
 	ta.ShowLineNumbers = false
@@ -1218,8 +1270,10 @@ func (m *model) View() string {
 		}
 	} else if m.slashMenuOpen() {
 		helpTextLine = "↑↓ select · tab complete · enter accept · esc dismiss · ctrl+j newline"
+	} else if m.modelPickerEffortOpen() {
+		helpTextLine = "↑↓/jk select effort · enter apply · esc back · alt+p close"
 	} else if m.modelPickerOpen() {
-		helpTextLine = "↑↓/jk select model · enter apply · esc cancel · alt+p close"
+		helpTextLine = "↑↓/jk select model · enter choose/apply · esc cancel · alt+p close"
 	} else if m.backtrackState.mode == backtrackSelecting {
 		helpTextLine = "↑↓/jk select prompt · enter fork before prompt · esc cancel"
 	} else if m.backtrackState.mode == backtrackArmed {
@@ -1245,6 +1299,8 @@ func (m *model) View() string {
 		parts = append(parts, m.approvalModalPage().content)
 	} else if m.slashMenuOpen() {
 		parts = append(parts, renderSlashMenu(m.width, m.slashItems, m.slashSel))
+	} else if m.modelPickerEffortOpen() {
+		parts = append(parts, renderModelEffortPicker(m.width, m.selectedModelPickerEntry(), m.modelPickerEfforts, m.modelPickerEffortSel, m.deps.Status.ReasoningEffort))
 	} else if m.modelPickerOpen() {
 		parts = append(parts, renderModelPicker(m.width, m.modelPickerItems, m.modelPickerSel, m.currentModelIdentity()))
 	} else if m.backtrackState.mode == backtrackSelecting {
@@ -1382,6 +1438,9 @@ func (m *model) modelPickerHeight() int {
 	if width <= 0 {
 		width = 80
 	}
+	if m.modelPickerEffortOpen() {
+		return lipgloss.Height(renderModelEffortPicker(width, m.selectedModelPickerEntry(), m.modelPickerEfforts, m.modelPickerEffortSel, m.deps.Status.ReasoningEffort))
+	}
 	return lipgloss.Height(renderModelPicker(width, m.modelPickerItems, m.modelPickerSel, m.currentModelIdentity()))
 }
 
@@ -1476,6 +1535,10 @@ func (m *model) queueWhileBusy(input string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if action, _ := parseSlash(input); action == slashPlan {
+		m.appendLine(lineError, permissionModeBusyMessage)
+		return m, nil
+	}
 	if isImmediatelyExecutableWhileBusy(input) {
 		m.textarea.Reset()
 		m.syncComposerHeight()
@@ -1484,7 +1547,7 @@ func (m *model) queueWhileBusy(input string) (tea.Model, tea.Cmd) {
 		return m.submit(input)
 	}
 	if action, _ := parseSlash(input); action == slashPermissions {
-		m.appendLine(lineError, "permission mode changes are unavailable while busy; retry when idle")
+		m.appendLine(lineError, permissionModeBusyMessage)
 		return m, nil
 	}
 	if !isQueueableInput(input) {
@@ -1524,6 +1587,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSystem, m.statusReport())
 		m.appendLine(lineSep, "")
 		return m, nil
+	case slashGoal:
+		return m.cmdGoal(arg)
 	case slashRules:
 		return m.cmdRules(arg)
 	case slashSide:
@@ -1554,6 +1619,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdQueue(arg)
 	case slashPermissions:
 		return m.cmdPermissions(arg)
+	case slashPlan:
+		return m.cmdPlan(arg)
 	case slashMemory:
 		return m.cmdMemory(arg)
 	case slashUnknown:
@@ -1599,8 +1666,7 @@ func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSep, "")
 		return m, nil
 	}
-	if m.mode != modeIdle {
-		m.appendLine(lineError, "permission mode changes are unavailable while busy; retry when idle")
+	if m.permissionModeChangeUnavailable() {
 		return m, nil
 	}
 	state := m.deps.PolicyInfo.ApprovalState
@@ -1610,6 +1676,56 @@ func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 	}
 	if err := state.SetInteractiveMode(arg); err != nil {
 		m.appendLine(lineError, "usage: /permissions [ask|auto|plan]")
+		return m, nil
+	}
+	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
+	return m, nil
+}
+
+func (m *model) permissionModeChangeUnavailable() bool {
+	if m.mode == modeIdle && !m.hasPendingApproval() {
+		return false
+	}
+	m.appendLine(lineError, permissionModeBusyMessage)
+	return true
+}
+
+// cmdPlan keeps the plan phase temporary and explicit: only a non-reserved
+// argument becomes a single normal model turn, and the resulting mode remains
+// plan until a later /plan exit|ask|auto or /permissions transition.
+func (m *model) cmdPlan(prompt string) (tea.Model, tea.Cmd) {
+	if m.permissionModeChangeUnavailable() {
+		return m, nil
+	}
+	state := m.deps.PolicyInfo.ApprovalState
+	if state == nil {
+		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
+		return m, nil
+	}
+
+	target := "plan"
+	switch strings.ToLower(strings.TrimSpace(prompt)) {
+	case "exit", "ask":
+		target = "ask"
+	case "auto":
+		target = "auto"
+	default:
+		if err := state.SetInteractiveMode("plan"); err != nil {
+			m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
+			return m, nil
+		}
+		prompt = strings.TrimSpace(prompt)
+		if prompt == "" {
+			m.appendLine(lineSystem, "permission mode: plan")
+			return m, nil
+		}
+		m.appendLine(lineUser, prompt)
+		m.streamingAssistant = false
+		return m.startTurn(prompt)
+	}
+
+	if err := state.SetInteractiveMode(target); err != nil {
+		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
 		return m, nil
 	}
 	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
@@ -1998,7 +2114,7 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		}
 		m.replaceSession(result.Session)
 		m.resetSessionTransientState()
-		m.deps.Status = result.Status
+		m.deps.Status = cloneStatusInfo(result.Status)
 		m.deps.SessionOpts = result.SessionOpts
 		if m.deps.InvalidateRulesSnapshot != nil {
 			m.deps.InvalidateRulesSnapshot()
@@ -2941,6 +3057,9 @@ func (m *model) statusReport() string {
 	if label := strings.TrimSpace(m.deps.Status.ModelDisplayName); label != "" {
 		report += "  model_label=" + label
 	}
+	if lifecycle := strings.TrimSpace(m.deps.Status.DeclaredCatalogLifecycle); lifecycle != "" {
+		report += "  model_catalog_lifecycle=" + lifecycle
+	}
 	if title != "" {
 		report += "  title=" + title
 	}
@@ -2948,6 +3067,12 @@ func (m *model) statusReport() string {
 		report += fmt.Sprintf("  max_step=%d", m.deps.Status.MaxStep)
 	}
 	report += "  reasoning_effort=" + reasoningEffortStatus(m.deps.Status.ReasoningEffort)
+	if efforts := m.deps.Status.DeclaredReasoningEfforts; len(efforts) > 0 {
+		report += "  reasoning_effort_declared_available=" + strings.Join(efforts, ",")
+	}
+	if declaredDefault := strings.TrimSpace(m.deps.Status.DeclaredReasoningEffortDefault); declaredDefault != "" {
+		report += "  reasoning_effort_declared_catalog_default=" + declaredDefault
+	}
 	if frag := m.statusPolicyFragment(); frag != "" {
 		report += "  " + frag
 	}

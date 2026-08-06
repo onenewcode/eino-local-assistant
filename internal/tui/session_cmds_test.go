@@ -750,6 +750,7 @@ func TestBusyInputDisposition(t *testing.T) {
 		{"/help", busyInputExecuteImmediately},
 		{"/context", busyInputExecuteImmediately},
 		{"/status", busyInputExecuteImmediately},
+		{"/goal", busyInputExecuteImmediately},
 		{"/rules", busyInputExecuteImmediately},
 		{"/btw question", busyInputExecuteImmediately},
 		{"/side question", busyInputExecuteImmediately},

@@ -14,15 +14,16 @@ const maxQueue = 32
 const queuePreviewRunes = 48
 
 const (
-	queueCommandUsage       = "usage: /queue | /queue clear | /queue drop <1-based-index> | /queue edit <1-based-index> <new text> | /queue resume"
-	queueEmptyMessage       = "queue empty"
-	queueDropIndexError     = "queue drop index must be a positive integer"
-	queueDropRangeError     = "queue drop index out of range"
-	queueEditTextError      = "queue edit text must not be empty"
-	queueEditRangeError     = "queue edit index out of range"
-	queueEditIndexError     = "queue edit index must be a positive integer"
-	queueEditAdmissionError = "queue edit rejected: new text cannot be a mutative or immediately executable slash command"
-	queueResumeBusyMessage  = "queue resume unavailable: current operation is still running; queue and pause unchanged"
+	queueCommandUsage         = "usage: /queue | /queue clear | /queue drop <1-based-index> | /queue edit <1-based-index> <new text> | /queue resume"
+	queueEmptyMessage         = "queue empty"
+	queueDropIndexError       = "queue drop index must be a positive integer"
+	queueDropRangeError       = "queue drop index out of range"
+	queueEditTextError        = "queue edit text must not be empty"
+	queueEditRangeError       = "queue edit index out of range"
+	queueEditIndexError       = "queue edit index must be a positive integer"
+	queueEditAdmissionError   = "queue edit rejected: new text cannot be a mutative or immediately executable slash command"
+	queueResumeBusyMessage    = "queue resume unavailable: current operation is still running; queue and pause unchanged"
+	permissionModeBusyMessage = "permission mode changes are unavailable while busy; retry when idle"
 )
 
 // backtrackKeyInput is the internal representation used if a future input
@@ -85,12 +86,14 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 		// Steering targets the existing regular turn directly. It is never a
 		// FIFO follow-up, including when the core rejects the admission.
 		return busyInputSteer
-	case slashHelp, slashContext, slashStatus, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
+	case slashHelp, slashContext, slashStatus, slashGoal, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
 		return busyInputExecuteImmediately
 	case slashPermissions:
 		if strings.TrimSpace(arg) == "" {
 			return busyInputExecuteImmediately
 		}
+		return busyInputReject
+	case slashPlan:
 		return busyInputReject
 	case slashModel:
 		return busyInputReject

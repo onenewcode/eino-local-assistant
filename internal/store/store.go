@@ -21,12 +21,15 @@ const (
 
 // ThreadMeta is list/detail metadata for one durable agent thread.
 type ThreadMeta struct {
-	ID           string    `json:"id"`
-	Title        string    `json:"title"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	Model        string    `json:"model,omitempty"`
-	MessageCount int       `json:"message_count"`
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Model     string    `json:"model,omitempty"`
+	// ReasoningEffort is the requested opaque effort value, not provider
+	// confirmation of the value actually applied to a request.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	MessageCount    int    `json:"message_count"`
 	// ParentID, ForkBoundaryTurnID, and ForkSourceHash are populated only for
 	// source-preserving children. ForkSourceHash is the source journal hash at
 	// the boundary event.
@@ -96,6 +99,18 @@ type ThreadRepository interface {
 // test fakes remain source-compatible while they adopt the new contract.
 type ThreadModelRepository interface {
 	SetThreadModel(ctx context.Context, id string, expectedRevision uint64, model string) (ThreadState, error)
+}
+
+// ThreadModelBindingRepository is an optional extension for atomically
+// replacing a thread's model and requested reasoning effort. It is separate
+// from ThreadModelRepository so older repositories and test fakes keep their
+// source-compatible model-only contract.
+type ThreadModelBindingRepository interface {
+	// SetThreadModelBinding records one model.changed event containing the full
+	// model selection tuple. An empty model retains the current model identity,
+	// which allows an effort-only mutation; an empty reasoning effort clears the
+	// requested value and restores provider-default semantics.
+	SetThreadModelBinding(ctx context.Context, id string, expectedRevision uint64, model, reasoningEffort string) (ThreadState, error)
 }
 
 // ThreadForkRepository is the optional v1 source-preserving fork extension.

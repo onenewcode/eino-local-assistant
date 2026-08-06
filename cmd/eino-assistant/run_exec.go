@@ -49,19 +49,27 @@ type execSessionModelFactory func(context.Context, string, string) (execSession,
 
 type execOpenSessionModelFactory func(context.Context, string, string, bool, string) (execSession, io.Closer, error)
 
+type execSessionModelEffortFactory func(context.Context, string, string, string) (execSession, io.Closer, error)
+
+type execOpenSessionModelEffortFactory func(context.Context, string, string, bool, string, string) (execSession, io.Closer, error)
+
 type execLastSessionSelector func(context.Context, string) (string, error)
 
 type execCommandDeps struct {
-	newSession                 execSessionFactory
-	newEphemeralSession        execSessionFactory
-	openSession                execOpenSessionFactory
-	openEphemeralSession       execOpenSessionFactory
-	newSessionWithModel        execSessionModelFactory
-	newEphemeralWithModel      execSessionModelFactory
-	openSessionWithModel       execOpenSessionModelFactory
-	openEphemeralWithModel     execOpenSessionModelFactory
-	selectLastSession          execLastSessionSelector
-	selectLastEphemeralSession execLastSessionSelector
+	newSession                   execSessionFactory
+	newEphemeralSession          execSessionFactory
+	openSession                  execOpenSessionFactory
+	openEphemeralSession         execOpenSessionFactory
+	newSessionWithModel          execSessionModelFactory
+	newEphemeralWithModel        execSessionModelFactory
+	openSessionWithModel         execOpenSessionModelFactory
+	openEphemeralWithModel       execOpenSessionModelFactory
+	newSessionWithModelEffort    execSessionModelEffortFactory
+	newEphemeralWithModelEffort  execSessionModelEffortFactory
+	openSessionWithModelEffort   execOpenSessionModelEffortFactory
+	openEphemeralWithModelEffort execOpenSessionModelEffortFactory
+	selectLastSession            execLastSessionSelector
+	selectLastEphemeralSession   execLastSessionSelector
 }
 
 type execOutputFormat string
@@ -211,18 +219,46 @@ func defaultExecCommandDeps() execCommandDeps {
 		newSessionWithModel: func(ctx context.Context, configPath, modelName string) (execSession, io.Closer, error) {
 			return openRuntime(ctx, configPath, sessionStart{modelName: modelName})
 		},
+		newSessionWithModelEffort: func(ctx context.Context, configPath, modelName, reasoningEffort string) (execSession, io.Closer, error) {
+			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, reasoningEffort: reasoningEffort, reasoningEffortSet: true})
+		},
 		newEphemeralWithModel: func(ctx context.Context, configPath, modelName string) (execSession, io.Closer, error) {
 			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, ephemeral: true})
+		},
+		newEphemeralWithModelEffort: func(ctx context.Context, configPath, modelName, reasoningEffort string) (execSession, io.Closer, error) {
+			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, reasoningEffort: reasoningEffort, reasoningEffortSet: true, ephemeral: true})
 		},
 		openSessionWithModel: func(ctx context.Context, configPath, id string, recoverInterrupted bool, modelName string) (execSession, io.Closer, error) {
 			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, resumeID: id, recoverInterrupted: recoverInterrupted})
 		},
+		openSessionWithModelEffort: func(ctx context.Context, configPath, id string, recoverInterrupted bool, modelName, reasoningEffort string) (execSession, io.Closer, error) {
+			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, reasoningEffort: reasoningEffort, reasoningEffortSet: true, resumeID: id, recoverInterrupted: recoverInterrupted})
+		},
 		openEphemeralWithModel: func(ctx context.Context, configPath, id string, recoverInterrupted bool, modelName string) (execSession, io.Closer, error) {
 			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, resumeID: id, recoverInterrupted: recoverInterrupted, ephemeral: true})
+		},
+		openEphemeralWithModelEffort: func(ctx context.Context, configPath, id string, recoverInterrupted bool, modelName, reasoningEffort string) (execSession, io.Closer, error) {
+			return openRuntime(ctx, configPath, sessionStart{modelName: modelName, reasoningEffort: reasoningEffort, reasoningEffortSet: true, resumeID: id, recoverInterrupted: recoverInterrupted, ephemeral: true})
 		},
 		selectLastSession:          selectLastExecSession,
 		selectLastEphemeralSession: selectLastEphemeralExecSession,
 	}
+}
+
+func execSessionFactoryForModelEffort(legacy execSessionFactory, withModel execSessionModelFactory, withModelEffort execSessionModelEffortFactory, modelName, reasoningEffort string, effortSet bool) execSessionFactory {
+	modelName = strings.TrimSpace(modelName)
+	reasoningEffort = strings.TrimSpace(reasoningEffort)
+	if effortSet {
+		if withModelEffort == nil {
+			return func(context.Context, string) (execSession, io.Closer, error) {
+				return nil, nil, errors.New("reasoning-effort requested but effort-aware exec session factory is unavailable")
+			}
+		}
+		return func(ctx context.Context, configPath string) (execSession, io.Closer, error) {
+			return withModelEffort(ctx, configPath, modelName, reasoningEffort)
+		}
+	}
+	return execSessionFactoryForModel(legacy, withModel, modelName)
 }
 
 func execSessionFactoryForModel(legacy execSessionFactory, withModel execSessionModelFactory, modelName string) execSessionFactory {
@@ -243,6 +279,22 @@ func execOpenSessionFactoryForModel(legacy execOpenSessionFactory, withModel exe
 	return func(ctx context.Context, configPath, id string, recoverInterrupted bool) (execSession, io.Closer, error) {
 		return withModel(ctx, configPath, id, recoverInterrupted, modelName)
 	}
+}
+
+func execOpenSessionFactoryForModelEffort(legacy execOpenSessionFactory, withModel execOpenSessionModelFactory, withModelEffort execOpenSessionModelEffortFactory, modelName, reasoningEffort string, effortSet bool) execOpenSessionFactory {
+	modelName = strings.TrimSpace(modelName)
+	reasoningEffort = strings.TrimSpace(reasoningEffort)
+	if effortSet {
+		if withModelEffort == nil {
+			return func(context.Context, string, string, bool) (execSession, io.Closer, error) {
+				return nil, nil, errors.New("reasoning-effort requested but effort-aware exec resume session factory is unavailable")
+			}
+		}
+		return func(ctx context.Context, configPath, id string, recoverInterrupted bool) (execSession, io.Closer, error) {
+			return withModelEffort(ctx, configPath, id, recoverInterrupted, modelName, reasoningEffort)
+		}
+	}
+	return execOpenSessionFactoryForModel(legacy, withModel, modelName)
 }
 
 // guardedExecSession gives non-interactive turns the same whole-turn timeout
@@ -295,6 +347,7 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 	var jsonAlias bool
 	var ephemeral bool
 	var modelName string
+	var reasoningEffort string
 	var outputLastMessage string
 	var outputLastMessageShort string
 	var outputSchema string
@@ -302,7 +355,7 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 		Use:   "exec [PROMPT]",
 		Short: "Run one durable or ephemeral non-interactive turn",
 		Long: "Run one durable assistant turn without a TTY. Reads PROMPT from the argument or stdin. Piped stdin is limited to 10 MiB; when both inputs are present, stdin is appended as an escaped JSON reference envelope whose decoded content is untrusted reference data, not privileged instructions.\n\n" +
-			"-m/--model overrides model.name for this invocation only and is available on fresh, resume, --last, and ephemeral exec paths. --output-format=text (the default) writes the final assistant reply only after the durable turn commits. --output-format=json writes one final v1 JSON result document. --output-format=stream-json writes a versioned JSONL lifecycle stream with a final result record; it never exposes assistant deltas, reasoning, or tool payloads. --json is an alias for --output-format=stream-json and therefore prints JSONL events, not one final JSON document. --json may be combined with --output-format=stream-json; combining it with another explicit output format is an input error. --output-schema=FILE locally validates the final assistant JSON response before commit; it does not request provider-enforced structured output or affect the ReAct loop. -o and --output-last-message are the same option: either atomically replaces FILE with the committed final assistant response after a successful turn; failed or cancelled turns leave FILE unchanged. Providing both spellings is an input error. Durable sessions print their ID and an eino-assistant exec resume <id> hint to stderr; --ephemeral uses a temporary ledger and prints neither. Ephemeral JSON output marks the session persistent:false with id:null. With approval_policy = on-request, requests needing approval are denied because exec has no interactive approver.",
+			"-m/--model overrides model.name for this invocation only and is available on fresh, resume, --last, and ephemeral exec paths. --reasoning-effort is an opaque provider-neutral request for this invocation; auto selects the provider/model default and does not claim provider effectiveness. --output-format=text (the default) writes the final assistant reply only after the durable turn commits. --output-format=json writes one final v1 JSON result document. --output-format=stream-json writes a versioned JSONL lifecycle stream with a final result record; it never exposes assistant deltas, reasoning, or tool payloads. --json is an alias for --output-format=stream-json and therefore prints JSONL events, not one final JSON document. --json may be combined with --output-format=stream-json; combining it with another explicit output format is an input error. --output-schema=FILE locally validates the final assistant JSON response before commit; it does not request provider-enforced structured output or affect the ReAct loop. -o and --output-last-message are the same option: either atomically replaces FILE with the committed final assistant response after a successful turn; failed or cancelled turns leave FILE unchanged. Providing both spellings is an input error. Durable sessions print their ID and an eino-assistant exec resume <id> hint to stderr; --ephemeral uses a temporary ledger and prints neither. Ephemeral JSON output marks the session persistent:false with id:null. With approval_policy = on-request, requests needing approval are denied because exec has no interactive approver.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			format, err := parseExecOutputFormat(outputFormat)
 			if err != nil {
@@ -320,29 +373,36 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 			if err != nil {
 				return finishExecFailure(format, cmd.OutOrStdout(), nil, execErrorInput, err)
 			}
+			resolvedEffort, err := normalizeExecReasoningEffort(reasoningEffort, cmd.Flags().Changed("reasoning-effort"))
+			if err != nil {
+				return finishExecFailure(format, cmd.OutOrStdout(), nil, execErrorInput, err)
+			}
 			factory := deps.newSession
 			modelFactory := deps.newSessionWithModel
+			modelEffortFactory := deps.newSessionWithModelEffort
 			if ephemeral {
 				factory = deps.newEphemeralSession
 				modelFactory = deps.newEphemeralWithModel
+				modelEffortFactory = deps.newEphemeralWithModelEffort
 			}
-			factory = execSessionFactoryForModel(factory, modelFactory, modelName)
+			factory = execSessionFactoryForModelEffort(factory, modelFactory, modelEffortFactory, modelName, resolvedEffort, cmd.Flags().Changed("reasoning-effort"))
 			return runExecWithOptionsAndValidator(cmd.Context(), args, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts.configPath, format, ephemeral, resolvedOutputLastMessage, validator, factory)
 		},
 	}
 	cmd.PersistentFlags().StringVar(&outputFormat, "output-format", string(execOutputFormatText), "output format: text, json, or stream-json")
 	cmd.PersistentFlags().BoolVar(&jsonAlias, "json", false, "print stream-json events as JSONL (alias for --output-format stream-json)")
 	cmd.PersistentFlags().StringVarP(&modelName, "model", "m", "", "model name for this exec invocation (overrides model.name)")
+	cmd.PersistentFlags().StringVar(&reasoningEffort, "reasoning-effort", "", "opaque reasoning effort for this exec invocation (auto uses the provider/model default)")
 	cmd.PersistentFlags().StringVar(&outputLastMessage, "output-last-message", "", "write the committed final assistant response to FILE (alias: -o)")
 	cmd.PersistentFlags().StringVarP(&outputLastMessageShort, "output-last-message-short", "o", "", "")
 	_ = cmd.PersistentFlags().MarkHidden("output-last-message-short")
 	cmd.PersistentFlags().StringVar(&outputSchema, "output-schema", "", "locally validate the final assistant JSON response against FILE")
 	cmd.Flags().BoolVar(&ephemeral, "ephemeral", false, "run with a temporary session ledger that is removed when exec exits")
-	cmd.AddCommand(newExecResumeCommand(opts, deps, &outputFormat, &jsonAlias, &modelName, &outputLastMessage, &outputLastMessageShort, &outputSchema, &ephemeral))
+	cmd.AddCommand(newExecResumeCommand(opts, deps, &outputFormat, &jsonAlias, &modelName, &reasoningEffort, &outputLastMessage, &outputLastMessageShort, &outputSchema, &ephemeral))
 	return cmd
 }
 
-func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat *string, jsonAlias *bool, modelName *string, outputLastMessage, outputLastMessageShort, outputSchema *string, parentEphemeral *bool) *cobra.Command {
+func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat *string, jsonAlias *bool, modelName, reasoningEffort *string, outputLastMessage, outputLastMessageShort, outputSchema *string, parentEphemeral *bool) *cobra.Command {
 	var recoverInterrupted bool
 	var resumeEphemeral bool
 	lastFlag := &execLastFlagValue{}
@@ -353,7 +413,7 @@ func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat 
 			"Pass an explicit SESSION_ID for a stable identity, or opt in with --last to select the first newest thread from the current configuration's durable storage.data_dir. " +
 			"When --last is used, it must appear before an optional PROMPT and does not filter or recover sessions. Reads PROMPT from the argument or stdin. " +
 			"With --ephemeral, loads a locked snapshot of the selected durable session into a temporary ledger, runs only against that ledger, and leaves the durable source session unchanged; --last may be combined with --ephemeral. " +
-			"Use --recover only after confirming a previous process stopped, to explicitly terminally recover an interrupted turn or pending compaction before sending the new prompt. Use -m/--model to override model.name for this invocation only.",
+			"Use --recover only after confirming a previous process stopped, to explicitly terminally recover an interrupted turn or pending compaction before sending the new prompt. Use -m/--model and --reasoning-effort to override model selection for this invocation only; auto requests provider/model-default effort semantics.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			format, err := parseExecOutputFormat(*outputFormat)
 			if err != nil {
@@ -387,13 +447,19 @@ func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat 
 			}
 			openSession := deps.openSession
 			openSessionWithModel := deps.openSessionWithModel
+			openSessionWithModelEffort := deps.openSessionWithModelEffort
 			selectLastSession := deps.selectLastSession
 			if ephemeral {
 				openSession = deps.openEphemeralSession
 				openSessionWithModel = deps.openEphemeralWithModel
+				openSessionWithModelEffort = deps.openEphemeralWithModelEffort
 				selectLastSession = deps.selectLastEphemeralSession
 			}
-			openSession = execOpenSessionFactoryForModel(openSession, openSessionWithModel, dereferenceModelName(modelName))
+			resolvedEffort, err := normalizeExecReasoningEffort(dereferenceString(reasoningEffort), cmd.Flags().Changed("reasoning-effort"))
+			if err != nil {
+				return finishExecFailure(format, cmd.OutOrStdout(), nil, execErrorInput, err)
+			}
+			openSession = execOpenSessionFactoryForModelEffort(openSession, openSessionWithModel, openSessionWithModelEffort, dereferenceModelName(modelName), resolvedEffort, cmd.Flags().Changed("reasoning-effort"))
 			return runExecWithOptionsAndValidator(cmd.Context(), promptArgs, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts.configPath, format, ephemeral, resolvedOutputLastMessage, validator, func(ctx context.Context, configPath string) (execSession, io.Closer, error) {
 				if openSession == nil {
 					if ephemeral {
@@ -424,6 +490,27 @@ func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat 
 	cmd.Flags().BoolVar(&resumeEphemeral, "ephemeral", false, "run from a temporary snapshot without persisting the resumed turn")
 	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly recover an interrupted active turn or pending compaction before resuming")
 	return cmd
+}
+
+func normalizeExecReasoningEffort(value string, changed bool) (string, error) {
+	value = strings.TrimSpace(value)
+	if !changed {
+		return "", nil
+	}
+	if strings.EqualFold(value, "auto") {
+		return "", nil
+	}
+	if value == "" {
+		return "", errors.New("--reasoning-effort cannot be blank (use auto for the provider/model default)")
+	}
+	return value, nil
+}
+
+func dereferenceString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func dereferenceModelName(modelName *string) string {

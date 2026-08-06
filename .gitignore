@@ -12,4 +12,5 @@ coverage.out
 .DS_Store
 .claude/
 .codex/
+.worktrees/
 config.toml

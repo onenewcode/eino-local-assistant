@@ -31,6 +31,8 @@ type sessionStart struct {
 	recoverInterrupted bool
 	ephemeral          bool
 	modelName          string
+	reasoningEffort    string
+	reasoningEffortSet bool
 }
 
 func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr error) {
@@ -133,6 +135,16 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		SideQuestion: runtime.sideQuestion,
 		SwitchModel: func(ctx context.Context, session *chat.Session, name string) (tui.ModelSwitchResult, error) {
 			bundle, switchErr := runtime.switchModel(ctx, session, name)
+			if switchErr != nil {
+				return tui.ModelSwitchResult{}, switchErr
+			}
+			return tui.ModelSwitchResult{
+				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxSteps(), sandboxInfo, runtimeInfo),
+				SessionOpts: bundle.sessionOpts,
+			}, nil
+		},
+		SwitchModelWithOptions: func(ctx context.Context, session *chat.Session, selection tui.ModelSelection) (tui.ModelSwitchResult, error) {
+			bundle, switchErr := runtime.switchModelWithOptions(ctx, session, selection.ModelName, selection.ReasoningEffort)
 			if switchErr != nil {
 				return tui.ModelSwitchResult{}, switchErr
 			}
@@ -413,7 +425,54 @@ func statusFromConfig(cfg config.Config, registry *tools.Registry, cmdMode strin
 		runtimeInfo,
 	)
 	status.ModelDisplayName = cfg.Model.CatalogDisplayName(cfg.Model.Name)
+	status.DeclaredCatalogLifecycle = declaredCatalogLifecycle(cfg.Model)
+	status.DeclaredReasoningEfforts, status.DeclaredReasoningEffortDefault = declaredReasoningCapabilities(cfg.Model)
 	return status
+}
+
+// declaredCatalogLifecycle returns only the local catalog declaration for the
+// current canonical model name. It does not describe provider health,
+// entitlement, discovery, or provider-effective state.
+func declaredCatalogLifecycle(modelCfg config.ModelConfig) string {
+	canonicalName := strings.TrimSpace(modelCfg.Name)
+	if canonicalName == "" {
+		return ""
+	}
+	for _, entry := range modelCfg.CatalogEntries() {
+		if !strings.EqualFold(strings.TrimSpace(entry.Name), canonicalName) {
+			continue
+		}
+		lifecycle := strings.ToLower(strings.TrimSpace(entry.Lifecycle))
+		if lifecycle == "" {
+			return "active"
+		}
+		return lifecycle
+	}
+	return ""
+}
+
+// declaredReasoningCapabilities returns only metadata for the current
+// canonical catalog name. Free-form names and aliases intentionally receive
+// no catalog capability claims.
+func declaredReasoningCapabilities(modelCfg config.ModelConfig) ([]string, string) {
+	canonicalName := strings.TrimSpace(modelCfg.Name)
+	if canonicalName == "" {
+		return nil, ""
+	}
+	for _, entry := range modelCfg.CatalogEntries() {
+		if !strings.EqualFold(strings.TrimSpace(entry.Name), canonicalName) {
+			continue
+		}
+		efforts := make([]string, 0, len(entry.Capabilities.ReasoningEfforts))
+		for _, effort := range entry.Capabilities.ReasoningEfforts {
+			effort = strings.TrimSpace(effort)
+			if effort != "" {
+				efforts = append(efforts, effort)
+			}
+		}
+		return efforts, strings.TrimSpace(entry.Capabilities.DefaultReasoningEffort)
+	}
+	return nil, ""
 }
 
 func modelCatalogFromConfig(entries []config.ModelCatalogEntry) []tui.ModelCatalogEntry {
@@ -430,13 +489,14 @@ func modelCatalogFromConfig(entries []config.ModelCatalogEntry) []tui.ModelCatal
 			Lifecycle:     strings.TrimSpace(entry.Lifecycle),
 			Provenance:    "config",
 			Capabilities: tui.ModelCatalogCapabilities{
-				ContextWindowTokens: entry.Capabilities.ContextWindowTokens,
-				MaxOutputTokens:     entry.Capabilities.MaxOutputTokens,
-				SupportsReasoning:   copyBoolPointer(entry.Capabilities.SupportsReasoning),
-				ReasoningEfforts:    append([]string(nil), entry.Capabilities.ReasoningEfforts...),
-				InputModalities:     append([]string(nil), entry.Capabilities.InputModalities...),
-				SupportsTools:       copyBoolPointer(entry.Capabilities.SupportsTools),
-				SupportsStreaming:   copyBoolPointer(entry.Capabilities.SupportsStreaming),
+				ContextWindowTokens:    entry.Capabilities.ContextWindowTokens,
+				MaxOutputTokens:        entry.Capabilities.MaxOutputTokens,
+				SupportsReasoning:      copyBoolPointer(entry.Capabilities.SupportsReasoning),
+				ReasoningEfforts:       append([]string(nil), entry.Capabilities.ReasoningEfforts...),
+				DefaultReasoningEffort: strings.TrimSpace(entry.Capabilities.DefaultReasoningEffort),
+				InputModalities:        append([]string(nil), entry.Capabilities.InputModalities...),
+				SupportsTools:          copyBoolPointer(entry.Capabilities.SupportsTools),
+				SupportsStreaming:      copyBoolPointer(entry.Capabilities.SupportsStreaming),
 			},
 		})
 	}

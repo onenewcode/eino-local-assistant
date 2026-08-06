@@ -139,10 +139,13 @@ type ThreadState struct {
 	recordedCompactionOperationIDs map[string]struct{}
 }
 
-// ModelChange is the durable payload for a model.changed event. An empty
-// Model means the caller selected the provider default identity.
+// ModelChange is the full durable model selection payload for a model.changed
+// event. An empty Model means the caller selected the provider default
+// identity; effort-only API calls resolve their retained model before writing
+// this payload.
 type ModelChange struct {
-	Model string `json:"model"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // UsageOperation identifies the product operation that made a model request.

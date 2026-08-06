@@ -75,8 +75,10 @@ max_bytes = 262144
 
 TUI 当前实现提供 `ask`、`auto` 和 `plan` 三个会话内模式。`plan` 是当前 TUI 进程级的临时 read-only phase，不是配置持久化，也不是完整的 plan artifact workflow；它不生成或持久化任务计划、计划文件或独立 plan 账本。三种模式都只存在于进程运行时，不写入 TOML、session ledger 或 resume 数据；进程退出后不保留。
 
+`/plan` 与 `/permissions plan` 进入同一个临时 read-only phase，复用相同的 idle-only admission、状态展示与执行边界；它不新增 artifact、持久化或权限语义。`/plan` 无参数只切换到 plan；`/plan <prompt>` 仅在 idle 时先切到 plan，再把 `<prompt>` 交给一次正常 TUI model turn，并在 turn 结束后保持 plan；精确的 `/plan exit` 与 `/plan ask` 恢复 ask，`/plan auto` 恢复 auto。这些形式都不是持久 plan workflow。
+
 - `/permissions` 无参数只读展示当前模式、静态规则、sandbox 和 runtime 信息，不改变任何授权状态。
-- `/permissions plan` 只在 idle 时进入 plan；`/permissions ask` 或 `/permissions auto` 只在 idle 时退出 plan 并恢复对应模式。busy、compacting 或其他非 idle 状态拒绝模式切换，不进入 FIFO，不改变正在运行的工具或审批，并保留 composer draft。
+- `/permissions plan` 只在 idle 时进入 plan；`/permissions ask` 或 `/permissions auto` 只在 idle 时退出 plan 并恢复对应模式。`/plan` 的无参、prompt 和 `exit|ask|auto` 形式遵循同一边界。busy、compacting、pending approval 或其他非 idle 状态拒绝模式切换或 prompt，不进入 FIFO，不改变正在运行的工具或审批，并保留 composer draft。
 - `ask` 让普通 `DecisionAsk` 继续进入现有 TUI once / session / deny 审批；`auto` 只在工具实际授权边界自动放行 `DecisionAsk`。`DecisionAllow` 仍受后续执行护栏约束，`DecisionDeny`（包括 hard deny）不能被模式改写。
 - plan 下 `apply_patch` 无条件返回结构化 `denied=true`、`decision=deny`、`reason=plan_read_only`，在输入校验、文件读取、审批或 worker 启动之前拒绝。
 - plan 下 `shell` 只有 `PermissionSet` 原始求值为 `DecisionAllow` 才能继续；session allow、`approval_policy = "never"` 或 TUI 审批不能把 `ask` 提升为 allow，含 shell 元字符的 allow 也会先降为 ask。hard deny 仍按既有策略拒绝；其他非原始 allow 直接以 `plan_read_only` 拒绝。通过后必须使用 enforced OS read-only worker；没有 sandbox、sandbox 不可用、worker 关闭或返回结果不是 enforced read-only 时，均以 `sandbox_unavailable` 结构化拒绝并 fail-closed，不回退到无 sandbox 或 host 执行，也不请求 ask/host escalation。
@@ -111,7 +113,7 @@ TUI 当前实现提供 `ask`、`auto` 和 `plan` 三个会话内模式。`plan` 
 - `ask` 模式下普通审批提供 once / session / deny；Esc = deny。`auto` 只跳过这一步的 `DecisionAsk`，不改变 deny、路径钳制或 sandbox 决策；`plan` 不提供审批绕过，而是执行上述 read-only 阶段门。
 - 宿主升级审批带有明显风险提示，只提供 once / deny，不能记为 session allow；命令会完整换行显示，控制字符会转义，并附带 SHA-256 指纹以避免长命令或终端序列伪装审批内容。长命令用 PgUp/PgDn 在审批详情中逐页检查。
 - 状态栏显示当前 TUI 会话的 `cmd=ask|auto|plan`、`sb=rw|ro`、后端可用性与 `net=off|allow:n`；不会把静态配置误报为持久化的会话设置。
-- `/permissions` 无参数只读显示当前模式、权限规则、sandbox 模式/后端、只读根数量、受保护路径、网络 allowlist、runtime 预算和 session allow/deny；带 `ask|auto|plan` 参数的切换仅在 idle 生效。
+- `/permissions` 无参数只读显示当前模式、权限规则、sandbox 模式/后端、只读根数量、受保护路径、网络 allowlist、runtime 预算和 session allow/deny；带 `ask|auto|plan` 参数的切换仅在 idle 生效。`/plan` 的所有形式也仅在 idle 生效，prompt 失败时不启动 turn，动态模式仍保持 plan。
 - 工具输入、结果、沙盒元数据及 runtime 终止原因会进入该 session 的 tool lifecycle/artifact 记录；不要仅依赖 TUI 文案进行审计。
 
 普通审批的 session key：

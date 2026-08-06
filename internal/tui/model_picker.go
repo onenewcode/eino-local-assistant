@@ -19,6 +19,10 @@ func (m *model) modelPickerOpen() bool {
 	return len(m.modelPickerItems) > 0
 }
 
+func (m *model) modelPickerEffortOpen() bool {
+	return m.modelPickerOpen() && len(m.modelPickerEfforts) > 0
+}
+
 func (m *model) openModelPicker() (tea.Model, tea.Cmd) {
 	if m.mode != modeIdle {
 		m.appendLine(lineError, "model picker unavailable while busy; retry when idle")
@@ -36,13 +40,15 @@ func (m *model) openModelPicker() (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "model picker unavailable: no configured catalog; use /model <name>")
 		return m, nil
 	}
-	if m.deps.SwitchModel == nil {
+	if m.deps.SwitchModel == nil && m.deps.SwitchModelWithOptions == nil {
 		m.appendLine(lineError, "model picker unavailable: runtime callback is not configured")
 		return m, nil
 	}
 	items := copyModelCatalogEntries(m.deps.ModelCatalog)
 	m.modelPickerItems = items
 	m.modelPickerSel = modelPickerSelection(items, m.currentModelIdentity())
+	m.modelPickerEfforts = nil
+	m.modelPickerEffortSel = 0
 	m.clearSlashMenu()
 	m.clearBacktrack()
 	m.layout()
@@ -53,13 +59,23 @@ func (m *model) openModelPicker() (tea.Model, tea.Cmd) {
 func (m *model) closeModelPicker() {
 	m.modelPickerItems = nil
 	m.modelPickerSel = 0
+	m.modelPickerEfforts = nil
+	m.modelPickerEffortSel = 0
 	m.layout()
 	m.refreshViewport()
+}
+
+func (m *model) selectedModelPickerEntry() ModelCatalogEntry {
+	entry, _ := selectedModelPickerEntry(m.modelPickerItems, m.modelPickerSel)
+	return entry
 }
 
 func (m *model) handleModelPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !m.modelPickerOpen() {
 		return m, nil
+	}
+	if m.modelPickerEffortOpen() {
+		return m.handleModelEffortPickerKey(msg)
 	}
 	switch {
 	case msg.Type == tea.KeyEsc || isModelPickerToggleKey(msg):
@@ -79,7 +95,71 @@ func (m *model) handleModelPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.appendLine(lineError, "model picker: no selectable model is configured")
 			return m, nil
 		}
-		return m.applyModelName(entry.CanonicalName)
+		return m.chooseModelPickerEntry(entry)
+	default:
+		return m, nil
+	}
+}
+
+func (m *model) chooseModelPickerEntry(entry ModelCatalogEntry) (tea.Model, tea.Cmd) {
+	if m.deps.SwitchModelWithOptions == nil {
+		// The legacy callback cannot carry an effort. Preserve the original
+		// one-step picker behavior instead of exposing an unapplyable second
+		// level to older embedders.
+		return m.applyModelSelection(ModelSelection{ModelName: entry.CanonicalName}, true)
+	}
+	efforts := modelPickerEffortOptions(entry)
+	if len(efforts) > 1 {
+		m.modelPickerEfforts = efforts
+		m.modelPickerEffortSel = modelPickerEffortSelection(
+			efforts,
+			m.deps.Status.ReasoningEffort,
+			entry.Capabilities.DefaultReasoningEffort,
+		)
+		m.layout()
+		m.refreshViewport()
+		return m, nil
+	}
+	if len(efforts) == 0 {
+		m.appendLine(lineError, "model picker: no reasoning effort option is configured")
+		return m, nil
+	}
+	return m.applyModelSelection(ModelSelection{
+		ModelName:       entry.CanonicalName,
+		ReasoningEffort: efforts[0],
+	}, true)
+}
+
+func (m *model) handleModelEffortPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case msg.Type == tea.KeyEsc || isModelPickerToggleKey(msg):
+		if isModelPickerToggleKey(msg) {
+			m.closeModelPicker()
+			return m, nil
+		}
+		m.modelPickerEfforts = nil
+		m.modelPickerEffortSel = 0
+		m.layout()
+		m.refreshViewport()
+		return m, nil
+	case msg.Type == tea.KeyUp || modelPickerKeyRune(msg, 'k'):
+		m.modelPickerEffortSel = moveEffortPickerSelection(m.modelPickerEfforts, m.modelPickerEffortSel, -1)
+		m.refreshViewport()
+		return m, nil
+	case msg.Type == tea.KeyDown || modelPickerKeyRune(msg, 'j'):
+		m.modelPickerEffortSel = moveEffortPickerSelection(m.modelPickerEfforts, m.modelPickerEffortSel, 1)
+		m.refreshViewport()
+		return m, nil
+	case msg.Type == tea.KeyEnter:
+		effort, ok := selectedEffortPickerOption(m.modelPickerEfforts, m.modelPickerEffortSel)
+		if !ok {
+			m.appendLine(lineError, "model picker: no reasoning effort is selected")
+			return m, nil
+		}
+		return m.applyModelSelection(ModelSelection{
+			ModelName:       m.selectedModelPickerEntry().CanonicalName,
+			ReasoningEffort: effort,
+		}, true)
 	default:
 		return m, nil
 	}
@@ -109,6 +189,7 @@ func copyModelCatalogEntries(entries []ModelCatalogEntry) []ModelCatalogEntry {
 		out[i].Description = strings.TrimSpace(out[i].Description)
 		out[i].Aliases = append([]string(nil), out[i].Aliases...)
 		out[i].Capabilities.ReasoningEfforts = append([]string(nil), out[i].Capabilities.ReasoningEfforts...)
+		out[i].Capabilities.DefaultReasoningEffort = strings.TrimSpace(out[i].Capabilities.DefaultReasoningEffort)
 		out[i].Capabilities.InputModalities = append([]string(nil), out[i].Capabilities.InputModalities...)
 	}
 	return out
@@ -164,12 +245,117 @@ func modelPickerEntrySelectable(entry ModelCatalogEntry) bool {
 	return strings.ToLower(strings.TrimSpace(entry.Lifecycle)) != "retired" && strings.TrimSpace(entry.CanonicalName) != ""
 }
 
+// modelPickerEffortOptions keeps the catalog's declared order. Empty is the
+// explicit provider-default choice; it is never used for a named effort.
+func modelPickerEffortOptions(entry ModelCatalogEntry) []string {
+	declared := normalizedEffortValues(entry.Capabilities.ReasoningEfforts)
+	defaultEffort := strings.TrimSpace(entry.Capabilities.DefaultReasoningEffort)
+	switch len(declared) {
+	case 0:
+		if defaultEffort != "" {
+			return []string{defaultEffort}
+		}
+		return []string{""}
+	case 1:
+		if defaultEffort != "" && !containsEffort(declared, defaultEffort) {
+			return []string{"", declared[0], defaultEffort}
+		}
+		return declared
+	default:
+		options := make([]string, 0, len(declared)+2)
+		options = append(options, "")
+		options = append(options, declared...)
+		// A catalog default normally appears in the declared list. Keep an
+		// explicitly supplied default selectable even if a hand-written
+		// catalog omitted it from that list.
+		if defaultEffort != "" && !containsEffort(options, defaultEffort) {
+			options = append(options, defaultEffort)
+		}
+		return options
+	}
+}
+
+func normalizedEffortValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || containsEffort(result, value) {
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
+}
+
+func containsEffort(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(want)) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelPickerEffortSelection(options []string, current, catalogDefault string) int {
+	if index := effortPickerOptionIndex(options, current); index >= 0 {
+		return index
+	}
+	if index := effortPickerOptionIndex(options, catalogDefault); index >= 0 {
+		return index
+	}
+	if index := effortPickerOptionIndex(options, ""); index >= 0 {
+		return index
+	}
+	return 0
+}
+
+func effortPickerOptionIndex(options []string, want string) int {
+	for i, option := range options {
+		if strings.EqualFold(strings.TrimSpace(option), strings.TrimSpace(want)) {
+			return i
+		}
+	}
+	return -1
+}
+
+func moveEffortPickerSelection(options []string, selected, delta int) int {
+	if len(options) == 0 || delta == 0 {
+		return selected
+	}
+	if selected < 0 || selected >= len(options) {
+		selected = 0
+	}
+	selected += delta
+	if selected < 0 {
+		selected = len(options) - 1
+	}
+	if selected >= len(options) {
+		selected = 0
+	}
+	return selected
+}
+
+func selectedEffortPickerOption(options []string, selected int) (string, bool) {
+	if selected < 0 || selected >= len(options) {
+		return "", false
+	}
+	return strings.TrimSpace(options[selected]), true
+}
+
 func (m *model) applyModelName(name string) (tea.Model, tea.Cmd) {
+	return m.applyModelSelection(ModelSelection{ModelName: name}, false)
+}
+
+func (m *model) applyModelSelection(selection ModelSelection, fromPicker bool) (tea.Model, tea.Cmd) {
 	if !m.modelSwitchAvailable() {
 		return m, nil
 	}
-	name = strings.TrimSpace(name)
-	if name == "" {
+	selection.ModelName = strings.TrimSpace(selection.ModelName)
+	selection.ReasoningEffort = strings.TrimSpace(selection.ReasoningEffort)
+	if selection.ModelName == "" {
 		m.appendLine(lineError, "usage: /model <name>")
 		return m, nil
 	}
@@ -178,26 +364,47 @@ func (m *model) applyModelName(name string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "model switch failed: session is unavailable")
 		return m, nil
 	}
-	if m.deps.SwitchModel == nil {
-		m.appendLine(lineError, "model switch unavailable: runtime callback is not configured")
+	var (
+		result       ModelSwitchResult
+		err          error
+		optionsRoute bool
+	)
+	switch {
+	case fromPicker && m.deps.SwitchModelWithOptions != nil:
+		optionsRoute = true
+		result, err = m.deps.SwitchModelWithOptions(m.processCtx(), session, selection)
+	case m.deps.SwitchModel != nil && selection.ReasoningEffort == "":
+		// The legacy callback can only represent a provider-default effort.
+		result, err = m.deps.SwitchModel(m.processCtx(), session, selection.ModelName)
+	case !fromPicker && m.deps.SwitchModelWithOptions != nil:
+		// Keep free-form /model usable when an embedding only supplies the new
+		// callback; an unspecified effort preserves provider-default semantics.
+		optionsRoute = true
+		result, err = m.deps.SwitchModelWithOptions(m.processCtx(), session, selection)
+	default:
+		m.appendLine(lineError, "model switch unavailable: reasoning-effort callback is not configured")
 		return m, nil
 	}
-	result, err := m.deps.SwitchModel(m.processCtx(), session, name)
 	if err != nil {
 		m.appendLine(lineError, "model switch failed: "+err.Error())
 		return m, nil
 	}
+	if optionsRoute {
+		// The TUI owns the requested/effective distinction. The callback result
+		// must not turn a requested value into an unverified effective claim.
+		result.Status.ReasoningEffort = selection.ReasoningEffort
+	}
 	// The callback commits the same Session pointer. Only replace the display
 	// and future-session snapshot; no session-generation or transient reset is
 	// allowed for an in-place model change.
-	m.deps.Status = result.Status
+	m.deps.Status = cloneStatusInfo(result.Status)
 	m.deps.SessionOpts = result.SessionOpts
 	if m.modelPickerOpen() {
 		m.closeModelPicker()
 	}
 	displayName := strings.TrimSpace(result.Status.ModelDisplayName)
 	if displayName == "" {
-		displayName = modelCatalogDisplayName(m.deps.ModelCatalog, name)
+		displayName = modelCatalogDisplayName(m.deps.ModelCatalog, selection.ModelName)
 	}
 	canonical := strings.TrimSpace(result.Status.Model)
 	if canonical == "" {
@@ -212,7 +419,7 @@ func (m *model) applyModelName(name string) (tea.Model, tea.Cmd) {
 	if displayName == "" {
 		displayName = "provider default"
 	}
-	m.appendLine(lineSystem, "model switched to "+displayName)
+	m.appendLine(lineSystem, "model switched to "+displayName+" · reasoning_effort="+reasoningEffortStatus(result.Status.ReasoningEffort))
 	m.appendLine(lineSep, "")
 	return m, nil
 }
@@ -332,8 +539,63 @@ func renderModelPicker(width int, entries []ModelCatalogEntry, selected int, cur
 	if start > 0 || end < len(entries) {
 		lines = append(lines, modelPickerMetaStyle.Render(fmt.Sprintf("  showing %d-%d; use up/down for more", start+1, end)))
 	}
-	lines = append(lines, modelPickerFooterStyle.Render("  enter apply · esc cancel · alt+p close"))
+	lines = append(lines, modelPickerFooterStyle.Render("  enter choose/apply · esc cancel · alt+p close"))
 	return strings.Join(lines, "\n")
+}
+
+func renderModelEffortPicker(width int, entry ModelCatalogEntry, options []string, selected int, current string) string {
+	if len(options) == 0 {
+		return ""
+	}
+	if width < 32 {
+		width = 32
+	}
+	if selected < 0 || selected >= len(options) {
+		selected = 0
+	}
+	label := strings.TrimSpace(entry.DisplayName)
+	if label == "" {
+		label = strings.TrimSpace(entry.CanonicalName)
+	}
+	if label == "" {
+		label = "selected model"
+	}
+	lines := []string{
+		modelPickerEffortTitleStyle.Render("Reasoning effort · " + label),
+		modelPickerEffortMetaStyle.Render("  requested: " + reasoningEffortPickerLabel(current)),
+	}
+	defaultEffort := strings.TrimSpace(entry.Capabilities.DefaultReasoningEffort)
+	for i, option := range options {
+		marker := "  "
+		if i == selected {
+			marker = "> "
+		}
+		line := marker + reasoningEffortPickerLabel(option)
+		if strings.EqualFold(strings.TrimSpace(option), strings.TrimSpace(current)) {
+			line += "  current"
+		}
+		if option != "" && defaultEffort != "" && strings.EqualFold(strings.TrimSpace(option), defaultEffort) {
+			line += "  catalog default"
+		}
+		line = truncateModelPickerText(line, width-2)
+		if i == selected {
+			lines = append(lines, modelPickerEffortSelectedStyle.Render(line))
+		} else {
+			lines = append(lines, modelPickerEffortRowStyle.Render(line))
+		}
+	}
+	lines = append(lines,
+		modelPickerEffortMetaStyle.Render("  empty means provider default; catalog capabilities are declarations"),
+		modelPickerEffortFooterStyle.Render("  enter apply · esc back · alt+p close"),
+	)
+	return strings.Join(lines, "\n")
+}
+
+func reasoningEffortPickerLabel(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "provider default (unspecified)"
+	}
+	return strings.TrimSpace(value)
 }
 
 func appendPickerMeta(current, next string) string {
@@ -387,6 +649,9 @@ func modelPickerCapabilitySummary(entry ModelCatalogEntry) string {
 	}
 	if len(caps.ReasoningEfforts) > 0 {
 		parts = append(parts, "effort="+strings.Join(caps.ReasoningEfforts, "/"))
+	}
+	if defaultEffort := strings.TrimSpace(caps.DefaultReasoningEffort); defaultEffort != "" {
+		parts = append(parts, "default_effort="+defaultEffort)
 	}
 	if len(caps.InputModalities) > 0 {
 		parts = append(parts, "input="+strings.Join(caps.InputModalities, "/"))

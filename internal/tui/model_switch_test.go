@@ -29,13 +29,14 @@ func TestModelSwitchIdleKeepsSessionAndUpdatesSnapshots(t *testing.T) {
 	}
 	oldTranscript := session.Transcript()
 	oldStatus := StatusInfo{
-		Model:           "openai/old-model",
-		Tools:           []string{"shell", "apply_patch"},
-		ReasoningEffort: "medium",
-		MaxStep:         8,
-		CmdPolicy:       "cmd=ask",
-		Sandbox:         SandboxInfo{Mode: "workspace", Backend: "seatbelt"},
-		Runtime:         RuntimeInfo{MaxReactSteps: 8, MaxToolCalls: 12},
+		Model:                    "openai/old-model",
+		DeclaredCatalogLifecycle: "active",
+		Tools:                    []string{"shell", "apply_patch"},
+		ReasoningEffort:          "medium",
+		MaxStep:                  8,
+		CmdPolicy:                "cmd=ask",
+		Sandbox:                  SandboxInfo{Mode: "workspace", Backend: "seatbelt"},
+		Runtime:                  RuntimeInfo{MaxReactSteps: 8, MaxToolCalls: 12},
 	}
 	oldOpts := chat.SessionOptions{Store: threadStore, ModelName: "old-model"}
 	m := newModel(Deps{
@@ -54,13 +55,14 @@ func TestModelSwitchIdleKeepsSessionAndUpdatesSnapshots(t *testing.T) {
 	turnID := m.turnID
 	replacement := &staticModel{}
 	wantStatus := StatusInfo{
-		Model:           "openai/new-model",
-		Tools:           []string{"shell", "apply_patch", "memory_read"},
-		ReasoningEffort: "high",
-		MaxStep:         12,
-		CmdPolicy:       oldStatus.CmdPolicy,
-		Sandbox:         oldStatus.Sandbox,
-		Runtime:         oldStatus.Runtime,
+		Model:                    "openai/new-model",
+		DeclaredCatalogLifecycle: "deprecated",
+		Tools:                    []string{"shell", "apply_patch", "memory_read"},
+		ReasoningEffort:          "high",
+		MaxStep:                  12,
+		CmdPolicy:                oldStatus.CmdPolicy,
+		Sandbox:                  oldStatus.Sandbox,
+		Runtime:                  oldStatus.Runtime,
 	}
 	wantOpts := chat.SessionOptions{Store: threadStore, ModelName: "new-model"}
 	var callbackCalls int

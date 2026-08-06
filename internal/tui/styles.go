@@ -207,6 +207,19 @@ var (
 				Foreground(lipgloss.Color("243"))
 	modelPickerFooterStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("245"))
+	modelPickerEffortTitleStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("114")).
+					Bold(true)
+	modelPickerEffortRowStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("250"))
+	modelPickerEffortSelectedStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("252")).
+					Background(lipgloss.Color("236")).
+					Bold(true)
+	modelPickerEffortMetaStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("243"))
+	modelPickerEffortFooterStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("245"))
 
 	taskPaneTitleStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("114")).

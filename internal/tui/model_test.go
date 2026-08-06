@@ -88,6 +88,60 @@ func TestSubmitStatus(t *testing.T) {
 	}
 }
 
+func TestStatusReportSeparatesDeclaredCapabilitiesFromRequestedEffort(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: session,
+		Status: StatusInfo{
+			Model:                          "openai/reasoning-model",
+			DeclaredCatalogLifecycle:       "deprecated",
+			ReasoningEffort:                "high",
+			DeclaredReasoningEfforts:       []string{"low", "high"},
+			DeclaredReasoningEffortDefault: "high",
+		},
+	})
+	report := m.statusReport()
+	for _, want := range []string{
+		"model_catalog_lifecycle=deprecated",
+		"reasoning_effort=requested:high",
+		"reasoning_effort_declared_available=low,high",
+		"reasoning_effort_declared_catalog_default=high",
+	} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("status report missing %q:\n%s", want, report)
+		}
+	}
+	if strings.Contains(report, "reasoning_effort_effective") {
+		t.Fatalf("status report made an effective-value claim:\n%s", report)
+	}
+}
+
+func TestStatusReportOmitsUndeclaredCatalogLifecycle(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: session,
+		Status:  StatusInfo{Model: "openai/custom-deployment"},
+	})
+	if report := m.statusReport(); strings.Contains(report, "model_catalog_lifecycle=") {
+		t.Fatalf("status report exposed lifecycle for an undeclared model:\n%s", report)
+	}
+}
+
+func TestNewModelOwnsDeclaredReasoningEfforts(t *testing.T) {
+	efforts := []string{"low", "high"}
+	m := newModel(Deps{Status: StatusInfo{DeclaredReasoningEfforts: efforts}})
+	efforts[0] = "caller-mutated"
+	if m.deps.Status.DeclaredReasoningEfforts[0] != "low" {
+		t.Fatalf("TUI status shares caller effort slice: %#v", m.deps.Status.DeclaredReasoningEfforts)
+	}
+	m.deps.Status.DeclaredReasoningEfforts[1] = "tui-mutated"
+	if efforts[1] != "high" {
+		t.Fatalf("caller effort slice shares TUI status: %#v", efforts)
+	}
+}
+
 func TestSubmitRulesReportsCapturedMetadata(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
 	m := newModel(Deps{

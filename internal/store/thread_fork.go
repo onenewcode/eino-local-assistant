@@ -523,6 +523,7 @@ func rebuildForkEvents(childID string, source forkSource) ([]ThreadEvent, Thread
 			// The post-boundary model.changed event itself remains out of the child
 			// prefix, so provenance still points at the exact source boundary.
 			created.Meta.Model = source.state.Meta.Model
+			created.Meta.ReasoningEffort = source.state.Meta.ReasoningEffort
 			created.Meta.ParentID = source.state.ID
 			created.Meta.ForkBoundaryTurnID = source.boundaryTurn
 			created.Meta.ForkSourceHash = source.sourceHash

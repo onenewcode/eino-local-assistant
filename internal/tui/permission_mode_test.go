@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"eino-local-assistant/internal/tools"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
@@ -79,19 +81,171 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 	}
 }
 
+func TestPlanAliasSwitchesIdleModeAndPreservesStatus(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(Deps{
+		Ctx:    context.Background(),
+		Status: StatusInfo{CmdPolicy: "cmd=ask"},
+		PolicyInfo: CommandPolicyInfo{
+			Approval:      string(tools.ApprovalOnRequest),
+			ApprovalState: state,
+		},
+	})
+
+	next, cmd := m.submit("/plan")
+	if cmd != nil {
+		t.Fatal("plan alias should not start a turn")
+	}
+	m = next.(*model)
+	if got := state.InteractiveMode(); got != "plan" {
+		t.Fatalf("state mode = %q, want plan", got)
+	}
+	if got := m.statusPolicyFragment(); got != "cmd=plan" {
+		t.Fatalf("status policy = %q, want cmd=plan", got)
+	}
+	if !hasLineContaining(m.lines, lineSystem, "permission mode: plan") {
+		t.Fatalf("alias switch confirmation missing: %#v", m.lines)
+	}
+
+	if m.mode != modeIdle {
+		t.Fatalf("no-argument plan alias changed TUI operation mode to %s", modeName(m.mode))
+	}
+}
+
+func TestPlanParserDistinguishesPromptAndReservedTransitions(t *testing.T) {
+	cases := []struct {
+		input string
+		arg   string
+	}{
+		{input: "/plan", arg: ""},
+		{input: "/plan inspect the repository", arg: "inspect the repository"},
+		{input: "/plan exit", arg: "exit"},
+		{input: "/plan ask", arg: "ask"},
+		{input: "/plan AUTO", arg: "AUTO"},
+	}
+	for _, tc := range cases {
+		action, arg := parseSlash(tc.input)
+		if action != slashPlan || arg != tc.arg {
+			t.Errorf("parseSlash(%q) = (%v, %q), want (%v, %q)", tc.input, action, arg, slashPlan, tc.arg)
+		}
+	}
+}
+
+func TestPlanPromptStartsOneNormalTurnAndRetainsPlanMode(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(t)
+	m.deps.PolicyInfo.ApprovalState = state
+	beforeTurnID := m.turnID
+
+	next, cmd := m.submit("/plan inspect the repository")
+	if cmd == nil {
+		t.Fatal("plan prompt should start the normal TUI turn")
+	}
+	m = next.(*model)
+	if state.InteractiveMode() != "plan" {
+		t.Fatalf("plan prompt mode = %q, want plan", state.InteractiveMode())
+	}
+	if m.mode != modeBusy || m.turnID != beforeTurnID+1 {
+		t.Fatalf("plan prompt did not start exactly one turn: mode=%s turnID=%d", modeName(m.mode), m.turnID)
+	}
+	if !hasLineContaining(m.lines, lineUser, "inspect the repository") {
+		t.Fatalf("plan prompt was not shown as the model prompt: %#v", m.lines)
+	}
+
+	cancelAndWaitForTurn(t, m)
+	m.finishTurn(context.Canceled)
+	if state.InteractiveMode() != "plan" {
+		t.Fatalf("plan mode was not retained after turn cleanup: %q", state.InteractiveMode())
+	}
+}
+
+func TestPlanReservedTransitionsOnlySwitchMode(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(t)
+	m.deps.PolicyInfo.ApprovalState = state
+	for _, tc := range []struct {
+		input string
+		want  string
+	}{
+		{input: "/plan exit", want: "ask"},
+		{input: "/plan auto", want: "auto"},
+		{input: "/plan ask", want: "ask"},
+	} {
+		beforeTurnID := m.turnID
+		next, cmd := m.submit(tc.input)
+		m = next.(*model)
+		if cmd != nil || m.mode != modeIdle || m.turnID != beforeTurnID {
+			t.Fatalf("%s started a turn: cmd=%v mode=%s turnID=%d", tc.input, cmd, modeName(m.mode), m.turnID)
+		}
+		if got := state.InteractiveMode(); got != tc.want {
+			t.Fatalf("%s mode = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestPlanPromptFailureDoesNotStartTurnAndKeepsPlanMode(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newModel(Deps{
+		Ctx: context.Background(),
+		PolicyInfo: CommandPolicyInfo{
+			Approval:      string(tools.ApprovalOnRequest),
+			ApprovalState: state,
+		},
+	})
+	beforeTurnID := m.turnID
+
+	next, cmd := m.submit("/plan inspect without a session")
+	m = next.(*model)
+	if cmd != nil || m.mode != modeIdle || m.turnID != beforeTurnID {
+		t.Fatalf("failed plan prompt started a turn: cmd=%v mode=%s turnID=%d", cmd, modeName(m.mode), m.turnID)
+	}
+	if state.InteractiveMode() != "plan" {
+		t.Fatalf("failed plan prompt should retain plan mode, got %q", state.InteractiveMode())
+	}
+	if !hasLineContaining(m.lines, lineError, "session is unavailable") {
+		t.Fatalf("failed plan prompt error missing: %#v", m.lines)
+	}
+}
+
 func TestPermissionsPlanIsDocumentedInHelpAndSlashMenu(t *testing.T) {
 	if !strings.Contains(helpText(), "/permissions [ask|auto|plan]") {
 		t.Fatalf("help does not document plan mode: %s", helpText())
 	}
+	if !strings.Contains(helpText(), "/plan") {
+		t.Fatalf("help does not document the direct plan alias: %s", helpText())
+	}
+	planRow := false
 	for _, command := range slashCatalog() {
+		if command.Name == "/plan" {
+			planRow = true
+			if len(command.Aliases) != 0 || command.NeedsArg {
+				t.Fatalf("plan catalog row should be independent and no-argument: %#v", command)
+			}
+			if !strings.Contains(command.Description, "prompt") || !strings.Contains(command.Description, "exit|ask|auto") {
+				t.Fatalf("plan menu description does not document prompt/transitions: %q", command.Description)
+			}
+		}
 		if command.Name == "/permissions" {
 			if !strings.Contains(command.Description, "ask|auto|plan") {
 				t.Fatalf("permissions menu description = %q", command.Description)
 			}
-			return
 		}
 	}
-	t.Fatal("permissions command missing from slash catalog")
+	if !planRow {
+		t.Fatal("plan command missing from slash catalog")
+	}
 }
 
 func TestPermissionsModeChangeIsRejectedBusyWithoutDroppingDraft(t *testing.T) {
@@ -161,6 +315,118 @@ func TestPermissionsPlanChangeIsRejectedCompactingWithoutDroppingDraft(t *testin
 	}
 }
 
+func TestPlanAliasMatchesPermissionsPlanAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    mode
+		pending bool
+	}{
+		{name: "busy", mode: modeBusy},
+		{name: "compacting", mode: modeCompacting},
+		{name: "approval", mode: modeBusy, pending: true},
+		{name: "pending approval while otherwise idle", mode: modeIdle, pending: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, input := range []string{"/permissions plan", "/plan", "/plan inspect files", "/plan exit", "/plan ask", "/plan auto"} {
+				state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				m := newModel(Deps{
+					Ctx: context.Background(),
+					PolicyInfo: CommandPolicyInfo{
+						Approval:      string(tools.ApprovalOnRequest),
+						ApprovalState: state,
+					},
+				})
+				m.mode = tc.mode
+				if tc.pending {
+					m.pendingApproval = &approvalRequestMsg{ID: "plan-approval"}
+				}
+				m.queue = []string{"already queued"}
+				m.textarea.SetValue(input)
+
+				next, cmd := m.queueWhileBusy(input)
+				m = next.(*model)
+				if cmd != nil {
+					t.Fatalf("%s returned command: %v", input, cmd)
+				}
+				if got := state.InteractiveMode(); got != "ask" {
+					t.Fatalf("%s changed state to %q", input, got)
+				}
+				if len(m.queue) != 1 || m.queue[0] != "already queued" {
+					t.Fatalf("%s changed queue: %#v", input, m.queue)
+				}
+				if got := m.textarea.Value(); got != input {
+					t.Fatalf("%s changed draft to %q", input, got)
+				}
+				if !hasLineContaining(m.lines, lineError, "permission mode changes are unavailable while busy") {
+					t.Fatalf("%s rejection error missing: %#v", input, m.lines)
+				}
+			}
+		})
+	}
+}
+
+func TestPlanRejectedFromBusySlashMenuKeepsDraftAndDoesNotCancel(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(t)
+	m.deps.PolicyInfo.ApprovalState = state
+	m.mode = modeBusy
+	m.queue = []string{"already queued"}
+	cancelCalls := 0
+	m.turnCancel = func() { cancelCalls++ }
+	m.textarea.SetValue("/plan")
+	m.syncSlashMenu()
+	if !m.slashMenuOpen() {
+		t.Fatal("plan slash menu should be open")
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(*model)
+	if cmd != nil || cancelCalls != 0 {
+		t.Fatalf("busy plan menu action started/cancelled work: cmd=%v cancelCalls=%d", cmd, cancelCalls)
+	}
+	if got := m.textarea.Value(); got != "/plan" {
+		t.Fatalf("busy plan menu action dropped draft: %q", got)
+	}
+	if len(m.queue) != 1 || m.queue[0] != "already queued" {
+		t.Fatalf("busy plan menu action changed queue: %#v", m.queue)
+	}
+}
+
+func TestPlanRejectedWithPendingApprovalKeepsStateAndDraft(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(t)
+	m.deps.PolicyInfo.ApprovalState = state
+	m.pendingApproval = &approvalRequestMsg{ID: "pending-plan"}
+	m.textarea.SetValue("/plan inspect while approval is pending")
+	cancelCalls := 0
+	m.turnCancel = func() { cancelCalls++ }
+	beforeTurnID := m.turnID
+
+	next, cmd := m.submit(m.textarea.Value())
+	m = next.(*model)
+	if cmd != nil || m.mode != modeIdle || m.turnID != beforeTurnID || cancelCalls != 0 {
+		t.Fatalf("pending plan action changed operation: cmd=%v mode=%s turnID=%d cancelCalls=%d", cmd, modeName(m.mode), m.turnID, cancelCalls)
+	}
+	if state.InteractiveMode() != "ask" {
+		t.Fatalf("pending plan action changed mode to %q", state.InteractiveMode())
+	}
+	if got := m.textarea.Value(); got != "/plan inspect while approval is pending" {
+		t.Fatalf("pending plan action dropped draft: %q", got)
+	}
+	if m.pendingApproval == nil {
+		t.Fatal("pending approval was cleared by rejected plan action")
+	}
+}
+
 func TestPermissionsParseAndBusyClassification(t *testing.T) {
 	cases := []struct {
 		input  string
@@ -172,6 +438,9 @@ func TestPermissionsParseAndBusyClassification(t *testing.T) {
 		{input: "/permissions ask", action: slashPermissions, arg: "ask", busy: busyInputReject},
 		{input: "/permissions auto", action: slashPermissions, arg: "auto", busy: busyInputReject},
 		{input: "/permissions plan", action: slashPermissions, arg: "plan", busy: busyInputReject},
+		{input: "/plan", action: slashPlan, busy: busyInputReject},
+		{input: "/plan inspect files", action: slashPlan, arg: "inspect files", busy: busyInputReject},
+		{input: "/plan exit", action: slashPlan, arg: "exit", busy: busyInputReject},
 	}
 	for _, tc := range cases {
 		action, arg := parseSlash(tc.input)

@@ -28,6 +28,7 @@ func TestSessionForkOpensChildWithProvenanceAndPreservesSource(t *testing.T) {
 		Store:                  threadStore,
 		Title:                  "source title",
 		ModelName:              "source-model",
+		ReasoningEffort:        "high",
 		Pricing:                usage.Pricing{InputPerMillion: 1.25, OutputPerMillion: 4.5},
 		Context:                contextbuild.Config{WindowTokens: 1200, MaxOutputTokens: 180, KeepRecentTurns: 3, AutoCompactTriggerPercent: 70, PostCompactTargetPercent: 40, SummaryMaxTokens: 160, LowGainThresholdPercent: 5},
 		MaxLowGainAttempts:     7,
@@ -89,6 +90,9 @@ func TestSessionForkOpensChildWithProvenanceAndPreservesSource(t *testing.T) {
 
 	if child.model != source.model || child.threads != source.threads {
 		t.Fatal("child did not inherit the source model and repository")
+	}
+	if child.ModelName() != "source-model" || child.ReasoningEffort() != "high" {
+		t.Fatalf("child model binding = %q/%q, want source-model/high", child.ModelName(), child.ReasoningEffort())
 	}
 	if child.systemPrompt != source.systemPrompt || child.contextCfg != source.contextCfg || child.pricing != source.pricing || child.maxLowGainAttempts != source.maxLowGainAttempts {
 		t.Fatalf("child runtime configuration = %#v, source = %#v", child, source)

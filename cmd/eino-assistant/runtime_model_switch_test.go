@@ -191,6 +191,31 @@ func TestRuntimeSwitchModelCommitsCandidateInPlace(t *testing.T) {
 	}
 }
 
+func TestRuntimeSwitchModelWithOptionsCommitsRequestedEffortAtomically(t *testing.T) {
+	r, session, threadStore := newRuntimeModelSwitchFixture(t)
+	r.modelFactory.newChatModel = func(_ context.Context, cfg config.ModelConfig) (model.ToolCallingChatModel, error) {
+		if cfg.ReasoningEffort != "high" {
+			t.Fatalf("candidate reasoning effort = %q, want high", cfg.ReasoningEffort)
+		}
+		return &runtimeFactoryChatModel{name: cfg.Name}, nil
+	}
+
+	bundle, err := r.switchModelWithOptions(context.Background(), session, "new-model", " high ")
+	if err != nil {
+		t.Fatalf("switchModelWithOptions: %v", err)
+	}
+	if bundle.sessionOpts.ReasoningEffort != "high" || session.ReasoningEffort() != "high" || r.cfg.Model.ReasoningEffort != "high" {
+		t.Fatalf("requested effort after switch: bundle=%q session=%q cfg=%q", bundle.sessionOpts.ReasoningEffort, session.ReasoningEffort(), r.cfg.Model.ReasoningEffort)
+	}
+	state, err := threadStore.LoadThread(context.Background(), session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	if state.Meta.Model != "new-model" || state.Meta.ReasoningEffort != "high" {
+		t.Fatalf("durable binding = %q/%q, want new-model/high", state.Meta.Model, state.Meta.ReasoningEffort)
+	}
+}
+
 func TestRuntimeCandidateFailureDoesNotPolluteOldBundle(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -271,8 +296,9 @@ func TestRuntimeCandidateFailureDoesNotPolluteOldBundle(t *testing.T) {
 func TestRuntimeOpenSessionUsesTargetDurableModelBeforeBuilding(t *testing.T) {
 	r, active, threadStore := newRuntimeModelSwitchFixture(t)
 	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{
-		Store:     threadStore,
-		ModelName: "durable-target",
+		Store:           threadStore,
+		ModelName:       "durable-target",
+		ReasoningEffort: "high",
 	})
 	if err != nil {
 		t.Fatalf("target NewSession: %v", err)
@@ -299,6 +325,9 @@ func TestRuntimeOpenSessionUsesTargetDurableModelBeforeBuilding(t *testing.T) {
 	}
 	if r.cfg.Model.Name != "durable-target" || r.sessionOpts.ModelName != "durable-target" {
 		t.Fatalf("runtime model identity after resume: cfg=%q opts=%q", r.cfg.Model.Name, r.sessionOpts.ModelName)
+	}
+	if r.cfg.Model.ReasoningEffort != "high" || r.sessionOpts.ReasoningEffort != "high" || opened.session.ReasoningEffort() != "high" {
+		t.Fatalf("runtime effort after resume: cfg=%q opts=%q session=%q", r.cfg.Model.ReasoningEffort, r.sessionOpts.ReasoningEffort, opened.session.ReasoningEffort())
 	}
 }
 
@@ -342,14 +371,17 @@ func TestRuntimeOpenSessionFailureLeavesOldBundleUnchanged(t *testing.T) {
 func TestResolveStartupModelConfigUsesDurableTargetBeforeBundle(t *testing.T) {
 	r, _, threadStore := newRuntimeModelSwitchFixture(t)
 	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{
-		Store:     threadStore,
-		ModelName: "durable-target",
+		Store:           threadStore,
+		ModelName:       "durable-target",
+		ReasoningEffort: "medium",
 	})
 	if err != nil {
 		t.Fatalf("target NewSession: %v", err)
 	}
 
-	cfg, err := resolveStartupModelConfig(context.Background(), validRuntimeConfig("configured-model"), sessionStart{
+	configured := validRuntimeConfig("configured-model")
+	configured.Model.ReasoningEffort = "high"
+	cfg, err := resolveStartupModelConfig(context.Background(), configured, sessionStart{
 		resumeID: target.ID(),
 	}, threadStore)
 	if err != nil {
@@ -372,8 +404,73 @@ func TestResolveStartupModelConfigUsesDurableTargetBeforeBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildModelBundle: %v", err)
 	}
-	if providerName != "durable-target" || bundle.sessionOpts.ModelName != "durable-target" {
-		t.Fatalf("startup model identity: provider=%q opts=%q", providerName, bundle.sessionOpts.ModelName)
+	if providerName != "durable-target" || bundle.sessionOpts.ModelName != "durable-target" || bundle.sessionOpts.ReasoningEffort != "medium" {
+		t.Fatalf("startup model binding: provider=%q model=%q effort=%q", providerName, bundle.sessionOpts.ModelName, bundle.sessionOpts.ReasoningEffort)
+	}
+}
+
+func TestResolveStartupModelConfigExplicitEffortKeepsDurableModel(t *testing.T) {
+	_, _, threadStore := newRuntimeModelSwitchFixture(t)
+	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{
+		Store:           threadStore,
+		ModelName:       "durable-target",
+		ReasoningEffort: "medium",
+	})
+	if err != nil {
+		t.Fatalf("target NewSession: %v", err)
+	}
+	cfg := validRuntimeConfig("configured-model")
+	cfg.Model.ReasoningEffort = "low"
+	resolved, err := resolveStartupModelConfig(context.Background(), cfg, sessionStart{
+		resumeID:           target.ID(),
+		reasoningEffort:    "",
+		reasoningEffortSet: true,
+	}, threadStore)
+	if err != nil {
+		t.Fatalf("resolve explicit effort: %v", err)
+	}
+	if resolved.Model.Name != "durable-target" || resolved.Model.ReasoningEffort != "" {
+		t.Fatalf("resolved explicit effort binding: model=%q effort=%q", resolved.Model.Name, resolved.Model.ReasoningEffort)
+	}
+}
+
+func TestResolveStartupModelConfigRestoresEmptyDurableEffort(t *testing.T) {
+	_, _, threadStore := newRuntimeModelSwitchFixture(t)
+	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{
+		Store:           threadStore,
+		ModelName:       "durable-target",
+		ReasoningEffort: "",
+	})
+	if err != nil {
+		t.Fatalf("target NewSession: %v", err)
+	}
+	cfg := validRuntimeConfig("configured-model")
+	cfg.Model.ReasoningEffort = "high"
+	resolved, err := resolveStartupModelConfig(context.Background(), cfg, sessionStart{resumeID: target.ID()}, threadStore)
+	if err != nil {
+		t.Fatalf("resolveStartupModelConfig: %v", err)
+	}
+	if resolved.Model.Name != "durable-target" || resolved.Model.ReasoningEffort != "" {
+		t.Fatalf("resolved durable default binding: model=%q effort=%q", resolved.Model.Name, resolved.Model.ReasoningEffort)
+	}
+
+	legacy, err := resolveStartupModelConfig(context.Background(), cfg, sessionStart{resumeID: target.ID()}, runtimeMetaLoaderFunc(func(context.Context, string) (store.ThreadMeta, error) {
+		return store.ThreadMeta{Model: "durable-target"}, nil
+	}))
+	if err != nil {
+		t.Fatalf("resolve legacy metadata: %v", err)
+	}
+	if legacy.Model.ReasoningEffort != "" {
+		t.Fatalf("legacy metadata effort=%q, want empty durable value", legacy.Model.ReasoningEffort)
+	}
+	legacyNoModel, err := resolveStartupModelConfig(context.Background(), cfg, sessionStart{resumeID: "legacy-thread"}, runtimeMetaLoaderFunc(func(context.Context, string) (store.ThreadMeta, error) {
+		return store.ThreadMeta{}, nil
+	}))
+	if err != nil {
+		t.Fatalf("resolve legacy no-model metadata: %v", err)
+	}
+	if legacyNoModel.Model.ReasoningEffort != "high" {
+		t.Fatalf("legacy no-model effort=%q, want configured high", legacyNoModel.Model.ReasoningEffort)
 	}
 }
 
@@ -384,15 +481,17 @@ func TestResolveStartupModelConfigExplicitOverrideWinsWithoutMetadataLoad(t *tes
 		called = true
 		return store.ThreadMeta{}, errors.New("metadata must not be loaded")
 	})
-	cfg, err := resolveStartupModelConfig(context.Background(), validRuntimeConfig("configured-model"), sessionStart{
+	configured := validRuntimeConfig("configured-model")
+	configured.Model.ReasoningEffort = "medium"
+	cfg, err := resolveStartupModelConfig(context.Background(), configured, sessionStart{
 		resumeID:  "durable-target",
 		modelName: "explicit-model",
 	}, loader)
 	if err != nil {
 		t.Fatalf("resolveStartupModelConfig: %v", err)
 	}
-	if called || cfg.Model.Name != "explicit-model" {
-		t.Fatalf("explicit startup model: loaded=%v name=%q", called, cfg.Model.Name)
+	if called || cfg.Model.Name != "explicit-model" || cfg.Model.ReasoningEffort != "medium" {
+		t.Fatalf("explicit startup binding: loaded=%v name=%q effort=%q", called, cfg.Model.Name, cfg.Model.ReasoningEffort)
 	}
 
 	var providerName string

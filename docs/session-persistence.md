@@ -278,7 +278,7 @@ checkpoint 必须是严格 JSON，并包含：
 | `/queue clear` | 即刻删除尚未开始的 follow-up，不取消当前 turn 或 compact。 |
 | `/delete <id>` | 唯一物理删除原始事件、checkpoint 和 artifact 的命令；不能删除当前 thread。 |
 
-生成或 compaction 中，`/help`、`/context`、`/status`、`/sessions`、`/queue` 立即运行。`/compact`、`/clear`、`/new`、`/resume`、`/fork`、`/title`、`/delete`、`/exit` 不会被排队，因此 queued prompt 不会在另一个 thread 或 checkpoint 上执行；`/fork` 只在 idle 且无参数时执行。
+生成或 compaction 中，`/help`、`/context`、`/status`、`/goal`、`/sessions`、`/queue` 立即运行。`/compact`、`/clear`、`/new`、`/resume`、`/fork`、`/title`、`/delete`、`/exit` 不会被排队，因此 queued prompt 不会在另一个 thread 或 checkpoint 上执行；`/fork` 只在 idle 且无参数时执行。
 
 ## 相关代码
 

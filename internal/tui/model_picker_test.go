@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -80,6 +81,68 @@ func TestModelPickerAltPOpensWithCapabilitiesAndAppliesCanonicalName(t *testing.
 	}
 	if !hasLineContaining(m.lines, lineSystem, "model switched to Coding 5.2 (openai/gpt-5.2-coding)") {
 		t.Fatalf("picker confirmation missing: %#v", m.lines)
+	}
+}
+
+func TestModelPickerEffortOptions(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry ModelCatalogEntry
+		want  []string
+	}{
+		{
+			name: "single declaration keeps different catalog default",
+			entry: ModelCatalogEntry{Capabilities: ModelCatalogCapabilities{
+				ReasoningEfforts:       []string{"low"},
+				DefaultReasoningEffort: "xhigh",
+			}},
+			want: []string{"", "low", "xhigh"},
+		},
+		{
+			name: "single declaration deduplicates matching catalog default",
+			entry: ModelCatalogEntry{Capabilities: ModelCatalogCapabilities{
+				ReasoningEfforts:       []string{"low"},
+				DefaultReasoningEffort: "LOW",
+			}},
+			want: []string{"low"},
+		},
+		{
+			name: "empty declaration keeps catalog default behavior",
+			entry: ModelCatalogEntry{Capabilities: ModelCatalogCapabilities{
+				DefaultReasoningEffort: "balanced",
+			}},
+			want: []string{"balanced"},
+		},
+		{
+			name:  "empty declaration without default uses provider default",
+			entry: ModelCatalogEntry{},
+			want:  []string{""},
+		},
+		{
+			name: "multiple declarations retain order and append different default",
+			entry: ModelCatalogEntry{Capabilities: ModelCatalogCapabilities{
+				ReasoningEfforts:       []string{"low", "high"},
+				DefaultReasoningEffort: "xhigh",
+			}},
+			want: []string{"", "low", "high", "xhigh"},
+		},
+		{
+			name: "multiple declarations deduplicate default case insensitively",
+			entry: ModelCatalogEntry{Capabilities: ModelCatalogCapabilities{
+				ReasoningEfforts:       []string{"low", "high"},
+				DefaultReasoningEffort: "HIGH",
+			}},
+			want: []string{"", "low", "high"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := modelPickerEffortOptions(tt.entry)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("modelPickerEffortOptions() = %#v, want %#v", got, tt.want)
+			}
+		})
 	}
 }
 

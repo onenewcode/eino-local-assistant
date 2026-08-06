@@ -179,7 +179,7 @@ func TestExecResumeRequiresExplicitIDOrLastAndDocumentsRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("exec resume --help: %v", err)
 	}
-	for _, want := range []string{"--recover", "--last", "--ephemeral", "-m", "--model", "-o", "--output-last-message", "stable identity", "storage.data_dir", "temporary snapshot", "[PROMPT]"} {
+	for _, want := range []string{"--recover", "--last", "--ephemeral", "-m", "--model", "--reasoning-effort", "-o", "--output-last-message", "stable identity", "storage.data_dir", "temporary snapshot", "[PROMPT]"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("headless resume help missing %q:\n%s", want, stdout)
 		}

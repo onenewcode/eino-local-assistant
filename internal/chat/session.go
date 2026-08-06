@@ -80,10 +80,11 @@ type Model interface {
 // compactor and pricing travel with the primary model so a successful idle
 // replacement cannot leave auxiliary calls on the previous provider.
 type ModelBinding struct {
-	Model     Model
-	ModelName string
-	Compactor contextbuild.CheckpointCompactor
-	Pricing   usage.Pricing
+	Model           Model
+	ModelName       string
+	ReasoningEffort string
+	Compactor       contextbuild.CheckpointCompactor
+	Pricing         usage.Pricing
 }
 
 // TurnEventKind identifies events emitted while a turn is running.
@@ -175,6 +176,9 @@ type SessionOptions struct {
 	Title string
 	// ModelName is recorded in meta (display / diagnostics).
 	ModelName string
+	// ReasoningEffort is the requested opaque effort persisted with ModelName.
+	// An empty value selects provider/model default semantics.
+	ReasoningEffort string
 	// Now overrides time for tests (session id + meta timestamps).
 	Now func() time.Time
 	// Pricing converts tokens to USD (zero rates => $0).
@@ -272,6 +276,7 @@ type Session struct {
 	id                 string
 	title              string
 	modelName          string
+	reasoningEffort    string
 	pricing            usage.Pricing
 	contextCfg         contextbuild.Config
 	maxLowGainAttempts int
@@ -355,6 +360,7 @@ func NewSession(model Model, systemPrompt string, opts SessionOptions) (*Session
 		id:                     id,
 		title:                  strings.TrimSpace(opts.Title),
 		modelName:              strings.TrimSpace(opts.ModelName),
+		reasoningEffort:        strings.TrimSpace(opts.ReasoningEffort),
 		pricing:                opts.Pricing,
 		contextCfg:             opts.Context.Normalize(),
 		maxLowGainAttempts:     opts.MaxLowGainAttempts,
@@ -363,11 +369,12 @@ func NewSession(model Model, systemPrompt string, opts SessionOptions) (*Session
 		finalResponseValidator: opts.FinalResponseValidator,
 	}
 	state, err := s.threads.CreateThread(context.Background(), store.ThreadMeta{
-		ID:        id,
-		Title:     s.title,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Model:     s.modelName,
+		ID:              id,
+		Title:           s.title,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Model:           s.modelName,
+		ReasoningEffort: s.reasoningEffort,
 	}, systemPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("create thread: %w", err)
@@ -448,12 +455,15 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		return nil, fmt.Errorf("thread %q has no system prompt", id)
 	}
 	s := &Session{
-		model:                  model,
-		transcript:             transcript,
-		threads:                st,
-		id:                     state.ID,
-		title:                  state.Meta.Title,
-		modelName:              state.Meta.Model,
+		model:      model,
+		transcript: transcript,
+		threads:    st,
+		id:         state.ID,
+		title:      state.Meta.Title,
+		modelName:  state.Meta.Model,
+		// Legacy thread payloads have no effort field; the zero value intentionally
+		// falls back to provider/model default rather than a process-wide option.
+		reasoningEffort:        state.Meta.ReasoningEffort,
 		pricing:                opts.Pricing,
 		contextCfg:             opts.Context.Normalize(),
 		maxLowGainAttempts:     opts.MaxLowGainAttempts,
@@ -668,16 +678,38 @@ func (s *Session) ModelName() string {
 	return s.modelName
 }
 
-// ReplaceModel atomically replaces the complete provider binding at an idle
-// boundary and records its identity in the thread journal. Provider
-// construction and any configuration validation happen before this method is
-// called.
+// ReasoningEffort returns the requested effort persisted with this session.
+// An empty value means the provider/model default, not a reported effective
+// provider value.
+func (s *Session) ReasoningEffort() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reasoningEffort
+}
+
+// ReplaceModel atomically replaces the provider binding at an idle boundary
+// and records its identity in the thread journal. For source compatibility,
+// model-only callers retain the current reasoning effort when ModelName is
+// non-empty. Provider construction and any configuration validation happen
+// before this method is called.
 //
 // The local operation lock is deliberately acquired with TryLock: a model
 // switch must not silently wait for a running turn or compaction. The store
 // repeats the lifecycle check under its write lock and protects the mutation
 // with the session's observed revision against external writers.
 func (s *Session) ReplaceModel(ctx context.Context, binding ModelBinding) error {
+	return s.replaceModel(ctx, binding, true)
+}
+
+// ReplaceModelWithOptions atomically replaces the complete provider binding,
+// including an explicitly empty ReasoningEffort. An empty effort means the
+// provider/model default; unlike ReplaceModel, this method does not inherit
+// the current effort from a model-only binding.
+func (s *Session) ReplaceModelWithOptions(ctx context.Context, binding ModelBinding) error {
+	return s.replaceModel(ctx, binding, false)
+}
+
+func (s *Session) replaceModel(ctx context.Context, binding ModelBinding, retainModelOnlyEffort bool) error {
 	if binding.Model == nil {
 		return errors.New("chat model is required")
 	}
@@ -688,15 +720,39 @@ func (s *Session) ReplaceModel(ctx context.Context, binding ModelBinding) error 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	repository, ok := s.threads.(store.ThreadModelRepository)
-	if !ok {
-		return ErrModelChangeUnsupported
-	}
 	s.mu.RLock()
 	threadID := s.id
 	expectedRevision := s.revision
+	currentReasoningEffort := s.reasoningEffort
 	s.mu.RUnlock()
-	state, err := repository.SetThreadModel(ctx, threadID, expectedRevision, strings.TrimSpace(binding.ModelName))
+	modelName := strings.TrimSpace(binding.ModelName)
+	reasoningEffort := strings.TrimSpace(binding.ReasoningEffort)
+	if retainModelOnlyEffort && modelName != "" && reasoningEffort == "" {
+		// Model-only replacement retains the current tuple's effort for callers
+		// that predate the optional effort field.
+		reasoningEffort = currentReasoningEffort
+	}
+	var (
+		state store.ThreadState
+		err   error
+	)
+	if repository, ok := s.threads.(store.ThreadModelBindingRepository); ok && (!retainModelOnlyEffort || modelName != "" || reasoningEffort != "") {
+		state, err = repository.SetThreadModelBinding(ctx, threadID, expectedRevision, modelName, reasoningEffort)
+	} else if !retainModelOnlyEffort {
+		// Explicit replacements require the atomic full-binding repository so an
+		// empty effort cannot be mistaken for a legacy model-only update.
+		return ErrModelChangeUnsupported
+	} else if repository, ok := s.threads.(store.ThreadModelRepository); ok {
+		if reasoningEffort != "" {
+			// A legacy repository cannot durably record the complete binding.
+			return ErrModelChangeUnsupported
+		}
+		// Keep model-only repositories source-compatible. Their durable payload
+		// cannot carry a non-empty effort.
+		state, err = repository.SetThreadModel(ctx, threadID, expectedRevision, modelName)
+	} else {
+		return ErrModelChangeUnsupported
+	}
 	if err != nil {
 		return fmt.Errorf("replace session model: %w", err)
 	}
@@ -1830,6 +1886,7 @@ func (s *Session) applyThreadStateLocked(state store.ThreadState) {
 	}
 	s.title = state.Meta.Title
 	s.modelName = state.Meta.Model
+	s.reasoningEffort = state.Meta.ReasoningEffort
 	s.promptTokens = state.Meta.PromptTokens
 	s.completionTokens = state.Meta.CompletionTokens
 	s.totalTokens = state.Meta.TotalTokens

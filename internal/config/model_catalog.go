@@ -32,9 +32,13 @@ type ModelCatalogCapabilities struct {
 	MaxOutputTokens     int      `toml:"max_output_tokens"`
 	SupportsReasoning   *bool    `toml:"supports_reasoning"`
 	ReasoningEfforts    []string `toml:"reasoning_efforts"`
-	InputModalities     []string `toml:"input_modalities"`
-	SupportsTools       *bool    `toml:"supports_tools"`
-	SupportsStreaming   *bool    `toml:"supports_streaming"`
+	// DefaultReasoningEffort is the declared default requested effort for this
+	// catalog entry. Empty means unknown or provider default; it is not an
+	// observed provider-effective effort.
+	DefaultReasoningEffort string   `toml:"default_reasoning_effort"`
+	InputModalities        []string `toml:"input_modalities"`
+	SupportsTools          *bool    `toml:"supports_tools"`
+	SupportsStreaming      *bool    `toml:"supports_streaming"`
 }
 
 // CatalogEntries returns a defensive copy suitable for a picker or report.
@@ -186,6 +190,15 @@ func normalizeCatalogCapabilities(capabilities *ModelCatalogCapabilities, entryI
 	}
 	if capabilities.ContextWindowTokens > 0 && capabilities.MaxOutputTokens >= capabilities.ContextWindowTokens && capabilities.MaxOutputTokens > 0 {
 		return fmt.Errorf("model.catalog[%d].capabilities.max_output_tokens must be smaller than context_window_tokens", entryIndex)
+	}
+	capabilities.DefaultReasoningEffort = strings.TrimSpace(capabilities.DefaultReasoningEffort)
+	if capabilities.DefaultReasoningEffort != "" {
+		if err := validateCatalogToken(
+			fmt.Sprintf("model.catalog[%d].capabilities.default_reasoning_effort", entryIndex),
+			capabilities.DefaultReasoningEffort,
+		); err != nil {
+			return err
+		}
 	}
 	var err error
 	capabilities.ReasoningEfforts, err = normalizeCatalogValueList(

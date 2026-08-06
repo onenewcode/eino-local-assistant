@@ -194,14 +194,14 @@ func TestThreadStoreForkInheritsCurrentModelAfterCommittedBoundary(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "fork-model-source", Model: "model-before"}, "system")
+	source, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "fork-model-source", Model: "model-before", ReasoningEffort: "low"}, "system")
 	if err != nil {
 		t.Fatal(err)
 	}
 	source = appendForkTestTurn(ctx, t, threadStore, source, "turn-model", false)
-	source, err = threadStore.SetThreadModel(ctx, source.ID, source.Revision, "model-after")
+	source, err = threadStore.SetThreadModelBinding(ctx, source.ID, source.Revision, "model-after", "high")
 	if err != nil {
-		t.Fatalf("SetThreadModel: %v", err)
+		t.Fatalf("SetThreadModelBinding: %v", err)
 	}
 	sourceFilesBefore := allForkThreadFiles(t, threadStore.Root(), source.ID)
 	sourceEvents := readForkTestEvents(t, filepath.Join(threadStore.Root(), sessionsDirName, source.ID))
@@ -222,15 +222,15 @@ func TestThreadStoreForkInheritsCurrentModelAfterCommittedBoundary(t *testing.T)
 	if result.SourceHash != boundaryHash {
 		t.Fatalf("fork source hash = %q, want committed boundary hash %q", result.SourceHash, boundaryHash)
 	}
-	if result.ChildState.Meta.Model != "model-after" {
-		t.Fatalf("fork result model = %q, want current model-after", result.ChildState.Meta.Model)
+	if result.ChildState.Meta.Model != "model-after" || result.ChildState.Meta.ReasoningEffort != "high" {
+		t.Fatalf("fork result binding = %#v, want model-after/high", result.ChildState.Meta)
 	}
 	child, err := threadStore.LoadThread(ctx, result.ChildID)
 	if err != nil {
 		t.Fatalf("LoadThread child: %v", err)
 	}
-	if child.Meta.Model != "model-after" || child.Meta.ForkSourceHash != result.SourceHash {
-		t.Fatalf("child model/provenance = %#v, want model-after and %q", child.Meta, result.SourceHash)
+	if child.Meta.Model != "model-after" || child.Meta.ReasoningEffort != "high" || child.Meta.ForkSourceHash != result.SourceHash {
+		t.Fatalf("child binding/provenance = %#v, want model-after/high and %q", child.Meta, result.SourceHash)
 	}
 	childEvents := readForkTestEvents(t, filepath.Join(threadStore.Root(), sessionsDirName, result.ChildID))
 	if childEvents[len(childEvents)-1].Kind == EventModelChanged || len(childEvents) != len(sourceEvents)-1 {
@@ -244,15 +244,15 @@ func TestThreadStoreForkInheritsCurrentModelAfterCommittedBoundary(t *testing.T)
 	if err != nil {
 		t.Fatalf("ForkThreadBeforeFirstTurn: %v", err)
 	}
-	if beforeFirst.SourceHash != sourceEvents[0].Hash || beforeFirst.ChildState.Meta.Model != "model-after" {
-		t.Fatalf("before-first result = %#v, want creation provenance and current model", beforeFirst)
+	if beforeFirst.SourceHash != sourceEvents[0].Hash || beforeFirst.ChildState.Meta.Model != "model-after" || beforeFirst.ChildState.Meta.ReasoningEffort != "high" {
+		t.Fatalf("before-first result = %#v, want creation provenance and current binding", beforeFirst)
 	}
 	beforeFirstChild, err := threadStore.LoadThread(ctx, beforeFirst.ChildID)
 	if err != nil {
 		t.Fatalf("LoadThread before-first child: %v", err)
 	}
-	if beforeFirstChild.Meta.Model != "model-after" || beforeFirstChild.Revision != 1 {
-		t.Fatalf("before-first child = %#v, want current model and creation-only prefix", beforeFirstChild)
+	if beforeFirstChild.Meta.Model != "model-after" || beforeFirstChild.Meta.ReasoningEffort != "high" || beforeFirstChild.Revision != 1 {
+		t.Fatalf("before-first child = %#v, want current binding and creation-only prefix", beforeFirstChild)
 	}
 	beforeFirstEvents := readForkTestEvents(t, filepath.Join(threadStore.Root(), sessionsDirName, beforeFirst.ChildID))
 	if len(beforeFirstEvents) != 1 || beforeFirstEvents[0].Kind != EventThreadCreated {

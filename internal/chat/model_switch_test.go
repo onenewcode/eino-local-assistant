@@ -23,10 +23,11 @@ func TestSessionReplaceModelPersistsIdentityAndResume(t *testing.T) {
 	initialCompactor := &modelBindingTestCompactor{}
 	initialPricing := usage.Pricing{InputPerMillion: 1, OutputPerMillion: 2}
 	session, err := NewSession(initialModel, "frozen system", SessionOptions{
-		Store:     threadStore,
-		ModelName: "model-a",
-		Compactor: initialCompactor,
-		Pricing:   initialPricing,
+		Store:           threadStore,
+		ModelName:       "model-a",
+		ReasoningEffort: "medium",
+		Compactor:       initialCompactor,
+		Pricing:         initialPricing,
 	})
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
@@ -39,6 +40,9 @@ func TestSessionReplaceModelPersistsIdentityAndResume(t *testing.T) {
 	beforeState, err := threadStore.LoadThread(ctx, id)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if beforeState.Meta.Model != "model-a" || beforeState.Meta.ReasoningEffort != "medium" {
+		t.Fatalf("created model binding = %q/%q, want model-a/medium", beforeState.Meta.Model, beforeState.Meta.ReasoningEffort)
 	}
 
 	replacement := &scriptedModel{}
@@ -58,6 +62,9 @@ func TestSessionReplaceModelPersistsIdentityAndResume(t *testing.T) {
 	if session.Model() != replacement || session.ModelName() != "model-b" {
 		t.Fatalf("active model = %p/%q, want %p/model-b", session.Model(), session.ModelName(), replacement)
 	}
+	if session.ReasoningEffort() != "medium" {
+		t.Fatalf("active reasoning effort = %q, want medium", session.ReasoningEffort())
+	}
 	if session.compactor != replacementCompactor || session.pricing != replacementPricing {
 		t.Fatalf("auxiliary binding = %p/%#v, want %p/%#v", session.compactor, session.pricing, replacementCompactor, replacementPricing)
 	}
@@ -68,7 +75,7 @@ func TestSessionReplaceModelPersistsIdentityAndResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterState.Meta.Model != "model-b" || afterState.Meta.MessageCount != beforeState.Meta.MessageCount || afterState.Meta.ModelCallCount != beforeState.Meta.ModelCallCount {
+	if afterState.Meta.Model != "model-b" || afterState.Meta.ReasoningEffort != "medium" || afterState.Meta.MessageCount != beforeState.Meta.MessageCount || afterState.Meta.ModelCallCount != beforeState.Meta.ModelCallCount {
 		t.Fatalf("persisted model replacement changed unrelated projection: before=%#v after=%#v", beforeState.Meta, afterState.Meta)
 	}
 	if afterState.Revision != beforeState.Revision+1 {
@@ -80,8 +87,8 @@ func TestSessionReplaceModelPersistsIdentityAndResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
-	if resumed.ID() != id || resumed.SystemPrompt() != "frozen system" || resumed.ModelName() != "model-b" {
-		t.Fatalf("resumed identity = id=%q prompt=%q model=%q", resumed.ID(), resumed.SystemPrompt(), resumed.ModelName())
+	if resumed.ID() != id || resumed.SystemPrompt() != "frozen system" || resumed.ModelName() != "model-b" || resumed.ReasoningEffort() != "medium" {
+		t.Fatalf("resumed identity = id=%q prompt=%q model=%q effort=%q", resumed.ID(), resumed.SystemPrompt(), resumed.ModelName(), resumed.ReasoningEffort())
 	}
 	if resumed.Model() != resumedProvider {
 		t.Fatalf("resume did not retain caller-provided model object")
@@ -112,6 +119,81 @@ func TestSessionReplaceModelAllowsProviderDefaultIdentity(t *testing.T) {
 	}
 	if state.Meta.Model != "" {
 		t.Fatalf("provider-default model identity = %q, want empty", state.Meta.Model)
+	}
+}
+
+func TestSessionReplaceModelWithOptionsClearsAndSetsProviderDefaultEffort(t *testing.T) {
+	ctx := context.Background()
+	threadStore := newDurableThreadStore(t)
+	session, err := NewSession(&scriptedModel{}, "system", SessionOptions{
+		Store:           threadStore,
+		ModelName:       "model-a",
+		ReasoningEffort: "high",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	if err := session.ReplaceModelWithOptions(ctx, ModelBinding{Model: &scriptedModel{}}); err != nil {
+		t.Fatalf("clear provider default effort: %v", err)
+	}
+	if session.ModelName() != "model-a" || session.ReasoningEffort() != "" {
+		t.Fatalf("cleared provider default effort = %q/%q, want model-a/empty", session.ModelName(), session.ReasoningEffort())
+	}
+	state, err := threadStore.LoadThread(ctx, session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread after clear: %v", err)
+	}
+	if state.Meta.Model != "model-a" || state.Meta.ReasoningEffort != "" {
+		t.Fatalf("persisted cleared provider default effort = %q/%q, want model-a/empty", state.Meta.Model, state.Meta.ReasoningEffort)
+	}
+
+	if err := session.ReplaceModelWithOptions(ctx, ModelBinding{
+		Model:           &scriptedModel{},
+		ReasoningEffort: "low",
+	}); err != nil {
+		t.Fatalf("set provider default effort: %v", err)
+	}
+	if session.ModelName() != "model-a" || session.ReasoningEffort() != "low" {
+		t.Fatalf("set provider default effort = %q/%q, want model-a/low", session.ModelName(), session.ReasoningEffort())
+	}
+	state, err = threadStore.LoadThread(ctx, session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread after set: %v", err)
+	}
+	if state.Meta.Model != "model-a" || state.Meta.ReasoningEffort != "low" {
+		t.Fatalf("persisted provider default binding = %q/%q, want model-a/low", state.Meta.Model, state.Meta.ReasoningEffort)
+	}
+}
+
+func TestOpenSessionLegacyEffortPayloadFallsBackToProviderDefault(t *testing.T) {
+	ctx := context.Background()
+	threadStore := newDurableThreadStore(t)
+	session, err := NewSession(&scriptedModel{}, "system", SessionOptions{
+		Store:           threadStore,
+		ModelName:       "model-a",
+		ReasoningEffort: "high",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	state, err := threadStore.LoadThread(ctx, session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	if _, err := threadStore.SetThreadModel(ctx, session.ID(), state.Revision, "model-a"); err != nil {
+		t.Fatalf("SetThreadModel: %v", err)
+	}
+
+	legacyOpen, err := OpenSession(&scriptedModel{}, threadStore, session.ID(), SessionOptions{
+		Store:           threadStore,
+		ReasoningEffort: "low",
+	})
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	if legacyOpen.ReasoningEffort() != "" {
+		t.Fatalf("legacy effort = %q, want provider default", legacyOpen.ReasoningEffort())
 	}
 }
 
@@ -274,6 +356,63 @@ func TestSessionReplaceModelKeepsLegacyRepositoryCompatibility(t *testing.T) {
 	}
 	if err := session.ReplaceModel(context.Background(), ModelBinding{Model: &scriptedModel{}, ModelName: "model-b"}); !errors.Is(err, ErrModelChangeUnsupported) {
 		t.Fatalf("legacy repository error = %v, want ErrModelChangeUnsupported", err)
+	}
+}
+
+func TestSessionReplaceModelRejectsEffortOnLegacyRepository(t *testing.T) {
+	legacy := &legacyModelSwitchRepository{ThreadRepository: newDurableThreadStore(t)}
+	session, err := NewSession(&scriptedModel{}, "system", SessionOptions{Store: legacy, ModelName: "model-a"})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	before, err := legacy.LoadThread(context.Background(), session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	replacement := &scriptedModel{}
+	if err := session.ReplaceModel(context.Background(), ModelBinding{
+		Model:           replacement,
+		ModelName:       "model-b",
+		ReasoningEffort: "high",
+	}); !errors.Is(err, ErrModelChangeUnsupported) {
+		t.Fatalf("legacy effort error = %v, want ErrModelChangeUnsupported", err)
+	}
+	if session.ModelName() != "model-a" || session.ReasoningEffort() != "" || session.Model() == replacement {
+		t.Fatalf("failed legacy effort replacement changed local binding: model=%p name=%q effort=%q", session.Model(), session.ModelName(), session.ReasoningEffort())
+	}
+	after, err := legacy.LoadThread(context.Background(), session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread after rejection: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed legacy effort replacement changed durable state:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestSessionReplaceModelUsesBindingRepositoryForEffortOnlyChange(t *testing.T) {
+	ctx := context.Background()
+	threadStore := newDurableThreadStore(t)
+	session, err := NewSession(&scriptedModel{}, "system", SessionOptions{
+		Store:           threadStore,
+		ModelName:       "model-a",
+		ReasoningEffort: "low",
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	replacement := &scriptedModel{}
+	if err := session.ReplaceModel(ctx, ModelBinding{Model: replacement, ReasoningEffort: "high"}); err != nil {
+		t.Fatalf("effort-only ReplaceModel: %v", err)
+	}
+	if session.Model() != replacement || session.ModelName() != "model-a" || session.ReasoningEffort() != "high" {
+		t.Fatalf("effort-only local binding = %p/%q/%q, want replacement/model-a/high", session.Model(), session.ModelName(), session.ReasoningEffort())
+	}
+	state, err := threadStore.LoadThread(ctx, session.ID())
+	if err != nil {
+		t.Fatalf("LoadThread: %v", err)
+	}
+	if state.Meta.Model != "model-a" || state.Meta.ReasoningEffort != "high" {
+		t.Fatalf("effort-only durable binding = %q/%q, want model-a/high", state.Meta.Model, state.Meta.ReasoningEffort)
 	}
 }
 
