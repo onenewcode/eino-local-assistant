@@ -68,6 +68,7 @@ type commandRuntime struct {
 	workspaceRoot         string
 	readOnlyRoots         []string
 	protectedPaths        []string
+	sandboxEnvironment    sandbox.EnvironmentSnapshot
 	sandboxRunner         *tools.SandboxRunner
 	runtimeCfg            config.RuntimeConfig
 	composePromptSnapshot func() (string, agent.PromptLayerSnapshot, error)
@@ -489,22 +490,29 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
-	readOnlyRoots, err := cfg.Sandbox.ResolveReadOnlyRoots()
-	if err != nil {
-		return nil, err
-	}
-	sandboxRunner, err := tools.NewSandboxRunner(tools.SandboxRunnerOptions{
-		Mode:           sandbox.Mode(cfg.Sandbox.ModeNormalized()),
-		WorkspaceRoot:  workspaceRoot,
-		ReadOnlyRoots:  readOnlyRoots,
-		ProtectedPaths: protectedPaths,
-		AllowedHosts:   cfg.Sandbox.Network.AllowedDomains,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create sandbox runner: %w", err)
+	var sandboxRunner *tools.SandboxRunner
+	var effectiveReadOnlyRoots []string
+	var sandboxEnvironment sandbox.EnvironmentSnapshot
+	if sandboxMode := cfg.Sandbox.ModeNormalized(); sandboxMode != "" {
+		readOnlyRoots, resolveErr := cfg.Sandbox.ResolveReadOnlyRoots()
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		sandboxRunner, err = tools.NewSandboxRunner(tools.SandboxRunnerOptions{
+			Mode:                sandbox.Mode(sandboxMode),
+			WorkspaceRoot:       workspaceRoot,
+			ReadOnlyRoots:       readOnlyRoots,
+			ProtectedPaths:      protectedPaths,
+			ToolchainVisibility: sandbox.ToolchainVisibility(cfg.Sandbox.ToolchainVisibilityNormalized()),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create sandbox runner: %w", err)
+		}
+		effectiveReadOnlyRoots = sandboxRunner.ReadOnlyRoots()
+		sandboxEnvironment = sandboxRunner.EnvironmentSnapshot()
 	}
 	defer func() {
-		if err != nil {
+		if err != nil && sandboxRunner != nil {
 			if closeErr := sandboxRunner.Close(); closeErr != nil {
 				err = errors.Join(err, fmt.Errorf("close sandbox runner during startup: %w", closeErr))
 			}
@@ -593,8 +601,9 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		sessionAllows:      sessionAllows,
 		sessionDenies:      sessionDenies,
 		workspaceRoot:      workspaceRoot,
-		readOnlyRoots:      readOnlyRoots,
+		readOnlyRoots:      effectiveReadOnlyRoots,
 		protectedPaths:     protectedPaths,
+		sandboxEnvironment: sandboxEnvironment,
 		sandboxRunner:      sandboxRunner,
 		runtimeCfg:         runtimeCfg,
 	}

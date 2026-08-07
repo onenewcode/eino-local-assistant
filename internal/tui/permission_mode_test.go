@@ -104,7 +104,7 @@ func TestPermissionsYoloIsExplicitAndVisible(t *testing.T) {
 	if got := state.Mode(); got != tools.ApprovalYolo {
 		t.Fatalf("state mode = %q, want yolo", got)
 	}
-	if got, want := m.statusPolicyFragment(), "cmd=yolo · YOLO=UNSAFE · sb=off · sb_backend=host · net=host"; got != want {
+	if got, want := m.statusPolicyFragment(), "cmd=yolo · YOLO=UNSAFE"; got != want {
 		t.Fatalf("yolo status = %q, want %q", got, want)
 	}
 	if !hasLineContaining(m.lines, lineError, tools.YoloModeWarning) {
@@ -125,7 +125,7 @@ func TestPermissionsYoloIsExplicitAndVisible(t *testing.T) {
 	if err := state.SetInteractiveMode("ask"); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := m.statusPolicyFragment(), "cmd=ask · sb=rw · sb_backend=seatbelt · net=off"; got != want {
+	if got, want := m.statusPolicyFragment(), "cmd=ask · sb=rw"; got != want {
 		t.Fatalf("status after leaving yolo = %q, want %q", got, want)
 	}
 	report = m.deps.PolicyInfo.FormatPermissions()

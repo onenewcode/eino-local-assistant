@@ -51,18 +51,19 @@ system_prompt = "你是一个严谨、实用的编程助手。"
 [workspace]
 root = ""
 
-# 默认 workspace-write：shell 与 apply_patch 在短生命周期 worker 中运行，
-# 只能修改 workspace；read-only 会将 workspace 以只读方式暴露。
+# 默认关闭 OS sandbox；需要时显式设置 mode = "workspace-write" 或 "read-only"。
+# workspace-write 只能修改 workspace；read-only 会将 workspace 以只读方式暴露。
 [sandbox]
-mode = "workspace-write"
+# mode = "workspace-write" # workspace-write | read-only
+# 默认自动发现宿主工具链 PATH、符号链接目标和依赖缓存并以只读方式挂载。
+# 高安全场景可设为 explicit，仅使用手动配置的 read_only_roots。
+toolchain_visibility = "auto" # auto | explicit
 # 仅接受已存在的绝对目录；按真实路径规范化后以只读方式挂载。
 # read_only_roots = ["/absolute/path/to/go-or-node-toolchain"]
 # 这里只能追加字面工作区路径或字面 `/**` 子树；内建 .git、.agents、.eino-assistant、.eino、.env 永远受保护。
 # protected_paths = [".env.local", "secrets/**"]
 
-# 空列表表示无网络。仅允许精确 DNS 主机名（不接受 URL、端口、IP 或通配符）。
-# [sandbox.network]
-# allowed_domains = ["proxy.golang.org", "registry.npmjs.org"]
+# sandbox 只限制文件系统，网络始终开放；不需要 network 参数。
 
 # 单个 agent turn 的总预算；0 也会采用下列默认值。
 # 一个 tool-enabled 模型响应计一个 model step；该响应中的 0..N 个工具调用

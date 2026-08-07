@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -18,15 +17,6 @@ var (
 	// ErrUnsupportedPlatform means no strict sandbox backend is implemented for
 	// the current operating system.
 	ErrUnsupportedPlatform = errors.New("sandbox platform is unsupported")
-)
-
-const (
-	// EnvSandboxProxySocket names the Unix socket used by a Linux worker relay
-	// to reach the host-side hostname-filtering proxy.
-	EnvSandboxProxySocket = "EINO_SANDBOX_PROXY_SOCKET"
-	// EnvSandboxProxyPort names the worker-local loopback port a Linux relay
-	// must listen on before a network-enabled tool starts.
-	EnvSandboxProxyPort = "EINO_SANDBOX_PROXY_PORT"
 )
 
 // Backend identifies the OS sandbox backend used by a command specification.
@@ -48,14 +38,6 @@ type CommandSpec struct {
 	Args    []string
 	Dir     string
 	Env     []string
-	// ProxySocket is a host-side Unix socket mounted into a Linux bwrap worker.
-	// A worker that receives both relay fields must expose ProxyPort on its own
-	// isolated loopback interface and relay it to this socket before running the
-	// requested tool. It is empty for macOS and network-disabled commands.
-	ProxySocket string
-	// ProxyPort is the loopback port the Linux worker relay must listen on. It
-	// is zero for macOS and network-disabled commands.
-	ProxyPort int
 }
 
 // Command creates an exec.Cmd from the specification without starting it.
@@ -70,17 +52,17 @@ func (spec CommandSpec) Command(ctx context.Context) *exec.Cmd {
 }
 
 // BuildCommand validates policy and builds the strict backend command for the
-// current operating system. A nonzero proxyPort is valid only when the policy
-// has an allowed-host list, and vice versa. The proxy must enforce that list.
-func BuildCommand(ctx context.Context, policy Policy, workerPath string, workerArgs []string, proxyPort int) (CommandSpec, error) {
-	return BuildCommandWithAvailability(ctx, policy, workerPath, workerArgs, proxyPort, CurrentAvailability())
+// current operating system. Network access remains available inside the
+// filesystem sandbox.
+func BuildCommand(ctx context.Context, policy Policy, workerPath string, workerArgs []string) (CommandSpec, error) {
+	return BuildCommandWithAvailability(ctx, policy, workerPath, workerArgs, CurrentAvailability())
 }
 
 // BuildCommandWithAvailability is BuildCommand with an already-resolved
 // backend. Runners capture this before a model can change the workspace or
 // ambient PATH, so a later tool call cannot replace the sandbox launcher.
 // It fully normalizes policy (including the workspace hard-link scan).
-func BuildCommandWithAvailability(ctx context.Context, policy Policy, workerPath string, workerArgs []string, proxyPort int, availability Availability) (CommandSpec, error) {
+func BuildCommandWithAvailability(ctx context.Context, policy Policy, workerPath string, workerArgs []string, availability Availability) (CommandSpec, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return CommandSpec{}, err
@@ -90,14 +72,14 @@ func BuildCommandWithAvailability(ctx context.Context, policy Policy, workerPath
 	if err != nil {
 		return CommandSpec{}, err
 	}
-	return buildCommandFromNormalized(normalized, workerPath, workerArgs, proxyPort, availability)
+	return buildCommandFromNormalized(normalized, workerPath, workerArgs, availability)
 }
 
 // BuildCommandFromNormalized builds a launcher command from a policy that was
 // already produced by NormalizePolicy or Policy.WithTempDir. It skips the
 // workspace hard-link walk so per-tool execution stays cheap after session
 // startup validation.
-func BuildCommandFromNormalized(ctx context.Context, policy Policy, workerPath string, workerArgs []string, proxyPort int, availability Availability) (CommandSpec, error) {
+func BuildCommandFromNormalized(ctx context.Context, policy Policy, workerPath string, workerArgs []string, availability Availability) (CommandSpec, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return CommandSpec{}, err
@@ -106,18 +88,14 @@ func BuildCommandFromNormalized(ctx context.Context, policy Policy, workerPath s
 	if err := requireNormalizedPolicy(policy); err != nil {
 		return CommandSpec{}, err
 	}
-	return buildCommandFromNormalized(policy, workerPath, workerArgs, proxyPort, availability)
+	return buildCommandFromNormalized(policy, workerPath, workerArgs, availability)
 }
 
-func buildCommandFromNormalized(policy Policy, workerPath string, workerArgs []string, proxyPort int, availability Availability) (CommandSpec, error) {
+func buildCommandFromNormalized(policy Policy, workerPath string, workerArgs []string, availability Availability) (CommandSpec, error) {
 	worker, err := normalizeWorkerPath(workerPath)
 	if err != nil {
 		return CommandSpec{}, err
 	}
-	if err := validateProxyPort(policy, proxyPort); err != nil {
-		return CommandSpec{}, err
-	}
-
 	if !availability.Available {
 		if availability.Backend == "" {
 			return CommandSpec{}, fmt.Errorf("%w: %w: %s", ErrUnavailable, ErrUnsupportedPlatform, availability.Reason)
@@ -128,7 +106,7 @@ func buildCommandFromNormalized(policy Policy, workerPath string, workerArgs []s
 	if err != nil {
 		return CommandSpec{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	return buildCurrentCommand(policy, worker, workerArgs, proxyPort, launcher)
+	return buildCurrentCommand(policy, worker, workerArgs, launcher)
 }
 
 // requireNormalizedPolicy is a cheap shape check for session-validated policies.
@@ -145,13 +123,6 @@ func requireNormalizedPolicy(policy Policy) error {
 	}
 	return nil
 }
-
-// LinuxSandboxRelayPort is the fixed loopback port used inside each bubblewrap
-// network namespace for the host proxy relay. The namespace is private, so a
-// fixed port avoids host-side listen/close races and concurrent-worker clashes.
-// Stay above 1023: even with user-namespace root, privileged ports are a
-// footgun for non-bwrap worker entrypaths and for future capability tightening.
-const LinuxSandboxRelayPort = 18765
 
 func normalizeSandboxLauncher(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
@@ -222,63 +193,6 @@ func ResolveExecutablePath(raw string) (string, error) {
 	return normalizeWorkerPath(raw)
 }
 
-func validateProxyPort(policy Policy, proxyPort int) error {
-	hasHosts := len(policy.Network.AllowedHosts) > 0
-	if proxyPort < 0 || proxyPort > 65535 {
-		return errors.New("sandbox proxy port must be between 0 and 65535")
-	}
-	if hasHosts && proxyPort == 0 {
-		return errors.New("sandbox network allowlist requires a loopback proxy port")
-	}
-	if !hasHosts && proxyPort != 0 {
-		return errors.New("sandbox loopback proxy port requires a network allowlist")
-	}
-	return nil
-}
-
-func sandboxEnvironment(policy Policy, proxyPort int, path string) []string {
-	env := []string{
-		"HOME=" + policy.TempDir,
-		"TMPDIR=" + policy.TempDir,
-		"TMP=" + policy.TempDir,
-		"TEMP=" + policy.TempDir,
-		"PATH=" + path,
-		"NO_PROXY=",
-		"no_proxy=",
-	}
-	if proxyPort == 0 {
-		return append(env,
-			"HTTP_PROXY=",
-			"HTTPS_PROXY=",
-			"ALL_PROXY=",
-			"http_proxy=",
-			"https_proxy=",
-			"all_proxy=",
-		)
-	}
-
-	proxyURL := "http://127.0.0.1:" + strconv.Itoa(proxyPort)
-	return append(env,
-		"HTTP_PROXY="+proxyURL,
-		"HTTPS_PROXY="+proxyURL,
-		"ALL_PROXY="+proxyURL,
-		"http_proxy="+proxyURL,
-		"https_proxy="+proxyURL,
-		"all_proxy="+proxyURL,
-	)
-}
-
-func bubblewrapEnvironment(policy Policy, proxyPort int) []string {
-	env := sandboxEnvironment(policy, proxyPort, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	if proxyPort == 0 {
-		return env
-	}
-	return append(env,
-		EnvSandboxProxySocket+"="+proxySocketPath(policy),
-		EnvSandboxProxyPort+"="+strconv.Itoa(proxyPort),
-	)
-}
-
-func proxySocketPath(policy Policy) string {
-	return filepath.Join(policy.TempDir, "proxy.sock")
+func sandboxEnvironment(policy Policy) []string {
+	return policy.Environment.ForExecution(policy.TempDir)
 }

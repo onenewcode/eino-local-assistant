@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 )
 
 // SeatbeltProfile builds a macOS Seatbelt profile for a worker. It is exposed
 // separately so callers can inspect the policy recorded with an execution.
-func SeatbeltProfile(policy Policy, workerPath string, proxyPort int) (string, error) {
+func SeatbeltProfile(policy Policy, workerPath string) (string, error) {
 	normalized, err := NormalizePolicy(policy)
 	if err != nil {
 		return "", err
@@ -19,16 +18,13 @@ func SeatbeltProfile(policy Policy, workerPath string, proxyPort int) (string, e
 	if err != nil {
 		return "", err
 	}
-	if err := validateProxyPort(normalized, proxyPort); err != nil {
-		return "", err
-	}
-	return seatbeltProfile(normalized, worker, proxyPort), nil
+	return seatbeltProfile(normalized, worker), nil
 }
 
 // BuildSeatbeltCommand builds a sandbox-exec invocation without checking that
 // sandbox-exec is installed. BuildCommand performs that availability check for
 // the current platform.
-func BuildSeatbeltCommand(policy Policy, workerPath string, workerArgs []string, proxyPort int) (CommandSpec, error) {
+func BuildSeatbeltCommand(policy Policy, workerPath string, workerArgs []string) (CommandSpec, error) {
 	normalized, err := NormalizePolicy(policy)
 	if err != nil {
 		return CommandSpec{}, err
@@ -37,26 +33,23 @@ func BuildSeatbeltCommand(policy Policy, workerPath string, workerArgs []string,
 	if err != nil {
 		return CommandSpec{}, err
 	}
-	if err := validateProxyPort(normalized, proxyPort); err != nil {
-		return CommandSpec{}, err
-	}
-	return buildSeatbeltCommand(normalized, worker, workerArgs, proxyPort, "sandbox-exec"), nil
+	return buildSeatbeltCommand(normalized, worker, workerArgs, "sandbox-exec"), nil
 }
 
-func buildSeatbeltCommand(policy Policy, workerPath string, workerArgs []string, proxyPort int, sandboxExec string) CommandSpec {
+func buildSeatbeltCommand(policy Policy, workerPath string, workerArgs []string, sandboxExec string) CommandSpec {
 	args := make([]string, 0, len(workerArgs)+3)
-	args = append(args, "-p", seatbeltProfile(policy, workerPath, proxyPort), workerPath)
+	args = append(args, "-p", seatbeltProfile(policy, workerPath), workerPath)
 	args = append(args, workerArgs...)
 	return CommandSpec{
 		Backend: BackendSeatbelt,
 		Path:    sandboxExec,
 		Args:    args,
 		Dir:     policy.Workspace,
-		Env:     sandboxEnvironment(policy, proxyPort, "/usr/bin:/bin:/usr/sbin:/sbin"),
+		Env:     sandboxEnvironment(policy),
 	}
 }
 
-func seatbeltProfile(policy Policy, workerPath string, proxyPort int) string {
+func seatbeltProfile(policy Policy, workerPath string) string {
 	var profile strings.Builder
 	profile.WriteString("(version 1)\n")
 	profile.WriteString("(deny default)\n")
@@ -103,21 +96,15 @@ func seatbeltProfile(policy Policy, workerPath string, proxyPort int) string {
 		writeSeatbeltPathRules(&profile, "deny", "process-exec*", protected)
 	}
 
-	profile.WriteString("(deny network*)\n")
-	if proxyPort != 0 {
-		// Seatbelt accepts the special localhost host form (but rejects numeric
-		// literals in remote tcp filters). The proxy listens only on 127.0.0.1
-		// and owns hostname allowlisting.
-		profile.WriteString("(allow network-outbound (remote tcp ")
-		profile.WriteString(seatbeltQuote("localhost:" + strconv.Itoa(proxyPort)))
-		profile.WriteString("))\n")
-	}
+	// The sandbox boundary is filesystem-only. Developer tools and package
+	// managers must retain ordinary host network access in every filesystem mode.
+	profile.WriteString("(allow network*)\n")
 	return profile.String()
 }
 
 // writeMacOSWorkerRuntimeRules allows the local kernel and Mach primitives
 // needed by a Go worker and its same-sandbox subprocesses. It deliberately
-// avoids wildcard Mach lookup, general system sockets, and network operations.
+// avoids wildcard Mach lookup and general system sockets.
 func writeMacOSWorkerRuntimeRules(profile *strings.Builder) {
 	profile.WriteString("(allow process-exec)\n")
 	profile.WriteString("(allow process-fork)\n")

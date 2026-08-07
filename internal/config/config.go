@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"net/url"
 	"os"
 	"path"
@@ -20,7 +19,7 @@ import (
 // Tool posture follows Codex + Claude Code conventions:
 //   - approval_policy (Codex): when to ask the human
 //   - [workspace] (Codex lite): path clamp root
-//   - [sandbox]: OS worker filesystem and network boundary
+//   - [sandbox]: optional OS worker filesystem boundary
 //   - [runtime]: whole-turn ReAct budgets
 //   - [tools.shell] / [tools.apply_patch]: per-tool limits
 type Config struct {
@@ -251,6 +250,10 @@ const (
 	SandboxModeWorkspaceWrite = "workspace-write"
 	// SandboxModeReadOnly mounts the workspace read-only.
 	SandboxModeReadOnly = "read-only"
+	// SandboxToolchainVisibilityAuto discovers safe host toolchain paths.
+	SandboxToolchainVisibilityAuto = "auto"
+	// SandboxToolchainVisibilityExplicit disables host toolchain discovery.
+	SandboxToolchainVisibilityExplicit = "explicit"
 
 	// DefaultRuntimeMaxTurnSeconds bounds a complete ReAct turn when no runtime
 	// override is configured.
@@ -270,22 +273,18 @@ const (
 	maxRuntimeToolCalls   = 128
 )
 
-// SandboxConfig describes the filesystem and network boundary applied to
-// side-effecting tools. The host process remains outside this boundary.
+// SandboxConfig describes the optional filesystem boundary applied to
+// side-effecting tools. An empty Mode leaves tools on the host by default.
 type SandboxConfig struct {
-	// Mode is workspace-write (default) or read-only.
+	// Mode is empty (disabled), workspace-write, or read-only.
 	Mode string `toml:"mode"`
+	// ToolchainVisibility is auto (default) or explicit. Auto discovers safe
+	// host toolchain paths and exposes them read-only to workers.
+	ToolchainVisibility string `toml:"toolchain_visibility"`
 	// ReadOnlyRoots are explicit absolute host directories exposed read-only to a worker.
 	ReadOnlyRoots []string `toml:"read_only_roots"`
 	// ProtectedPaths append workspace-relative literal deny paths to the built-in set.
-	ProtectedPaths []string             `toml:"protected_paths"`
-	Network        SandboxNetworkConfig `toml:"network"`
-}
-
-// SandboxNetworkConfig controls worker HTTP(S) egress through the sandbox proxy.
-type SandboxNetworkConfig struct {
-	// AllowedDomains is an exact DNS hostname allowlist. An empty list disables egress.
-	AllowedDomains []string `toml:"allowed_domains"`
+	ProtectedPaths []string `toml:"protected_paths"`
 }
 
 // RuntimeConfig bounds one agent turn independently from per-command shell limits.
@@ -315,16 +314,31 @@ func (c Config) ApprovalPolicyNormalized() string {
 	}
 }
 
-// ModeNormalized returns the effective sandbox mode, using workspace-write
-// when the TOML field is omitted. Validation rejects any other value.
+// ModeNormalized returns the effective sandbox mode. An omitted mode disables
+// the OS sandbox; validation rejects any non-empty value other than the two
+// supported worker modes.
 func (c SandboxConfig) ModeNormalized() string {
 	switch mode := strings.ToLower(strings.TrimSpace(c.Mode)); mode {
-	case "", SandboxModeWorkspaceWrite:
+	case "":
+		return ""
+	case SandboxModeWorkspaceWrite:
 		return SandboxModeWorkspaceWrite
 	case SandboxModeReadOnly:
 		return SandboxModeReadOnly
 	default:
 		return mode
+	}
+}
+
+// ToolchainVisibilityNormalized returns the effective host toolchain policy.
+func (c SandboxConfig) ToolchainVisibilityNormalized() string {
+	switch visibility := strings.ToLower(strings.TrimSpace(c.ToolchainVisibility)); visibility {
+	case "", SandboxToolchainVisibilityAuto:
+		return SandboxToolchainVisibilityAuto
+	case SandboxToolchainVisibilityExplicit:
+		return SandboxToolchainVisibilityExplicit
+	default:
+		return visibility
 	}
 }
 
@@ -508,6 +522,10 @@ func Load(path string) (Config, error) {
 				return Config{}, errors.New("parse TOML configuration: [permissions] is no longer supported; delete it. Move shell prefix approvals to ~/.eino-assistant/rules/*.rules (default.rules is initialized before runtime configuration is validated); configure apply_patch through approval_policy and [sandbox].protected_paths. This table is not migrated automatically")
 			case "projects":
 				return Config{}, errors.New("parse TOML configuration: [projects] is only read from the user-owned ~/.eino-assistant/config.toml tool-policy trust file; remove it from the runtime configuration passed to --config")
+			case "sandbox":
+				if len(key) > 1 && key[1] == "network" {
+					return Config{}, errors.New("parse TOML configuration: [sandbox.network] is no longer supported; sandbox network access is always open; remove sandbox.network.allowed_domains")
+				}
 			case "runtime":
 				if len(key) > 1 && key[1] == "max_react_steps" {
 					return Config{}, errors.New("parse TOML configuration: runtime.max_react_steps is no longer supported; replace it with runtime.max_model_steps. One tool-enabled model response consumes a model step; individual tool executions use runtime.max_tool_calls")
@@ -729,10 +747,16 @@ func (c *SandboxConfig) Validate() error {
 		return nil
 	}
 	switch c.ModeNormalized() {
-	case SandboxModeWorkspaceWrite, SandboxModeReadOnly:
+	case "", SandboxModeWorkspaceWrite, SandboxModeReadOnly:
 		// valid
 	default:
 		return fmt.Errorf("sandbox.mode must be %q or %q", SandboxModeWorkspaceWrite, SandboxModeReadOnly)
+	}
+	switch c.ToolchainVisibilityNormalized() {
+	case SandboxToolchainVisibilityAuto, SandboxToolchainVisibilityExplicit:
+		// valid
+	default:
+		return fmt.Errorf("sandbox.toolchain_visibility must be %q or %q", SandboxToolchainVisibilityAuto, SandboxToolchainVisibilityExplicit)
 	}
 
 	roots, err := c.ResolveReadOnlyRoots()
@@ -747,7 +771,7 @@ func (c *SandboxConfig) Validate() error {
 	}
 	c.ProtectedPaths = protected
 
-	return c.Network.Validate()
+	return nil
 }
 
 func normalizeProtectedPaths(paths []string) ([]string, error) {
@@ -791,52 +815,6 @@ func normalizeProtectedPaths(paths []string) ([]string, error) {
 		normalized = append(normalized, pattern)
 	}
 	return normalized, nil
-}
-
-// Validate checks and canonicalizes network egress hostnames.
-func (c *SandboxNetworkConfig) Validate() error {
-	if c == nil || len(c.AllowedDomains) == 0 {
-		return nil
-	}
-	domains := make([]string, 0, len(c.AllowedDomains))
-	seen := make(map[string]struct{}, len(c.AllowedDomains))
-	for _, raw := range c.AllowedDomains {
-		domain, err := normalizeAllowedDomain(raw)
-		if err != nil {
-			return err
-		}
-		if _, ok := seen[domain]; ok {
-			continue
-		}
-		seen[domain] = struct{}{}
-		domains = append(domains, domain)
-	}
-	c.AllowedDomains = domains
-	return nil
-}
-
-func normalizeAllowedDomain(raw string) (string, error) {
-	domain := strings.ToLower(strings.TrimSpace(raw))
-	if domain == "" {
-		return "", errors.New("sandbox.network.allowed_domains entries must not be empty")
-	}
-	if net.ParseIP(domain) != nil {
-		return "", fmt.Errorf("sandbox.network.allowed_domains %q must be a DNS hostname, not an IP address", raw)
-	}
-	if len(domain) > 253 || strings.ContainsAny(domain, ":/@?#[\\]") || strings.Contains(domain, "*") {
-		return "", fmt.Errorf("sandbox.network.allowed_domains %q must be an exact DNS hostname", raw)
-	}
-	for _, label := range strings.Split(domain, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return "", fmt.Errorf("sandbox.network.allowed_domains %q must be an exact DNS hostname", raw)
-		}
-		for _, r := range label {
-			if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' {
-				return "", fmt.Errorf("sandbox.network.allowed_domains %q must be an exact DNS hostname", raw)
-			}
-		}
-	}
-	return domain, nil
 }
 
 // Validate checks runtime guardrails. Zero means use the documented product default.

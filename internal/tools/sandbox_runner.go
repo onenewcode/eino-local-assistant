@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -24,12 +22,15 @@ type SandboxRunnerOptions struct {
 	WorkspaceRoot  string
 	ReadOnlyRoots  []string
 	ProtectedPaths []string
-	AllowedHosts   []string
+	// ToolchainVisibility controls whether safe host toolchain paths are
+	// discovered and mounted read-only. Empty uses automatic discovery.
+	ToolchainVisibility sandbox.ToolchainVisibility
+	// HostEnvironment is a test seam. Nil snapshots the parent process
+	// environment when the runner is created.
+	HostEnvironment []string
 	// WorkerPath overrides the current executable for integration tests. Empty
 	// uses os.Executable, which is the production private worker entrypoint.
 	WorkerPath string
-	// startUnixProxy is an internal test seam for the Linux relay transport.
-	startUnixProxy unixProxyStarter
 	// currentAvailability is an internal seam for launcher-pinning tests.
 	currentAvailability func() sandbox.Availability
 }
@@ -37,11 +38,15 @@ type SandboxRunnerOptions struct {
 // SandboxOutcome is persisted in tool results so the model and session ledger
 // can distinguish an enforced restriction from a host escalation.
 type SandboxOutcome struct {
-	Mode      string `json:"mode,omitempty"`
-	Backend   string `json:"backend,omitempty"`
-	Network   string `json:"network,omitempty"`
-	Enforced  bool   `json:"enforced,omitempty"`
-	Escalated bool   `json:"escalated,omitempty"`
+	Mode                string   `json:"mode,omitempty"`
+	Backend             string   `json:"backend,omitempty"`
+	Enforced            bool     `json:"enforced,omitempty"`
+	Escalated           bool     `json:"escalated,omitempty"`
+	EnvironmentMode     string   `json:"environment_mode,omitempty"`
+	ToolchainVisibility string   `json:"toolchain_visibility,omitempty"`
+	EffectivePath       []string `json:"effective_path,omitempty"`
+	VisibleRootCount    int      `json:"visible_root_count,omitempty"`
+	CacheRootCount      int      `json:"cache_root_count,omitempty"`
 	// Bypassed marks explicit yolo host execution. It is separate from
 	// Escalated, which means a single ordinary-mode host request.
 	Bypassed bool `json:"bypassed,omitempty"`
@@ -51,16 +56,9 @@ func yoloSandboxOutcome() SandboxOutcome {
 	return SandboxOutcome{
 		Mode:     string(ApprovalYolo),
 		Backend:  "host",
-		Network:  "host",
 		Bypassed: true,
 	}
 }
-
-type sandboxProxy interface {
-	Close() error
-}
-
-type unixProxyStarter func(allowedHosts []string, socketPath string) (sandboxProxy, error)
 
 // SandboxRunner launches the private worker through the current platform's
 // strict backend. It never falls back to the host on a backend failure.
@@ -71,11 +69,10 @@ type SandboxRunner struct {
 	// basePolicy is session-validated (NormalizePolicy at construction) with
 	// TempDir cleared. Each Execute rebinds a private temp dir via WithTempDir
 	// without repeating the workspace hard-link scan.
-	basePolicy     sandbox.Policy
-	workerPath     string
-	availability   sandbox.Availability
-	startUnixProxy unixProxyStarter
-	workerCleanup  func() error
+	basePolicy    sandbox.Policy
+	workerPath    string
+	availability  sandbox.Availability
+	workerCleanup func() error
 }
 
 // sandboxWorkerShutdownGrace gives the worker's signal handler enough time to
@@ -104,14 +101,22 @@ func NewSandboxRunner(opts SandboxRunnerOptions) (*SandboxRunner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create sandbox validation temp dir: %w", err)
 	}
+	hostEnvironment := opts.HostEnvironment
+	if hostEnvironment == nil {
+		hostEnvironment = os.Environ()
+	}
+	environment, err := sandbox.DiscoverHostEnvironment(hostEnvironment, workspace, opts.ToolchainVisibility)
+	if err != nil {
+		return nil, fmt.Errorf("discover sandbox environment: %w", err)
+	}
 	defer os.RemoveAll(tempDir)
 	policy, err := sandbox.NormalizePolicy(sandbox.Policy{
 		Mode:           opts.Mode,
 		Workspace:      workspace,
 		TempDir:        tempDir,
+		Environment:    environment,
 		ReadOnlyRoots:  opts.ReadOnlyRoots,
 		ProtectedPaths: opts.ProtectedPaths,
-		Network:        sandbox.NetworkPolicy{AllowedHosts: opts.AllowedHosts},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("validate sandbox policy: %w", err)
@@ -128,21 +133,41 @@ func NewSandboxRunner(opts SandboxRunnerOptions) (*SandboxRunner, error) {
 	if err != nil {
 		return nil, err
 	}
-	startUnixProxy := opts.startUnixProxy
-	if startUnixProxy == nil {
-		startUnixProxy = defaultUnixProxyStarter
-	}
 	base := policy.WithoutTempDir()
 	base.ReadOnlyRoots = append([]string(nil), policy.ReadOnlyRoots...)
 	base.ProtectedPaths = append([]string(nil), policy.ProtectedPaths...)
-	base.Network.AllowedHosts = append([]string(nil), policy.Network.AllowedHosts...)
+	base.Environment.Variables = append([]string(nil), policy.Environment.Variables...)
+	base.Environment.PathEntries = append([]string(nil), policy.Environment.PathEntries...)
+	base.Environment.ReadOnlyRoots = append([]string(nil), policy.Environment.ReadOnlyRoots...)
+	base.Environment.CacheRoots = append([]string(nil), policy.Environment.CacheRoots...)
 	return &SandboxRunner{
-		basePolicy:     base,
-		workerPath:     stagedWorker,
-		availability:   availability,
-		startUnixProxy: startUnixProxy,
-		workerCleanup:  workerCleanup,
+		basePolicy:    base,
+		workerPath:    stagedWorker,
+		availability:  availability,
+		workerCleanup: workerCleanup,
 	}, nil
+}
+
+// EnvironmentSnapshot returns the session-stable environment metadata used by
+// workers. It is a copy so display code cannot alter the launch policy.
+func (r *SandboxRunner) EnvironmentSnapshot() sandbox.EnvironmentSnapshot {
+	if r == nil {
+		return sandbox.EnvironmentSnapshot{}
+	}
+	snapshot := r.basePolicy.Environment
+	snapshot.Variables = append([]string(nil), snapshot.Variables...)
+	snapshot.PathEntries = append([]string(nil), snapshot.PathEntries...)
+	snapshot.ReadOnlyRoots = append([]string(nil), snapshot.ReadOnlyRoots...)
+	snapshot.CacheRoots = append([]string(nil), snapshot.CacheRoots...)
+	return snapshot
+}
+
+// ReadOnlyRoots returns all explicit and automatically discovered roots.
+func (r *SandboxRunner) ReadOnlyRoots() []string {
+	if r == nil {
+		return nil
+	}
+	return append([]string(nil), r.basePolicy.ReadOnlyRoots...)
 }
 
 // Close waits for active workers and removes the host-private worker copy.
@@ -180,10 +205,6 @@ func (r *SandboxRunner) beginExecution() (string, error) {
 	return r.workerPath, nil
 }
 
-func defaultUnixProxyStarter(allowedHosts []string, socketPath string) (sandboxProxy, error) {
-	return sandbox.StartUnixHTTPProxy(allowedHosts, socketPath)
-}
-
 // Execute runs one private worker request in the configured OS sandbox.
 func (r *SandboxRunner) Execute(ctx context.Context, request SandboxWorkerRequest) (SandboxWorkerResponse, SandboxOutcome, error) {
 	if r == nil {
@@ -215,34 +236,12 @@ func (r *SandboxRunner) Execute(ctx context.Context, request SandboxWorkerReques
 		policy.Mode = sandbox.ReadOnly
 	}
 
-	var proxy sandboxProxy
-	proxyPort := 0
-	if len(policy.Network.AllowedHosts) > 0 {
-		if runtime.GOOS == "linux" {
-			// The relay listens inside bwrap's private netns, so a fixed port is
-			// free of host listen/close races and concurrent worker collisions.
-			proxyPort = sandbox.LinuxSandboxRelayPort
-			proxy, err = r.startUnixProxy(policy.Network.AllowedHosts, filepath.Join(tempDir, "proxy.sock"))
-		} else {
-			var hostProxy *sandbox.HTTPProxy
-			hostProxy, err = sandbox.StartHTTPProxy(policy.Network.AllowedHosts)
-			if err == nil {
-				proxy = hostProxy
-				proxyPort = hostProxy.Port()
-			}
-		}
-		if err != nil {
-			return SandboxWorkerResponse{}, SandboxOutcome{}, err
-		}
-		defer proxy.Close()
-	}
-
 	request.WorkspaceRoot = policy.Workspace
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return SandboxWorkerResponse{}, SandboxOutcome{}, fmt.Errorf("encode sandbox worker request: %w", err)
 	}
-	spec, err := sandbox.BuildCommandFromNormalized(ctx, policy, workerPath, []string{"__sandbox_worker"}, proxyPort, r.availability)
+	spec, err := sandbox.BuildCommandFromNormalized(ctx, policy, workerPath, []string{"__sandbox_worker"}, r.availability)
 	if err != nil {
 		return SandboxWorkerResponse{}, SandboxOutcome{}, err
 	}
@@ -258,11 +257,16 @@ func (r *SandboxRunner) Execute(ctx context.Context, request SandboxWorkerReques
 	command.Stdout = stdout
 	command.Stderr = stderr
 	configureCommandProcessGroup(command)
+	snapshot := r.EnvironmentSnapshot()
 	outcome := SandboxOutcome{
-		Mode:     string(policy.Mode),
-		Backend:  string(spec.Backend),
-		Network:  sandboxNetworkLabel(policy),
-		Enforced: true,
+		Mode:                string(policy.Mode),
+		Backend:             string(spec.Backend),
+		Enforced:            true,
+		EnvironmentMode:     sandboxEnvironmentMode(snapshot),
+		ToolchainVisibility: string(snapshot.Mode),
+		EffectivePath:       append([]string(nil), snapshot.PathEntries...),
+		VisibleRootCount:    len(policy.ReadOnlyRoots),
+		CacheRootCount:      len(snapshot.CacheRoots),
 	}
 	run, err := runCommandWithLifecycleWithGrace(ctx, command, stdout, stderr, sandboxWorkerShutdownGrace, commandWaitGrace)
 	if err != nil {
@@ -285,9 +289,9 @@ func (r *SandboxRunner) Execute(ctx context.Context, request SandboxWorkerReques
 	return response, outcome, nil
 }
 
-func sandboxNetworkLabel(policy sandbox.Policy) string {
-	if len(policy.Network.AllowedHosts) == 0 {
-		return "off"
+func sandboxEnvironmentMode(snapshot sandbox.EnvironmentSnapshot) string {
+	if snapshot.Mode == sandbox.ToolchainVisibilityAuto {
+		return "filtered-host"
 	}
-	return fmt.Sprintf("allow:%d", len(policy.Network.AllowedHosts))
+	return "isolated"
 }

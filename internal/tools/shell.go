@@ -36,8 +36,22 @@ When using the shell, you must adhere to the following guidelines:
 - Do not use shell for ordinary file create/edit/delete (no touch/echo-redirection/sed/heredoc when apply_patch can do it).
 - Use shell for terminal work: git, builds, tests, package managers, process inspection, and reading/searching with cat/head/rg when appropriate.
 - Non-zero exit codes are normal results—read stderr and recover. Never invent command output.
+- failure_class=command_not_found means the command was not resolved inside the worker; do not infer that the project prerequisite is absent. Inspect the sandbox metadata or request sandbox_permissions=require_escalated when the toolchain itself is host-visible only.
 - If denied=true with user_denied, do not retry an equivalent command or bypass via apply_patch; stop and ask the user.
 - Reaching the stdout/stderr cap signals the command's original process group; on macOS a deliberately detached descendant may survive. The discarded tail is not retained—re-run with a narrower command or higher max_output_bytes.`
+)
+
+// FailureClass separates command results from sandbox and authorization
+// failures so the model does not confuse worker visibility with dependencies.
+type FailureClass string
+
+const (
+	FailureNone               FailureClass = ""
+	FailureCommandNotFound    FailureClass = "command_not_found"
+	FailureExecutionBlocked   FailureClass = "execution_blocked"
+	FailureSandboxUnavailable FailureClass = "sandbox_unavailable"
+	FailureCommandFailed      FailureClass = "command_failed"
+	FailurePolicyDenied       FailureClass = "policy_denied"
 )
 
 // ShellOptions configures the Codex-style shell tool.
@@ -110,6 +124,8 @@ type ShellOutput struct {
 	Decision string `json:"decision,omitempty"`
 	// Reason explains a deny or the policy hit that required approval.
 	Reason string `json:"reason,omitempty"`
+	// FailureClass explains whether a nonzero result is a command or boundary failure.
+	FailureClass FailureClass `json:"failure_class,omitempty"`
 	// StopRetrying hints the model should not re-issue the same blocked command prefix.
 	StopRetrying bool `json:"stop_retrying,omitempty"`
 	// Impact is the policy-derived command tier, independent of authorization.
@@ -311,10 +327,10 @@ func runShell(ctx context.Context, defaults ShellOptions, input ShellInput) (She
 		out.Sandbox = &SandboxOutcome{
 			Mode:      "host",
 			Backend:   "host",
-			Network:   "host",
 			Escalated: true,
 		}
 	}
+	out.FailureClass = classifyShellFailure(out)
 	return out, nil
 }
 
@@ -331,27 +347,39 @@ func runSandboxShell(ctx context.Context, defaults ShellOptions, command, cwd st
 		if stopped, ok := shellContextStopResult(ctx, command, cwd, outcome); ok {
 			return stopped, nil
 		}
+		failure := FailureExecutionBlocked
+		if errors.Is(err, sandbox.ErrUnavailable) {
+			failure = FailureSandboxUnavailable
+		}
 		out := softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": "+err.Error(), true)
+		out.FailureClass = failure
 		out.Sandbox = &outcome
 		return out, nil
 	}
 	if readOnly && (outcome.Mode != string(sandbox.ReadOnly) || !outcome.Enforced || outcome.Escalated) {
 		out := softDeny(command, cwd, DecisionDeny, ReasonSandboxUnavailable+": plan mode requires an enforced read-only sandbox", true)
+		out.FailureClass = FailureSandboxUnavailable
 		out.Sandbox = &outcome
 		return out, nil
 	}
 	if response.Error != "" {
 		out := softDeny(command, cwd, DecisionDeny, "sandbox_worker_error: "+response.Error, true)
+		out.FailureClass = FailureExecutionBlocked
 		out.Sandbox = &outcome
 		return out, nil
 	}
 	if response.Shell == nil {
 		out := softDeny(command, cwd, DecisionDeny, "sandbox_worker_error: missing shell result", true)
+		out.FailureClass = FailureExecutionBlocked
 		out.Sandbox = &outcome
 		return out, nil
 	}
 	out := *response.Shell
 	out.Sandbox = &outcome
+	out.FailureClass = classifyShellFailure(out)
+	if out.FailureClass == FailureCommandNotFound {
+		out.Reason = "command_not_found_in_sandbox: inspect sandbox.effective_path or request sandbox_permissions=require_escalated"
+	}
 	return out, nil
 }
 
@@ -825,9 +853,33 @@ func softDeny(command, cwd string, decision Decision, reason string, stopRetryin
 		Denied:       true,
 		Decision:     string(decision),
 		Reason:       reason,
+		FailureClass: FailurePolicyDenied,
 		StopRetrying: stopRetrying,
 		Stderr:       stderr,
 	}
+}
+
+func classifyShellFailure(out ShellOutput) FailureClass {
+	if out.Denied {
+		return FailurePolicyDenied
+	}
+	if out.ExitCode == 0 && !out.TimedOut && !out.Cancelled && !out.OutputLimited {
+		return FailureNone
+	}
+	if out.TimedOut || out.Cancelled || out.OutputLimited {
+		return FailureCommandFailed
+	}
+	lowerStderr := strings.ToLower(out.Stderr)
+	if out.ExitCode == 127 && strings.Contains(lowerStderr, "command not found") {
+		return FailureCommandNotFound
+	}
+	if strings.Contains(lowerStderr, "operation not permitted") || strings.Contains(lowerStderr, "permission denied") {
+		return FailureExecutionBlocked
+	}
+	if out.ExitCode != 0 {
+		return FailureCommandFailed
+	}
+	return FailureNone
 }
 
 func resolveWorkingDir(defaultDir, inputDir string) (string, error) {

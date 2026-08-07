@@ -254,7 +254,6 @@ func TestFormatPermissionsShowsSandboxAndRuntime(t *testing.T) {
 			Backend:        "seatbelt",
 			ReadOnlyRoots:  []string{"/usr/local"},
 			ProtectedPaths: []string{".git", ".env", "secrets"},
-			AllowedDomains: []string{"api.example.test", "packages.example.test"},
 			HostEscalation: true,
 		},
 		Runtime: RuntimeInfo{
@@ -270,7 +269,6 @@ func TestFormatPermissionsShowsSandboxAndRuntime(t *testing.T) {
 		"backend: seatbelt",
 		"read_only_roots: 1",
 		"- .git",
-		"network: allow:2",
 		"host_escalation: once/deny only",
 		"max_turn_seconds: 600",
 		"max_model_steps: 8",
@@ -285,12 +283,11 @@ func TestSandboxStatusFragments(t *testing.T) {
 	policy := CommandPolicyInfo{
 		Mode: "ask",
 		Sandbox: SandboxInfo{
-			Mode:           "read-only",
-			Backend:        "bubblewrap",
-			AllowedDomains: []string{"api.example.test"},
+			Mode:    "read-only",
+			Backend: "bubblewrap",
 		},
 	}
-	if got := policy.StatusFragment(); got != "cmd=ask · sb=ro · sb_backend=bubblewrap · net=allow:1" {
+	if got := policy.StatusFragment(); got != "cmd=ask · sb=ro" {
 		t.Fatalf("policy status = %q", got)
 	}
 	status := StatusInfo{
@@ -300,7 +297,7 @@ func TestSandboxStatusFragments(t *testing.T) {
 			Backend: "unavailable",
 		},
 	}
-	if got := status.StatusFragment(); got != "cmd=auto · sb=rw · sb_backend=unavailable · net=off" {
+	if got := status.StatusFragment(); got != "cmd=auto · sb=unavailable" {
 		t.Fatalf("status fragment = %q", got)
 	}
 }
@@ -318,7 +315,7 @@ func TestStatusUsesPolicySandboxFallbackAndRuntime(t *testing.T) {
 			},
 		},
 	}}
-	if got := m.statusPolicyFragment(); got != "cmd=ask · sb=rw · sb_backend=seatbelt · net=off" {
+	if got := m.statusPolicyFragment(); got != "cmd=ask · sb=rw" {
 		t.Fatalf("status policy = %q", got)
 	}
 	report := m.statusReport()

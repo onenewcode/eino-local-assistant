@@ -2,6 +2,6 @@
 
 package sandbox
 
-func buildCurrentCommand(policy Policy, workerPath string, workerArgs []string, proxyPort int, executable string) (CommandSpec, error) {
+func buildCurrentCommand(policy Policy, workerPath string, workerArgs []string, executable string) (CommandSpec, error) {
 	return CommandSpec{}, ErrUnsupportedPlatform
 }

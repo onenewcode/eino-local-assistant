@@ -45,7 +45,7 @@ func TestFormatToolCardRunningArgsOnHeader(t *testing.T) {
 }
 
 func TestFormatToolCardSummarizesShellWithoutSandboxJSON(t *testing.T) {
-	card := formatToolCardWithInput("shell", `{"command":"ls -la /workspace"}`, `{"cancelled":false,"command":"ls -la /workspace","decision":"allow","denied":false,"duration_ms":14,"exit_code":0,"impact":"read_only","sandbox":{"network":"denied"}}`, "ok")
+	card := formatToolCardWithInput("shell", `{"command":"ls -la /workspace"}`, `{"cancelled":false,"command":"ls -la /workspace","decision":"allow","denied":false,"duration_ms":14,"exit_code":0,"impact":"read_only","sandbox":{"enforced":true}}`, "ok")
 	for _, want := range []string{"shell", "ls -la /workspace", "exit 0", "14ms", "read-only"} {
 		if !strings.Contains(card, want) {
 			t.Fatalf("shell card %q missing %q", card, want)

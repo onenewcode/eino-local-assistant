@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-func TestSeatbeltProfileConstrictsFilesystemAndNetwork(t *testing.T) {
+func TestSeatbeltProfileConstrictsFilesystemAndKeepsNetworkOpen(t *testing.T) {
 	t.Parallel()
 	policy, worker := testPolicyAndWorker(t, WorkspaceWrite)
-	profile, err := SeatbeltProfile(policy, worker, 3128)
+	profile, err := SeatbeltProfile(policy, worker)
 	if err != nil {
 		t.Fatalf("SeatbeltProfile() error = %v", err)
 	}
@@ -35,8 +35,7 @@ func TestSeatbeltProfileConstrictsFilesystemAndNetwork(t *testing.T) {
 		"(deny file-read* (literal \"" + filepath.Join(policy.Workspace, ".git") + "\"))",
 		"(deny file-read* (subpath \"" + filepath.Join(policy.Workspace, ".git") + "\"))",
 		"(deny file-write* (subpath \"" + filepath.Join(policy.Workspace, ".env") + "\"))",
-		"(deny network*)",
-		"(allow network-outbound (remote tcp \"localhost:3128\"))",
+		"(allow network*)",
 	} {
 		if !strings.Contains(profile, want) {
 			t.Errorf("profile does not contain %q:\n%s", want, profile)
@@ -47,6 +46,9 @@ func TestSeatbeltProfileConstrictsFilesystemAndNetwork(t *testing.T) {
 	}
 	if strings.Contains(profile, "(allow process*)") {
 		t.Errorf("profile must not use a broad process permission:\n%s", profile)
+	}
+	if strings.Contains(profile, "(deny network*)") {
+		t.Errorf("profile unexpectedly denies network access:\n%s", profile)
 	}
 }
 
@@ -85,8 +87,7 @@ func containsString(values []string, wanted string) bool {
 func TestSeatbeltProfileReadOnlyDoesNotGrantWorkspaceWrites(t *testing.T) {
 	t.Parallel()
 	policy, worker := testPolicyAndWorker(t, ReadOnly)
-	policy.Network.AllowedHosts = nil
-	profile, err := SeatbeltProfile(policy, worker, 0)
+	profile, err := SeatbeltProfile(policy, worker)
 	if err != nil {
 		t.Fatalf("SeatbeltProfile() error = %v", err)
 	}
@@ -98,15 +99,15 @@ func TestSeatbeltProfileReadOnlyDoesNotGrantWorkspaceWrites(t *testing.T) {
 	if !strings.Contains(profile, tempWrite) {
 		t.Errorf("read-only profile does not grant private temporary writes:\n%s", profile)
 	}
-	if strings.Contains(profile, "network-outbound") {
-		t.Errorf("network-disabled profile unexpectedly grants outbound access:\n%s", profile)
+	if !strings.Contains(profile, "(allow network*)") {
+		t.Errorf("read-only profile does not keep network access open:\n%s", profile)
 	}
 }
 
 func TestSeatbeltCommandUsesReplacementEnvironment(t *testing.T) {
 	t.Parallel()
 	policy, worker := testPolicyAndWorker(t, WorkspaceWrite)
-	spec, err := BuildSeatbeltCommand(policy, worker, []string{"--worker"}, 3128)
+	spec, err := BuildSeatbeltCommand(policy, worker, []string{"--worker"})
 	if err != nil {
 		t.Fatalf("BuildSeatbeltCommand() error = %v", err)
 	}
@@ -116,27 +117,11 @@ func TestSeatbeltCommandUsesReplacementEnvironment(t *testing.T) {
 	if len(spec.Args) < 4 || spec.Args[0] != "-p" || spec.Args[2] != worker || spec.Args[3] != "--worker" {
 		t.Errorf("spec.Args = %#v, want sandbox-exec profile and worker argv", spec.Args)
 	}
-	if !containsEnvironment(spec.Env, "HTTP_PROXY=http://127.0.0.1:3128") {
-		t.Errorf("Env = %#v, want loopback HTTP_PROXY", spec.Env)
-	}
 	if containsEnvironmentPrefix(spec.Env, "SSH_AUTH_SOCK=") {
 		t.Errorf("Env must not inherit SSH_AUTH_SOCK: %#v", spec.Env)
 	}
-	if containsEnvironmentPrefix(spec.Env, "EINO_SANDBOX_PROXY_") || spec.ProxySocket != "" || spec.ProxyPort != 0 {
-		t.Errorf("Seatbelt command must use the host loopback proxy directly: %#v", spec)
-	}
-}
-
-func TestProxyPortRequiresAnAllowlist(t *testing.T) {
-	t.Parallel()
-	policy, worker := testPolicyAndWorker(t, WorkspaceWrite)
-	policy.Network.AllowedHosts = nil
-	if _, err := SeatbeltProfile(policy, worker, 3128); err == nil || !strings.Contains(err.Error(), "requires a network allowlist") {
-		t.Fatalf("SeatbeltProfile() error = %v, want allowlist requirement", err)
-	}
-	policy.Network.AllowedHosts = []string{"api.example.com"}
-	if _, err := SeatbeltProfile(policy, worker, 0); err == nil || !strings.Contains(err.Error(), "requires a loopback proxy") {
-		t.Fatalf("SeatbeltProfile() error = %v, want proxy requirement", err)
+	if containsEnvironmentPrefix(spec.Env, "EINO_SANDBOX_PROXY_") {
+		t.Errorf("Seatbelt command contains removed relay variables: %#v", spec)
 	}
 }
 
@@ -161,17 +146,7 @@ func testPolicyAndWorker(t *testing.T, mode Mode) (Policy, string) {
 		TempDir:        canonicalTestPath(t, tempDir),
 		ReadOnlyRoots:  []string{canonicalTestPath(t, readOnlyRoot)},
 		ProtectedPaths: []string{".git/**", ".env"},
-		Network:        NetworkPolicy{AllowedHosts: []string{"api.example.com"}},
 	}, canonicalTestPath(t, worker)
-}
-
-func containsEnvironment(entries []string, wanted string) bool {
-	for _, entry := range entries {
-		if entry == wanted {
-			return true
-		}
-	}
-	return false
 }
 
 func containsEnvironmentPrefix(entries []string, prefix string) bool {

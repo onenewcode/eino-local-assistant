@@ -54,10 +54,6 @@ func TestNormalizePolicyCanonicalizesStrictInputs(t *testing.T) {
 		TempDir:        tempDir,
 		ReadOnlyRoots:  []string{readOnlyRoot, readOnlyRoot},
 		ProtectedPaths: []string{".git/**", ".env", ".git/**"},
-		Network: NetworkPolicy{AllowedHosts: []string{
-			"API.Example.COM.",
-			"api.example.com",
-		}},
 	})
 	if err != nil {
 		t.Fatalf("NormalizePolicy() error = %v", err)
@@ -76,9 +72,6 @@ func TestNormalizePolicyCanonicalizesStrictInputs(t *testing.T) {
 	}
 	if got, want := normalized.ProtectedPaths, []string{".env", ".git/**"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("ProtectedPaths = %#v, want %#v", got, want)
-	}
-	if got, want := normalized.Network.AllowedHosts, []string{"api.example.com"}; !reflect.DeepEqual(got, want) {
-		t.Errorf("AllowedHosts = %#v, want %#v", got, want)
 	}
 }
 
@@ -146,20 +139,6 @@ func TestNormalizePolicyRejectsAmbiguousOrUnsafeBoundaries(t *testing.T) {
 				Workspace: workspace, TempDir: tempDir, ProtectedPaths: []string{filepath.Join(workspace, ".env")},
 			},
 			want: "workspace-relative",
-		},
-		{
-			name: "IP allowlist entry",
-			policy: Policy{
-				Workspace: workspace, TempDir: tempDir, Network: NetworkPolicy{AllowedHosts: []string{"127.0.0.1"}},
-			},
-			want: "IP literals",
-		},
-		{
-			name: "wildcard allowlist entry",
-			policy: Policy{
-				Workspace: workspace, TempDir: tempDir, Network: NetworkPolicy{AllowedHosts: []string{"*.example.com"}},
-			},
-			want: "exact DNS",
 		},
 		{
 			name: "invalid mode",

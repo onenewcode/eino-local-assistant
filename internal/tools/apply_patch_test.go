@@ -196,7 +196,7 @@ func TestApplyPatchYoloBypassesApprovalAndSandbox(t *testing.T) {
 	if len(approver.Requests()) != 0 {
 		t.Fatalf("yolo invoked approver: %#v", approver.Requests())
 	}
-	if out.Sandbox == nil || !out.Sandbox.Bypassed || out.Sandbox.Backend != "host" || out.Sandbox.Network != "host" {
+	if out.Sandbox == nil || !out.Sandbox.Bypassed || out.Sandbox.Backend != "host" {
 		t.Fatalf("yolo patch sandbox outcome = %#v", out.Sandbox)
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "yolo.txt")); err != nil || string(got) != "host" {

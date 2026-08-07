@@ -17,6 +17,48 @@ import (
 	"eino-local-assistant/internal/sandbox"
 )
 
+func TestSandboxRunnerDarwinWorkerSeesHostToolchain(t *testing.T) {
+	if !sandbox.Available() {
+		t.Skip("sandbox-exec is unavailable")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go is unavailable on the host: %v", err)
+	}
+	worker := buildSandboxWorkerBinary(t)
+	workspace := t.TempDir()
+	runner, err := NewSandboxRunner(SandboxRunnerOptions{
+		Mode:                sandbox.WorkspaceWrite,
+		WorkspaceRoot:       workspace,
+		WorkerPath:          worker,
+		ToolchainVisibility: sandbox.ToolchainVisibilityAuto,
+		HostEnvironment:     os.Environ(),
+	})
+	if err != nil {
+		t.Fatalf("NewSandboxRunner() error = %v", err)
+	}
+	defer runner.Close()
+
+	response, outcome, err := runner.Execute(context.Background(), SandboxWorkerRequest{
+		Kind:           sandboxWorkerShell,
+		WorkingDir:     workspace,
+		Command:        "go version",
+		TimeoutSeconds: 10,
+		MaxOutputBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("sandbox go version: %v", err)
+	}
+	if response.Shell == nil || response.Shell.ExitCode != 0 {
+		t.Fatalf("sandbox go version response = %#v; outcome=%#v", response, outcome)
+	}
+	if !strings.Contains(response.Shell.Stdout, "go version") {
+		t.Fatalf("sandbox go version stdout = %q", response.Shell.Stdout)
+	}
+	if outcome.ToolchainVisibility != string(sandbox.ToolchainVisibilityAuto) || outcome.EnvironmentMode != "filtered-host" {
+		t.Fatalf("sandbox environment outcome = %#v", outcome)
+	}
+}
+
 func TestSandboxRunnerDarwinWorkerEnforcesWorkspaceBoundary(t *testing.T) {
 	if !sandbox.Available() {
 		t.Skip("sandbox-exec is unavailable")

@@ -3,7 +3,6 @@ package sandbox
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,14 +22,8 @@ const (
 	WorkspaceWrite Mode = "workspace-write"
 )
 
-// NetworkPolicy lists exact DNS host names that the caller's proxy may reach.
-// The OS sandbox never permits direct external network access; it permits only
-// the supplied loopback proxy endpoint when this list is non-empty.
-type NetworkPolicy struct {
-	AllowedHosts []string
-}
-
-// Policy defines the filesystem and network boundary for one worker process.
+// Policy defines the filesystem boundary for one worker process. Network access
+// remains available to support normal development tools and package managers.
 // All roots must name existing directories. ProtectedPaths are anchored,
 // workspace-relative literals or a literal directory followed by /**. A
 // protected directory protects its descendants.
@@ -38,9 +31,9 @@ type Policy struct {
 	Mode           Mode
 	Workspace      string
 	TempDir        string
+	Environment    EnvironmentSnapshot
 	ReadOnlyRoots  []string
 	ProtectedPaths []string
-	Network        NetworkPolicy
 }
 
 // NormalizePolicy validates a policy and returns a canonical, deterministic
@@ -63,7 +56,13 @@ func NormalizePolicy(policy Policy) (Policy, error) {
 		return Policy{}, errors.New("workspace and temp_dir must not overlap")
 	}
 
-	readOnlyRoots, err := normalizeReadOnlyRoots(policy.ReadOnlyRoots, workspace, tempDir)
+	environment, err := normalizeEnvironmentSnapshot(policy.Environment)
+	if err != nil {
+		return Policy{}, err
+	}
+	readOnlyInputs := append([]string(nil), policy.ReadOnlyRoots...)
+	readOnlyInputs = append(readOnlyInputs, environment.ReadOnlyRoots...)
+	readOnlyRoots, err := normalizeReadOnlyRoots(readOnlyInputs, workspace, tempDir)
 	if err != nil {
 		return Policy{}, err
 	}
@@ -74,20 +73,13 @@ func NormalizePolicy(policy Policy) (Policy, error) {
 	if err != nil {
 		return Policy{}, err
 	}
-	allowedHosts, err := normalizeAllowedHosts(policy.Network.AllowedHosts)
-	if err != nil {
-		return Policy{}, err
-	}
-
 	return Policy{
 		Mode:           mode,
 		Workspace:      workspace,
 		TempDir:        tempDir,
+		Environment:    environment,
 		ReadOnlyRoots:  readOnlyRoots,
 		ProtectedPaths: protectedPaths,
-		Network: NetworkPolicy{
-			AllowedHosts: allowedHosts,
-		},
 	}, nil
 }
 
@@ -354,56 +346,6 @@ func rejectSymlinkComponent(workspace, relative string) error {
 		}
 	}
 	return nil
-}
-
-func normalizeAllowedHosts(rawHosts []string) ([]string, error) {
-	if len(rawHosts) == 0 {
-		return nil, nil
-	}
-
-	hosts := make(map[string]struct{}, len(rawHosts))
-	for i, raw := range rawHosts {
-		host, err := normalizeHost(raw)
-		if err != nil {
-			return nil, fmt.Errorf("sandbox network.allowed_hosts[%d]: %w", i, err)
-		}
-		hosts[host] = struct{}{}
-	}
-
-	result := make([]string, 0, len(hosts))
-	for host := range hosts {
-		result = append(result, host)
-	}
-	sort.Strings(result)
-	return result, nil
-}
-
-func normalizeHost(raw string) (string, error) {
-	host := strings.ToLower(strings.TrimSpace(raw))
-	host = strings.TrimSuffix(host, ".")
-	if host == "" {
-		return "", errors.New("host is required")
-	}
-	if net.ParseIP(host) != nil {
-		return "", errors.New("IP literals are not allowed")
-	}
-	if len(host) > 253 || strings.ContainsAny(host, ":/@*?[]\\") {
-		return "", errors.New("host must be an exact DNS name")
-	}
-	for _, label := range strings.Split(host, ".") {
-		if len(label) == 0 || len(label) > 63 {
-			return "", errors.New("host must be an exact DNS name")
-		}
-		for i, r := range label {
-			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
-				return "", errors.New("host must be an exact DNS name")
-			}
-			if (i == 0 || i == len(label)-1) && r == '-' {
-				return "", errors.New("host labels must not start or end with a hyphen")
-			}
-		}
-	}
-	return host, nil
 }
 
 func pathsOverlap(left, right string) bool {

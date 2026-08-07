@@ -476,10 +476,16 @@ type SandboxInfo struct {
 	ReadOnlyRoots []string
 	// ProtectedPaths contains effective built-in and user-added deny paths.
 	ProtectedPaths []string
-	// AllowedDomains is the exact HTTP(S) egress allowlist; empty means no network.
-	AllowedDomains []string
 	// HostEscalation reports whether shell can request a one-time host escape.
 	HostEscalation bool
+	// ToolchainVisibility is auto or explicit.
+	ToolchainVisibility string
+	// EnvironmentMode describes the child environment, not the filesystem mode.
+	EnvironmentMode string
+	// PathEntries are the effective executable lookup directories.
+	PathEntries []string
+	// CacheRoots are read-only dependency/cache roots discovered for workers.
+	CacheRoots []string
 	// Yolo reports that the configured worker boundary is deliberately bypassed
 	// by the explicit yolo mode. It is not inferred from backend availability.
 	Yolo bool
@@ -491,8 +497,11 @@ func (info SandboxInfo) Configured() bool {
 		strings.TrimSpace(info.Backend) != "" ||
 		len(info.ReadOnlyRoots) > 0 ||
 		len(info.ProtectedPaths) > 0 ||
-		len(info.AllowedDomains) > 0 ||
 		info.HostEscalation ||
+		strings.TrimSpace(info.ToolchainVisibility) != "" ||
+		strings.TrimSpace(info.EnvironmentMode) != "" ||
+		len(info.PathEntries) > 0 ||
+		len(info.CacheRoots) > 0 ||
 		info.Yolo
 }
 
@@ -512,19 +521,14 @@ func (info SandboxInfo) statusFragments() []string {
 		return nil
 	}
 	if info.Yolo {
-		return []string{"YOLO=UNSAFE", "sb=off", "sb_backend=host", "net=host"}
+		return []string{"YOLO=UNSAFE"}
 	}
-	fragments := make([]string, 0, 3)
+	fragments := make([]string, 0, 1)
+	if strings.EqualFold(strings.TrimSpace(info.Backend), "unavailable") {
+		return []string{"sb=unavailable"}
+	}
 	if mode := info.modeLabel(); mode != "" {
 		fragments = append(fragments, "sb="+mode)
-	}
-	if backend := strings.TrimSpace(info.Backend); backend != "" {
-		fragments = append(fragments, "sb_backend="+backend)
-	}
-	if len(info.AllowedDomains) == 0 {
-		fragments = append(fragments, "net=off")
-	} else {
-		fragments = append(fragments, fmt.Sprintf("net=allow:%d", len(info.AllowedDomains)))
 	}
 	return fragments
 }
@@ -661,6 +665,14 @@ func (info CommandPolicyInfo) writeSandboxReport(b *strings.Builder) {
 	fmt.Fprintln(b, "  sandbox:")
 	fmt.Fprintf(b, "    mode: %s\n", mode)
 	fmt.Fprintf(b, "    backend: %s\n", backend)
+	if visibility := strings.TrimSpace(sandbox.ToolchainVisibility); visibility != "" {
+		fmt.Fprintf(b, "    toolchain_visibility: %s\n", visibility)
+	}
+	if environment := strings.TrimSpace(sandbox.EnvironmentMode); environment != "" {
+		fmt.Fprintf(b, "    environment: %s\n", environment)
+	}
+	fmt.Fprintf(b, "    path_entries: %d\n", len(sandbox.PathEntries))
+	fmt.Fprintf(b, "    cache_roots: %d\n", len(sandbox.CacheRoots))
 	fmt.Fprintf(b, "    read_only_roots: %d\n", len(sandbox.ReadOnlyRoots))
 	if len(sandbox.ProtectedPaths) == 0 {
 		fmt.Fprintln(b, "    protected_paths: (none)")
@@ -668,14 +680,6 @@ func (info CommandPolicyInfo) writeSandboxReport(b *strings.Builder) {
 		fmt.Fprintln(b, "    protected_paths:")
 		for _, protected := range sandbox.ProtectedPaths {
 			fmt.Fprintf(b, "      - %s\n", protected)
-		}
-	}
-	if len(sandbox.AllowedDomains) == 0 {
-		fmt.Fprintln(b, "    network: off")
-	} else {
-		fmt.Fprintf(b, "    network: allow:%d\n", len(sandbox.AllowedDomains))
-		for _, domain := range sandbox.AllowedDomains {
-			fmt.Fprintf(b, "      - %s\n", domain)
 		}
 	}
 	if sandbox.HostEscalation {
@@ -734,7 +738,7 @@ func (info CommandPolicyInfo) CmdPolicyFragment() string {
 // StatusFragment returns compact policy and sandbox state for the status bar.
 func (info CommandPolicyInfo) StatusFragment() string {
 	if info.yoloActive() {
-		return strings.Join([]string{info.CmdPolicyFragment(), "YOLO=UNSAFE", "sb=off", "sb_backend=host", "net=host"}, " · ")
+		return strings.Join([]string{info.CmdPolicyFragment(), "YOLO=UNSAFE"}, " · ")
 	}
 	fragments := make([]string, 0, 4)
 	if cmd := info.CmdPolicyFragment(); cmd != "" {

@@ -397,8 +397,11 @@ func TestLoadSandboxAndRuntimeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got.Sandbox.ModeNormalized() != SandboxModeWorkspaceWrite {
+	if got.Sandbox.ModeNormalized() != "" {
 		t.Fatalf("sandbox mode = %q", got.Sandbox.ModeNormalized())
+	}
+	if got.Sandbox.ToolchainVisibilityNormalized() != SandboxToolchainVisibilityAuto {
+		t.Fatalf("toolchain visibility = %q, want auto", got.Sandbox.ToolchainVisibilityNormalized())
 	}
 	if roots, err := got.Sandbox.ResolveReadOnlyRoots(); err != nil || len(roots) != 0 {
 		t.Fatalf("read-only roots = %v, %v", roots, err)
@@ -459,11 +462,9 @@ func TestLoadNormalizesSandboxSettings(t *testing.T) {
 	doc := validConfiguration + fmt.Sprintf(`
 [sandbox]
 mode = "read-only"
+toolchain_visibility = "explicit"
 read_only_roots = [%q, %q]
 protected_paths = ["secrets", "secrets"]
-
-[sandbox.network]
-allowed_domains = ["API.Example.TEST", "api.example.test"]
 
 [runtime]
 max_turn_seconds = 120
@@ -478,15 +479,15 @@ max_consecutive_equivalent_tool_calls = 2
 	if got.Sandbox.ModeNormalized() != SandboxModeReadOnly {
 		t.Fatalf("sandbox mode = %q", got.Sandbox.ModeNormalized())
 	}
+	if got.Sandbox.ToolchainVisibilityNormalized() != SandboxToolchainVisibilityExplicit {
+		t.Fatalf("toolchain visibility = %q, want explicit", got.Sandbox.ToolchainVisibilityNormalized())
+	}
 	canonicalRoot, err := filepath.EvalSymlinks(realRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(got.Sandbox.ReadOnlyRoots, []string{canonicalRoot}) {
 		t.Fatalf("read-only roots = %#v, want %#v", got.Sandbox.ReadOnlyRoots, []string{canonicalRoot})
-	}
-	if !reflect.DeepEqual(got.Sandbox.Network.AllowedDomains, []string{"api.example.test"}) {
-		t.Fatalf("allowed domains = %#v", got.Sandbox.Network.AllowedDomains)
 	}
 	wantProtected := append(DefaultSandboxProtectedPaths(), "secrets")
 	if !reflect.DeepEqual(got.Sandbox.EffectiveProtectedPaths(), wantProtected) {
@@ -543,6 +544,11 @@ func TestLoadRejectsInvalidSandboxSettings(t *testing.T) {
 			name: "mode",
 			doc:  "[sandbox]\nmode = \"permissive\"\n",
 			want: "sandbox.mode",
+		},
+		{
+			name: "toolchain visibility",
+			doc:  "[sandbox]\ntoolchain_visibility = \"host\"\n",
+			want: "sandbox.toolchain_visibility",
 		},
 		{
 			name: "filesystem root workspace",

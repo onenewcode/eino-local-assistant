@@ -2,6 +2,6 @@
 
 package sandbox
 
-func buildCurrentCommand(policy Policy, workerPath string, workerArgs []string, proxyPort int, executable string) (CommandSpec, error) {
-	return buildSeatbeltCommand(policy, workerPath, workerArgs, proxyPort, executable), nil
+func buildCurrentCommand(policy Policy, workerPath string, workerArgs []string, executable string) (CommandSpec, error) {
+	return buildSeatbeltCommand(policy, workerPath, workerArgs, executable), nil
 }

@@ -3,25 +3,20 @@
 package tools
 
 import (
-	"bufio"
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"eino-local-assistant/internal/sandbox"
 )
 
-func TestSandboxRunnerLinuxRelayPreventsDirectNetworkAndUsesProxy(t *testing.T) {
+func TestSandboxRunnerLinuxKeepsDirectNetworkOpen(t *testing.T) {
 	if !sandbox.Available() {
 		t.Skip("bwrap is unavailable")
 	}
@@ -30,42 +25,22 @@ func TestSandboxRunnerLinuxRelayPreventsDirectNetworkAndUsesProxy(t *testing.T) 
 	worker := buildSandboxWorkerBinary(t)
 	probe := buildSandboxNetworkProbe(t, workspace)
 	directTarget := startDirectNetworkTarget(t)
-	observations := &relayObservations{}
 	runner, err := NewSandboxRunner(SandboxRunnerOptions{
 		Mode:          sandbox.WorkspaceWrite,
 		WorkspaceRoot: workspace,
-		AllowedHosts:  []string{"allowed.test"},
 		WorkerPath:    worker,
-		startUnixProxy: func(_ []string, socketPath string) (sandboxProxy, error) {
-			return startRelayTestProxy(socketPath, observations)
-		},
 	})
 	if err != nil {
 		t.Fatalf("NewSandboxRunner() error = %v", err)
 	}
+	defer runner.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	direct := executeLinuxSandboxProbe(t, ctx, runner, shellQuote(probe)+" direct "+shellQuote(directTarget))
-	if direct.ExitCode == 0 {
-		t.Fatalf("direct host network unexpectedly succeeded: %#v", direct)
-	}
-
-	allowed := executeLinuxSandboxProbe(t, ctx, runner, shellQuote(probe)+" proxy allowed.test")
-	if allowed.ExitCode != 0 || !strings.Contains(allowed.Stdout, "allowed response") {
-		t.Fatalf("allowlisted proxy request failed: %#v", allowed)
-	}
-
-	for _, target := range []string{"blocked.test", "127.0.0.1"} {
-		blocked := executeLinuxSandboxProbe(t, ctx, runner, shellQuote(probe)+" proxy "+shellQuote(target))
-		if blocked.ExitCode == 0 {
-			t.Fatalf("proxy target %q unexpectedly succeeded: %#v", target, blocked)
-		}
-	}
-
-	if got := observations.List(); !containsAllHosts(got, "allowed.test", "blocked.test", "127.0.0.1") {
-		t.Fatalf("relay did not receive expected proxy targets: %#v", got)
+	direct := executeLinuxSandboxProbe(t, ctx, runner, shellQuote(probe)+" "+shellQuote(directTarget))
+	if direct.ExitCode != 0 {
+		t.Fatalf("direct host network was blocked: %#v", direct)
 	}
 }
 
@@ -89,6 +64,7 @@ func TestSandboxRunnerLinuxFailsClosedWithoutBwrap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSandboxRunner() error = %v", err)
 	}
+	defer runner.Close()
 	_, _, err = runner.Execute(context.Background(), SandboxWorkerRequest{
 		Kind:           sandboxWorkerShell,
 		Command:        "true",
@@ -125,7 +101,7 @@ func executeLinuxSandboxProbe(t *testing.T, ctx context.Context, runner *Sandbox
 	if response.Shell == nil {
 		t.Fatalf("sandbox worker response = %#v", response)
 	}
-	if outcome.Backend != string(sandbox.BackendBubblewrap) || !outcome.Enforced || outcome.Network != "allow:1" {
+	if outcome.Backend != string(sandbox.BackendBubblewrap) || !outcome.Enforced {
 		t.Fatalf("sandbox outcome = %#v", outcome)
 	}
 	return *response.Shell
@@ -168,53 +144,23 @@ func buildSandboxNetworkProbe(t *testing.T, workspace string) string {
 
 import (
 	"fmt"
-	"io"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"time"
 )
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: probe direct|proxy target")
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: probe target")
 		os.Exit(2)
 	}
-	switch os.Args[1] {
-	case "direct":
-		connection, err := net.DialTimeout("tcp", os.Args[2], 2*time.Second)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		connection.Close()
-		fmt.Println("direct response")
-	case "proxy":
-		proxyURL, err := url.Parse(os.Getenv("HTTP_PROXY"))
-		if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
-			fmt.Fprintln(os.Stderr, "missing HTTP_PROXY")
-			os.Exit(2)
-		}
-		transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-		defer transport.CloseIdleConnections()
-		client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
-		response, err := client.Get("http://" + os.Args[2] + "/")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		defer response.Body.Close()
-		body, _ := io.ReadAll(response.Body)
-		if response.StatusCode != http.StatusOK {
-			fmt.Fprintln(os.Stderr, response.Status)
-			os.Exit(1)
-		}
-		fmt.Print(string(body))
-	default:
-		fmt.Fprintln(os.Stderr, "unknown mode")
-		os.Exit(2)
+	connection, err := net.DialTimeout("tcp", os.Args[1], 2*time.Second)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
+	connection.Close()
+	fmt.Println("direct response")
 }
 `
 	if err := os.WriteFile(source, []byte(program), 0o600); err != nil {
@@ -246,112 +192,6 @@ func startDirectNetworkTarget(t *testing.T) string {
 		}
 	}()
 	return listener.Addr().String()
-}
-
-type relayObservations struct {
-	mu    sync.Mutex
-	hosts []string
-}
-
-func (o *relayObservations) Add(host string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.hosts = append(o.hosts, host)
-}
-
-func (o *relayObservations) List() []string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return append([]string(nil), o.hosts...)
-}
-
-type relayTestProxy struct {
-	listener net.Listener
-	done     chan struct{}
-	wg       sync.WaitGroup
-	seen     *relayObservations
-	once     sync.Once
-}
-
-func startRelayTestProxy(socketPath string, seen *relayObservations) (sandboxProxy, error) {
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return nil, err
-	}
-	proxy := &relayTestProxy{listener: listener, done: make(chan struct{}), seen: seen}
-	go proxy.acceptLoop()
-	return proxy, nil
-}
-
-func (p *relayTestProxy) acceptLoop() {
-	defer close(p.done)
-	for {
-		connection, err := p.listener.Accept()
-		if err != nil {
-			return
-		}
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
-			defer connection.Close()
-			p.serve(connection)
-		}()
-	}
-}
-
-func (p *relayTestProxy) serve(connection net.Conn) {
-	request, err := http.ReadRequest(bufio.NewReader(connection))
-	if err != nil {
-		return
-	}
-	defer request.Body.Close()
-	host := request.URL.Hostname()
-	p.seen.Add(host)
-	status := http.StatusForbidden
-	body := "blocked"
-	if host == "allowed.test" {
-		status = http.StatusOK
-		body = "allowed response"
-	}
-	response := &http.Response{
-		StatusCode:    status,
-		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        make(http.Header),
-		Body:          io.NopCloser(strings.NewReader(body)),
-		ContentLength: int64(len(body)),
-		Close:         true,
-	}
-	response.Header.Set("Connection", "close")
-	response.Header.Set("Content-Type", "text/plain")
-	_ = response.Write(connection)
-}
-
-func (p *relayTestProxy) Close() error {
-	if p == nil {
-		return nil
-	}
-	var err error
-	p.once.Do(func() {
-		err = p.listener.Close()
-		<-p.done
-		p.wg.Wait()
-	})
-	return err
-}
-
-func containsAllHosts(haystack []string, want ...string) bool {
-	seen := make(map[string]struct{}, len(haystack))
-	for _, host := range haystack {
-		seen[host] = struct{}{}
-	}
-	for _, host := range want {
-		if _, ok := seen[host]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func shellQuote(value string) string {

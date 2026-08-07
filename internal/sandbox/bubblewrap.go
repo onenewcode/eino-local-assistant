@@ -10,10 +10,9 @@ import (
 )
 
 // BubblewrapArgs builds a strict bwrap argument vector without checking that
-// bwrap is installed. The generated namespace has no host network interface;
-// a nonzero proxy port requires the worker to use EnvSandboxProxySocket and
-// EnvSandboxProxyPort to start its loopback-to-Unix relay before the tool.
-func BubblewrapArgs(policy Policy, workerPath string, workerArgs []string, proxyPort int) ([]string, error) {
+// bwrap is installed. The filesystem namespace deliberately keeps the host
+// network namespace so package managers and developer tools can connect.
+func BubblewrapArgs(policy Policy, workerPath string, workerArgs []string) ([]string, error) {
 	normalized, err := NormalizePolicy(policy)
 	if err != nil {
 		return nil, err
@@ -22,15 +21,12 @@ func BubblewrapArgs(policy Policy, workerPath string, workerArgs []string, proxy
 	if err != nil {
 		return nil, err
 	}
-	if err := validateProxyPort(normalized, proxyPort); err != nil {
-		return nil, err
-	}
-	return bubblewrapArgs(normalized, worker, workerArgs, proxyPort, existingLinuxRuntimeMounts())
+	return bubblewrapArgs(normalized, worker, workerArgs, existingLinuxRuntimeMounts())
 }
 
 // BuildBubblewrapCommand builds a bwrap invocation without checking that bwrap
 // is installed. BuildCommand performs that availability check for Linux.
-func BuildBubblewrapCommand(policy Policy, workerPath string, workerArgs []string, proxyPort int) (CommandSpec, error) {
+func BuildBubblewrapCommand(policy Policy, workerPath string, workerArgs []string) (CommandSpec, error) {
 	normalized, err := NormalizePolicy(policy)
 	if err != nil {
 		return CommandSpec{}, err
@@ -39,21 +35,16 @@ func BuildBubblewrapCommand(policy Policy, workerPath string, workerArgs []strin
 	if err != nil {
 		return CommandSpec{}, err
 	}
-	if err := validateProxyPort(normalized, proxyPort); err != nil {
-		return CommandSpec{}, err
-	}
-	args, err := bubblewrapArgs(normalized, worker, workerArgs, proxyPort, existingLinuxRuntimeMounts())
+	args, err := bubblewrapArgs(normalized, worker, workerArgs, existingLinuxRuntimeMounts())
 	if err != nil {
 		return CommandSpec{}, err
 	}
 	return CommandSpec{
-		Backend:     BackendBubblewrap,
-		Path:        "bwrap",
-		Args:        args,
-		Dir:         policy.Workspace,
-		Env:         bubblewrapEnvironment(policy, proxyPort),
-		ProxySocket: proxySocketPathWhenEnabled(policy, proxyPort),
-		ProxyPort:   proxyPort,
+		Backend: BackendBubblewrap,
+		Path:    "bwrap",
+		Args:    args,
+		Dir:     policy.Workspace,
+		Env:     sandboxEnvironment(policy),
 	}, nil
 }
 
@@ -63,7 +54,7 @@ type bindMount struct {
 	writable bool
 }
 
-func bubblewrapArgs(policy Policy, workerPath string, workerArgs []string, proxyPort int, runtimeRoots []string) ([]string, error) {
+func bubblewrapArgs(policy Policy, workerPath string, workerArgs []string, runtimeRoots []string) ([]string, error) {
 	mounts := bubblewrapMounts(policy, workerPath, runtimeRoots)
 	protected, err := protectedMasks(policy)
 	if err != nil {
@@ -77,7 +68,6 @@ func bubblewrapArgs(policy Policy, workerPath string, workerArgs []string, proxy
 		"--unshare-pid",
 		"--unshare-ipc",
 		"--unshare-uts",
-		"--unshare-net",
 		"--cap-drop",
 		"ALL",
 		"--hostname",
@@ -85,7 +75,6 @@ func bubblewrapArgs(policy Policy, workerPath string, workerArgs []string, proxy
 		"--tmpfs",
 		"/",
 	}
-
 	for _, directory := range mountParentDirectories(mounts) {
 		args = append(args, "--dir", directory)
 	}
@@ -105,20 +94,13 @@ func bubblewrapArgs(policy Policy, workerPath string, workerArgs []string, proxy
 	}
 
 	args = append(args, "--clearenv")
-	for _, entry := range bubblewrapEnvironment(policy, proxyPort) {
+	for _, entry := range sandboxEnvironment(policy) {
 		name, value, _ := strings.Cut(entry, "=")
 		args = append(args, "--setenv", name, value)
 	}
 	args = append(args, "--chdir", policy.Workspace, "--", workerPath)
 	args = append(args, workerArgs...)
 	return args, nil
-}
-
-func proxySocketPathWhenEnabled(policy Policy, proxyPort int) string {
-	if proxyPort == 0 {
-		return ""
-	}
-	return proxySocketPath(policy)
 }
 
 func bubblewrapMounts(policy Policy, workerPath string, runtimeRoots []string) []bindMount {

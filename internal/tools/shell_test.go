@@ -125,6 +125,28 @@ func TestRunCommandReturnsNonZeroExitAsSoftResult(t *testing.T) {
 	if out.ExitCode != 2 {
 		t.Errorf("exit_code = %d, want 2", out.ExitCode)
 	}
+	if out.FailureClass != FailureCommandFailed {
+		t.Errorf("failure_class = %q, want %q", out.FailureClass, FailureCommandFailed)
+	}
+}
+
+func TestRunCommandClassifiesCommandNotFound(t *testing.T) {
+	tool, err := NewShell(autoRunOpts())
+	if err != nil {
+		t.Fatalf("NewShell() error = %v", err)
+	}
+
+	raw, err := tool.InvokableRun(context.Background(), `{"command":"eino-command-that-does-not-exist"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun() error = %v, want soft result", err)
+	}
+	var out ShellOutput
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatalf("decode output %q: %v", raw, err)
+	}
+	if out.FailureClass != FailureCommandNotFound {
+		t.Fatalf("failure_class = %q, want %q; stderr=%q", out.FailureClass, FailureCommandNotFound, out.Stderr)
+	}
 }
 
 func TestRunCommandRejectsEmptyCommand(t *testing.T) {
@@ -717,7 +739,7 @@ func TestRunCommandYoloBypassesApprovalAndSandbox(t *testing.T) {
 	if len(approver.Requests()) != 0 {
 		t.Fatalf("yolo invoked approver: %#v", approver.Requests())
 	}
-	if out.Sandbox == nil || !out.Sandbox.Bypassed || out.Sandbox.Backend != "host" || out.Sandbox.Network != "host" {
+	if out.Sandbox == nil || !out.Sandbox.Bypassed || out.Sandbox.Backend != "host" {
 		t.Fatalf("yolo sandbox outcome = %#v", out.Sandbox)
 	}
 }

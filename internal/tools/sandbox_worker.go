@@ -6,14 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"os"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
-
-	"eino-local-assistant/internal/sandbox"
 )
 
 // SandboxWorkerRequest is the private parent-to-worker protocol used for
@@ -74,14 +67,6 @@ func runSandboxWorker(ctx context.Context, in io.Reader, out io.Writer) error {
 		return writeSandboxWorkerResponse(out, SandboxWorkerResponse{Error: "decode request: " + err.Error()})
 	}
 
-	relay, err := startSandboxProxyRelay()
-	if err != nil {
-		return writeSandboxWorkerResponse(out, SandboxWorkerResponse{Error: "start sandbox network relay: " + err.Error()})
-	}
-	if relay != nil {
-		defer relay.Close()
-	}
-
 	root := strings.TrimSpace(req.WorkspaceRoot)
 	if root == "" {
 		return writeSandboxWorkerResponse(out, SandboxWorkerResponse{Error: "workspace_root is required"})
@@ -127,75 +112,6 @@ func runSandboxWorker(ctx context.Context, in io.Reader, out io.Writer) error {
 		return writeSandboxWorkerResponse(out, SandboxWorkerResponse{Error: fmt.Sprintf("unsupported worker kind %q", req.Kind)})
 	}
 }
-
-// sandboxProxyRelay exposes the host-side Unix proxy socket on the worker's
-// private loopback interface. It is used only inside Linux bwrap's network
-// namespace; macOS workers receive neither relay environment variable.
-type sandboxProxyRelay struct {
-	listener net.Listener
-	socket   string
-	done     chan struct{}
-	once     sync.Once
-}
-
-func startSandboxProxyRelay() (*sandboxProxyRelay, error) {
-	socket := strings.TrimSpace(os.Getenv(sandbox.EnvSandboxProxySocket))
-	portRaw := strings.TrimSpace(os.Getenv(sandbox.EnvSandboxProxyPort))
-	if socket == "" && portRaw == "" {
-		return nil, nil
-	}
-	if socket == "" || portRaw == "" {
-		return nil, errors.New("incomplete relay configuration")
-	}
-	port, err := strconv.Atoi(portRaw)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, errors.New("invalid relay port")
-	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:"+strconv.Itoa(port))
-	if err != nil {
-		return nil, err
-	}
-	relay := &sandboxProxyRelay{listener: listener, socket: socket, done: make(chan struct{})}
-	go relay.acceptLoop()
-	return relay, nil
-}
-
-func (r *sandboxProxyRelay) acceptLoop() {
-	defer close(r.done)
-	for {
-		client, err := r.listener.Accept()
-		if err != nil {
-			return
-		}
-		go r.relay(client)
-	}
-}
-
-func (r *sandboxProxyRelay) relay(client net.Conn) {
-	defer client.Close()
-	upstream, err := net.DialTimeout("unix", r.socket, 10*time.Second)
-	if err != nil {
-		return
-	}
-	defer upstream.Close()
-	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
-	<-done
-}
-
-func (r *sandboxProxyRelay) Close() error {
-	if r == nil {
-		return nil
-	}
-	var err error
-	r.once.Do(func() {
-		err = r.listener.Close()
-		<-r.done
-	})
-	return err
-}
-
 func writeSandboxWorkerResponse(out io.Writer, response SandboxWorkerResponse) error {
 	return json.NewEncoder(out).Encode(response)
 }

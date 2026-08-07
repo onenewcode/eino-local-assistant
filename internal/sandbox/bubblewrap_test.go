@@ -15,7 +15,7 @@ func TestBubblewrapArgsUseNamespacesAndNarrowMounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePolicy() error = %v", err)
 	}
-	args, err := bubblewrapArgs(normalized, worker, []string{"--worker"}, 3128, []string{"/runtime"})
+	args, err := bubblewrapArgs(normalized, worker, []string{"--worker"}, []string{"/runtime"})
 	if err != nil {
 		t.Fatalf("bubblewrapArgs() error = %v", err)
 	}
@@ -25,7 +25,6 @@ func TestBubblewrapArgsUseNamespacesAndNarrowMounts(t *testing.T) {
 		{"--new-session"},
 		{"--unshare-user"},
 		{"--unshare-pid"},
-		{"--unshare-net"},
 		{"--cap-drop", "ALL"},
 		{"--tmpfs", "/"},
 		{"--bind", normalized.Workspace, normalized.Workspace},
@@ -34,9 +33,6 @@ func TestBubblewrapArgsUseNamespacesAndNarrowMounts(t *testing.T) {
 		{"--tmpfs", filepath.Join(normalized.Workspace, ".git")},
 		{"--ro-bind", "/dev/null", filepath.Join(normalized.Workspace, ".env")},
 		{"--clearenv"},
-		{"--setenv", "HTTP_PROXY", "http://127.0.0.1:3128"},
-		{"--setenv", EnvSandboxProxySocket, filepath.Join(normalized.TempDir, "proxy.sock")},
-		{"--setenv", EnvSandboxProxyPort, "3128"},
 		{"--chdir", normalized.Workspace},
 		{"--", worker, "--worker"},
 	} {
@@ -46,6 +42,9 @@ func TestBubblewrapArgsUseNamespacesAndNarrowMounts(t *testing.T) {
 	}
 	if containsSequence(args, []string{"--ro-bind", "/", "/"}) || containsSequence(args, []string{"--bind", "/", "/"}) {
 		t.Errorf("argv exposes the host root: %#v", args)
+	}
+	if containsSequence(args, []string{"--unshare-net"}) {
+		t.Errorf("argv unexpectedly isolates the host network: %#v", args)
 	}
 }
 
@@ -66,7 +65,7 @@ func TestBubblewrapArgsReadOnlyAndAbsentProtectedPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NormalizePolicy() error = %v", err)
 	}
-	args, err := bubblewrapArgs(normalized, worker, nil, 0, nil)
+	args, err := bubblewrapArgs(normalized, worker, nil, nil)
 	if err != nil {
 		t.Fatalf("bubblewrapArgs() error = %v", err)
 	}
@@ -79,11 +78,8 @@ func TestBubblewrapArgsReadOnlyAndAbsentProtectedPath(t *testing.T) {
 	if !containsSequence(args, []string{"--tmpfs", filepath.Join(normalized.Workspace, ".eino-assistant")}) {
 		t.Errorf("absent protected path is not reserved with tmpfs: %#v", args)
 	}
-	if containsSequence(args, []string{"--setenv", "HTTP_PROXY", "http://127.0.0.1:"}) {
-		t.Errorf("network-disabled argv unexpectedly has an HTTP proxy: %#v", args)
-	}
-	if containsSequence(args, []string{"--setenv", EnvSandboxProxySocket}) || containsSequence(args, []string{"--setenv", EnvSandboxProxyPort}) {
-		t.Errorf("network-disabled argv unexpectedly has relay configuration: %#v", args)
+	if containsSequence(args, []string{"--unshare-net"}) {
+		t.Errorf("read-only argv unexpectedly isolates the host network: %#v", args)
 	}
 }
 
@@ -92,25 +88,24 @@ func TestBubblewrapArgsRejectsHostRootReadOnlyMount(t *testing.T) {
 	policy, worker := testPolicyAndWorker(t, WorkspaceWrite)
 	policy.ReadOnlyRoots = []string{string(filepath.Separator)}
 
-	_, err := BubblewrapArgs(policy, worker, nil, 0)
+	_, err := BubblewrapArgs(policy, worker, nil)
 	if err == nil || !strings.Contains(err.Error(), "overlaps workspace") {
 		t.Fatalf("BubblewrapArgs() error = %v, want host root overlap rejection", err)
 	}
 }
 
-func TestBuildBubblewrapCommandExposesRelayContract(t *testing.T) {
+func TestBuildBubblewrapCommandKeepsNetworkOpenWithoutRelay(t *testing.T) {
 	t.Parallel()
 	policy, worker := testPolicyAndWorker(t, WorkspaceWrite)
-	spec, err := BuildBubblewrapCommand(policy, worker, nil, 3128)
+	spec, err := BuildBubblewrapCommand(policy, worker, nil)
 	if err != nil {
 		t.Fatalf("BuildBubblewrapCommand() error = %v", err)
 	}
-	wantSocket := filepath.Join(canonicalTestPath(t, policy.TempDir), "proxy.sock")
-	if spec.ProxySocket != wantSocket || spec.ProxyPort != 3128 {
-		t.Errorf("relay = socket %q port %d, want %q and 3128", spec.ProxySocket, spec.ProxyPort, wantSocket)
+	if containsSequence(spec.Args, []string{"--unshare-net"}) {
+		t.Errorf("bwrap command unexpectedly isolates the host network: %#v", spec.Args)
 	}
-	if !containsEnvironment(spec.Env, EnvSandboxProxySocket+"="+wantSocket) || !containsEnvironment(spec.Env, EnvSandboxProxyPort+"=3128") {
-		t.Errorf("Env = %#v, want Linux relay variables", spec.Env)
+	if containsEnvironmentPrefix(spec.Env, "EINO_SANDBOX_PROXY_") {
+		t.Errorf("Env = %#v, contains removed relay variables", spec.Env)
 	}
 }
 
@@ -139,7 +134,7 @@ func TestBuildCommandRejectsHardLinkedBackendLauncher(t *testing.T) {
 	}
 	availability.Available = true
 	availability.Executable = launcher
-	_, err := BuildCommandWithAvailability(context.Background(), policy, worker, nil, 3128, availability)
+	_, err := BuildCommandWithAvailability(context.Background(), policy, worker, nil, availability)
 	if err == nil || !strings.Contains(err.Error(), "multiple hard links") {
 		t.Fatalf("BuildCommandWithAvailability() error = %v, want hard-linked launcher rejection", err)
 	}

@@ -95,18 +95,24 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 	} else if runtime.approvalMode == tools.ApprovalNever {
 		cmdMode = "auto"
 	}
-	availability := sandbox.CurrentAvailability()
-	backend := string(availability.Backend)
-	if !availability.Available {
-		backend = "unavailable"
-	}
-	sandboxInfo := tui.SandboxInfo{
-		Mode:           modelCfg.Sandbox.ModeNormalized(),
-		Backend:        backend,
-		ReadOnlyRoots:  runtime.readOnlyRoots,
-		ProtectedPaths: runtime.protectedPaths,
-		AllowedDomains: modelCfg.Sandbox.Network.AllowedDomains,
-		HostEscalation: !modelCfg.Tools.Shell.Disabled,
+	var sandboxInfo tui.SandboxInfo
+	if runtime.sandboxRunner != nil {
+		availability := sandbox.CurrentAvailability()
+		backend := string(availability.Backend)
+		if !availability.Available {
+			backend = "unavailable"
+		}
+		sandboxInfo = tui.SandboxInfo{
+			Mode:                modelCfg.Sandbox.ModeNormalized(),
+			Backend:             backend,
+			ReadOnlyRoots:       runtime.readOnlyRoots,
+			ProtectedPaths:      runtime.protectedPaths,
+			HostEscalation:      !modelCfg.Tools.Shell.Disabled,
+			ToolchainVisibility: string(runtime.sandboxEnvironment.Mode),
+			EnvironmentMode:     sandboxEnvironmentMode(runtime.sandboxEnvironment),
+			PathEntries:         runtime.sandboxEnvironment.PathEntries,
+			CacheRoots:          runtime.sandboxEnvironment.CacheRoots,
+		}
 	}
 	runtimeInfo := tui.RuntimeInfo{
 		MaxTurnSeconds:                    runtime.runtimeCfg.MaxTurnSeconds,
@@ -197,6 +203,13 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		fmt.Fprintln(stderr, hint)
 	}
 	return err
+}
+
+func sandboxEnvironmentMode(snapshot sandbox.EnvironmentSnapshot) string {
+	if snapshot.Mode == sandbox.ToolchainVisibilityAuto {
+		return "filtered-host"
+	}
+	return "isolated"
 }
 
 // effectiveSandboxProtectedPaths adds host-owned control files that happen to
