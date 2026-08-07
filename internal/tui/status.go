@@ -33,11 +33,17 @@ func sessionCtxFragment(session *chat.Session) string {
 	if session == nil {
 		return ""
 	}
+	status := session.ContextStatus()
+	// Tool calls can add a large bounded result after the previous provider
+	// response. Prefer the newer local projection until the next provider
+	// usage snapshot arrives, rather than displaying a stale exact number.
+	if status.CurrentEstimateIsNewer && status.CurrentTokens > 0 {
+		return usage.FormatCompactEstimatedContext(status.CurrentTokens, session.ContextConfig().WindowTokens)
+	}
 	snapshot := sessionContextSnapshot(session)
 	if snapshot != nil {
 		return usage.FormatCompactContextSnapshot(snapshot)
 	}
-	status := session.ContextStatus()
 	if status.CurrentTokens > 0 {
 		return usage.FormatCompactEstimatedContext(status.CurrentTokens, session.ContextConfig().WindowTokens)
 	}

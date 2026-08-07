@@ -860,6 +860,19 @@ func taskRunFromPlan(input TaskPlanInput, userRequest string) (*taskRun, error) 
 		}
 		run.scenarios[id] = taskScenario{ID: id, Description: description, RequirementIDs: requirements}
 	}
+	// user-request is an implicit controller-owned root requirement. Requiring a
+	// model to repeat its generated ID in an otherwise valid scenario list made
+	// task_plan fail for normal plans. Every scenario now explicitly inherits it
+	// in the materialized graph, so user scope cannot be dropped while callers
+	// only need to map the requirements they authored.
+	if _, exists := run.requirements[taskUserRequestID]; exists {
+		for id, scenario := range run.scenarios {
+			if !containsString(scenario.RequirementIDs, taskUserRequestID) {
+				scenario.RequirementIDs = append(scenario.RequirementIDs, taskUserRequestID)
+				run.scenarios[id] = scenario
+			}
+		}
+	}
 	for _, raw := range input.Tasks {
 		id, goal := strings.TrimSpace(raw.ID), strings.TrimSpace(raw.Goal)
 		if id == "" || goal == "" {

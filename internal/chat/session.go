@@ -226,10 +226,13 @@ type CompactionResult struct {
 // ContextStatus exposes the active context projection without exposing raw
 // checkpoint payloads in the normal status bar.
 type ContextStatus struct {
-	CeilingTokens             int
-	TriggerTokens             int
-	TargetTokens              int
-	CurrentTokens             int
+	CeilingTokens int
+	TriggerTokens int
+	TargetTokens  int
+	CurrentTokens int
+	// CurrentEstimateIsNewer is true when tool lifecycle events have changed
+	// the next request view after the last provider usage snapshot.
+	CurrentEstimateIsNewer    bool
 	MeasuredTokens            int
 	MeasuredWindowTokens      int
 	MeasuredKnown             bool
@@ -313,7 +316,13 @@ type Session struct {
 	usageStatus      store.UsageStatus
 	lastContext      *store.ContextSnapshot
 	lastPlan         contextbuild.PromptPlan
-	autoCompact      bool
+	// inFlightMessages is the current uncommitted turn as it will be replayed
+	// to the next ReAct call. It makes tool-call and tool-result context growth
+	// visible before the enclosing turn is committed.
+	inFlightMessages       []*schema.Message
+	inFlightContextEpoch   uint64
+	currentEstimateIsNewer bool
+	autoCompact            bool
 	// Durable anti-thrashing state is projected from ThreadState after every
 	// local mutation and checked before automatic compaction.
 	autoCompactionPaused      bool
@@ -833,14 +842,15 @@ func (s *Session) ContextStatus() ContextStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	status := ContextStatus{
-		CeilingTokens:     s.lastPlan.CeilingTokens,
-		TriggerTokens:     s.lastPlan.TriggerTokens,
-		TargetTokens:      s.lastPlan.TargetTokens,
-		CurrentTokens:     s.lastPlan.ResultTokens,
-		OriginalTokens:    s.lastPlan.OriginalTokens,
-		HotTurnGroups:     len(s.lastPlan.IncludedGroupIDs),
-		OmittedTurnGroups: len(s.lastPlan.OmittedGroupIDs),
-		LastFallbacks:     append([]contextbuild.PlanFallback(nil), s.lastPlan.Fallbacks...),
+		CeilingTokens:          s.lastPlan.CeilingTokens,
+		TriggerTokens:          s.lastPlan.TriggerTokens,
+		TargetTokens:           s.lastPlan.TargetTokens,
+		CurrentTokens:          s.lastPlan.ResultTokens,
+		CurrentEstimateIsNewer: s.currentEstimateIsNewer,
+		OriginalTokens:         s.lastPlan.OriginalTokens,
+		HotTurnGroups:          len(s.lastPlan.IncludedGroupIDs),
+		OmittedTurnGroups:      len(s.lastPlan.OmittedGroupIDs),
+		LastFallbacks:          append([]contextbuild.PlanFallback(nil), s.lastPlan.Fallbacks...),
 	}
 	if s.lastContext != nil {
 		status.MeasuredTokens = s.lastContext.PromptTokens
@@ -936,6 +946,12 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			s.abortTaskCompletionForTurn(context.Background(), turnID, "turn ended before final delivery committed")
 		}
 		s.clearActiveTaskTurn(turnID)
+		s.clearInFlightContext()
+		if !turnCommitted {
+			// Failed and cancelled turns never enter the next prompt. Rebuild the
+			// idle estimate after their terminal lifecycle record is durable.
+			s.refreshAutoCompaction()
+		}
 	}()
 	// Keep the local CAS revision aligned even if context construction or the
 	// model fails after the durable turn.started event.
@@ -964,6 +980,7 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		return turnTerminationError(ctx, err)
 	}
 	s.setPlan(plan)
+	s.beginInFlightContext([]*schema.Message{userMsg})
 
 	callIDAllocator := &turnCallIDAllocator{}
 	usageTracker := newTurnUsageTracker(callIDAllocator)
@@ -974,10 +991,20 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			normalized, record := s.normalizedModelUsage(turnID, tracked)
 			event.ModelUsage = &normalized
 			recorder.recordUsage(record)
+			if recorder.err() == nil {
+				// A provider usage event is emitted after one model request finishes,
+				// before the enclosing user turn commits. Publish it immediately so
+				// the status bar does not wait for final delivery.
+				s.applyThreadStateIfCurrent(recorder.state())
+				s.markInFlightContextMeasured()
+			}
 		} else if event.Kind != TurnEventSteerConsumed {
 			// Tool observations reach consumers only after their lifecycle entry
 			// has been accepted by the durable recorder.
 			emitEvent = recorder.record(event)
+			if emitEvent {
+				s.recordInFlightToolContext(recorder, event)
+			}
 		}
 		if emit != nil && emitEvent {
 			emit(event)
@@ -1792,14 +1819,22 @@ func (s *Session) loadPromptSnapshot() (store.ThreadState, []store.TurnGroup, er
 }
 
 func (s *Session) planForGroups(all []contextbuild.TurnGroup, checkpoint *contextbuild.Checkpoint, coverage []string, current *schema.Message) (contextbuild.PromptPlan, error) {
+	var currentMessages []*schema.Message
+	if current != nil {
+		currentMessages = []*schema.Message{current}
+	}
+	return s.planForGroupsMessages(all, checkpoint, coverage, currentMessages)
+}
+
+func (s *Session) planForGroupsMessages(all []contextbuild.TurnGroup, checkpoint *contextbuild.Checkpoint, coverage []string, current []*schema.Message) (contextbuild.PromptPlan, error) {
 	groups := uncoveredGroups(all, coverage)
 	input := contextbuild.PlannerInput{
 		ImmutableMessages: []*schema.Message{schema.SystemMessage(s.systemPrompt)},
 		Checkpoint:        checkpoint,
 		TurnGroups:        groups,
 	}
-	if current != nil {
-		input.CurrentMessages = []*schema.Message{current}
+	if len(current) > 0 {
+		input.CurrentMessages = cloneMessages(current)
 	}
 	plan, err := contextbuild.PlanContext(input, s.contextCfg)
 	if err != nil || checkpoint == nil || !planHasFallback(plan, "checkpoint_omitted") {
@@ -1894,6 +1929,99 @@ func (s *Session) compactionGoal(groups []contextbuild.TurnGroup) string {
 func (s *Session) setPlan(plan contextbuild.PromptPlan) {
 	s.mu.Lock()
 	s.lastPlan = plan
+	s.mu.Unlock()
+}
+
+// beginInFlightContext records the uncommitted user request before the first
+// model response. The plan is already built by threadPrompt; later tool
+// lifecycle events extend and re-plan this same view.
+func (s *Session) beginInFlightContext(messages []*schema.Message) {
+	s.mu.Lock()
+	s.inFlightMessages = cloneMessages(messages)
+	s.inFlightContextEpoch++
+	s.currentEstimateIsNewer = len(messages) > 0
+	s.mu.Unlock()
+}
+
+func (s *Session) clearInFlightContext() {
+	s.mu.Lock()
+	s.inFlightMessages = nil
+	s.inFlightContextEpoch++
+	s.currentEstimateIsNewer = false
+	s.mu.Unlock()
+}
+
+// markInFlightContextMeasured records that the latest provider usage snapshot
+// corresponds to the currently assembled view. A later tool event flips it
+// back to a local estimate until the following model request finishes.
+func (s *Session) markInFlightContextMeasured() {
+	s.mu.Lock()
+	s.currentEstimateIsNewer = false
+	s.mu.Unlock()
+}
+
+// recordInFlightToolContext extends the model-visible in-flight view only
+// after the same event has been durably accepted. Tool results use the
+// recorder's bounded projection, never their raw artifact payload.
+func (s *Session) recordInFlightToolContext(recorder *threadTurnRecorder, event TurnEvent) {
+	toolCallID := strings.TrimSpace(event.ToolCallID)
+	toolName := strings.TrimSpace(event.Tool)
+	if recorder == nil || toolCallID == "" || toolName == "" {
+		return
+	}
+	var message *schema.Message
+	switch event.Kind {
+	case TurnEventToolStart:
+		message = schema.AssistantMessage("", []schema.ToolCall{{
+			ID:   toolCallID,
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      toolName,
+				Arguments: canonicalToolArguments(event.Input),
+			},
+		}})
+	case TurnEventToolEnd, TurnEventToolError:
+		output := event.Output
+		if projection, ok := recorder.modelToolResultProjection(toolCallID); ok {
+			output = projection
+		}
+		message = schema.ToolMessage(output, toolCallID, schema.WithToolName(toolName))
+	default:
+		return
+	}
+	s.appendInFlightContextMessage(message)
+}
+
+func (s *Session) appendInFlightContextMessage(message *schema.Message) {
+	if message == nil {
+		return
+	}
+	s.mu.Lock()
+	if len(s.inFlightMessages) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.inFlightMessages = append(s.inFlightMessages, cloneMessages([]*schema.Message{message})...)
+	s.inFlightContextEpoch++
+	epoch := s.inFlightContextEpoch
+	messages := cloneMessages(s.inFlightMessages)
+	s.mu.Unlock()
+
+	_, groups, err := s.loadPromptSnapshot()
+	if err != nil {
+		return
+	}
+	all := durableContextGroups(groups)
+	checkpoint, coverage := s.checkpointAndCoverage()
+	plan, err := s.planForGroupsMessages(all, checkpoint, coverage, messages)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	if s.inFlightContextEpoch == epoch {
+		s.lastPlan = plan
+		s.currentEstimateIsNewer = true
+	}
 	s.mu.Unlock()
 }
 

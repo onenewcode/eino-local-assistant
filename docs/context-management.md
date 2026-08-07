@@ -139,6 +139,8 @@ lifecycle；不会从 SQLite 恢复状态。持久会话仅自动修复无歧义
 ## 状态显示
 
 provider 已返回 usage 时，状态栏显示 `ctx=<used>/<window>`；本地规划但尚未发出
-请求时显示 `ctx≈<estimate>/<window>`。两种形式都以完整窗口为分母，且不将本地
-估算说成 provider 事实。`/context` 同时列出 85% 触发点、95% 安全上限、50% 目标、
-最近 provider 快照、当前本地估算和自动压缩暂停原因。
+请求时显示 `ctx≈<estimate>/<window>`。工具调用开始或结束会立刻重建当前未提交 turn
+的本地视图；该视图比上一笔 provider usage 更新时，状态栏优先显示 `ctx≈...`，直到
+下一次模型请求返回新的 usage。两种形式都以完整窗口为分母，且不将本地估算说成
+provider 事实。`/context` 同时列出 85% 触发点、95% 安全上限、50% 目标、最近 provider
+快照、当前本地估算和自动压缩暂停原因。

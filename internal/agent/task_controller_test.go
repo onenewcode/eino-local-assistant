@@ -691,17 +691,21 @@ func TestTaskControllerPreservesRawUserRequestAsRootRequirement(t *testing.T) {
 	ctx := chat.WithTaskRequestContext(taskTestContext(t, "task-raw-request"), "Add an empty state without changing existing API behavior.")
 
 	plan := simpleTaskPlan()
-	if _, err := controller.SetPlan(ctx, plan); err == nil || !strings.Contains(err.Error(), taskUserRequestID) {
-		t.Fatalf("plan that omits the raw root requirement error = %v", err)
-	}
-	plan.Scenarios[0].RequirementIDs = append(plan.Scenarios[0].RequirementIDs, taskUserRequestID)
 	if result, err := controller.SetPlan(ctx, plan); err != nil || !result.OK {
-		t.Fatalf("plan that maps raw request = %#v, %v", result, err)
+		t.Fatalf("plan with an implicit raw request = %#v, %v", result, err)
 	}
 	status := controller.TaskExecutionStatus(ctx)
 	if status.Requirements != 2 || !strings.Contains(controller.ExecutionPacket(ctx), "Add an empty state") {
 		t.Fatalf("raw root requirement missing from task state: %#v", status)
 	}
+	controller.mu.RLock()
+	for _, scenario := range controller.runs["task-raw-request"].scenarios {
+		if !containsString(scenario.RequirementIDs, taskUserRequestID) {
+			controller.mu.RUnlock()
+			t.Fatalf("scenario did not inherit %q: %#v", taskUserRequestID, scenario)
+		}
+	}
+	controller.mu.RUnlock()
 
 	plan.Requirements = append(plan.Requirements, TaskRequirementInput{ID: taskUserRequestID, Description: "model-rewritten scope"})
 	if _, err := controller.SetPlan(ctx, plan); err == nil || !strings.Contains(err.Error(), "must exactly preserve") {

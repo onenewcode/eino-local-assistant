@@ -22,7 +22,7 @@ func NewTaskTools(controller *TaskController) ([]tool.BaseTool, error) {
 	}
 	plan, err := utils.InferTool(
 		"task_plan",
-		`Create or safely update the active autonomous coding task graph. Use this before editing for a substantial coding request. Include every direct user requirement, concrete normal/empty/failure/boundary scenarios, dependency-aware tasks, and at least one exact shell proof command per task. The controller automatically reserves requirement_id user-request for the current raw user request; map it to at least one scenario but do not redefine it. After an interrupted run, omitting user-request preserves the original scope and its unchanged accepted evidence. To replace scope, include user-request with the current raw user request exactly. Calling this updates controller-owned state; it does not mark anything done.`,
+		`Create or safely update the active autonomous coding task graph. Use this before editing for a substantial coding request. Include every direct user requirement, concrete normal/empty/failure/boundary scenarios, dependency-aware tasks, and at least one exact shell proof command per task. The controller automatically reserves requirement_id user-request for the current raw user request and attaches it to every materialized scenario; for an initial plan, do not define or map that reserved ID yourself. After an interrupted run, omitting user-request preserves the original scope and its unchanged accepted evidence. To replace scope, include user-request with the current raw user request exactly. Calling this updates controller-owned state; it does not mark anything done.`,
 		func(ctx context.Context, input TaskPlanInput) (TaskToolOutput, error) {
 			return controller.SetPlan(ctx, input)
 		},

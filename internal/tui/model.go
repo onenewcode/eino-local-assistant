@@ -2405,7 +2405,12 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 		usage.FormatTokens(status.CeilingTokens),
 		usage.FormatTokens(status.TargetTokens),
 	)
-	fmt.Fprintf(&b, "planned_view=%s  source_estimate=%s  hot_groups=%d  omitted_groups=%d\n",
+	viewLabel := "planned_view"
+	if status.CurrentEstimateIsNewer {
+		viewLabel = "current_request_estimate"
+	}
+	fmt.Fprintf(&b, "%s=%s  source_estimate=%s  hot_groups=%d  omitted_groups=%d\n",
+		viewLabel,
 		usage.FormatTokens(status.CurrentTokens),
 		usage.FormatTokens(status.OriginalTokens),
 		status.HotTurnGroups,

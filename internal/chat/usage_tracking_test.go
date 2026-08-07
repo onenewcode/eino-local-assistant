@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
+	"eino-local-assistant/internal/contextbuild"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
@@ -79,6 +81,40 @@ func TestSessionAskAssignsDistinctRecordsToMissingUsageCallIDs(t *testing.T) {
 	}
 }
 
+func TestSessionPublishesNewerContextEstimateAfterToolResult(t *testing.T) {
+	model := &inFlightToolEventModel{
+		stream: &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("done", nil)}}},
+	}
+	session, err := NewSession(model, "system", SessionOptions{
+		Store:   newDurableThreadStore(t),
+		Context: contextbuild.Config{WindowTokens: 20_000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var afterCall, afterResult ContextStatus
+	if err := session.AskWithEvents(context.Background(), "inspect output", nil, func(event TurnEvent) {
+		switch event.Kind {
+		case TurnEventToolStart:
+			afterCall = session.ContextStatus()
+		case TurnEventToolEnd:
+			afterResult = session.ContextStatus()
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !afterCall.MeasuredKnown || afterCall.MeasuredTokens != 120 {
+		t.Fatalf("tool-call boundary did not publish prior provider usage: %+v", afterCall)
+	}
+	if !afterResult.CurrentEstimateIsNewer || afterResult.CurrentTokens <= afterCall.CurrentTokens {
+		t.Fatalf("tool result did not advance the in-flight context estimate: before=%+v after=%+v", afterCall, afterResult)
+	}
+	if final := session.ContextStatus(); final.CurrentEstimateIsNewer {
+		t.Fatalf("committed turn retained a stale in-flight estimate: %+v", final)
+	}
+}
+
 func TestSessionAskRejectsConflictingUsageCallID(t *testing.T) {
 	model := &usageEventModel{
 		stream: &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("done", nil)}}},
@@ -146,6 +182,28 @@ func TestSessionWaitsForDelayedModelUsageEvents(t *testing.T) {
 type usageEventModel struct {
 	stream Stream
 	events []ModelUsageEvent
+}
+
+type inFlightToolEventModel struct {
+	stream Stream
+}
+
+func (m *inFlightToolEventModel) Stream(_ context.Context, _ []*schema.Message) (Stream, error) {
+	return m.stream, nil
+}
+
+func (m *inFlightToolEventModel) StreamWithEvents(_ context.Context, _ []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error) {
+	emit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &ModelUsageEvent{
+		CallID:    "first-request",
+		Operation: ModelUsageOperationAgent,
+		Available: true,
+		Usage:     usage.Turn{PromptTokens: 120, CompletionTokens: 8, TotalTokens: 128},
+	}})
+	emit(TurnEvent{Kind: TurnEventToolStart, Tool: "read_artifact", ToolCallID: "artifact-call", Input: `{"artifact_id":"sha256-test"}`})
+	emit(TurnEvent{Kind: TurnEventToolEnd, Tool: "read_artifact", ToolCallID: "artifact-call", Output: strings.Repeat("evidence ", 2_000)})
+	done := make(chan struct{})
+	close(done)
+	return m.stream, done, nil
 }
 
 func (m *usageEventModel) Stream(_ context.Context, _ []*schema.Message) (Stream, error) {
