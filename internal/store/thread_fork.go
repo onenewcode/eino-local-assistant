@@ -37,7 +37,7 @@ var (
 	_ ThreadForkBeforeFirstRepository = (*ThreadStore)(nil)
 )
 
-// ForkThread publishes a child session bundle containing a complete committed
+// ForkThread publishes a child session file containing a complete committed
 // prefix. The child rebuilds its event chain rather than sharing source IDs.
 func (s *ThreadStore) ForkThread(ctx context.Context, sourceID, childID, lastTurnID string) (ForkResult, error) {
 	return s.forkThread(ctx, sourceID, childID, forkBoundary{lastTurnID: lastTurnID})
@@ -116,7 +116,7 @@ func (s *ThreadStore) resolveForkChildID(sourceID, requested string) (string, er
 			continue
 		}
 		path := s.newThreadJournalPath(candidate, time.Now().UTC())
-		if _, err := os.Lstat(filepath.Dir(path)); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 			return candidate, nil
 		} else if err != nil {
 			return "", fmt.Errorf("inspect generated fork destination: %w", err)
@@ -228,26 +228,26 @@ func (s *ThreadStore) publishFork(ctx context.Context, childPath, childID string
 	if err != nil {
 		return ForkResult{}, err
 	}
-	childDir := filepath.Dir(childPath)
-	parent := filepath.Dir(childDir)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
+	childDayDir := filepath.Dir(childPath)
+	if err := os.MkdirAll(childDayDir, 0o700); err != nil {
 		return ForkResult{}, fmt.Errorf("create fork session date directory: %w", err)
 	}
-	tmpDir, err := os.MkdirTemp(parent, ".fork-")
+	tmp, err := os.CreateTemp(childDayDir, ".fork-")
 	if err != nil {
-		return ForkResult{}, fmt.Errorf("create fork session directory: %w", err)
+		return ForkResult{}, fmt.Errorf("create temporary fork journal: %w", err)
 	}
-	if err := os.Chmod(tmpDir, 0o700); err != nil {
-		_ = os.RemoveAll(tmpDir)
+	tmpJournal := tmp.Name()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpJournal)
 		return ForkResult{}, err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(tmpDir)
-		}
-	}()
-	if err := writeBytesAtomic(journalPath(tmpDir, childID), journal); err != nil {
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpJournal)
+		return ForkResult{}, err
+	}
+	defer func() { _ = os.Remove(tmpJournal) }()
+	if err := writeBytesAtomic(tmpJournal, journal); err != nil {
 		return ForkResult{}, fmt.Errorf("write fork journal: %w", err)
 	}
 	if err := stableReadContextError(ctx); err != nil {
@@ -256,15 +256,13 @@ func (s *ThreadStore) publishFork(ctx context.Context, childPath, childID string
 	if err := s.ensureForkDestinationAbsent(childPath, childID); err != nil {
 		return ForkResult{}, err
 	}
-	if err := os.Rename(tmpDir, childDir); err != nil {
+	if err := publishNewJournal(tmpJournal, childPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return ForkResult{}, fmt.Errorf("%w: thread %q", ErrForkDestinationExists, childID)
 		}
-		return ForkResult{}, fmt.Errorf("publish fork session directory: %w", err)
+		return ForkResult{}, fmt.Errorf("publish fork session journal: %w", err)
 	}
-	cleanup = false
-	_ = syncDirectory(parent)
-	_ = s.projectThread(childDir, childState, childEvents)
+	_ = s.projectThread(childDayDir, childState, childEvents)
 	return ForkResult{SourceID: source.state.ID, ChildID: childID, LastTurnID: source.boundaryTurn, SourceHash: source.sourceHash, ChildState: childState}, nil
 }
 

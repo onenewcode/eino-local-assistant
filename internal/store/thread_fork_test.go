@@ -36,7 +36,7 @@ func TestThreadStoreForkThreadRebuildsDirectJSONLPrefix(t *testing.T) {
 		t.Fatalf("ForkThread: %v", err)
 	}
 	childPath := threadJournalPathForTest(t, threadStore, result.ChildID)
-	if filepath.Base(childPath) != journalFileName || filepath.Base(filepath.Dir(childPath)) != result.ChildID || filepath.Base(filepath.Dir(filepath.Dir(childPath))) != source.CreatedAt.UTC().Format("02") {
+	if filepath.Base(childPath) != journalFileName(result.ChildID) || filepath.Base(filepath.Dir(childPath)) != source.CreatedAt.UTC().Format("02") {
 		t.Fatalf("child session path = %q", childPath)
 	}
 	if info, err := os.Stat(childPath); err != nil || !info.Mode().IsRegular() {

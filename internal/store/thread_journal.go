@@ -1,12 +1,14 @@
 package store
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -134,47 +136,48 @@ func replayJournalReadOnly(path, id string) (ThreadState, []ThreadEvent, bool, e
 }
 
 func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []ThreadEvent, bool, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return ThreadState{}, nil, false, fmt.Errorf("read journal: %w", err)
 	}
+	defer f.Close()
 
 	events := make([]ThreadEvent, 0)
-	offset := 0
-	validEnd := 0
+	reader := bufio.NewReader(f)
+	var offset int64
+	var validEnd int64
 	tornTail := false
 	missingFinalNewline := false
-	for offset < len(data) {
-		relEnd := bytes.IndexByte(data[offset:], '\n')
-		if relEnd < 0 {
-			line := bytes.TrimSpace(data[offset:])
-			if len(line) == 0 {
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			end := offset + int64(len(line))
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 {
+				event, parseErr := decodeThreadEvent(trimmed, id)
+				if parseErr != nil {
+					if errors.Is(readErr, io.EOF) {
+						tornTail = true
+						break
+					}
+					return ThreadState{}, nil, false, fmt.Errorf("%w: journal record at byte %d: %v", ErrJournalCorrupt, validEnd, parseErr)
+				}
+				events = append(events, event)
+			}
+			if errors.Is(readErr, io.EOF) {
+				missingFinalNewline = true
+				validEnd = end
 				break
 			}
-			event, parseErr := decodeThreadEvent(line, id)
-			if parseErr != nil {
-				tornTail = true
-				break
-			}
-			events = append(events, event)
-			validEnd = len(data)
-			missingFinalNewline = true
+			validEnd = end
+			offset = end
+		}
+		if errors.Is(readErr, io.EOF) {
 			break
 		}
-
-		end := offset + relEnd
-		line := bytes.TrimSpace(data[offset:end])
-		offset = end + 1
-		if len(line) == 0 {
-			validEnd = offset
-			continue
+		if readErr != nil {
+			return ThreadState{}, nil, false, fmt.Errorf("read journal: %w", readErr)
 		}
-		event, parseErr := decodeThreadEvent(line, id)
-		if parseErr != nil {
-			return ThreadState{}, nil, false, fmt.Errorf("%w: journal record at byte %d: %v", ErrJournalCorrupt, validEnd, parseErr)
-		}
-		events = append(events, event)
-		validEnd = offset
 	}
 
 	state := ThreadState{FormatVersion: SessionJournalFormatVersion, ID: id}
@@ -199,7 +202,7 @@ func replayJournalWithRepair(path, id string, repair bool) (ThreadState, []Threa
 	}
 
 	if repair && tornTail {
-		if err := truncateJournal(path, int64(validEnd)); err != nil {
+		if err := truncateJournal(path, validEnd); err != nil {
 			return ThreadState{}, nil, false, err
 		}
 	}

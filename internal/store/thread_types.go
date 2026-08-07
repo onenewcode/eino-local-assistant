@@ -9,9 +9,9 @@ import (
 )
 
 const (
-	// SessionJournalFormatVersion is the on-disk format used by ThreadStore. Version 5
+	// SessionJournalFormatVersion is the on-disk format used by ThreadStore. Version 6
 	// stores each active session as one date-partitioned JSONL file.
-	SessionJournalFormatVersion = 5
+	SessionJournalFormatVersion = 6
 
 	// MaxArtifactBytes bounds full payload retention for one artifact. Larger
 	// inputs are retained as digest plus head/tail metadata.
@@ -338,10 +338,13 @@ type CheckpointInput struct {
 	Payload        json.RawMessage `json:"payload,omitempty"`
 	SourceEventIDs []string        `json:"source_event_ids,omitempty"`
 	SourceHash     string          `json:"source_hash,omitempty"`
-	Focus          string          `json:"focus,omitempty"`
-	BeforeTokens   int             `json:"before_tokens,omitempty"`
-	AfterTokens    int             `json:"after_tokens,omitempty"`
-	Automatic      bool            `json:"automatic,omitempty"`
+	// TailStartSequence is the first raw event that remains model-visible after
+	// this checkpoint. Zero means the next event after the checkpoint itself.
+	TailStartSequence uint64 `json:"tail_start_sequence,omitempty"`
+	Focus             string `json:"focus,omitempty"`
+	BeforeTokens      int    `json:"before_tokens,omitempty"`
+	AfterTokens       int    `json:"after_tokens,omitempty"`
+	Automatic         bool   `json:"automatic,omitempty"`
 	// LowGain is ignored on write. Kept only so older callers/fixtures compile;
 	// anti-thrash streak is owned exclusively by compaction failure events.
 	LowGain         bool   `json:"low_gain,omitempty"`
@@ -355,23 +358,24 @@ type CheckpointInput struct {
 // coverage only; callers resolve ParentID lineage to recover the full source
 // manifest without placing it in the model-visible payload.
 type Checkpoint struct {
-	ID             string          `json:"id"`
-	ThreadID       string          `json:"thread_id"`
-	Revision       uint64          `json:"revision"`
-	Sequence       uint64          `json:"sequence"`
-	CreatedAt      time.Time       `json:"created_at"`
-	ParentID       string          `json:"parent_id,omitempty"`
-	Kind           string          `json:"kind,omitempty"`
-	WindowNumber   uint64          `json:"window_number,omitempty"`
-	MessageRefs    []MessageRef    `json:"message_refs,omitempty"`
-	Summary        *ArtifactRef    `json:"summary,omitempty"`
-	Payload        json.RawMessage `json:"payload,omitempty"`
-	SourceEventIDs []string        `json:"source_event_ids,omitempty"`
-	SourceHash     string          `json:"source_hash,omitempty"`
-	Focus          string          `json:"focus,omitempty"`
-	BeforeTokens   int             `json:"before_tokens,omitempty"`
-	AfterTokens    int             `json:"after_tokens,omitempty"`
-	Automatic      bool            `json:"automatic,omitempty"`
+	ID                string          `json:"id"`
+	ThreadID          string          `json:"thread_id"`
+	Revision          uint64          `json:"revision"`
+	Sequence          uint64          `json:"sequence"`
+	CreatedAt         time.Time       `json:"created_at"`
+	ParentID          string          `json:"parent_id,omitempty"`
+	Kind              string          `json:"kind,omitempty"`
+	WindowNumber      uint64          `json:"window_number,omitempty"`
+	MessageRefs       []MessageRef    `json:"message_refs,omitempty"`
+	Summary           *ArtifactRef    `json:"summary,omitempty"`
+	Payload           json.RawMessage `json:"payload,omitempty"`
+	SourceEventIDs    []string        `json:"source_event_ids,omitempty"`
+	SourceHash        string          `json:"source_hash,omitempty"`
+	TailStartSequence uint64          `json:"tail_start_sequence,omitempty"`
+	Focus             string          `json:"focus,omitempty"`
+	BeforeTokens      int             `json:"before_tokens,omitempty"`
+	AfterTokens       int             `json:"after_tokens,omitempty"`
+	Automatic         bool            `json:"automatic,omitempty"`
 	// LowGain is historical journal metadata only. New checkpoints always write
 	// false; successful installs always clear LowGainStreak.
 	LowGain         bool   `json:"low_gain,omitempty"`
@@ -441,6 +445,8 @@ type ToolGroup struct {
 // TurnGroup reconstructs the durable lifecycle for a single agent turn.
 type TurnGroup struct {
 	TurnID         string       `json:"turn_id"`
+	StartSequence  uint64       `json:"-"`
+	EndSequence    uint64       `json:"-"`
 	Started        *TurnStart   `json:"started,omitempty"`
 	Tools          []ToolGroup  `json:"tools,omitempty"`
 	Usages         []ModelUsage `json:"usages,omitempty"`

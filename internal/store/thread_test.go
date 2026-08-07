@@ -434,7 +434,6 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if next.Revision != recovered.Revision+1 {
 		t.Fatalf("next revision = %d", next.Revision)
 	}
-	dir := threadPathForTest(t, store, state.ID)
 	rebuilt, err := store.LoadThread(ctx, state.ID)
 	if err != nil {
 		t.Fatalf("LoadThread state replay: %v", err)
@@ -442,12 +441,11 @@ func TestThreadStoreRecoversTornJournalTail(t *testing.T) {
 	if rebuilt.Revision != next.Revision {
 		t.Fatalf("rebuilt revision = %d, want %d", rebuilt.Revision, next.Revision)
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
+	if filepath.Base(journal) != journalFileName(state.ID) {
+		t.Fatalf("session journal name = %q, want %q", filepath.Base(journal), journalFileName(state.ID))
 	}
-	if len(entries) != 2 || entries[0].Name() != summaryFileName || entries[1].Name() != journalFileName {
-		t.Fatalf("session directory entries = %#v, want %q and %q", entries, summaryFileName, journalFileName)
+	if info, err := os.Stat(journal); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("session journal = %v, %v", info, err)
 	}
 	data, err := os.ReadFile(journal)
 	if err != nil {

@@ -20,7 +20,7 @@ var errThreadSourceChanged = errors.New("thread source changed during read")
 type sourceFingerprint [sha256.Size]byte
 
 // withReadOnlyThread locks the journal file itself. There is no separate lock
-// tree, so the session bundle has no lock-file lifecycle to clean up.
+// file, so a session has no lock-file lifecycle to clean up.
 func (s *ThreadStore) withReadOnlyThread(ctx context.Context, id string, fn func(string, bool) error) error {
 	if ctx == nil {
 		ctx = context.Background()

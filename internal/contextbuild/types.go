@@ -97,7 +97,10 @@ func (a ArtifactRef) validate() error {
 // assistant tool call, nor can a turn be split halfway through a transaction.
 // Groups are ordered oldest to newest when passed to ContextPlanner.
 type TurnGroup struct {
-	ID             string            `json:"id"`
+	ID string `json:"id"`
+	// StartSequence is a local ledger cursor. It never enters a compactor
+	// request or prompt, but lets resume seek directly to an uncovered tail.
+	StartSequence  uint64            `json:"-"`
 	SourceEventIDs []string          `json:"source_event_ids,omitempty"`
 	Messages       []*schema.Message `json:"messages,omitempty"`
 	Artifacts      []ArtifactRef     `json:"artifacts,omitempty"`

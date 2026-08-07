@@ -96,6 +96,10 @@ func turnGroupsFromEvents(events []ThreadEvent) ([]TurnGroup, error) {
 		}
 		group := getGroup(event.TurnID)
 		group.SourceEventIDs = append(group.SourceEventIDs, event.ID)
+		if group.StartSequence == 0 {
+			group.StartSequence = event.Sequence
+		}
+		group.EndSequence = event.Sequence
 		switch event.Kind {
 		case EventTurnStarted:
 			var payload TurnStart

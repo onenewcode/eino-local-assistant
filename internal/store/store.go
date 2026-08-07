@@ -106,6 +106,23 @@ type ThreadOpenSnapshotRepository interface {
 	LoadThreadOpenSnapshot(ctx context.Context, id string, messageLimit int) (ThreadOpenSnapshot, error)
 }
 
+// ThreadResumeSnapshot is the bounded view needed to resume a long-lived
+// session. TurnGroups contains only the raw tail not covered by CheckpointLineage.
+// The complete transcript remains available from the canonical JSONL on demand.
+type ThreadResumeSnapshot struct {
+	State             ThreadState
+	Transcript        []*schema.Message
+	TurnGroups        []TurnGroup
+	CheckpointLineage []Checkpoint
+}
+
+// ThreadResumeSnapshotRepository lets a store avoid replaying a complete
+// transcript into memory on every resume. Implementations must fall back to a
+// canonical JSONL replay when their index cannot be validated.
+type ThreadResumeSnapshotRepository interface {
+	LoadThreadResumeSnapshot(ctx context.Context, id string, messageLimit int) (ThreadResumeSnapshot, error)
+}
+
 // ThreadModelRepository is an optional extension for idle model replacement.
 // It is deliberately separate from ThreadRepository so older repositories and
 // test fakes remain source-compatible while they adopt the new contract.

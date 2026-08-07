@@ -439,7 +439,7 @@ func (c RuntimeConfig) Normalize() RuntimeConfig {
 // StorageConfig controls local session persistence.
 type StorageConfig struct {
 	// DataDir is the root for session data. Empty uses ~/.eino-assistant.
-	// Sessions are date-partitioned bundles under <DataDir>/sessions/YYYY/MM/DD/.
+	// Sessions are date-partitioned JSONL files under <DataDir>/sessions/YYYY/MM/DD/.
 	DataDir string `toml:"data_dir"`
 }
 
@@ -888,7 +888,7 @@ func validatePercent(name string, value int) error {
 
 // ResolveDataDir returns the absolute session storage root.
 // Empty DataDir defaults to ~/.eino-assistant. Session files live under
-// <root>/sessions/YYYY/MM/DD/<id>/.
+// <root>/sessions/YYYY/MM/DD/<id>.jsonl.
 func (c StorageConfig) ResolveDataDir() (string, error) {
 	dir := strings.TrimSpace(c.DataDir)
 	if dir == "" {

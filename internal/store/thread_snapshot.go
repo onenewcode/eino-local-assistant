@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-// SnapshotThread copies a locked session bundle into another store. The JSONL
-// ledger is authoritative and the destination summary is rebuilt from it.
+// SnapshotThread copies one locked session journal into another store. The
+// JSONL ledger is authoritative and the destination SQLite projection is rebuilt from it.
 func (s *ThreadStore) SnapshotThread(ctx context.Context, id string, destination *ThreadStore) error {
 	if s == nil {
 		return errors.New("source thread store is required")
@@ -54,47 +54,44 @@ func (s *ThreadStore) snapshotJournal(sourcePath, destinationPath, id string) er
 	if _, _, _, err := replayJournalReadOnly(sourcePath, id); err != nil {
 		return fmt.Errorf("validate source thread: %w", err)
 	}
-	destinationDir := filepath.Dir(destinationPath)
-	parent := filepath.Dir(destinationDir)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
+	destinationDayDir := filepath.Dir(destinationPath)
+	if err := os.MkdirAll(destinationDayDir, 0o700); err != nil {
 		return fmt.Errorf("create snapshot sessions directory: %w", err)
 	}
-	if _, err := os.Lstat(destinationDir); err == nil {
+	if _, err := os.Lstat(destinationPath); err == nil {
 		return fmt.Errorf("snapshot thread %q already exists", id)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect snapshot thread: %w", err)
 	}
-	tmpDir, err := os.MkdirTemp(parent, ".snapshot-")
+	tmp, err := os.CreateTemp(destinationDayDir, ".snapshot-")
 	if err != nil {
-		return fmt.Errorf("create snapshot session directory: %w", err)
+		return fmt.Errorf("create temporary snapshot journal: %w", err)
 	}
-	if err := os.Chmod(tmpDir, 0o700); err != nil {
-		_ = os.RemoveAll(tmpDir)
+	tmpPath := tmp.Name()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(tmpDir)
-		}
-	}()
-	tmpPath := journalPath(tmpDir, id)
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := copySnapshotFile(sourcePath, tmpPath, info); err != nil {
 		return fmt.Errorf("copy snapshot journal: %w", err)
 	}
-	if err := os.Rename(tmpDir, destinationDir); err != nil {
+	if err := publishNewJournal(tmpPath, destinationPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("snapshot thread %q already exists", id)
 		}
-		return fmt.Errorf("publish snapshot session directory: %w", err)
+		return fmt.Errorf("publish snapshot session journal: %w", err)
 	}
-	cleanup = false
-	_ = syncDirectory(parent)
 	state, events, _, err := replayJournalReadOnly(destinationPath, id)
 	if err != nil {
 		return fmt.Errorf("replay snapshot projection: %w", err)
 	}
-	return s.projectThread(destinationDir, state, events)
+	return s.projectThread(destinationDayDir, state, events)
 }
 
 func validateSnapshotRegularFile(info os.FileInfo, name string) error {

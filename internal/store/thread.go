@@ -24,13 +24,12 @@ const (
 	// event ledger, but user-facing storage lives under sessions/.
 	sessionsDirName   = "sessions"
 	sessionDateLayout = "2006/01/02"
-	journalFileName   = "updates.jsonl"
-	summaryFileName   = "summary.json"
+	journalFileSuffix = ".jsonl"
 )
 
 // ThreadStore persists revisioned, append-only local agent sessions. Each
-// active session is a date-partitioned directory with an append-only JSONL
-// ledger and a rebuildable summary projection.
+// active session is one date-partitioned JSONL file with a rebuildable SQLite
+// projection.
 type ThreadStore struct {
 	root     string
 	db       *sql.DB
@@ -42,6 +41,7 @@ var _ ThreadRepository = (*ThreadStore)(nil)
 var _ ThreadModelRepository = (*ThreadStore)(nil)
 var _ ThreadModelBindingRepository = (*ThreadStore)(nil)
 var _ ThreadOpenSnapshotRepository = (*ThreadStore)(nil)
+var _ ThreadResumeSnapshotRepository = (*ThreadStore)(nil)
 
 type localThreadLock struct {
 	held chan struct{}
@@ -72,9 +72,9 @@ func OpenThreadStore(root string, opts ThreadStoreOptions) (*ThreadStore, error)
 			return nil, err
 		}
 		s := &ThreadStore{root: root, readOnly: true}
-		if err := s.openProjection(true); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
+		// The canonical JSONL remains readable when the optional projection is
+		// absent, corrupt, or from an incompatible schema.
+		_ = s.openProjection(true)
 		return s, nil
 	}
 	if err := os.MkdirAll(filepath.Join(root, sessionsDirName), 0o700); err != nil {
@@ -82,7 +82,9 @@ func OpenThreadStore(root string, opts ThreadStoreOptions) (*ThreadStore, error)
 	}
 	s := &ThreadStore{root: root}
 	if err := s.openProjection(false); err != nil {
-		return nil, err
+		// A locked or unreadable projection must not make durable journals
+		// impossible to resume. The next successful open will rebuild it.
+		s.db = nil
 	}
 	return s, nil
 }
@@ -104,8 +106,8 @@ func (s *ThreadStore) sessionsRoot() string {
 	return filepath.Join(s.root, sessionsDirName)
 }
 
-// NewThreadID returns a day-local time-sortable ID. The date belongs only in
-// the session directory hierarchy, so it is not duplicated in the filename.
+// NewThreadID returns a day-local time-sortable ID. The date belongs to the
+// session path, so it is not duplicated in the filename.
 func NewThreadID(now time.Time) string {
 	if now.IsZero() {
 		now = time.Now()
@@ -125,7 +127,7 @@ func randomHex(nBytes int) string {
 	return hex.EncodeToString(buf)
 }
 
-func (s *ThreadStore) threadDir(id string) (string, error) {
+func (s *ThreadStore) threadDayDir(id string) (string, error) {
 	path, err := s.threadJournalPath(id)
 	if err != nil {
 		return "", err
@@ -171,16 +173,16 @@ func (s *ThreadStore) ThreadPath(id string) (string, error) {
 	return s.threadJournalPath(id)
 }
 
-func (s *ThreadStore) newThreadDir(id string, createdAt time.Time) string {
-	return filepath.Join(sessionDayDir(s.sessionsRoot(), createdAt), id)
-}
-
 func (s *ThreadStore) newThreadJournalPath(id string, createdAt time.Time) string {
-	return journalPath(s.newThreadDir(id, createdAt), id)
+	return journalPath(sessionDayDir(s.sessionsRoot(), createdAt), id)
 }
 
-func journalPath(dir, _ string) string {
-	return filepath.Join(dir, journalFileName)
+func journalFileName(id string) string {
+	return id + journalFileSuffix
+}
+
+func journalPath(dir, id string) string {
+	return filepath.Join(dir, journalFileName(id))
 }
 
 func sessionDayDir(sessionsRoot string, createdAt time.Time) string {
@@ -249,29 +251,29 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 		meta.UpdatedAt = meta.UpdatedAt.UTC()
 	}
 	meta.MessageCount = 0
-	finalDir := s.newThreadDir(id, meta.CreatedAt)
-	finalJournal := journalPath(finalDir, id)
+	finalJournal := s.newThreadJournalPath(id, meta.CreatedAt)
 	if err := s.ensureThreadIDAbsent(id, finalJournal); err != nil {
 		return ThreadState{}, err
 	}
-	parent := filepath.Dir(finalDir)
+	parent := filepath.Dir(finalJournal)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return ThreadState{}, fmt.Errorf("create session date directory: %w", err)
 	}
-	tmpDir, err := os.MkdirTemp(parent, ".creating-")
+	tmp, err := os.CreateTemp(parent, ".creating-")
 	if err != nil {
-		return ThreadState{}, fmt.Errorf("create temporary session directory: %w", err)
+		return ThreadState{}, fmt.Errorf("create temporary session journal: %w", err)
 	}
-	if err := os.Chmod(tmpDir, 0o700); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		return ThreadState{}, fmt.Errorf("set temporary session directory permissions: %w", err)
+	tmpJournal := tmp.Name()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpJournal)
+		return ThreadState{}, fmt.Errorf("set temporary session journal permissions: %w", err)
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(tmpDir)
-		}
-	}()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpJournal)
+		return ThreadState{}, fmt.Errorf("close temporary session journal: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpJournal) }()
 
 	initial := ThreadState{
 		FormatVersion: SessionJournalFormatVersion,
@@ -298,7 +300,7 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	if err != nil {
 		return ThreadState{}, err
 	}
-	if err := appendJournalEvent(journalPath(tmpDir, id), event); err != nil {
+	if err := appendJournalEvent(tmpJournal, event); err != nil {
 		return ThreadState{}, err
 	}
 	state := initial
@@ -311,19 +313,28 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 			return ThreadState{}, err
 		}
 	}
-	if err := os.Rename(tmpDir, finalDir); err != nil {
+	if err := publishNewJournal(tmpJournal, finalJournal); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return ThreadState{}, fmt.Errorf("thread %q already exists", id)
 		}
-		return ThreadState{}, fmt.Errorf("publish session directory: %w", err)
+		return ThreadState{}, fmt.Errorf("publish session journal: %w", err)
 	}
-	cleanup = false
-	// The ledger is published atomically with its session directory. A parent
-	// directory sync failure must not report creation as failed and invite a
-	// duplicate retry, so this final durability hint is best effort.
-	_ = syncDirectory(parent)
-	_ = s.projectThread(finalDir, state, []ThreadEvent{event})
+	_ = s.projectThread(parent, state, []ThreadEvent{event})
 	return state, nil
+}
+
+// publishNewJournal atomically exposes a fully synced temp journal without
+// replacing an existing session file. The temp file lives beside destination,
+// so the hard link remains on the same filesystem.
+func publishNewJournal(tempPath, destination string) error {
+	if err := os.Link(tempPath, destination); err != nil {
+		return err
+	}
+	_ = os.Remove(tempPath)
+	// A directory sync failure must not report creation as failed and invite a
+	// duplicate retry after the journal has already become visible.
+	_ = syncDirectory(filepath.Dir(destination))
+	return nil
 }
 
 // DeleteThread removes one session journal. The advisory lock prevents a
@@ -334,11 +345,11 @@ func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 		return err
 	}
 	defer unlock()
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("delete session directory: %w", err)
+	if err := os.Remove(journalPath(dir, id)); err != nil {
+		return fmt.Errorf("delete session journal: %w", err)
 	}
 	if s.db != nil {
-		_, _ = s.db.Exec(`DELETE FROM threads WHERE id=?`, id)
+		_, _ = s.db.Exec(`DELETE FROM thread_catalog WHERE id=?`, id)
 	}
 	return nil
 }
@@ -353,7 +364,13 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 	metas := make([]ThreadMeta, 0, len(paths))
 	for id := range paths {
 		meta, fresh, loadErr := s.projectedMetaIfFresh(id)
-		if loadErr == nil && !fresh {
+		if loadErr != nil {
+			// The catalog is a convenience index. A failed query must not hide
+			// canonical JSONL sessions from --last or session listing.
+			fresh = false
+			loadErr = nil
+		}
+		if !fresh {
 			meta, loadErr = s.LoadThreadMeta(ctx, id)
 		}
 		if loadErr != nil {
@@ -396,8 +413,8 @@ func (s *ThreadStore) ListThreadsReadOnly(ctx context.Context) ([]ThreadMeta, er
 	return metas, nil
 }
 
-// activeThreadPaths discovers session directories in the current YYYY/MM/DD
-// hierarchy. A valid session owns its updates.jsonl ledger directly.
+// activeThreadPaths discovers date-partitioned JSONL session files in the
+// current YYYY/MM/DD hierarchy.
 func (s *ThreadStore) activeThreadPaths() (map[string]string, error) {
 	sessions := s.sessionsRoot()
 	years, err := os.ReadDir(sessions)
@@ -439,11 +456,14 @@ func (s *ThreadStore) activeThreadPaths() (map[string]string, error) {
 					return nil, fmt.Errorf("read session day %q/%q/%q: %w", year.Name(), month.Name(), day.Name(), err)
 				}
 				for _, entry := range entries {
-					if !entry.IsDir() || validateThreadID(entry.Name()) != nil {
+					if entry.IsDir() || !strings.HasSuffix(entry.Name(), journalFileSuffix) {
 						continue
 					}
-					id := entry.Name()
-					journal := journalPath(filepath.Join(dayPath, id), id)
+					id := strings.TrimSuffix(entry.Name(), journalFileSuffix)
+					if err := validateThreadID(id); err != nil {
+						continue
+					}
+					journal := filepath.Join(dayPath, entry.Name())
 					info, err := os.Lstat(journal)
 					if errors.Is(err, os.ErrNotExist) {
 						continue
@@ -473,10 +493,10 @@ func (s *ThreadStore) ensureThreadIDAbsent(id, candidate string) error {
 	if _, exists := paths[id]; exists {
 		return fmt.Errorf("%w: %q", errThreadAlreadyExists, id)
 	}
-	if _, err := os.Lstat(filepath.Dir(candidate)); err == nil {
+	if _, err := os.Lstat(candidate); err == nil {
 		return fmt.Errorf("%w: %q", errThreadAlreadyExists, id)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat session directory: %w", err)
+		return fmt.Errorf("stat session journal: %w", err)
 	}
 	return nil
 }
@@ -888,7 +908,7 @@ func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	dir, err := s.threadDir(id)
+	dir, err := s.threadDayDir(id)
 	if err != nil {
 		return "", nil, err
 	}

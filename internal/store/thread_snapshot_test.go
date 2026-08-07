@@ -52,7 +52,7 @@ func TestThreadStoreSnapshotThreadCopiesSessionBundleLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	destinationPath := threadJournalPathForTest(t, destination, state.ID)
-	if filepath.Base(destinationPath) != journalFileName || filepath.Base(filepath.Dir(destinationPath)) != state.ID {
+	if filepath.Base(destinationPath) != journalFileName(state.ID) || filepath.Base(filepath.Dir(destinationPath)) != state.CreatedAt.UTC().Format("02") {
 		t.Fatalf("snapshot path = %q", destinationPath)
 	}
 	after, err := os.ReadFile(destinationPath)

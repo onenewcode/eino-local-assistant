@@ -379,8 +379,7 @@ func NewSession(model Model, systemPrompt string, opts SessionOptions) (*Session
 	return s, nil
 }
 
-// OpenSession restores only the active checkpoint and recent visible tail for
-// a v4 session journal.
+// OpenSession restores the active checkpoint and only its uncovered raw tail.
 func OpenSession(model Model, st store.ThreadRepository, id string, opts SessionOptions) (*Session, error) {
 	if model == nil {
 		return nil, errors.New("chat model is required")
@@ -393,25 +392,34 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		return nil, errors.New("thread id is required")
 	}
 
-	var state store.ThreadState
-	var transcript []*schema.Message
-	var turns []store.TurnGroup
-	var err error
-	if snapshots, ok := st.(store.ThreadOpenSnapshotRepository); ok {
-		snapshot, loadErr := snapshots.LoadThreadOpenSnapshot(context.Background(), id, recentTranscriptMessages)
-		if loadErr != nil {
-			return nil, fmt.Errorf("load thread open snapshot: %w", loadErr)
+	loadSnapshot := func() (store.ThreadState, []*schema.Message, []store.TurnGroup, []store.Checkpoint, error) {
+		if snapshots, ok := st.(store.ThreadResumeSnapshotRepository); ok {
+			snapshot, err := snapshots.LoadThreadResumeSnapshot(context.Background(), id, recentTranscriptMessages)
+			if err != nil {
+				return store.ThreadState{}, nil, nil, nil, fmt.Errorf("load thread resume snapshot: %w", err)
+			}
+			return snapshot.State, snapshot.Transcript, snapshot.TurnGroups, snapshot.CheckpointLineage, nil
 		}
-		state, transcript, turns = snapshot.State, snapshot.Transcript, snapshot.TurnGroups
-	} else {
-		state, transcript, err = st.LoadThreadTranscript(context.Background(), id, recentTranscriptMessages)
+		if snapshots, ok := st.(store.ThreadOpenSnapshotRepository); ok {
+			snapshot, err := snapshots.LoadThreadOpenSnapshot(context.Background(), id, recentTranscriptMessages)
+			if err != nil {
+				return store.ThreadState{}, nil, nil, nil, fmt.Errorf("load thread open snapshot: %w", err)
+			}
+			return snapshot.State, snapshot.Transcript, snapshot.TurnGroups, nil, nil
+		}
+		state, transcript, err := st.LoadThreadTranscript(context.Background(), id, recentTranscriptMessages)
 		if err != nil {
-			return nil, fmt.Errorf("load thread transcript: %w", err)
+			return store.ThreadState{}, nil, nil, nil, fmt.Errorf("load thread transcript: %w", err)
 		}
-		turns, err = st.LoadTurnGroups(context.Background(), id)
+		turns, err := st.LoadTurnGroups(context.Background(), id)
 		if err != nil {
-			return nil, fmt.Errorf("load thread lifecycle: %w", err)
+			return store.ThreadState{}, nil, nil, nil, fmt.Errorf("load thread lifecycle: %w", err)
 		}
+		return state, transcript, turns, nil, nil
+	}
+	state, transcript, turns, persistedLineage, err := loadSnapshot()
+	if err != nil {
+		return nil, err
 	}
 	if activeTurn := activeTurnID(turns); activeTurn != "" {
 		if !opts.RecoverInterrupted {
@@ -421,9 +429,9 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		if err != nil {
 			return nil, fmt.Errorf("recover interrupted turn: %w", err)
 		}
-		state, transcript, err = st.LoadThreadTranscript(context.Background(), id, recentTranscriptMessages)
+		state, transcript, turns, persistedLineage, err = loadSnapshot()
 		if err != nil {
-			return nil, fmt.Errorf("reload recovered thread transcript: %w", err)
+			return nil, fmt.Errorf("reload recovered thread: %w", err)
 		}
 	}
 	if state.PendingCompaction != nil {
@@ -451,6 +459,10 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 		state, err = st.RecordCompactionFailure(context.Background(), id, state.Revision, failure)
 		if err != nil {
 			return nil, fmt.Errorf("recover interrupted compaction: %w", err)
+		}
+		state, transcript, turns, persistedLineage, err = loadSnapshot()
+		if err != nil {
+			return nil, fmt.Errorf("reload recovered compaction: %w", err)
 		}
 	}
 	if len(transcript) == 0 {
@@ -484,9 +496,14 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 	s.transcriptOffset = max(0, state.Meta.MessageCount-1-bodyCount)
 	s.transcriptHasMore = s.transcriptOffset > 0
 	if state.ActiveCheckpointID != "" {
-		persisted, err := st.LoadCheckpoint(context.Background(), id, state.ActiveCheckpointID)
-		if err != nil {
-			return nil, fmt.Errorf("load active checkpoint %q: %w", state.ActiveCheckpointID, err)
+		var persisted store.Checkpoint
+		if len(persistedLineage) > 0 && persistedLineage[0].ID == state.ActiveCheckpointID {
+			persisted = persistedLineage[0]
+		} else {
+			persisted, err = st.LoadCheckpoint(context.Background(), id, state.ActiveCheckpointID)
+			if err != nil {
+				return nil, fmt.Errorf("load active checkpoint %q: %w", state.ActiveCheckpointID, err)
+			}
 		}
 		schemaVersion, schemaErr := contextbuild.CheckpointSchemaVersionFromJSON(persisted.Payload)
 		if schemaErr != nil {
@@ -513,7 +530,14 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 			s.checkpointResetDuringOpen = true
 			s.mu.Unlock()
 		} else {
-			checkpoint, coverage, loadErr := loadVerifiedActiveCheckpoint(context.Background(), st, id, persisted.ID, turns)
+			var checkpoint contextbuild.Checkpoint
+			var coverage []string
+			var loadErr error
+			if len(persistedLineage) > 0 && persistedLineage[0].ID == persisted.ID {
+				checkpoint, coverage, loadErr = loadVerifiedIndexedCheckpoint(persistedLineage)
+			} else {
+				checkpoint, coverage, loadErr = loadVerifiedActiveCheckpoint(context.Background(), st, id, persisted.ID, turns)
+			}
 			if loadErr != nil {
 				return nil, fmt.Errorf("load active checkpoint lineage %q: %w", persisted.ID, loadErr)
 			}
@@ -1542,13 +1566,14 @@ func (s *Session) compact(ctx context.Context, focus string, automatic bool) (Co
 		Payload:  payload,
 		// Keep exact direct coverage in the cold ledger. The v2 checkpoint holds
 		// only bounded evidence anchors in its model-visible provenance.
-		SourceEventIDs: directSourceIDs,
-		SourceHash:     cp.DirectSourceHash(),
-		Focus:          strings.TrimSpace(focus),
-		BeforeTokens:   before,
-		AfterTokens:    after,
-		Automatic:      automatic,
-		OperationID:    operationID,
+		SourceEventIDs:    directSourceIDs,
+		SourceHash:        cp.DirectSourceHash(),
+		TailStartSequence: compactionTailStartSequence(all, candidates),
+		Focus:             strings.TrimSpace(focus),
+		BeforeTokens:      before,
+		AfterTokens:       after,
+		Automatic:         automatic,
+		OperationID:       operationID,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRevisionConflict) {
@@ -1668,7 +1693,7 @@ func compactionFailureReason(err error, cancelled bool) string {
 }
 
 func (s *Session) threadPrompt(current *schema.Message) ([]*schema.Message, contextbuild.PromptPlan, error) {
-	groups, err := s.threads.LoadTurnGroups(context.Background(), s.id)
+	_, groups, err := s.loadPromptSnapshot()
 	if err != nil {
 		return nil, contextbuild.PromptPlan{}, fmt.Errorf("load thread turns: %w", err)
 	}
@@ -1679,6 +1704,22 @@ func (s *Session) threadPrompt(current *schema.Message) ([]*schema.Message, cont
 		return nil, contextbuild.PromptPlan{}, err
 	}
 	return plan.Messages, plan, nil
+}
+
+func (s *Session) loadPromptSnapshot() (store.ThreadState, []store.TurnGroup, error) {
+	if snapshots, ok := s.threads.(store.ThreadResumeSnapshotRepository); ok {
+		snapshot, err := snapshots.LoadThreadResumeSnapshot(context.Background(), s.id, 0)
+		if err != nil {
+			return store.ThreadState{}, nil, err
+		}
+		return snapshot.State, snapshot.TurnGroups, nil
+	}
+	state, err := s.threads.LoadThread(context.Background(), s.id)
+	if err != nil {
+		return store.ThreadState{}, nil, err
+	}
+	groups, err := s.threads.LoadTurnGroups(context.Background(), s.id)
+	return state, groups, err
 }
 
 func (s *Session) planForGroups(all []contextbuild.TurnGroup, checkpoint *contextbuild.Checkpoint, coverage []string, current *schema.Message) (contextbuild.PromptPlan, error) {
@@ -1695,12 +1736,11 @@ func (s *Session) planForGroups(all []contextbuild.TurnGroup, checkpoint *contex
 	if err != nil || checkpoint == nil || !planHasFallback(plan, "checkpoint_omitted") {
 		return plan, err
 	}
-	// A checkpoint that no longer fits must not make its covered raw evidence
-	// disappear silently. Re-plan from raw groups so the normal deterministic
-	// complete-group fallback remains explicit and auditable.
-	input.Checkpoint = nil
-	input.TurnGroups = all
-	return contextbuild.PlanContext(input, s.contextCfg)
+	// The checkpoint owns a prefix that can be far larger than a model window.
+	// Falling back to the raw tail would silently lose that prefix, while
+	// replaying all raw events would defeat compaction. Stop and require an
+	// explicit compaction/recovery action instead.
+	return plan, fmt.Errorf("%w: active checkpoint is outside the current context budget", ErrCheckpointNotInstallable)
 }
 
 // planWithCheckpoint exposes the candidate's real model view without the
@@ -1738,13 +1778,9 @@ func (s *Session) refreshAutoCompaction() {
 // It is used on resume as well as at completed-turn boundaries so /context
 // reflects the actual active checkpoint and current source pressure.
 func (s *Session) refreshContextProjection() error {
-	state, err := s.threads.LoadThread(context.Background(), s.id)
+	state, groups, err := s.loadPromptSnapshot()
 	if err != nil {
-		return fmt.Errorf("load context state: %w", err)
-	}
-	groups, err := s.threads.LoadTurnGroups(context.Background(), s.id)
-	if err != nil {
-		return fmt.Errorf("load context turns: %w", err)
+		return fmt.Errorf("load context snapshot: %w", err)
 	}
 	all := durableContextGroups(groups)
 	checkpoint, coverage := s.checkpointAndCoverage()
@@ -2361,6 +2397,7 @@ func buildDurableContextGroups(groups []store.TurnGroup, artifactDigest func(sto
 		}
 		out = append(out, contextbuild.TurnGroup{
 			ID:             group.TurnID,
+			StartSequence:  group.StartSequence,
 			SourceEventIDs: append([]string(nil), group.SourceEventIDs...),
 			Messages:       messages,
 			Artifacts:      artifacts,
@@ -2472,27 +2509,38 @@ func compactionCandidates(all []contextbuild.TurnGroup, coverage []string, keepR
 	if keepRecent <= 0 {
 		keepRecent = contextbuild.DefaultConfig().KeepRecentTurns
 	}
-	cut := max(0, len(all)-keepRecent)
+	// Checkpoints cover one contiguous prefix. A sparse source set makes a
+	// resumed session reread all earlier turn groups merely to find holes.
+	// Oversized omitted turns therefore promote their entire preceding prefix.
+	groups := uncoveredGroups(all, coverage)
+	cut := max(0, len(groups)-keepRecent)
 	omitted := make(map[string]struct{}, len(omittedIDs))
 	for _, id := range omittedIDs {
 		omitted[id] = struct{}{}
 	}
-	candidates := uncoveredGroups(all[:cut], coverage)
-	seen := make(map[string]struct{}, len(candidates))
-	for _, group := range candidates {
-		seen[group.ID] = struct{}{}
+	for index, group := range groups {
+		if _, overflowed := omitted[group.ID]; overflowed {
+			cut = max(cut, index+1)
+		}
 	}
-	for _, group := range uncoveredGroups(all[cut:], coverage) {
-		if _, overflowed := omitted[group.ID]; !overflowed {
+	return append([]contextbuild.TurnGroup(nil), groups[:cut]...)
+}
+
+func compactionTailStartSequence(all, candidates []contextbuild.TurnGroup) uint64 {
+	if len(candidates) == 0 {
+		return 0
+	}
+	last := candidates[len(candidates)-1].ID
+	for index, group := range all {
+		if group.ID != last {
 			continue
 		}
-		if _, exists := seen[group.ID]; exists {
-			continue
+		if index+1 < len(all) {
+			return all[index+1].StartSequence
 		}
-		candidates = append(candidates, group)
-		seen[group.ID] = struct{}{}
+		return 0
 	}
-	return candidates
+	return 0
 }
 
 // durableCompactionSourceGroups selects only the durable groups in one exact
@@ -2643,6 +2691,43 @@ func loadVerifiedActiveCheckpoint(ctx context.Context, repo store.ThreadReposito
 			Hash:        persisted.Hash,
 			LineageHash: parsed.Provenance.LineageHash,
 		}
+	}
+	return active, mergeSourceEventIDs(parts...), nil
+}
+
+// loadVerifiedIndexedCheckpoint validates a checkpoint lineage read directly
+// from canonical JSONL offsets. The store builds those offsets only after a
+// complete journal replay; resume then validates the payload/parent bindings
+// without hydrating the already-covered raw turns a second time.
+func loadVerifiedIndexedCheckpoint(lineage []store.Checkpoint) (contextbuild.Checkpoint, []string, error) {
+	if len(lineage) == 0 {
+		return contextbuild.Checkpoint{}, nil, errors.New("active checkpoint lineage is empty")
+	}
+	parts := make([][]string, 0, len(lineage))
+	var (
+		parent   *contextbuild.ParentCheckpointRef
+		parentID string
+		active   contextbuild.Checkpoint
+	)
+	for i := len(lineage) - 1; i >= 0; i-- {
+		persisted := lineage[i]
+		if persisted.ParentID != parentID {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q parent %q does not match indexed parent %q", persisted.ID, persisted.ParentID, parentID)
+		}
+		expected, err := contextbuild.CheckpointProvenanceForSource(persisted.SourceEventIDs, persisted.SourceHash, parent)
+		if err != nil {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q provenance: %w", persisted.ID, err)
+		}
+		parsed, err := contextbuild.ParseCheckpointJSONForSource(persisted.Payload, expected, persisted.SourceEventIDs)
+		if err != nil {
+			return contextbuild.Checkpoint{}, nil, fmt.Errorf("checkpoint %q payload provenance: %w", persisted.ID, err)
+		}
+		parsed.ID = persisted.ID
+		parsed.StorageHash = persisted.Hash
+		active = parsed
+		parts = append(parts, persisted.SourceEventIDs)
+		parentID = persisted.ID
+		parent = &contextbuild.ParentCheckpointRef{ID: persisted.ID, Hash: persisted.Hash, LineageHash: parsed.Provenance.LineageHash}
 	}
 	return active, mergeSourceEventIDs(parts...), nil
 }

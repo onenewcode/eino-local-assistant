@@ -494,7 +494,7 @@ func TestLoadCompactionUsageDeduplicatesReplayRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := threadStore.threadDir(state.ID)
+	dir, err := threadStore.threadDayDir(state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +593,7 @@ func TestLoadThreadRejectsDuplicateStartedCompactionOperationID(t *testing.T) {
 	if _, err := threadStore.StartCompaction(ctx, state.ID, state.Revision, CompactionStart{OperationID: operationID}); err == nil || !strings.Contains(err.Error(), "already exists in journal") {
 		t.Fatalf("reused preflight operation id error = %v", err)
 	}
-	dir, err := threadStore.threadDir(state.ID)
+	dir, err := threadStore.threadDayDir(state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +642,7 @@ func TestCheckpointWithOperationIDRequiresPendingCompaction(t *testing.T) {
 	if _, _, err := threadStore.CommitCheckpoint(ctx, state.ID, state.Revision, input); err == nil || !strings.Contains(err.Error(), "requires a pending compaction") {
 		t.Fatalf("delayed checkpoint error = %v", err)
 	}
-	dir, err := threadStore.threadDir(state.ID)
+	dir, err := threadStore.threadDayDir(state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,7 +700,7 @@ func TestCompactionUsageWithOperationIDRequiresPendingOperation(t *testing.T) {
 	if _, err := threadStore.RecordUsage(ctx, state.ID, delayed); err == nil || !strings.Contains(err.Error(), "requires a pending compaction") {
 		t.Fatalf("delayed compaction usage error = %v", err)
 	}
-	dir, err := threadStore.threadDir(state.ID)
+	dir, err := threadStore.threadDayDir(state.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
