@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"eino-local-assistant/internal/contextbuild"
+	"eino-local-assistant/internal/logging"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
@@ -107,10 +109,10 @@ const (
 	// ReasoningContent deltas. It is never journaled and must not re-enter
 	// the model prompt (see stripReasoningForStorage).
 	TurnEventReasoning
-	// TurnEventTaskGate reports that the deterministic autonomous-task
-	// controller rejected an attempted final delivery and is continuing the
-	// same turn with a GapPacket. It is display-only and never journaled.
-	TurnEventTaskGate
+	// TurnEventTaskStatus publishes the plan checklist after a related tool
+	// lifecycle event became durable. It is never journaled: the plan snapshot
+	// is the source of truth on resume.
+	TurnEventTaskStatus
 	// TurnEventSteerConsumed reports that a steer input crossed the model's
 	// safe-call boundary. It is display-only and never enters the ledger.
 	TurnEventSteerConsumed
@@ -154,7 +156,7 @@ type TurnEvent struct {
 	SteerContent  string
 	Err           error
 	ModelUsage    *ModelUsageEvent
-	TaskGate      *TaskCompletionGate
+	TaskStatus    *TaskRunStatus
 }
 
 // EventEmitter receives progressive turn events. It may be called from a
@@ -334,11 +336,8 @@ type Session struct {
 	// OpenSession call, so UI entry points can notify once without replaying an
 	// old durable outcome on every later resume.
 	checkpointResetDuringOpen bool
-	// activeTaskTurnID lets an interactive cancellation revoke a completion
-	// approval only when that approval belongs to the still-uncommitted turn.
-	activeTaskTurnID       string
-	activeSteerTurn        *activeTurnSteer
-	finalResponseValidator func(string) error
+	activeSteerTurn           *activeTurnSteer
+	finalResponseValidator    func(string) error
 
 	// opMu makes a Session a single-writer actor even outside the TUI. The
 	// ThreadStore's revision CAS remains the cross-process safety boundary.
@@ -905,14 +904,25 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		return err
 	}
 	turnID := newLocalID("turn")
+	turnStartedAt := time.Now()
+	// Bind session/turn ids for the rest of this request. Never log input text.
+	ctx = logging.With(ctx,
+		"component", "chat",
+		"session_id", s.id,
+		"turn_id", turnID,
+		"model", s.ModelName(),
+	)
+	logging.InfoContext(ctx, "turn started",
+		"input_chars", utf8RuneCount(input),
+	)
 	state, err := s.threads.StartTurn(context.Background(), s.id, s.revision, store.TurnStart{
 		TurnID: turnID,
 		Input:  input,
 	})
 	if err != nil {
+		logging.ErrorContext(ctx, "turn start persist failed", "err", err)
 		return fmt.Errorf("persist turn start: %w", err)
 	}
-	s.setActiveTaskTurn(turnID)
 	turnCommitted := false
 	steerMailbox := newTurnSteerMailbox()
 	var steerModel TurnSteerModel
@@ -939,13 +949,6 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	defer func() {
 		closeSteering(turnCommitted)
 		s.clearSteerTurn(turnID)
-		if !turnCommitted {
-			// task_complete may have persisted before the model's final text and
-			// the turn commit. Do not let a cancelled or failed delivery retain
-			// that provisional approval.
-			s.abortTaskCompletionForTurn(context.Background(), turnID, "turn ended before final delivery committed")
-		}
-		s.clearActiveTaskTurn(turnID)
 		s.clearInFlightContext()
 		if !turnCommitted {
 			// Failed and cancelled turns never enter the next prompt. Rebuild the
@@ -1017,12 +1020,11 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			SteerContent:  input.Content,
 		})
 	})
-	turnCtx := WithTaskRequestContext(s.taskRuntimeContext(ctx), input)
-	turnCtx = WithTaskTurnContext(turnCtx, turnID)
+	turnCtx := WithTaskTurnContext(s.taskRuntimeContext(ctx), turnID)
 	turnCtx = WithTaskStateWriter(turnCtx, recorder.recordTaskState)
 	turnCtx = withTurnCallIDAllocator(turnCtx, callIDAllocator)
 	turnCtx = withToolResultProjectionStore(turnCtx, recorder)
-	answer, err := s.streamTaskAwareAnswer(turnCtx, view, onChunk, combinedEmit)
+	answer, err := s.streamAnswer(turnCtx, view, onChunk, combinedEmit)
 	if err != nil {
 		closeSteering(false)
 		if answer != nil && !usageTracker.hasEvents() {
@@ -1032,7 +1034,13 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			fallback := s.providerUsageEvent("final", answer)
 			combinedEmit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &fallback})
 		}
-		if terminalErr := s.terminateUncommittedTurn(recorder, isCancelledContext(ctx, err), turnTerminationReason(ctx, err)); terminalErr != nil {
+		cancelled := isCancelledContext(ctx, err)
+		logging.WarnContext(ctx, "turn failed",
+			"cancelled", cancelled,
+			"duration_ms", logging.DurationMillis(turnStartedAt),
+			"err", err,
+		)
+		if terminalErr := s.terminateUncommittedTurn(recorder, cancelled, turnTerminationReason(ctx, err)); terminalErr != nil {
 			return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
 		}
 		if recorder.err() != nil {
@@ -1067,20 +1075,6 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 		}
 		return turnTerminationError(ctx, err)
 	}
-	if runtime, ok := s.model.(TaskRuntime); ok {
-		gate := runtime.TaskCompletionGate(turnCtx)
-		if gate.Active && !gate.Complete {
-			summary := strings.TrimSpace(gate.Summary)
-			if summary == "" {
-				summary = "controller rejected completion before commit"
-			}
-			closeSteering(false)
-			if terminalErr := s.terminateUncommittedTurn(recorder, false, summary); terminalErr != nil {
-				return fmt.Errorf("persist turn lifecycle: %w", terminalErr)
-			}
-			return fmt.Errorf("%w: %s", ErrTaskCompletionUnresolved, summary)
-		}
-	}
 	if err := s.validateFinalResponse(answer.Content); err != nil {
 		closeSteering(false)
 		if terminalErr := s.terminateUncommittedTurn(recorder, false, "final response validation: "+err.Error()); terminalErr != nil {
@@ -1091,8 +1085,7 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 
 	// From this point onward the final response is at its commit boundary. A
 	// later UI cancellation belongs to the next interaction rather than this
-	// already-finished delivery; a failed commit is still revoked by the defer.
-	s.clearActiveTaskTurn(turnID)
+	// already-finished delivery.
 	commitMessages := []*schema.Message{userMsg}
 	commitMessages = append(commitMessages, steerMessages(steerInputs)...)
 	commitMessages = append(commitMessages, stripReasoningForStorage(answer))
@@ -1114,7 +1107,22 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 	// Re-plan after the committed boundary. This is the automatic-compaction
 	// barrier checked by the TUI before it drains queued follow-up messages.
 	s.refreshAutoCompaction()
+	answerChars := 0
+	if answer != nil {
+		answerChars = utf8RuneCount(answer.Content)
+	}
+	logging.InfoContext(ctx, "turn completed",
+		"duration_ms", logging.DurationMillis(turnStartedAt),
+		"answer_chars", answerChars,
+		"model_calls", usageTracker.callCount(),
+	)
 	return nil
+}
+
+// utf8RuneCount is a small observability helper. Rune count is a better
+// signal than byte length for mixed CJK/ASCII chat text.
+func utf8RuneCount(s string) int {
+	return utf8.RuneCountInString(s)
 }
 
 func (s *Session) validateFinalResponse(content string) error {
@@ -1127,34 +1135,21 @@ func (s *Session) validateFinalResponse(content string) error {
 	return validator(content)
 }
 
-// interruptActiveTaskForNewInput makes a later natural-language message the
-// scope boundary for unfinished autonomous work. This avoids inventing a
-// second slash-command control plane: the following task_plan can either
-// rebuild the old graph or redirect it while preserving only unchanged proof.
+// interruptActiveTaskForNewInput marks an active checklist interrupted when the
+// user sends a new message, so update_plan can refresh scope without inventing
+// a second control plane.
 func (s *Session) interruptActiveTaskForNewInput() error {
 	runtime, ok := s.model.(TaskRuntime)
 	if !ok {
 		return nil
 	}
 	ctx := s.taskRuntimeContext(context.Background())
-	if runtime.TaskExecutionStatus(ctx).State == "interrupted" {
-		// An earlier Esc/Ctrl+C has already made the prior graph a replan
-		// boundary. Let this new user message reach the model so task_plan can
-		// preserve or deliberately replace its scope.
+	status := runtime.TaskExecutionStatus(ctx)
+	if !status.Available || status.State != "active" {
 		return nil
 	}
-	if gate := runtime.TaskCompletionGate(ctx); !gate.Active {
-		return nil
-	}
-	receipt := runtime.InterruptTask(ctx, "superseded by a new user message")
-	if receipt.Applied || !runtime.TaskCompletionGate(ctx).Active {
-		return nil
-	}
-	summary := strings.TrimSpace(receipt.Summary)
-	if summary == "" {
-		summary = "controller kept the prior task active"
-	}
-	return fmt.Errorf("interrupt active autonomous task before new input: %s", summary)
+	_ = runtime.InterruptTask(ctx, "superseded by a new user message")
+	return nil
 }
 
 // terminateUncommittedTurn first uses the recorder's expected revision, then
@@ -1434,8 +1429,15 @@ func (s *Session) compactLocked(ctx context.Context, focus string, automatic boo
 	if s.compactor == nil {
 		return CompactionResult{}, ErrCompactionUnavailable
 	}
+	startedAt := time.Now()
+	ctx = logging.With(ctx,
+		"component", "context",
+		"session_id", s.id,
+		"automatic", automatic,
+	)
 	state, err := s.threads.LoadThread(context.Background(), s.id)
 	if err != nil {
+		logging.ErrorContext(ctx, "compaction failed", "err", err, "duration_ms", logging.DurationMillis(startedAt))
 		return CompactionResult{}, fmt.Errorf("load compaction state: %w", err)
 	}
 	if automatic && state.AutoCompactionPaused {
@@ -1519,6 +1521,10 @@ func (s *Session) compactLocked(ctx context.Context, focus string, automatic boo
 		}
 		return CompactionResult{}, fmt.Errorf("start compaction: %w", err)
 	}
+	logging.InfoContext(ctx, "compaction started",
+		"operation_id", operationID,
+		"source_groups", len(sourceGroups),
+	)
 	s.applyThreadState(state)
 	compactionCtx, cancelCompaction := context.WithCancel(ctx)
 	defer cancelCompaction()
@@ -1643,6 +1649,16 @@ func (s *Session) compactLocked(ctx context.Context, focus string, automatic boo
 	s.setPlan(afterPlan)
 	s.setAutoCompact(false)
 	s.refreshVisibleTranscript()
+	logging.InfoContext(ctx, "compaction completed",
+		"checkpoint_id", persisted.ID,
+		"operation_id", operationID,
+		"before_tokens", before,
+		"after_tokens", after,
+		"released_tokens", released,
+		"gain_percent", gain,
+		"compactor_calls", generated.Attempts,
+		"duration_ms", logging.DurationMillis(startedAt),
+	)
 	return CompactionResult{
 		CheckpointID:   persisted.ID,
 		OperationID:    operationID,
@@ -1665,6 +1681,15 @@ func (s *Session) persistCompactionFailure(ctx context.Context, state store.Thre
 	stale := errors.Is(cause, ErrCompactionStale)
 	cancelled := isCancelledContext(ctx, cause)
 	reason := compactionFailureReason(cause, cancelled)
+	logging.WarnContext(ctx, "compaction failed",
+		"session_id", s.id,
+		"operation_id", operationID,
+		"automatic", automatic,
+		"stale", stale,
+		"cancelled", cancelled,
+		"reason", reason,
+		"err", cause,
+	)
 	failure := store.CompactionFailure{
 		OperationID:        operationID,
 		Automatic:          automatic,

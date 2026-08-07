@@ -78,7 +78,7 @@ func TestModelPickerAltPOpensWithCapabilitiesAndAppliesCanonicalName(t *testing.
 	if m.textarea.Value() != "draft that should survive the picker" {
 		t.Fatalf("successful picker selection changed draft: %q", m.textarea.Value())
 	}
-	if !hasLineContaining(m.lines, lineSystem, "model switched to Coding 5.2 (openai/gpt-5.2-coding)") {
+	if !hasLineContaining(m.lines, lineSystem, "model switched to Coding 5.2") {
 		t.Fatalf("picker confirmation missing: %#v", m.lines)
 	}
 }
@@ -95,7 +95,7 @@ func TestModelPickerEffortOptions(t *testing.T) {
 				ReasoningEfforts:       []string{"low"},
 				DefaultReasoningEffort: "xhigh",
 			}},
-			want: []string{"", "low", "xhigh"},
+			want: []string{"low", "medium", "xhigh"},
 		},
 		{
 			name: "single declaration deduplicates matching catalog default",
@@ -103,19 +103,19 @@ func TestModelPickerEffortOptions(t *testing.T) {
 				ReasoningEfforts:       []string{"low"},
 				DefaultReasoningEffort: "LOW",
 			}},
-			want: []string{"low"},
+			want: []string{"low", "medium"},
 		},
 		{
 			name: "empty declaration keeps catalog default behavior",
 			entry: ModelCatalogEntry{Capabilities: ModelCatalogCapabilities{
 				DefaultReasoningEffort: "balanced",
 			}},
-			want: []string{"balanced"},
+			want: []string{"medium", "balanced"},
 		},
 		{
-			name:  "empty declaration without default uses provider default",
+			name:  "empty declaration defaults to medium",
 			entry: ModelCatalogEntry{},
-			want:  []string{""},
+			want:  []string{"medium"},
 		},
 		{
 			name: "multiple declarations retain order and append different default",
@@ -123,7 +123,7 @@ func TestModelPickerEffortOptions(t *testing.T) {
 				ReasoningEfforts:       []string{"low", "high"},
 				DefaultReasoningEffort: "xhigh",
 			}},
-			want: []string{"", "low", "high", "xhigh"},
+			want: []string{"low", "high", "medium", "xhigh"},
 		},
 		{
 			name: "multiple declarations deduplicate default case insensitively",
@@ -131,7 +131,7 @@ func TestModelPickerEffortOptions(t *testing.T) {
 				ReasoningEfforts:       []string{"low", "high"},
 				DefaultReasoningEffort: "HIGH",
 			}},
-			want: []string{"", "low", "high"},
+			want: []string{"low", "high", "medium"},
 		},
 	}
 
@@ -142,6 +142,55 @@ func TestModelPickerEffortOptions(t *testing.T) {
 				t.Fatalf("modelPickerEffortOptions() = %#v, want %#v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestModelPickerAppliesSelectedEffortInsteadOfAPlaceholder(t *testing.T) {
+	m := newTestModel(t)
+	m.deps.Status.Model = "openai/current-model"
+	m.deps.ModelCatalog = []ModelCatalogEntry{{
+		CanonicalName: "candidate-model",
+		DisplayName:   "Candidate",
+		Capabilities: ModelCatalogCapabilities{
+			ReasoningEfforts: []string{"low", "high"},
+		},
+	}}
+	var received ModelSelection
+	m.deps.SwitchModelWithOptions = func(_ context.Context, _ *chat.Session, selection ModelSelection) (ModelSwitchResult, error) {
+		received = selection
+		return ModelSwitchResult{
+			Status: StatusInfo{
+				Model:           "openai/" + selection.ModelName,
+				ReasoningEffort: selection.ReasoningEffort,
+			},
+			SessionOpts: chat.SessionOptions{
+				ModelName:       selection.ModelName,
+				ReasoningEffort: selection.ReasoningEffort,
+			},
+		}, nil
+	}
+
+	next, _ := m.openModelPicker()
+	m = next.(*model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(*model)
+	if !m.modelPickerEffortOpen() {
+		t.Fatal("model selection did not open the effort picker")
+	}
+	if got := m.modelPickerEfforts[m.modelPickerEffortSel]; got != defaultModelReasoningEffort {
+		t.Fatalf("initial picker effort = %q, want %q", got, defaultModelReasoningEffort)
+	}
+	if view := m.View(); strings.Contains(view, "default") {
+		t.Fatalf("effort picker must not show a default placeholder:\n%s", view)
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(*model)
+	if received.ModelName != "candidate-model" || received.ReasoningEffort != defaultModelReasoningEffort {
+		t.Fatalf("selected effort was not forwarded: %#v", received)
+	}
+	if got := m.deps.Status.ReasoningEffort; got != defaultModelReasoningEffort {
+		t.Fatalf("displayed effort = %q, want the applied request %q", got, defaultModelReasoningEffort)
 	}
 }
 
@@ -199,7 +248,7 @@ func TestModelNoCatalogKeepsFreeFormFallback(t *testing.T) {
 	if m.modelPickerOpen() {
 		t.Fatal("free-form model switch unexpectedly opened picker")
 	}
-	if !hasLineContaining(m.lines, lineSystem, "model switched to openai/custom-endpoint-deployment") {
+	if !hasLineContaining(m.lines, lineSystem, "model switched to custom-endpoint-deployment") {
 		t.Fatalf("free-form confirmation missing: %#v", m.lines)
 	}
 }

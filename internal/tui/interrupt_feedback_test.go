@@ -54,10 +54,9 @@ func TestBusyInterruptShowsCleanupFeedbackOnce(t *testing.T) {
 
 func TestStatusLabelShowsStoppingUntilTurnCleanup(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
+	m.deps.StatusLine.Fields = []string{statusFieldModelWithReasoning, statusFieldTaskProgress}
 	m.mode = modeBusy
 	m.interruptFeedbackShown = true
-	m.queue = []string{"next"}
 
 	line := m.statusLabel()
 	if !strings.Contains(line, "stopping") {
@@ -66,13 +65,6 @@ func TestStatusLabelShowsStoppingUntilTurnCleanup(t *testing.T) {
 	if strings.Contains(line, "thinking") {
 		t.Fatalf("stopping status must not report normal activity: %q", line)
 	}
-	if !strings.Contains(line, "queued:1") {
-		t.Fatalf("stopping status should retain queue suffix: %q", line)
-	}
-
-	// Keep the finish assertion focused on status cleanup; a queued follow-up
-	// would intentionally auto-drain into the next Working turn.
-	m.queue = nil
 	m.finishTurn(context.Canceled)
 	if got := m.statusLabel(); strings.Contains(got, "stopping") {
 		t.Fatalf("finishTurn should restore idle status, got %q", got)

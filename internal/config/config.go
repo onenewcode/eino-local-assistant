@@ -29,13 +29,15 @@ type Config struct {
 	// It is interpreted by the tools package, not as project-local runtime config.
 	Projects map[string]ProjectTrustConfig `toml:"projects"`
 	// ApprovalPolicy is Codex-style: on-request | never (also accepts on_request).
-	ApprovalPolicy string          `toml:"approval_policy"`
-	Storage        StorageConfig   `toml:"storage"`
-	Workspace      WorkspaceConfig `toml:"workspace"`
-	Tools          ToolsConfig     `toml:"tools"`
-	Sandbox        SandboxConfig   `toml:"sandbox"`
-	Runtime        RuntimeConfig   `toml:"runtime"`
-	UI             UIConfig        `toml:"ui"`
+	ApprovalPolicy string        `toml:"approval_policy"`
+	Storage        StorageConfig `toml:"storage"`
+	// Logging controls structured slog output and durable process logs.
+	Logging   LoggingConfig   `toml:"logging"`
+	Workspace WorkspaceConfig `toml:"workspace"`
+	Tools     ToolsConfig     `toml:"tools"`
+	Sandbox   SandboxConfig   `toml:"sandbox"`
+	Runtime   RuntimeConfig   `toml:"runtime"`
+	UI        UIConfig        `toml:"ui"`
 	// Rules loads workspace AGENTS.md as durable project instructions.
 	Rules RulesConfig `toml:"rules"`
 	// Memory is project-scoped semantic memory (not session resume).
@@ -321,11 +323,6 @@ func (c UIConfig) Validate() error {
 
 var statusLineFieldSet = map[string]struct{}{
 	"model-with-reasoning": {}, "context-used": {}, "used-tokens": {}, "task-progress": {},
-	"model": {}, "reasoning": {},
-	// Keep fields written by the first status-line release valid so upgrading
-	// does not make an existing user configuration unloadable.
-	"effort": {}, "context": {}, "activity": {}, "session": {}, "title": {},
-	"policy": {}, "task": {}, "queue": {}, "follow": {},
 }
 
 // ToolsConfig holds runtime limits for Codex-subset tools (not permission language).
@@ -563,6 +560,54 @@ type StorageConfig struct {
 	DataDir string `toml:"data_dir"`
 }
 
+// LoggingConfig controls structured process logging (log/slog) and durable
+// files under the storage root. Session journals remain the product ledger;
+// these logs are operational diagnostics only.
+type LoggingConfig struct {
+	// Enabled turns durable/process logging on. Omitted defaults to true.
+	Enabled *bool `toml:"enabled"`
+	// Level is debug | info | warn | error. Empty uses "info".
+	// The process environment variable EINO_LOG_LEVEL overrides this value.
+	Level string `toml:"level"`
+	// Dir is the log directory. Empty uses <storage.data_dir>/logs.
+	Dir string `toml:"dir"`
+	// Format is json | text for the durable file (and optional stderr).
+	// Empty uses json.
+	Format string `toml:"format"`
+	// Stderr mirrors structured logs to stderr. Keep false for interactive
+	// TUI so the Bubble Tea surface is not corrupted. Headless exec may enable
+	// this for CI diagnostics.
+	Stderr bool `toml:"stderr"`
+	// RetentionDays is how many daily log files to keep. Zero uses 7; negative
+	// disables pruning.
+	RetentionDays int `toml:"retention_days"`
+	// AddSource attaches caller file:line (noisy; off by default).
+	AddSource bool `toml:"add_source"`
+}
+
+// LoggingEnabled reports whether process logging is on.
+func (c LoggingConfig) LoggingEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// Validate checks logging configuration without touching the filesystem.
+func (c LoggingConfig) Validate() error {
+	switch strings.ToLower(strings.TrimSpace(c.Level)) {
+	case "", "debug", "info", "warn", "warning", "error":
+	default:
+		return fmt.Errorf("logging.level must be debug, info, warn, or error")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Format)) {
+	case "", "json", "text":
+	default:
+		return fmt.Errorf("logging.format must be json or text")
+	}
+	return nil
+}
+
 // ModelContextConfig controls the model-facing working context. Raw thread
 // turns remain in the event ledger and are never compacted in place.
 type ModelContextConfig struct {
@@ -581,19 +626,26 @@ const (
 	ProviderOpenAI = "openai"
 	// ProviderAnthropic identifies an Anthropic Messages API endpoint.
 	ProviderAnthropic = "anthropic"
+	// DefaultReasoningEffort is the requested effort used when configuration,
+	// startup flags, or a persisted legacy session omit one. It is an explicit
+	// request, not a display-only label or a provider-default placeholder.
+	DefaultReasoningEffort = "medium"
 )
 
 // ModelConfig describes a configured chat-model provider endpoint.
 type ModelConfig struct {
-	Provider        string              `toml:"provider"`
-	BaseURL         string              `toml:"base_url"`
-	APIKey          string              `toml:"api_key"`
-	Name            string              `toml:"name"`
-	Catalog         []ModelCatalogEntry `toml:"catalog"`
-	ReasoningEffort string              `toml:"reasoning_effort"`
-	TimeoutSeconds  int                 `toml:"timeout_seconds"`
-	Context         ModelContextConfig  `toml:"context"`
-	Pricing         PricingConfig       `toml:"pricing"`
+	Provider string              `toml:"provider"`
+	BaseURL  string              `toml:"base_url"`
+	APIKey   string              `toml:"api_key"`
+	Name     string              `toml:"name"`
+	Catalog  []ModelCatalogEntry `toml:"catalog"`
+	// ReasoningEffort is forwarded to every provider request. Omitted values
+	// normalize to DefaultReasoningEffort so the selected level is durable and
+	// visible in both the TUI and the session ledger.
+	ReasoningEffort string             `toml:"reasoning_effort"`
+	TimeoutSeconds  int                `toml:"timeout_seconds"`
+	Context         ModelContextConfig `toml:"context"`
+	Pricing         PricingConfig      `toml:"pricing"`
 }
 
 // Load reads a strict TOML file and validates the values needed to run.
@@ -693,13 +745,6 @@ func SaveStatusLineConfig(path string, fields []string, useThemeColors bool) err
 		return fmt.Errorf("validate updated configuration: %w", err)
 	}
 	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
-}
-
-// SaveStatusLineFields remains for callers compiled against the initial
-// persistent status-line API. New TUI code should use SaveStatusLineConfig so
-// the color preference is committed with the selected fields.
-func SaveStatusLineFields(path string, fields []string) error {
-	return SaveStatusLineConfig(path, fields, true)
 }
 
 func normalizeStatusLineFields(fields []string) []string {
@@ -872,6 +917,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.UI.Validate(); err != nil {
+		return err
+	}
+	if err := c.Logging.Validate(); err != nil {
 		return err
 	}
 	return c.Runtime.Validate()
@@ -1169,8 +1217,12 @@ func (c StorageConfig) ResolveDataDir() (string, error) {
 func (c *ModelConfig) Validate() error {
 	c.Provider = strings.TrimSpace(c.Provider)
 	// The accepted effort values belong to the selected provider and model.
-	// Keep this as an opaque string and let the provider report unsupported values.
+	// Keep this as an opaque string and let the provider report unsupported
+	// values, but never leave the runtime without an actual requested level.
 	c.ReasoningEffort = strings.TrimSpace(c.ReasoningEffort)
+	if c.ReasoningEffort == "" {
+		c.ReasoningEffort = DefaultReasoningEffort
+	}
 	if c.Provider == "" {
 		c.Provider = ProviderOpenAI
 	}

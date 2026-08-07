@@ -16,6 +16,7 @@ import (
 type turnUsageTracker struct {
 	mu        sync.Mutex
 	seen      bool
+	count     int
 	nextCall  int
 	allocator *turnCallIDAllocator
 }
@@ -36,6 +37,7 @@ func (t *turnUsageTracker) normalize(event ModelUsageEvent) ModelUsageEvent {
 		}
 	}
 	t.seen = true
+	t.count++
 	return event
 }
 
@@ -43,6 +45,16 @@ func (t *turnUsageTracker) hasEvents() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.seen
+}
+
+// callCount returns how many provider usage events were normalized this turn.
+func (t *turnUsageTracker) callCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count
 }
 
 func (s *Session) normalizedModelUsage(turnID string, event ModelUsageEvent) (ModelUsageEvent, store.ModelUsage) {

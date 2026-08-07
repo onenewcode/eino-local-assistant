@@ -129,10 +129,12 @@ func newRuntimeModelSwitchFixture(t *testing.T) (*commandRuntime, *chat.Session,
 func TestRuntimeBuildModelBundleOrderAndSharedTaskController(t *testing.T) {
 	r, _, _ := newRuntimeModelSwitchFixture(t)
 	var order []string
+	var providerEffort string
 	var raw model.ToolCallingChatModel
 	r.modelFactory = runtimeModelFactory{
 		newChatModel: func(_ context.Context, cfg config.ModelConfig) (model.ToolCallingChatModel, error) {
 			order = append(order, "provider:"+cfg.Name)
+			providerEffort = cfg.ReasoningEffort
 			raw = &runtimeFactoryChatModel{name: cfg.Name}
 			return raw, nil
 		},
@@ -161,6 +163,9 @@ func TestRuntimeBuildModelBundleOrderAndSharedTaskController(t *testing.T) {
 	}
 	if bundle.sessionOpts.ModelName != "new-model" || bundle.sessionOpts.Store != r.sessionStore || bundle.compactor == nil {
 		t.Fatalf("candidate session options=%#v", bundle.sessionOpts)
+	}
+	if providerEffort != config.DefaultReasoningEffort || bundle.sessionOpts.ReasoningEffort != config.DefaultReasoningEffort {
+		t.Fatalf("default effort must reach provider and session: provider=%q session=%q", providerEffort, bundle.sessionOpts.ReasoningEffort)
 	}
 }
 

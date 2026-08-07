@@ -8,40 +8,40 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 )
 
-func TestTaskToolsDriveControllerWithStructuredInvocations(t *testing.T) {
+func TestUpdatePlanToolDrivesChecklist(t *testing.T) {
 	controller := NewTaskController()
 	tools, err := NewTaskTools(controller)
 	if err != nil {
 		t.Fatalf("NewTaskTools: %v", err)
 	}
-	if len(tools) != 3 {
-		t.Fatalf("task tool count = %d, want 3", len(tools))
+	if len(tools) != 1 {
+		t.Fatalf("task tool count = %d, want 1", len(tools))
 	}
 
-	ctx := taskTestContext(t, "task-tools")
-	plan := taskInvokableByName(ctx, t, tools, "task_plan")
-	progress := taskInvokableByName(ctx, t, tools, "task_progress")
-	complete := taskInvokableByName(ctx, t, tools, "task_complete")
+	ctx := taskTestContext(t, "update-plan-tools")
+	update := taskInvokableByName(ctx, t, tools, "update_plan")
+	input := `{"explanation":"implement feature","plan":[{"step":"inspect code","status":"completed"},{"step":"apply patch","status":"in_progress"},{"step":"run tests","status":"pending"}]}`
+	output := runTaskTool(ctx, t, update, input)
+	if !output.OK || output.Message != "Plan updated" || output.RunState != planRunActive {
+		t.Fatalf("update_plan output = %#v", output)
+	}
+	status := controller.TaskExecutionStatus(ctx)
+	if status.Tasks != 3 || status.DoneTasks != 1 || len(status.ActiveTasks) != 1 {
+		t.Fatalf("status = %#v", status)
+	}
+}
 
-	planInput, err := json.Marshal(simpleTaskPlan())
+func TestUpdatePlanRejectsMultipleInProgress(t *testing.T) {
+	controller := NewTaskController()
+	tools, err := NewTaskTools(controller)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output := runTaskTool(ctx, t, plan, string(planInput)); !output.OK || output.RunState != taskRunActive {
-		t.Fatalf("task_plan output = %#v", output)
-	}
-	if output := runTaskTool(ctx, t, progress, `{"action":"start","task_id":"implement"}`); !output.OK || output.TaskState != taskWorking {
-		t.Fatalf("task_progress start output = %#v", output)
-	}
-
-	// task_progress cannot manufacture a proof; it must bind this controller's
-	// callback observation from a real shell invocation.
-	controller.RecordToolResult(ctx, "shell", "proof-call", "", `{"command":"go test ./internal/example","exit_code":0}`)
-	if output := runTaskTool(ctx, t, progress, `{"action":"record_proof","task_id":"implement","proof_id":"unit","tool_call_id":"proof-call"}`); !output.OK || output.TaskState != taskDone {
-		t.Fatalf("task_progress record_proof output = %#v", output)
-	}
-	if output := runTaskTool(ctx, t, complete, `{}`); !output.OK || !output.Complete || output.RunState != taskRunComplete {
-		t.Fatalf("task_complete output = %#v", output)
+	ctx := taskTestContext(t, "update-plan-multi-progress")
+	update := taskInvokableByName(ctx, t, tools, "update_plan")
+	output := runTaskTool(ctx, t, update, `{"plan":[{"step":"a","status":"in_progress"},{"step":"b","status":"in_progress"}]}`)
+	if output.OK {
+		t.Fatalf("expected rejection, got %#v", output)
 	}
 }
 

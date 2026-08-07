@@ -14,8 +14,8 @@ provider = "openai"
 base_url = "https://your-openai-endpoint/v1"
 api_key = "replace-with-your-api-key"
 name = "your-model-name"
-# Optional provider/model-specific opaque string; empty preserves the provider default.
-reasoning_effort = ""
+# Sent on every request. Omit it to use the same "medium" default.
+reasoning_effort = "medium"
 timeout_seconds = 60
 
 # Optional explicit picker catalog for this endpoint. These are local declared
@@ -33,6 +33,7 @@ timeout_seconds = 60
 # context_window_tokens = 128000
 # supports_reasoning = true
 # reasoning_efforts = ["low", "medium", "high"]
+# default_reasoning_effort = "medium"
 # input_modalities = ["text", "image"]
 # supports_tools = true
 # supports_streaming = true
@@ -83,6 +84,17 @@ max_consecutive_equivalent_tool_calls = 3
 
 [storage]
 data_dir = ""
+
+# Process diagnostics (log/slog). Session journals remain the product ledger;
+# these files are operational only and never replace resume/replay.
+[logging]
+# enabled = true                 # default true; set false to disable all process logs
+# level = "info"                 # debug | info | warn | error; EINO_LOG_LEVEL overrides
+# dir = ""                       # empty => <storage.data_dir>/logs (daily eino-YYYY-MM-DD.log)
+# format = "json"                # json | text
+# stderr = false                 # keep false for TUI; true mirrors structured logs to stderr
+# retention_days = 7             # prune older daily files; negative disables pruning
+# add_source = false             # attach caller file:line (noisy)
 
 # Project instructions + semantic memory (not session resume).
 [rules]

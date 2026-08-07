@@ -66,7 +66,7 @@ func TestSubmitStatus(t *testing.T) {
 		want string
 	}{
 		{name: "explicit", want: "reasoning_effort=requested:high"},
-		{name: "provider default", want: "reasoning_effort=provider-default/unspecified"},
+		{name: "omitted defaults to medium", want: "reasoning_effort=requested:medium"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			status := StatusInfo{Model: "deepseek", Tools: []string{"get_current_time"}}
@@ -428,7 +428,6 @@ func TestTurnEventsRejectOldSessionGenerationWithSameTurnID(t *testing.T) {
 		turnToolEndMsg{turnID: 7, sessionGeneration: oldGeneration, tool: "old-tool", callID: "old-call", output: "old output"},
 		turnToolErrorMsg{turnID: 7, sessionGeneration: oldGeneration, tool: "old-tool", callID: "old-call", err: errors.New("old error")},
 		turnUsageMsg{turnID: 7, sessionGeneration: oldGeneration, usage: chat.ModelUsageEvent{CallID: "old-usage", Available: true}},
-		turnTaskGateMsg{turnID: 7, sessionGeneration: oldGeneration, gate: chat.TaskCompletionGate{Summary: "old gate"}},
 		turnDoneMsg{turnID: 7, sessionGeneration: oldGeneration, err: errors.New("old done")},
 	}
 	for _, msg := range staleMessages {

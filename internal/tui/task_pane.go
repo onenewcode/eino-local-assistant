@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	taskPaneRows       = 6
-	taskPaneMaxGapRows = 2
+	taskPaneRows     = 7
+	taskPaneMaxItems = 5
 )
 
 // sessionTaskStatus reads only the UI-safe task projection exposed by Session.
@@ -66,21 +66,17 @@ func (m *model) taskPaneView() string {
 
 func renderTaskPane(width int, status chat.TaskRunStatus) string {
 	width = max(20, width)
-	rows := []string{
-		taskPaneTitleStyle.Render(taskPaneTruncate(taskPaneHeader(status), width)),
-		renderTaskPaneField("Goal", taskPaneGoal(status), width, taskPaneValueStyle),
-		renderTaskPaneField("Scope", taskPaneScope(status), width, taskPaneValueStyle),
+	rows := []string{taskPaneTitleStyle.Render(taskPaneTruncate(taskPaneHeader(status), width))}
+	if len(status.Items) == 0 {
+		label, value := taskPaneActivity(status)
+		rows = append(rows, renderTaskPaneField(label, value, width, taskPaneValueStyle))
+		return taskPaneWithRows(rows)
 	}
-	label, value := taskPaneActivity(status)
-	rows = append(rows, renderTaskPaneField(label, value, width, taskPaneValueStyle))
-
-	gaps := taskPaneGaps(status)
-	if len(gaps) == 0 {
-		rows = append(rows, renderTaskPaneField("Status", taskPaneFootnote(status), width, taskPaneLabelStyle))
-	} else {
-		for _, gap := range gaps[:min(len(gaps), taskPaneMaxGapRows)] {
-			rows = append(rows, renderTaskPaneField("Gap", gap, width, taskPaneGapStyle))
-		}
+	for _, item := range status.Items[:min(len(status.Items), taskPaneMaxItems)] {
+		rows = append(rows, renderTaskPaneItem(item, width))
+	}
+	if extra := len(status.Items) - taskPaneMaxItems; extra > 0 {
+		rows = append(rows, taskPaneLabelStyle.Render(taskPaneTruncate(fmt.Sprintf("  +%d more via /goal", extra), width)))
 	}
 	return taskPaneWithRows(rows)
 }
@@ -103,9 +99,7 @@ func taskPaneWithRows(rows []string) string {
 
 func taskPaneHeader(status chat.TaskRunStatus) string {
 	parts := []string{"Tasks", taskPaneState(status.State)}
-	if status.PlanRequired {
-		parts = append(parts, "plan required")
-	} else if status.Tasks > 0 {
+	if status.Tasks > 0 {
 		parts = append(parts, fmt.Sprintf("%d/%d", status.DoneTasks, status.Tasks))
 	}
 	parts = append(parts, "ctrl+t hide")
@@ -128,77 +122,42 @@ func taskPaneGoal(status chat.TaskRunStatus) string {
 	if goal := taskPaneCompact(status.Goal); goal != "" {
 		return goal
 	}
-	if status.PlanRequired {
-		return "workspace changes need a task plan"
-	}
-	return "task goal was not recorded"
-}
-
-func taskPaneScope(status chat.TaskRunStatus) string {
-	if status.PlanRequired {
-		return "task plan required"
-	}
-	parts := make([]string, 0, 2)
-	if status.Requirements > 0 {
-		parts = append(parts, fmt.Sprintf("%d requirements", status.Requirements))
-	}
-	if status.Scenarios > 0 {
-		parts = append(parts, fmt.Sprintf("%d scenarios", status.Scenarios))
-	}
-	if len(parts) == 0 && status.Tasks > 0 {
-		parts = append(parts, fmt.Sprintf("%d tasks", status.Tasks))
-	}
-	if len(parts) == 0 {
-		return "no plan details"
-	}
-	return strings.Join(parts, " · ")
+	return "plan note was not recorded"
 }
 
 func taskPaneActivity(status chat.TaskRunStatus) (string, string) {
 	switch status.State {
 	case "active":
-		if status.PlanRequired {
-			return "Next", "create a task plan before continuing"
+		if len(status.ActiveTasks) > 0 {
+			return "Current", strings.Join(status.ActiveTasks, ", ")
 		}
-		if active := taskPaneCompact(status.ActiveTask); active != "" {
-			return "Current", active
-		}
-		return "Next", "select the next planned task"
-	case "complete":
-		return "Result", "all task evidence is accepted"
+		return "Next", "update the plan when progress changes"
 	case "interrupted":
-		return "Resume", "send the next request to replan unfinished work"
+		return "Resume", "send the next request to refresh the checklist"
 	case "recovery_error":
-		return "Recovery", "inspect the saved task state before continuing"
+		return "Recovery", "inspect the saved plan state before continuing"
 	default:
 		return "State", taskPaneState(status.State)
 	}
 }
 
-func taskPaneFootnote(status chat.TaskRunStatus) string {
-	switch status.State {
-	case "complete":
-		return "ready for delivery"
-	case "interrupted":
-		return "completed evidence remains saved"
-	case "active":
-		return "waiting for the next verified step"
-	default:
-		return "task state is available"
+func renderTaskPaneItem(item chat.TaskListItem, width int) string {
+	state := taskPaneState(item.State)
+	marker := "□"
+	style := taskPaneValueStyle
+	switch item.State {
+	case "done":
+		marker = "✔"
+		style = taskPaneLabelStyle.Strikethrough(true)
+	case "working":
+		style = taskPaneTitleStyle
 	}
-}
-
-func taskPaneGaps(status chat.TaskRunStatus) []string {
-	gaps := make([]string, 0, min(len(status.Gaps), taskPaneMaxGapRows))
-	for _, gap := range status.Gaps {
-		if compact := taskPaneCompact(gap); compact != "" {
-			gaps = append(gaps, compact)
-		}
-		if len(gaps) == taskPaneMaxGapRows {
-			break
-		}
+	text := fmt.Sprintf("  %s %s", marker, taskPaneCompact(item.Goal))
+	if id := taskPaneCompact(item.ID); id != "" && taskPaneCompact(item.Goal) == "" {
+		text = fmt.Sprintf("  %s %s", marker, id)
 	}
-	return gaps
+	suffix := " · " + state
+	return style.Render(taskPaneTruncate(text, max(1, width-lipgloss.Width(suffix)))) + taskPaneLabelStyle.Render(suffix)
 }
 
 func renderTaskPaneField(label, value string, width int, valueStyle lipgloss.Style) string {

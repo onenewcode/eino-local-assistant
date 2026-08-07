@@ -14,8 +14,7 @@ const (
 	goalCommandMaxValueWidth = 160
 )
 
-// cmdGoal reports only the session's UI-safe task projection. It never asks
-// the model or consults the completion gate.
+// cmdGoal reports only the session's UI-safe plan checklist.
 func (m *model) cmdGoal(arg string) (tea.Model, tea.Cmd) {
 	if strings.TrimSpace(arg) != "" {
 		m.appendLine(lineError, goalCommandUsage)
@@ -37,19 +36,17 @@ func renderGoalCommand(status chat.TaskRunStatus) string {
 	b.WriteString("Goal\n")
 	fmt.Fprintf(&b, "  Goal: %s\n", goalCommandValue(taskPaneGoal(status), "task goal was not recorded"))
 	fmt.Fprintf(&b, "  State: %s\n", goalCommandValue(taskPaneState(status.State), "unavailable"))
-	fmt.Fprintf(&b, "  Scope: requirements=%d scenarios=%d tasks=%d\n", status.Requirements, status.Scenarios, status.Tasks)
 	fmt.Fprintf(&b, "  Progress: done=%d/%d\n", status.DoneTasks, status.Tasks)
-	fmt.Fprintf(&b, "  Active task: %s\n", goalCommandValue(status.ActiveTask, "none"))
-	fmt.Fprintf(&b, "  PlanRequired: %t\n", status.PlanRequired)
-
-	gaps := taskPaneGaps(status)
-	if len(gaps) == 0 {
-		b.WriteString("  Gaps: none")
-		return b.String()
+	activeTasks := "none"
+	if len(status.ActiveTasks) > 0 {
+		activeTasks = strings.Join(status.ActiveTasks, ", ")
 	}
-	b.WriteString("  Gaps:\n")
-	for _, gap := range gaps {
-		fmt.Fprintf(&b, "    - %s\n", taskPaneTruncate(gap, goalCommandMaxValueWidth))
+	fmt.Fprintf(&b, "  Active: %s\n", goalCommandValue(activeTasks, "none"))
+	if len(status.Items) > 0 {
+		b.WriteString("  Steps:\n")
+		for _, item := range status.Items {
+			fmt.Fprintf(&b, "    [%s] %s\n", goalCommandValue(taskPaneState(item.State), "unknown"), goalCommandValue(item.Goal, "step text was not recorded"))
+		}
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

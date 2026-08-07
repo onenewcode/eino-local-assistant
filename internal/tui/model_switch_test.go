@@ -113,7 +113,7 @@ func TestModelSwitchIdleKeepsSessionAndUpdatesSnapshots(t *testing.T) {
 	if state.Meta.Model != "new-model" {
 		t.Fatalf("durable model=%q, want new-model", state.Meta.Model)
 	}
-	if !hasLineContaining(mm.lines, lineSystem, "model switched to openai/new-model") {
+	if !hasLineContaining(mm.lines, lineSystem, "model switched to new-model") {
 		t.Fatalf("switch confirmation missing: %#v", mm.lines)
 	}
 }

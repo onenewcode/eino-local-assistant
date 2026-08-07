@@ -437,6 +437,10 @@ func isInteractive() bool {
 }
 
 func statusFrom(modelName, reasoningEffort string, registry *tools.Registry, cmdMode string, maxModelSteps int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {
+	reasoningEffort = strings.TrimSpace(reasoningEffort)
+	if reasoningEffort == "" {
+		reasoningEffort = config.DefaultReasoningEffort
+	}
 	names := make([]string, 0)
 	if registry != nil {
 		infos, err := registry.Infos(context.Background())

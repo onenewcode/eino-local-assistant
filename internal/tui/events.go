@@ -65,13 +65,12 @@ type turnUsageMsg struct {
 	usage             chat.ModelUsageEvent
 }
 
-// turnTaskGateMsg is a controller-owned completion rejection. It is separate
-// from model text so users can tell that the agent is continuing rather than
-// treating an earlier natural-language claim as the final delivery.
-type turnTaskGateMsg struct {
+// turnTaskStatusMsg is a fresh plan projection emitted after a durable tool
+// result has changed the checklist.
+type turnTaskStatusMsg struct {
 	turnID            int
 	sessionGeneration uint64
-	gate              chat.TaskCompletionGate
+	status            chat.TaskRunStatus
 }
 
 type turnDoneMsg struct {
@@ -173,11 +172,11 @@ func emitFromTurnEvent(ctx context.Context, turnID int, sessionGeneration uint64
 			}
 			// The producer may reuse its event object after Emit returns.
 			msg = turnUsageMsg{turnID: turnID, sessionGeneration: sessionGeneration, usage: *ev.ModelUsage}
-		case chat.TurnEventTaskGate:
-			if ev.TaskGate == nil {
+		case chat.TurnEventTaskStatus:
+			if ev.TaskStatus == nil {
 				return
 			}
-			msg = turnTaskGateMsg{turnID: turnID, sessionGeneration: sessionGeneration, gate: *ev.TaskGate}
+			msg = turnTaskStatusMsg{turnID: turnID, sessionGeneration: sessionGeneration, status: *ev.TaskStatus}
 		default:
 			return
 		}

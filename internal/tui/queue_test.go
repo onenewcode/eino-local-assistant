@@ -505,7 +505,6 @@ func TestQueueResumeEmptyAndRepeatedAreSafe(t *testing.T) {
 
 func TestQueueListAndStatusExposePause(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldQueue}
 	m.queuePaused = true
 	m.queue = []string{"one"}
 
@@ -521,9 +520,6 @@ func TestQueueListAndStatusExposePause(t *testing.T) {
 	if !hasLineContaining(mm.lines, lineSystem, "queue_paused=true") ||
 		!hasLineContaining(mm.lines, lineSystem, "queue_resume=/queue resume") {
 		t.Fatalf("status omitted paused state or resume hint: %#v", mm.lines)
-	}
-	if !strings.Contains(mm.statusLabel(), "queue:paused") {
-		t.Fatalf("status bar omitted paused state: %q", mm.statusLabel())
 	}
 }
 

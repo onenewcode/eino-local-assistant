@@ -130,14 +130,15 @@ func TestApplyModelOverrideRejectsInvalidModel(t *testing.T) {
 
 func TestStatusFromCarriesRequestedReasoningEffort(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		want string
+		name  string
+		input string
+		want  string
 	}{
-		{name: "explicit", want: "high"},
-		{name: "provider default", want: ""},
+		{name: "explicit", input: "high", want: "high"},
+		{name: "omitted defaults to medium", want: config.DefaultReasoningEffort},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			status := statusFrom("openai/test", test.want, nil, "ask", 8, tui.SandboxInfo{}, tui.RuntimeInfo{})
+			status := statusFrom("openai/test", test.input, nil, "ask", 8, tui.SandboxInfo{}, tui.RuntimeInfo{})
 			if status.ReasoningEffort != test.want {
 				t.Fatalf("reasoning effort = %q, want %q", status.ReasoningEffort, test.want)
 			}

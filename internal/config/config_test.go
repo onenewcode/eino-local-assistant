@@ -35,11 +35,12 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 	want := Config{
 		ApprovalPolicy: "on-request",
 		Model: ModelConfig{
-			Provider:       ProviderOpenAI,
-			BaseURL:        "https://api.example.test/v1",
-			APIKey:         "test-api-key",
-			Name:           "test-model",
-			TimeoutSeconds: 60,
+			Provider:        ProviderOpenAI,
+			BaseURL:         "https://api.example.test/v1",
+			APIKey:          "test-api-key",
+			Name:            "test-model",
+			ReasoningEffort: DefaultReasoningEffort,
+			TimeoutSeconds:  60,
 			Context: ModelContextConfig{
 				WindowTokens: 32_000,
 			},
@@ -47,6 +48,46 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoggingConfigDefaultsAndValidates(t *testing.T) {
+	got, err := Load(writeConfiguration(t, validConfiguration))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !got.Logging.LoggingEnabled() {
+		t.Fatal("logging should default to enabled")
+	}
+	if got.Logging.Level != "" || got.Logging.Format != "" {
+		t.Fatalf("omitted logging fields should stay empty for defaults, got %#v", got.Logging)
+	}
+
+	got, err = Load(writeConfiguration(t, validConfiguration+`
+[logging]
+enabled = false
+level = "debug"
+format = "text"
+stderr = true
+retention_days = 3
+`))
+	if err != nil {
+		t.Fatalf("Load(logging) error = %v", err)
+	}
+	if got.Logging.LoggingEnabled() {
+		t.Fatal("explicit enabled=false ignored")
+	}
+	if got.Logging.Level != "debug" || got.Logging.Format != "text" || !got.Logging.Stderr || got.Logging.RetentionDays != 3 {
+		t.Fatalf("logging config = %#v", got.Logging)
+	}
+
+	for _, doc := range []string{
+		"[logging]\nlevel = \"verbose\"\n",
+		"[logging]\nformat = \"yaml\"\n",
+	} {
+		if _, err := Load(writeConfiguration(t, validConfiguration+"\n"+doc)); err == nil {
+			t.Fatalf("Load(%q) succeeded for invalid logging", doc)
+		}
 	}
 }
 
@@ -62,11 +103,11 @@ func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
 		t.Fatal("theme colors should default to enabled")
 	}
 
-	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\" Model \", \"context-used\", \"policy\"]\nstatus_line_use_theme_colors = false\n"))
+	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\" model-with-reasoning \", \"context-used\"]\nstatus_line_use_theme_colors = false\n"))
 	if err != nil {
 		t.Fatalf("Load(configured status line) error = %v", err)
 	}
-	if want := []string{"model", "context-used", "policy"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+	if want := []string{"model-with-reasoning", "context-used"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
 		t.Fatalf("configured status line = %#v, want %#v", got.UI.StatusLineFields(), want)
 	}
 	if got.UI.StatusLineThemeColorsEnabled() {
@@ -89,8 +130,7 @@ func TestSaveStatusLineConfigPreservesUISettingsAndSourceComments(t *testing.T) 
 # keep this UI comment
 show_turn_usage = false
 status_line = [
-  "session",
-  "model",
+  "model-with-reasoning",
 ]
 `)
 	if err := SaveStatusLineConfig(path, []string{"model-with-reasoning", "context-used", "used-tokens"}, false); err != nil {
@@ -101,7 +141,7 @@ status_line = [
 		t.Fatalf("Load(saved configuration) error = %v", err)
 	}
 	if got.UI.TurnUsageEnabled() {
-		t.Fatal("SaveStatusLineFields changed ui.show_turn_usage")
+		t.Fatal("SaveStatusLineConfig changed ui.show_turn_usage")
 	}
 	if want := []string{"model-with-reasoning", "context-used", "used-tokens"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
 		t.Fatalf("saved status line = %#v, want %#v", got.UI.StatusLineFields(), want)
@@ -321,8 +361,8 @@ func TestModelValidateNormalizesBlankReasoningEffort(t *testing.T) {
 	if err := model.Validate(); err != nil {
 		t.Fatalf("ModelConfig.Validate() error = %v", err)
 	}
-	if model.ReasoningEffort != "" {
-		t.Fatalf("blank reasoning effort = %q, want empty", model.ReasoningEffort)
+	if model.ReasoningEffort != DefaultReasoningEffort {
+		t.Fatalf("blank reasoning effort = %q, want %q", model.ReasoningEffort, DefaultReasoningEffort)
 	}
 }
 

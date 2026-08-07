@@ -25,14 +25,13 @@ func TestShortSessionID(t *testing.T) {
 
 func TestFormatIdleStatusIncludesCoreParts(t *testing.T) {
 	p := idleStatusParts{
-		model:   "deepseek",
 		shortID: "abc123",
 		title:   "debug",
 		context: "ctx=754/6.0k (12%)",
 		queued:  "queued:2",
 	}
 	got := formatIdleStatus(120, p)
-	for _, want := range []string{"ready", "deepseek", "abc123", "debug", "ctx=754/6.0k (12%)", "queued:2"} {
+	for _, want := range []string{"ready", "abc123", "debug", "ctx=754/6.0k (12%)", "queued:2"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("status %q missing %q", got, want)
 		}
@@ -41,7 +40,6 @@ func TestFormatIdleStatusIncludesCoreParts(t *testing.T) {
 
 func TestFormatIdleStatusDropsWhenNarrow(t *testing.T) {
 	p := idleStatusParts{
-		model:   "very-long-model-name",
 		shortID: "abc123",
 		title:   "a fairly long title here",
 		context: "ctx=12.3k/128k (9%)",
@@ -64,7 +62,6 @@ func TestFormatIdleStatusDropsWhenNarrow(t *testing.T) {
 
 func TestFormatIdleStatusKeepsContextLongerThanDecoration(t *testing.T) {
 	p := idleStatusParts{
-		model:   "model-name",
 		shortID: "abc123",
 		title:   "title-here",
 		context: "ctx=1.2k/4.0k (30%)",
@@ -112,7 +109,7 @@ func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 		t.Fatalf("status must omit provider prefix: %q", line)
 	}
 	if !strings.Contains(line, "test-model") {
-		t.Fatalf("idle status should contain model: %q", line)
+		t.Fatalf("status must contain the model name: %q", line)
 	}
 	// The Codex-like footer never exposes the internal ctx= rendering.
 	if strings.Contains(line, "ctx=") {
@@ -120,38 +117,16 @@ func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 	}
 }
 
-func TestStatusLineFollowHint(t *testing.T) {
+func TestStatusLabelBusyUsesTaskProgress(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldFollow}
-	// Build tall content so not-at-bottom is possible.
-	for range 40 {
-		m.appendLine(lineSystem, strings.Repeat("x", 20))
-	}
-	m.viewport.GotoTop()
-	m.stickBottom = false
-	line := m.statusLine()
-	if !strings.Contains(line, "End to follow") {
-		t.Fatalf("expected follow hint when scrolled up: %q", line)
-	}
-	m.viewport.GotoBottom()
-	m.stickBottom = true
-	line = m.statusLine()
-	if strings.Contains(line, "End to follow") {
-		t.Fatalf("follow hint should clear at bottom: %q", line)
-	}
-}
-
-func TestStatusLabelBusyUsesSharedSuffix(t *testing.T) {
-	m := newTestModel(t)
-	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
+	m.deps.StatusLine.Fields = []string{statusFieldModelWithReasoning, statusFieldTaskProgress}
 	m.mode = modeBusy
-	m.queue = []string{"next"}
 	line := m.statusLabel()
 	if !strings.Contains(line, "thinking") {
-		t.Fatalf("busy status missing activity: %q", line)
+		t.Fatalf("busy status missing activity in task progress: %q", line)
 	}
-	if !strings.Contains(line, "queued:1") {
-		t.Fatalf("busy status should include queue via shared extras: %q", line)
+	if !strings.Contains(line, "Tasks 0/0") {
+		t.Fatalf("busy status missing task progress: %q", line)
 	}
 	if strings.Contains(line, "ctx=") {
 		t.Fatalf("busy status without measurement must omit ctx: %q", line)
@@ -165,9 +140,7 @@ func TestTaskStatusFragmentUsesCompactTaskState(t *testing.T) {
 		want   string
 	}{
 		{name: "active progress", status: chat.TaskRunStatus{Available: true, State: "active", DoneTasks: 1, Tasks: 3}, want: "task:1/3"},
-		{name: "fresh plan", status: chat.TaskRunStatus{Available: true, State: "active", PlanRequired: true}, want: "task:plan"},
 		{name: "interrupted", status: chat.TaskRunStatus{Available: true, State: "interrupted"}, want: "task:interrupted"},
-		{name: "complete", status: chat.TaskRunStatus{Available: true, State: "complete"}, want: "task:complete"},
 		{name: "unavailable", status: chat.TaskRunStatus{}, want: ""},
 	}
 	for _, test := range tests {

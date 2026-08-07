@@ -43,14 +43,8 @@ var (
 				Foreground(lipgloss.Color("230")).
 				Bold(true)
 
-	statusEffortStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("215"))
-
 	statusContextStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("111"))
-
-	statusActivityStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("114"))
 
 	statusPolicyStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("221"))
@@ -199,19 +193,13 @@ func renderStatusLine(segments []statusLineSegment, useThemeColors bool) string 
 
 func statusStyleForField(field string) lipgloss.Style {
 	switch field {
-	case statusFieldModelWithReasoning, statusFieldModel:
+	case statusFieldModelWithReasoning:
 		return statusModelStyle
-	case statusFieldReasoning, statusFieldEffort:
-		return statusEffortStyle
-	case statusFieldContextUsed, statusFieldContext:
+	case statusFieldContextUsed:
 		return statusContextStyle
 	case statusFieldUsedTokens:
 		return statusPolicyStyle
-	case statusFieldActivity:
-		return statusActivityStyle
-	case statusFieldPolicy:
-		return statusPolicyStyle
-	case statusFieldTaskProgress, statusFieldTask:
+	case statusFieldTaskProgress:
 		return statusTaskStyle
 	default:
 		return statusStyle
@@ -291,10 +279,6 @@ var (
 					Foreground(lipgloss.Color("252")).
 					Background(lipgloss.Color("236")).
 					Bold(true)
-	statusLinePickerPreviewLabelStyle = lipgloss.NewStyle().
-						Foreground(lipgloss.Color("245"))
-	statusLinePickerPreviewStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("252"))
 	statusLinePickerFooterStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("245"))
 
@@ -307,6 +291,22 @@ var (
 				Foreground(lipgloss.Color("252"))
 	taskPaneGapStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("203"))
+
+	taskPlanTitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114")).
+				Bold(true)
+	taskPlanWorkingStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114")).
+				Bold(true)
+	taskPlanPendingStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252"))
+	taskPlanDoneStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243")).
+				Strikethrough(true)
+	taskPlanBlockedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("203"))
+	taskPlanMutedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243"))
 )
 
 // renderSlashMenu paints the prefix-filtered command list above the composer.

@@ -8,10 +8,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"eino-local-assistant/internal/chat"
 	"eino-local-assistant/internal/contextbuild"
+	"eino-local-assistant/internal/logging"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/usage"
 
@@ -233,12 +235,19 @@ func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, em
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = logging.With(ctx, "component", "agent")
+	logging.DebugContext(ctx, "react turn started",
+		"max_model_steps", m.maxModelSteps,
+		"history_messages", len(messages),
+	)
 
 	toolContext := ctx
 	if emit != nil || m.taskController != nil {
 		toolContext = callbacks.InitCallbacks(ctx, &callbacks.RunInfo{}, toolEventCallback(emit, m.taskController))
 	}
-	history := m.messagesWithTaskPacket(ctx, messages)
+	// Keep controller state out of the accumulated history. Each request gets a
+	// fresh packet after the preceding tool batch has updated the DAG.
+	history := append([]*schema.Message(nil), messages...)
 	modelCallNumber := 0
 	for step := 0; step < m.maxModelSteps; step++ {
 		if err := runtimeguard.AcquireModelStep(toolContext); err != nil {
@@ -248,17 +257,43 @@ func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, em
 			return nil, nil, fmt.Errorf("acquire model step: %w", err)
 		}
 		history = m.rewriteMessages(toolContext, history)
-		if err := contextbuild.CheckRequestAdmission(history, m.admission); err != nil {
+		requestHistory := m.messagesWithTaskPacket(toolContext, history)
+		if err := contextbuild.CheckRequestAdmission(requestHistory, m.admission); err != nil {
+			logging.WarnContext(toolContext, "model request admission rejected",
+				"step", step+1,
+				"err", err,
+			)
 			return nil, nil, fmt.Errorf("admit model request: %w", err)
 		}
 		modelCallNumber++
+		stepStarted := time.Now()
+		logging.InfoContext(toolContext, "model step started",
+			"step", modelCallNumber,
+			"kind", "tool_enabled",
+			"request_messages", len(requestHistory),
+		)
 		// Session owns durable model-call IDs. Keeping this empty lets its
 		// turn-scoped usage tracker allocate IDs across task continuations.
-		response, presentation, err := m.inspectModelStream(toolContext, m.toolModel, history, "", emit)
+		response, presentation, err := m.inspectModelStream(toolContext, m.toolModel, requestHistory, "", emit)
 		if err != nil {
+			logging.ErrorContext(toolContext, "model step failed",
+				"step", modelCallNumber,
+				"duration_ms", logging.DurationMillis(stepStarted),
+				"err", err,
+			)
 			return nil, nil, err
 		}
 		response = withToolCallIDs(toolContext, response, modelCallNumber)
+		toolCalls := 0
+		if response != nil {
+			toolCalls = len(response.ToolCalls)
+		}
+		logging.InfoContext(toolContext, "model step completed",
+			"step", modelCallNumber,
+			"kind", "tool_enabled",
+			"tool_calls", toolCalls,
+			"duration_ms", logging.DurationMillis(stepStarted),
+		)
 		if len(response.ToolCalls) == 0 {
 			return presentation, completedEventStream(), nil
 		}
@@ -269,23 +304,44 @@ func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, em
 		if err != nil {
 			return nil, nil, err
 		}
+		batchStarted := time.Now()
+		logging.InfoContext(toolContext, "tool batch started",
+			"step", modelCallNumber,
+			"tool_calls", toolCalls,
+		)
 		results, err := m.invokeAdmittedToolBatch(toolContext, response, admissions, emit)
 		if err != nil {
+			logging.ErrorContext(toolContext, "tool batch failed",
+				"step", modelCallNumber,
+				"duration_ms", logging.DurationMillis(batchStarted),
+				"err", err,
+			)
 			return nil, nil, fmt.Errorf("run tool batch: %w", err)
 		}
 		// The session recorder persists large outputs as artifacts before it
 		// exposes their bounded projection. Do not let a persistence failure
 		// fall back to the raw tool output in the next model request.
 		if err := chat.ToolResultProjectionFailure(toolContext); err != nil {
+			logging.ErrorContext(toolContext, "tool result projection failed",
+				"step", modelCallNumber,
+				"err", err,
+			)
 			return nil, nil, fmt.Errorf("persist tool lifecycle: %w", err)
 		}
+		logging.InfoContext(toolContext, "tool batch completed",
+			"step", modelCallNumber,
+			"results", len(results),
+			"duration_ms", logging.DurationMillis(batchStarted),
+		)
 		history = append(history, projectToolResultMessages(toolContext, results)...)
 		// A tool batch is an active transaction. Its results are durable before
 		// the next model call, but compaction cannot safely run in the middle of
 		// it; the next admission check fails the turn rather than rerunning tools.
 	}
 
-	history = withFinalModelInstruction(history)
+	// The final fallback also sees the current controller state, but the
+	// ephemeral packet is not retained if this turn later continues.
+	history = withFinalModelInstruction(m.messagesWithTaskPacket(toolContext, history))
 	history = m.rewriteMessages(toolContext, history)
 	if err := contextbuild.CheckRequestAdmission(history, m.admission.WithoutTools()); err != nil {
 		return nil, nil, fmt.Errorf("admit final model request: %w", err)
@@ -294,10 +350,27 @@ func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, em
 		return nil, nil, fmt.Errorf("acquire final response: %w", err)
 	}
 	modelCallNumber++
+	finalStarted := time.Now()
+	logging.InfoContext(toolContext, "model step started",
+		"step", modelCallNumber,
+		"kind", "final",
+		"request_messages", len(history),
+	)
 	stream, done, err := newFinalModelResponseStream(toolContext, m.finalModel, history, "", emit)
 	if err != nil {
+		logging.ErrorContext(toolContext, "model step failed",
+			"step", modelCallNumber,
+			"kind", "final",
+			"duration_ms", logging.DurationMillis(finalStarted),
+			"err", err,
+		)
 		return nil, nil, err
 	}
+	logging.InfoContext(toolContext, "model step stream opened",
+		"step", modelCallNumber,
+		"kind", "final",
+		"duration_ms", logging.DurationMillis(finalStarted),
+	)
 	return stream, done, nil
 }
 
@@ -365,9 +438,10 @@ func newFinalModelResponseStream(ctx context.Context, chatModel model.BaseChatMo
 }
 
 type toolBatchAdmission struct {
-	executable bool
-	arguments  string
-	admission  runtimeguard.ToolAdmission
+	executable   bool
+	arguments    string
+	admission    runtimeguard.ToolAdmission
+	denialReason string
 }
 
 func (m *ReActModel) admitToolBatch(ctx context.Context, response *schema.Message) ([]toolBatchAdmission, error) {
@@ -394,9 +468,19 @@ func (m *ReActModel) admitToolBatch(ctx context.Context, response *schema.Messag
 		indexes = append(indexes, index)
 		decisions[index].executable = true
 	}
+	// Keep update_plan sequential when mixed with other tools so the checklist
+	// snapshot and shell/patch side effects stay ordered in one model turn.
+	if len(response.ToolCalls) > 1 && containsTaskControlCall(response.ToolCalls) {
+		for index := range decisions {
+			decisions[index].executable = true
+			decisions[index].denialReason = "requires_sequential_execution"
+		}
+		return decisions, nil
+	}
 	if len(calls) == 0 {
 		return decisions, nil
 	}
+
 	admissions, err := runtimeguard.AdmitToolBatch(ctx, calls)
 	if err != nil {
 		return nil, fmt.Errorf("admit tool batch: %w", err)
@@ -408,6 +492,15 @@ func (m *ReActModel) admitToolBatch(ctx context.Context, response *schema.Messag
 		decisions[indexes[index]].admission = admission
 	}
 	return decisions, nil
+}
+
+func containsTaskControlCall(calls []schema.ToolCall) bool {
+	for _, call := range calls {
+		if isTaskControlTool(call.Function.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // invokeAdmittedToolBatch sends only registered calls that passed runtime
@@ -427,6 +520,12 @@ func (m *ReActModel) invokeAdmittedToolBatch(ctx context.Context, response *sche
 	deniedResults := make([]*schema.Message, len(response.ToolCalls))
 	for index, call := range response.ToolCalls {
 		decision := decisions[index]
+		if decision.denialReason != "" {
+			result := sequentialRetryToolResult(call, decision.denialReason)
+			deniedResults[index] = result
+			emitDeniedToolLifecycle(emit, call, decision.arguments, result.Content)
+			continue
+		}
 		if !decision.executable {
 			result := unknownToolResult(call)
 			deniedResults[index] = result
@@ -470,6 +569,14 @@ func (m *ReActModel) invokeAdmittedToolBatch(ctx context.Context, response *sche
 		return nil, errors.New("tools node returned an oversized permitted tool-result batch")
 	}
 	return results, nil
+}
+
+func sequentialRetryToolResult(call schema.ToolCall, reason string) *schema.Message {
+	return schema.ToolMessage(
+		fmt.Sprintf(`{"denied":true,"reason":%q,"retry_next_model_call":true}`, reason),
+		call.ID,
+		schema.WithToolName(call.Function.Name),
+	)
 }
 
 func deniedToolResult(call schema.ToolCall, reason string) *schema.Message {
@@ -889,6 +996,13 @@ func emitModelUsage(emit chat.EventEmitter, callID string, turn usage.Turn, avai
 }
 
 func toolEventCallback(emit chat.EventEmitter, taskController *TaskController) callbacks.Handler {
+	emitTaskStatus := func(ctx context.Context) {
+		if emit == nil || taskController == nil {
+			return
+		}
+		status := taskController.TaskExecutionStatus(ctx)
+		emit(chat.TurnEvent{Kind: chat.TurnEventTaskStatus, TaskStatus: &status})
+	}
 	return react.BuildAgentCallback(nil, &cbtemplate.ToolCallbackHandler{
 		OnStart: func(ctx context.Context, info *callbacks.RunInfo, input *tool.CallbackInput) context.Context {
 			name := ""
@@ -899,13 +1013,21 @@ func toolEventCallback(emit chat.EventEmitter, taskController *TaskController) c
 			if input != nil {
 				args = input.ArgumentsInJSON
 			}
+			callID := compose.GetToolCallID(ctx)
+			// High-signal diagnostics only: never mirror argument bodies into
+			// process logs (session ledger remains the full provenance store).
+			logging.InfoContext(ctx, "tool started",
+				"tool", name,
+				"tool_call_id", callID,
+				"input_bytes", len(args),
+			)
 			// Preserve the complete observation for the session recorder. Rendering
 			// is deliberately bounded later in the TUI, not at this provenance edge.
 			if emit != nil {
 				emit(chat.TurnEvent{
 					Kind:       chat.TurnEventToolStart,
 					Tool:       name,
-					ToolCallID: compose.GetToolCallID(ctx),
+					ToolCallID: callID,
 					Input:      args,
 				})
 			}
@@ -920,19 +1042,21 @@ func toolEventCallback(emit chat.EventEmitter, taskController *TaskController) c
 			if output != nil {
 				response = output.Response
 			}
+			callID := compose.GetToolCallID(ctx)
+			logging.InfoContext(ctx, "tool completed",
+				"tool", name,
+				"tool_call_id", callID,
+				"output_bytes", len(response),
+			)
 			if emit != nil {
 				emit(chat.TurnEvent{
 					Kind:       chat.TurnEventToolEnd,
 					Tool:       name,
-					ToolCallID: compose.GetToolCallID(ctx),
+					ToolCallID: callID,
 					Output:     response,
 				})
 			}
-			if taskController != nil {
-				// The durable tool-completed event is recorded synchronously by the
-				// session emitter before controller accepts it as task evidence.
-				taskController.RecordToolResult(ctx, name, compose.GetToolCallID(ctx), "", response)
-			}
+			emitTaskStatus(ctx)
 			return ctx
 		},
 		OnError: func(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
@@ -940,24 +1064,21 @@ func toolEventCallback(emit chat.EventEmitter, taskController *TaskController) c
 			if info != nil {
 				name = info.Name
 			}
+			callID := compose.GetToolCallID(ctx)
+			logging.WarnContext(ctx, "tool error",
+				"tool", name,
+				"tool_call_id", callID,
+				"err", err,
+			)
 			if emit != nil {
 				emit(chat.TurnEvent{
 					Kind:       chat.TurnEventToolError,
 					Tool:       name,
-					ToolCallID: compose.GetToolCallID(ctx),
+					ToolCallID: callID,
 					Err:        err,
 				})
 			}
-			if taskController != nil && (name == "apply_patch" || name == "shell") {
-				// A patch operation can fail after an earlier edit, and an execution
-				// error can arrive after a shell process started. Treat both as
-				// uncertain workspace mutations before accepting old proof again.
-				failure := "tool error"
-				if err != nil {
-					failure += ": " + err.Error()
-				}
-				taskController.RecordToolResult(ctx, name, compose.GetToolCallID(ctx), "", failure)
-			}
+			emitTaskStatus(ctx)
 			return ctx
 		},
 	})
@@ -985,8 +1106,8 @@ func (m *ReActModel) messagesWithTaskPacket(ctx context.Context, messages []*sch
 	return withPacket
 }
 
-// TaskExecutionStatus, TaskCompletionGate, and InterruptTask satisfy the
-// optional chat.TaskRuntime contract without making chat depend on agent.
+// TaskExecutionStatus and InterruptTask satisfy the optional chat.TaskRuntime
+// contract without making chat depend on agent.
 func (m *ReActModel) TaskExecutionStatus(ctx context.Context) chat.TaskRunStatus {
 	if m == nil || m.taskController == nil {
 		return chat.TaskRunStatus{}
@@ -994,28 +1115,11 @@ func (m *ReActModel) TaskExecutionStatus(ctx context.Context) chat.TaskRunStatus
 	return m.taskController.TaskExecutionStatus(ctx)
 }
 
-func (m *ReActModel) TaskCompletionGate(ctx context.Context) chat.TaskCompletionGate {
-	if m == nil || m.taskController == nil {
-		return chat.TaskCompletionGate{}
-	}
-	return m.taskController.TaskCompletionGate(ctx)
-}
-
 func (m *ReActModel) InterruptTask(ctx context.Context, reason string) chat.TaskInterruptReceipt {
 	if m == nil || m.taskController == nil {
-		return chat.TaskInterruptReceipt{Summary: "task runtime is unavailable"}
+		return chat.TaskInterruptReceipt{Summary: "plan runtime is unavailable"}
 	}
 	return m.taskController.InterruptTask(ctx, reason)
-}
-
-// AbortTaskCompletion implements chat.TaskCompletionRevoker. It is invoked by
-// Session only when the turn that obtained completion approval cannot commit
-// its final delivery.
-func (m *ReActModel) AbortTaskCompletion(ctx context.Context, reason string) chat.TaskInterruptReceipt {
-	if m == nil || m.taskController == nil {
-		return chat.TaskInterruptReceipt{Summary: "task runtime is unavailable"}
-	}
-	return m.taskController.AbortTaskCompletion(ctx, reason)
 }
 
 // contentThenToolStreamToolCallChecker reports whether a model stream contains

@@ -23,9 +23,9 @@ func TestOpenAIModelStreamsSSE(t *testing.T) {
 		reasoningEffort     string
 		wantReasoningEffort string
 	}{
-		{name: "standard chat model", modelName: "test-model"},
-		{name: "o-series model", modelName: "o3-mini"},
-		{name: "versioned GPT-5 model", modelName: "gpt-5.1-codex"},
+		{name: "standard chat model", modelName: "test-model", wantReasoningEffort: config.DefaultReasoningEffort},
+		{name: "o-series model", modelName: "o3-mini", wantReasoningEffort: config.DefaultReasoningEffort},
+		{name: "versioned GPT-5 model", modelName: "gpt-5.1-codex", wantReasoningEffort: config.DefaultReasoningEffort},
 		{
 			name:                "explicit provider value",
 			modelName:           "test-model",

@@ -40,6 +40,15 @@ func TestStatusLineCommandOpensCodexStylePickerAndSavesDraft(t *testing.T) {
 	if strings.Contains(view, "openai/gpt-5.6-terra") {
 		t.Fatalf("picker preview leaked provider prefix:\n%s", view)
 	}
+	if strings.Count(view, "gpt-5.6-terra xhigh") != 1 {
+		t.Fatalf("picker should render one live status line below the composer:\n%s", view)
+	}
+	if strings.Contains(view, "Preview") {
+		t.Fatalf("picker must not render a second inline preview:\n%s", view)
+	}
+	if strings.Index(view, "gpt-5.6-terra xhigh") < strings.Index(view, "Message the assistant") {
+		t.Fatalf("live status line must render below the composer:\n%s", view)
+	}
 
 	// Theme colors is selected initially. Turn it off, then remove task-progress
 	// from the private draft before committing it with Enter.
@@ -97,7 +106,7 @@ func TestStatusLinePickerSearchAndCancelDiscardDraft(t *testing.T) {
 
 func TestStatusLinePickerFailedSaveKeepsDraftAndCommittedSettings(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLine = StatusLineConfig{Fields: []string{statusFieldModel}, UseThemeColors: true}
+	m.deps.StatusLine = StatusLineConfig{Fields: []string{statusFieldModelWithReasoning}, UseThemeColors: true}
 	m.deps.SaveStatusLineConfig = func(StatusLineConfig) error { return errors.New("read-only config") }
 
 	next, _ := m.submit("/statusline")
@@ -109,11 +118,41 @@ func TestStatusLinePickerFailedSaveKeepsDraftAndCommittedSettings(t *testing.T) 
 	if !m.statusLinePickerOpen() {
 		t.Fatal("failed save should keep picker open")
 	}
-	if want := []string{statusFieldModel}; !reflect.DeepEqual(m.deps.StatusLine.Fields, want) {
+	if want := []string{statusFieldModelWithReasoning}; !reflect.DeepEqual(m.deps.StatusLine.Fields, want) {
 		t.Fatalf("failed save applied fields = %#v, want %#v", m.deps.StatusLine.Fields, want)
 	}
 	if !hasLineContaining(m.lines, lineError, "save status-line settings: read-only config") {
 		t.Fatalf("save failure missing from transcript: %#v", m.lines)
+	}
+}
+
+func TestStatusLinePickerCombinesModelAndReasoning(t *testing.T) {
+	m := newTestModel(t)
+	m.deps.StatusLine = StatusLineConfig{
+		Fields: []string{
+			statusFieldModelWithReasoning,
+			statusFieldContextUsed,
+			statusFieldUsedTokens,
+			statusFieldTaskProgress,
+		},
+		UseThemeColors: true,
+	}
+	m.deps.StatusLine = normalizeStatusLineConfig(m.deps.StatusLine)
+	if want := []string{statusFieldModelWithReasoning, statusFieldContextUsed, statusFieldUsedTokens, statusFieldTaskProgress}; !reflect.DeepEqual(m.deps.StatusLine.Fields, want) {
+		t.Fatalf("combined model field = %#v, want %#v", m.deps.StatusLine.Fields, want)
+	}
+	m.deps.Status.ReasoningEffort = "high"
+	segments := m.statusLineSegments()
+	if len(segments) == 0 || segments[0].field != statusFieldModelWithReasoning || segments[0].text != "test-model high" {
+		t.Fatalf("combined model/reasoning segment = %#v", segments)
+	}
+	m.deps.Status.ReasoningEffort = ""
+	segments = m.statusLineSegments()
+	if len(segments) == 0 || segments[0].text != "test-model medium" {
+		t.Fatalf("omitted reasoning effort must render medium = %#v", segments)
+	}
+	if strings.Contains(segments[0].text, "default") {
+		t.Fatalf("status line must not render a default placeholder = %#v", segments)
 	}
 }
 

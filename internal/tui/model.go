@@ -36,8 +36,8 @@ type StatusInfo struct {
 	// entitlement, discovery, or an observed provider-effective state.
 	DeclaredCatalogLifecycle string
 	Tools                    []string
-	// ReasoningEffort is the configured/requested model reasoning effort.
-	// An empty value means the provider default is requested.
+	// ReasoningEffort is the configured/requested model reasoning effort. The
+	// runtime normalizes an omitted value to the explicit medium default.
 	ReasoningEffort string
 	// DeclaredReasoningEfforts contains the current canonical model's
 	// catalog-declared effort options. It does not establish provider support
@@ -213,6 +213,8 @@ const (
 type transcriptLine struct {
 	kind lineKind
 	text string
+	// taskStatus is set only for the display-only task-plan transcript card.
+	taskStatus *chat.TaskRunStatus
 	// folded is set when a lineReasoning block was collapsed to a one-line summary.
 	// Display-only; never enters the session ledger.
 	folded bool
@@ -237,6 +239,9 @@ const (
 	// lineSide is display-only output from /btw and /side.
 	lineSide
 	lineReview
+	// lineTaskPlan is a display-only full DAG snapshot emitted after controller
+	// state changes. The durable task snapshot remains controller-owned.
+	lineTaskPlan
 	lineSep
 )
 
@@ -292,6 +297,9 @@ type model struct {
 	// taskPaneOpen exposes a compact, read-only task projection without making
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
+	// taskStatusFingerprint avoids duplicate plan cards for lifecycle callbacks
+	// that leave the display-safe DAG unchanged.
+	taskStatusFingerprint string
 
 	// backtrackState is a pending source-preserving fork selection. It is kept
 	// separate from the durable session until the user confirms a prompt.
@@ -803,6 +811,7 @@ func (m *model) resetSessionTransientState() {
 	m.modelPickerEfforts = nil
 	m.modelPickerEffortSel = 0
 	m.statusLinePicker = nil
+	m.taskStatusFingerprint = ""
 	m.clearBacktrack()
 	m.clearSlashMenu()
 	m.closeTaskPane()
@@ -1208,15 +1217,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.addTurnUsage(msg.usage)
 		return m, m.nextEventCmd()
 
-	case turnTaskGateMsg:
+	case turnTaskStatusMsg:
 		if !m.acceptsTurn(msg.turnID, msg.sessionGeneration) {
 			return m, m.nextEventCmd()
 		}
-		summary := strings.TrimSpace(msg.gate.Summary)
-		if summary == "" {
-			summary = "controller rejected completion"
-		}
-		m.appendLine(lineSystem, "task completion check: "+summary+"; continuing")
+		m.appendUpdatedPlan(msg.status)
 		return m, m.nextEventCmd()
 
 	case turnDoneMsg:
@@ -1308,7 +1313,13 @@ func (m *model) View() string {
 		return ""
 	}
 
-	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegments(), m.deps.StatusLine.UseThemeColors))
+	statusLine := m.deps.StatusLine
+	if !m.statusLinePickerOpen() {
+		statusLine = m.deps.StatusLine
+	} else {
+		statusLine = m.statusLinePicker.draft
+	}
+	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegmentsForConfig(statusLine), statusLine.UseThemeColors))
 	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	if m.hasPendingApproval() {
 		if approvalAllowsSession(m.pendingApproval.Request) {
@@ -1425,8 +1436,8 @@ func (m *model) layout() {
 	}
 	m.textarea.SetWidth(innerW)
 	// viewport = total - composer border - status - help - optional task pane -
-	// slash/approval/backtrack/status-line picker. Keep one spare row so modal pages retain their
-	// historical safety margin at small terminal heights.
+	// slash/approval/backtrack/status-line picker. Keep one spare row so modal
+	// pages retain their historical safety margin at small terminal heights.
 	composerHeight := m.textarea.Height() + 2
 	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.statusLinePickerHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
@@ -2188,6 +2199,7 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		m.lines = seedLinesFromTranscript(transcript, resumeBanner(result.Session.ID(), len(transcript)), result.Session.Title())
 		m.appendLegacyCheckpointResetNotice(result.Session)
 		m.inputHist.seedFromMessages(transcript)
+		m.layout()
 		m.refreshViewport()
 		return m, nil
 	}
@@ -2220,6 +2232,7 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	m.lines = seedLinesFromTranscript(transcript, resumeBanner(session.ID(), len(transcript)), session.Title())
 	m.appendLegacyCheckpointResetNotice(session)
 	m.inputHist.seedFromMessages(transcript)
+	m.layout()
 	m.refreshViewport()
 	return m, nil
 }
@@ -3013,6 +3026,24 @@ func (m *model) appendLine(kind lineKind, text string) {
 	m.refreshViewport()
 }
 
+func (m *model) appendUpdatedPlan(status chat.TaskRunStatus) {
+	if !status.Available {
+		return
+	}
+	fingerprint := taskStatusFingerprint(status)
+	if fingerprint == m.taskStatusFingerprint {
+		return
+	}
+	m.taskStatusFingerprint = fingerprint
+	copyStatus := status
+	copyStatus.ActiveTasks = append([]string(nil), status.ActiveTasks...)
+	copyStatus.Items = append([]chat.TaskListItem(nil), status.Items...)
+	m.foldOpenReasoning()
+	m.streamingAssistant = false
+	m.lines = append(m.lines, transcriptLine{kind: lineTaskPlan, taskStatus: &copyStatus})
+	m.refreshViewport()
+}
+
 func (m *model) appendSideLine(text string) {
 	m.sideLines = append(m.sideLines, transcriptLine{kind: lineSide, text: text})
 	m.refreshViewport()
@@ -3043,6 +3074,10 @@ func (m *model) refreshViewport() {
 			b.WriteString(renderSystem(line.text))
 		case lineReview:
 			b.WriteString(renderSystem(line.text))
+		case lineTaskPlan:
+			if line.taskStatus != nil {
+				b.WriteString(renderUpdatedPlan(m.viewport.Width, *line.taskStatus))
+			}
 		case lineSep:
 			b.WriteString(renderSeparator(m.viewport.Width))
 		}
@@ -3193,7 +3228,7 @@ func reasoningEffortStatus(value string) string {
 	if value = strings.TrimSpace(value); value != "" {
 		return "requested:" + value
 	}
-	return "provider-default/unspecified"
+	return "requested:" + defaultModelReasoningEffort
 }
 
 func modeName(m mode) string {

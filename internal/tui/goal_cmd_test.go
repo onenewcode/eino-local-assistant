@@ -10,19 +10,15 @@ import (
 
 func TestGoalCommandShowsCompactTaskProjection(t *testing.T) {
 	backend := &taskControlModel{status: chat.TaskRunStatus{
-		Available:    true,
-		State:        "active",
-		Goal:         "add a read-only goal command to the terminal UI",
-		Requirements: 2,
-		Scenarios:    3,
-		Tasks:        4,
-		DoneTasks:    1,
-		ActiveTask:   "wire goal output",
-		PlanRequired: false,
-		Gaps: []string{
-			"finish the command wiring",
-			"run the focused regression tests",
-			"this third gap must stay out of the compact command output",
+		Available:   true,
+		State:       "active",
+		Goal:        "add a read-only goal command to the terminal UI",
+		Tasks:       2,
+		DoneTasks:   1,
+		ActiveTasks: []string{"step-2"},
+		Items: []chat.TaskListItem{
+			{ID: "step-1", Goal: "wire the command", State: "done"},
+			{ID: "step-2", Goal: "render the checklist", State: "working"},
 		},
 	}}
 	m := newModel(Deps{Ctx: context.Background(), Session: mustSession(t, backend, "system")})
@@ -36,32 +32,28 @@ func TestGoalCommandShowsCompactTaskProjection(t *testing.T) {
 		"Goal",
 		"Goal: add a read-only goal command to the terminal UI",
 		"State: active",
-		"Scope: requirements=2 scenarios=3 tasks=4",
-		"Progress: done=1/4",
-		"Active task: wire goal output",
-		"PlanRequired: false",
-		"Gaps:",
-		"- finish the command wiring",
-		"- run the focused regression tests",
+		"Progress: done=1/2",
+		"Active: step-2",
+		"Steps:",
+		"[done] wire the command",
+		"[working] render the checklist",
 	} {
 		if !hasLineContaining(mm.lines, lineSystem, want) {
 			t.Fatalf("/goal output missing %q: %#v", want, mm.lines)
 		}
 	}
-	if hasLineContaining(mm.lines, lineSystem, "third gap must stay out") {
-		t.Fatalf("/goal must cap gaps: %#v", mm.lines)
-	}
 }
 
 func TestGoalCommandCompactsAndTruncatesValues(t *testing.T) {
 	longGoal := strings.Repeat("goal ", goalCommandMaxValueWidth)
-	longGap := strings.Repeat("gap ", goalCommandMaxValueWidth)
 	status := chat.TaskRunStatus{
-		Available:  true,
-		State:      "recovery_error",
-		Goal:       "line one\nline two\t" + longGoal,
-		ActiveTask: "active\n task",
-		Gaps:       []string{longGap},
+		Available:   true,
+		State:       "recovery_error",
+		Goal:        "line one\nline two\t" + longGoal,
+		ActiveTasks: []string{"active\n task"},
+		Items: []chat.TaskListItem{
+			{ID: "step-1", Goal: "line one\nline two\t" + longGoal, State: "working"},
+		},
 	}
 	output := renderGoalCommand(status)
 	if strings.Contains(output, "line one\nline two") || strings.Contains(output, "active\n task") || strings.Contains(output, "\t") {

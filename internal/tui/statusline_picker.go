@@ -26,19 +26,6 @@ var statusLinePickerFieldRows = []statusLinePickerRow{
 	{field: statusFieldContextUsed, label: "context-used"},
 	{field: statusFieldUsedTokens, label: "used-tokens"},
 	{field: statusFieldTaskProgress, label: "task-progress"},
-	{field: statusFieldModel, label: "model"},
-	{field: statusFieldReasoning, label: "reasoning"},
-	{field: statusFieldActivity, label: "activity"},
-	{field: statusFieldSession, label: "session"},
-	{field: statusFieldTitle, label: "title"},
-	{field: statusFieldPolicy, label: "policy"},
-	{field: statusFieldQueue, label: "queue"},
-	{field: statusFieldFollow, label: "follow"},
-	// Names from the first release remain searchable so an existing selection
-	// can be edited rather than silently discarded on upgrade.
-	{field: statusFieldEffort, label: "effort (legacy)"},
-	{field: statusFieldContext, label: "context (legacy)"},
-	{field: statusFieldTask, label: "task (legacy)"},
 }
 
 func (m *model) statusLinePickerOpen() bool {
@@ -278,10 +265,7 @@ func (m *model) statusLinePickerView() string {
 	if len(rows) == 0 {
 		lines = append(lines, statusLinePickerSearchStyle.Render("  No matching fields"))
 	}
-	preview := renderStatusLine(m.statusLineSegmentsForConfig(m.statusLinePicker.draft), m.statusLinePicker.draft.UseThemeColors)
 	lines = append(lines,
-		statusLinePickerPreviewLabelStyle.Render("  Preview"),
-		statusLinePickerPreviewStyle.Render("  "+preview),
 		statusLinePickerFooterStyle.Render("  space toggle · enter save · esc cancel"),
 	)
 	return strings.Join(lines, "\n")

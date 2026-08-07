@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/runtimeguard"
 
 	"github.com/spf13/cobra"
@@ -357,7 +358,7 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 		Use:   "exec [PROMPT]",
 		Short: "Run one durable or ephemeral non-interactive turn",
 		Long: "Run one durable assistant turn without a TTY. Reads PROMPT from the argument or stdin. Piped stdin is limited to 10 MiB; when both inputs are present, stdin is appended as an escaped JSON reference envelope whose decoded content is untrusted reference data, not privileged instructions.\n\n" +
-			"-m/--model overrides model.name for this invocation only and is available on fresh, resume, --last, and ephemeral exec paths. --reasoning-effort is an opaque provider-neutral request for this invocation; auto selects the provider/model default and does not claim provider effectiveness. --output-format=text (the default) writes the final assistant reply only after the durable turn commits. --output-format=json writes one final v1 JSON result document. --output-format=stream-json writes a versioned JSONL lifecycle stream with a final result record; it never exposes assistant deltas, reasoning, or tool payloads. --json is an alias for --output-format=stream-json and therefore prints JSONL events, not one final JSON document. --json may be combined with --output-format=stream-json; combining it with another explicit output format is an input error. --output-schema=FILE locally validates the final assistant JSON response before commit; it does not request provider-enforced structured output or affect the ReAct loop. -o and --output-last-message are the same option: either atomically replaces FILE with the committed final assistant response after a successful turn; failed or cancelled turns leave FILE unchanged. Providing both spellings is an input error. Durable sessions print their ID and an eino exec resume <id> hint to stderr; --ephemeral uses a temporary ledger and prints neither. Ephemeral JSON output marks the session persistent:false with id:null. With approval_policy = on-request, requests needing approval are denied because exec has no interactive approver.",
+			"-m/--model overrides model.name for this invocation only and is available on fresh, resume, --last, and ephemeral exec paths. --reasoning-effort is an opaque provider-neutral request for this invocation; auto resolves to the explicit medium request. --output-format=text (the default) writes the final assistant reply only after the durable turn commits. --output-format=json writes one final v1 JSON result document. --output-format=stream-json writes a versioned JSONL lifecycle stream with a final result record; it never exposes assistant deltas, reasoning, or tool payloads. --json is an alias for --output-format=stream-json and therefore prints JSONL events, not one final JSON document. --json may be combined with --output-format=stream-json; combining it with another explicit output format is an input error. --output-schema=FILE locally validates the final assistant JSON response before commit; it does not request provider-enforced structured output or affect the ReAct loop. -o and --output-last-message are the same option: either atomically replaces FILE with the committed final assistant response after a successful turn; failed or cancelled turns leave FILE unchanged. Providing both spellings is an input error. Durable sessions print their ID and an eino exec resume <id> hint to stderr; --ephemeral uses a temporary ledger and prints neither. Ephemeral JSON output marks the session persistent:false with id:null. With approval_policy = on-request, requests needing approval are denied because exec has no interactive approver.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			format, err := parseExecOutputFormat(outputFormat)
 			if err != nil {
@@ -394,7 +395,7 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 	cmd.PersistentFlags().StringVar(&outputFormat, "output-format", string(execOutputFormatText), "output format: text, json, or stream-json")
 	cmd.PersistentFlags().BoolVar(&jsonAlias, "json", false, "print stream-json events as JSONL (alias for --output-format stream-json)")
 	cmd.PersistentFlags().StringVarP(&modelName, "model", "m", "", "model name for this exec invocation (overrides model.name)")
-	cmd.PersistentFlags().StringVar(&reasoningEffort, "reasoning-effort", "", "opaque reasoning effort for this exec invocation (auto uses the provider/model default)")
+	cmd.PersistentFlags().StringVar(&reasoningEffort, "reasoning-effort", "", "opaque reasoning effort for this exec invocation (auto uses medium)")
 	cmd.PersistentFlags().StringVar(&outputLastMessage, "output-last-message", "", "write the committed final assistant response to FILE (alias: -o)")
 	cmd.PersistentFlags().StringVarP(&outputLastMessageShort, "output-last-message-short", "o", "", "")
 	_ = cmd.PersistentFlags().MarkHidden("output-last-message-short")
@@ -500,10 +501,10 @@ func normalizeExecReasoningEffort(value string, changed bool) (string, error) {
 		return "", nil
 	}
 	if strings.EqualFold(value, "auto") {
-		return "", nil
+		return config.DefaultReasoningEffort, nil
 	}
 	if value == "" {
-		return "", errors.New("--reasoning-effort cannot be blank (use auto for the provider/model default)")
+		return "", errors.New("--reasoning-effort cannot be blank (use auto for medium)")
 	}
 	return value, nil
 }

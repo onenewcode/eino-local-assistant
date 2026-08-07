@@ -116,8 +116,8 @@ func New(tools ...tool.BaseTool) *Registry {
 }
 
 // Append adds tools to an existing registry through the same runtime guard as
-// built-ins. It is intended for product-owned tools such as task_plan,
-// task_progress, and task_complete that are registered after construction.
+// built-ins. It is intended for product-owned tools such as update_plan that
+// are registered after construction.
 // Passing an already guarded tool is idempotent and does not double-charge its
 // runtime budget.
 func (r *Registry) Append(tools ...tool.BaseTool) {

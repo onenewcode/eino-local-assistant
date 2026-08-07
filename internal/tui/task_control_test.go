@@ -21,10 +21,6 @@ func (m *taskControlModel) TaskExecutionStatus(context.Context) chat.TaskRunStat
 	return m.status
 }
 
-func (m *taskControlModel) TaskCompletionGate(context.Context) chat.TaskCompletionGate {
-	return chat.TaskCompletionGate{}
-}
-
 func (m *taskControlModel) InterruptTask(_ context.Context, reason string) chat.TaskInterruptReceipt {
 	m.interrupts = append(m.interrupts, reason)
 	if m.turnCancelled != nil {

@@ -1249,15 +1249,15 @@ func TestExecReasoningEffortAutoNormalizesAndBlankIsRejected(t *testing.T) {
 	if _, _, err := executeExecForTest(strings.NewReader(""), deps, "exec", "--reasoning-effort", "auto", "run"); err != nil {
 		t.Fatalf("auto: %v", err)
 	}
-	if got != "" {
-		t.Fatalf("auto effort = %q, want empty requested effort", got)
+	if got != config.DefaultReasoningEffort {
+		t.Fatalf("auto effort = %q, want %q", got, config.DefaultReasoningEffort)
 	}
 	got = "not-normalized"
 	if _, _, err := executeExecForTest(strings.NewReader(""), deps, "exec", "--reasoning-effort", "AUTO", "run"); err != nil {
 		t.Fatalf("AUTO: %v", err)
 	}
-	if got != "" {
-		t.Fatalf("case-insensitive auto effort = %q, want empty requested effort", got)
+	if got != config.DefaultReasoningEffort {
+		t.Fatalf("case-insensitive auto effort = %q, want %q", got, config.DefaultReasoningEffort)
 	}
 	_, _, err := executeExecForTest(strings.NewReader(""), deps, "exec", "--reasoning-effort", " ", "run")
 	if err == nil || !strings.Contains(err.Error(), "cannot be blank") {

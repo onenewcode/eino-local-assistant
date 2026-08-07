@@ -39,7 +39,11 @@ func formatToolCardWithInput(name, input, detail, phase string) string {
 		if summary := compactToolInput(name, input); summary != "" {
 			parts = append(parts, summary)
 		}
-		parts = append(parts, compactToolResult(detail))
+		if taskSummary, ok := compactTaskToolResult(name, detail); ok {
+			parts = append(parts, taskSummary)
+		} else {
+			parts = append(parts, compactToolResult(detail))
+		}
 	}
 
 	return name + "  " + strings.Join(parts, " · ")
@@ -126,6 +130,38 @@ func compactToolResult(raw string) string {
 		}
 	}
 	return "done"
+}
+
+func compactTaskToolResult(name, raw string) (string, bool) {
+	if name != "update_plan" {
+		return "", false
+	}
+	var result struct {
+		OK          bool   `json:"ok"`
+		RunState    string `json:"run_state"`
+		Message     string `json:"message"`
+		DisplayHint string `json:"display_hint"`
+	}
+	if json.Unmarshal([]byte(raw), &result) != nil {
+		return "", false
+	}
+	parts := make([]string, 0, 3)
+	if result.OK {
+		parts = append(parts, "accepted")
+	} else {
+		parts = append(parts, "rejected")
+	}
+	if state := taskPaneCompact(result.RunState); state != "" {
+		parts = append(parts, strings.ReplaceAll(state, "_", " "))
+	}
+	hint := taskPaneCompact(result.DisplayHint)
+	if hint == "" {
+		hint = taskPaneCompact(result.Message)
+	}
+	if hint != "" {
+		parts = append(parts, compactToolText(hint))
+	}
+	return strings.Join(parts, " · "), true
 }
 
 func resultMetadata(result map[string]any, includeDuration bool) string {

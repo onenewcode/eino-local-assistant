@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/usage"
 )
 
@@ -13,21 +14,9 @@ const (
 	statusFieldContextUsed        = "context-used"
 	statusFieldUsedTokens         = "used-tokens"
 	statusFieldTaskProgress       = "task-progress"
-	statusFieldModel              = "model"
-	statusFieldReasoning          = "reasoning"
-
-	// Legacy fields remain supported for user configurations written before
-	// the picker adopted Codex's names and grouping.
-	statusFieldEffort   = "effort"
-	statusFieldContext  = "context"
-	statusFieldActivity = "activity"
-	statusFieldSession  = "session"
-	statusFieldTitle    = "title"
-	statusFieldPolicy   = "policy"
-	statusFieldTask     = "task"
-	statusFieldQueue    = "queue"
-	statusFieldFollow   = "follow"
 )
+
+const defaultModelReasoningEffort = config.DefaultReasoningEffort
 
 var defaultStatusLineFields = []string{
 	statusFieldModelWithReasoning,
@@ -38,8 +27,6 @@ var defaultStatusLineFields = []string{
 
 var statusLineFieldSet = map[string]struct{}{
 	statusFieldModelWithReasoning: {}, statusFieldContextUsed: {}, statusFieldUsedTokens: {}, statusFieldTaskProgress: {},
-	statusFieldModel: {}, statusFieldReasoning: {}, statusFieldEffort: {}, statusFieldContext: {}, statusFieldActivity: {},
-	statusFieldSession: {}, statusFieldTitle: {}, statusFieldPolicy: {}, statusFieldTask: {}, statusFieldQueue: {}, statusFieldFollow: {},
 }
 
 // StatusLineConfig is the full persisted selection controlled by /statusline.
@@ -114,11 +101,11 @@ func statusLineContext(session *chat.Session) string {
 func (m *model) statusLineModelWithReasoning() string {
 	modelName := statusLineModelName(m.deps.Status.Model)
 	effort := strings.TrimSpace(m.deps.Status.ReasoningEffort)
+	if effort == "" {
+		effort = defaultModelReasoningEffort
+	}
 	if modelName == "" {
 		return effort
-	}
-	if effort == "" {
-		return modelName
 	}
 	return modelName + " " + effort
 }
@@ -162,30 +149,12 @@ func (m *model) statusLineSegments() []statusLineSegment {
 
 func (m *model) statusLineSegmentsForConfig(config StatusLineConfig) []statusLineSegment {
 	session := m.activeSession()
-	follow := !m.stickBottom && !m.viewport.AtBottom()
-	extras := collectStatusExtras(session, len(m.queue), follow, m.statusPolicyFragment())
-	if m.queuePaused {
-		extras.paused = "queue:paused"
-	}
 
 	values := map[string]string{
 		statusFieldModelWithReasoning: m.statusLineModelWithReasoning(),
 		statusFieldContextUsed:        statusLineContext(session),
 		statusFieldUsedTokens:         statusLineUsedTokens(session),
 		statusFieldTaskProgress:       joinStatusFields(statusLineTaskProgress(session), m.statusActivity()),
-		statusFieldModel:              statusLineModelName(m.deps.Status.Model),
-		statusFieldReasoning:          strings.TrimSpace(m.deps.Status.ReasoningEffort),
-		statusFieldEffort:             strings.TrimSpace(m.deps.Status.ReasoningEffort),
-		statusFieldContext:            statusLineContext(session),
-		statusFieldActivity:           m.statusActivity(),
-		statusFieldPolicy:             extras.cmdPolicy,
-		statusFieldTask:               extras.task,
-		statusFieldQueue:              joinStatusFields(extras.paused, extras.queued),
-		statusFieldFollow:             extras.follow,
-	}
-	if session != nil {
-		values[statusFieldSession] = shortSessionID(session.ID())
-		values[statusFieldTitle] = compactStatusTitle(session.Title())
 	}
 
 	segments := make([]statusLineSegment, 0, len(config.Fields))
@@ -222,9 +191,10 @@ func fitStatusLineSegments(width int, segments []statusLineSegment) []statusLine
 	}
 	kept := append([]statusLineSegment(nil), segments...)
 	for len(kept) > 1 && statusLineSegmentsWidth(kept) > width {
-		// Preserve the first configured field (normally model) and remove the
-		// least important trailing field at a constrained terminal width.
-		kept = kept[:len(kept)-1]
+		// Preserve model and task state whenever possible. Token usage is useful
+		// metadata but is the first field to give way to an active task/status.
+		drop := statusLineDropIndex(kept)
+		kept = append(kept[:drop], kept[drop+1:]...)
 	}
 	if len(kept) == 1 && statusLineSegmentsWidth(kept) > width && width > 1 {
 		runes := []rune(kept[0].text)
@@ -233,6 +203,15 @@ func fitStatusLineSegments(width int, segments []statusLineSegment) []statusLine
 		}
 	}
 	return kept
+}
+
+func statusLineDropIndex(segments []statusLineSegment) int {
+	for i := len(segments) - 1; i > 0; i-- {
+		if segments[i].field == statusFieldUsedTokens {
+			return i
+		}
+	}
+	return len(segments) - 1
 }
 
 func statusLineSegmentsWidth(segments []statusLineSegment) int {
@@ -302,12 +281,7 @@ func taskStatusFragment(session *chat.Session) string {
 	}
 	switch status.State {
 	case "active":
-		if status.PlanRequired {
-			return "task:plan"
-		}
 		return fmt.Sprintf("task:%d/%d", status.DoneTasks, status.Tasks)
-	case "complete":
-		return "task:complete"
 	case "interrupted":
 		return "task:interrupted"
 	default:
@@ -356,7 +330,6 @@ func joinStatusSuffix(e statusExtras) string {
 }
 
 type idleStatusParts struct {
-	model     string
 	shortID   string
 	title     string
 	cmdPolicy string
@@ -367,11 +340,8 @@ type idleStatusParts struct {
 	follow    string
 }
 
-func collectIdleStatus(session *chat.Session, modelName string, queueN int, followHint bool, cmdPolicy string) idleStatusParts {
+func collectIdleStatus(session *chat.Session, queueN int, followHint bool, cmdPolicy string) idleStatusParts {
 	p := idleStatusParts{}
-	if modelName != "" {
-		p.model = modelName
-	}
 	if session != nil {
 		if id := session.ID(); id != "" {
 			p.shortID = shortSessionID(id)
@@ -407,7 +377,6 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	optional := []seg{
 		{"title", p.title},
 		{"id", p.shortID},
-		{"model", p.model},
 		{"cmd", p.cmdPolicy},
 		{"context", p.context},
 		{"task", p.task},
@@ -419,7 +388,7 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	join := func(include map[string]bool) string {
 		parts := []string{base}
 		// Preferred display order (not drop order).
-		order := []string{"model", "id", "title", "cmd", "context", "task", "paused", "queued", "follow"}
+		order := []string{"id", "title", "cmd", "context", "task", "paused", "queued", "follow"}
 		for _, k := range order {
 			if !include[k] {
 				continue
@@ -434,14 +403,14 @@ func formatIdleStatus(width int, p idleStatusParts) string {
 	}
 
 	include := map[string]bool{
-		"title": true, "id": true, "model": true, "cmd": true,
+		"title": true, "id": true, "cmd": true,
 		"context": true, "task": true, "paused": true, "queued": true, "follow": true,
 	}
 	if width <= 0 {
 		width = 80
 	}
 	// Drop priority when over width — keep cmd/ctx longer than decoration.
-	dropOrder := []string{"title", "id", "model", "cmd", "context", "task"}
+	dropOrder := []string{"title", "id", "cmd", "context", "task"}
 	out := join(include)
 	for _, key := range dropOrder {
 		if len(out) <= width {

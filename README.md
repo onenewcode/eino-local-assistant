@@ -5,7 +5,7 @@
 
 - **交互终端（TTY）**：Bubble Tea 全屏 TUI（圆角输入框、状态条、滚动对话、markdown/工具卡片、spinner、斜杠命令）
 - **ReAct 工具循环**（Codex 子集）：`shell`、`apply_patch`，以及产品用 `get_current_time` / `read_artifact`；调用过程在 UI 中可见
-- **复杂任务控制器**：多步骤编码任务以需求—场景—任务图—shell proof 跟踪；图的紧凑投影随会话账本恢复，模型必须经 completion gate 才能交付
+- **任务清单（Codex 风格）**：多步骤工作可用 `update_plan` 维护 checklist；仅用于进度展示，不挡交付，不授予写权限
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 可按需在短生命周期 worker 中执行；默认关闭 OS sandbox，网络在所有模式下开放，并有总 turn / 模型决策 / tool-call 预算；显式 `--yolo`/`/permissions yolo` 会旁路 approval 与 OS sandbox，只保留尽力而为的命令和路径检查，不能作为安全边界
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，并可通过 `internal/chat.Session.Fork`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
 - **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话；TUI `/rules` 只查看当前 session 创建时捕获的 source metadata，不 reload 文件
@@ -13,6 +13,7 @@
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
+- **进程可观测性**：标准库 `log/slog` 结构化日志，默认持久化到 `~/.eino-assistant/logs/eino-YYYY-MM-DD.log`（见 [docs/logging.md](docs/logging.md)）；会话账本仍是 resume 真源
 - **CLI 子命令**：`chat` / `resume` / `sessions` / `version`（默认无子命令即 chat）
 
 需要交互式终端（`sessions` / `version` / `help` 除外）；管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
@@ -50,7 +51,7 @@ eino
 | `apply_patch` | create_file / update_file / delete_file | 默认 ask；与 shell 共用工作区沙盒边界 |
 | `get_current_time` | 真实本机时间 | 无 |
 | `read_artifact` | 当前 thread 的 artifact:// 证据 | thread 作用域 |
-| `task_plan` / `task_progress` / `task_complete` | 复杂任务的验收矩阵、proof 绑定与确定性完成门 | 无工作区权限；proof 只能引用实际 `shell` 结果 |
+| `update_plan` | 多步骤 checklist（pending / in_progress / completed，至多一个 in_progress） | 进度 UI only；不挡交付；写入仍由 permissions/sandbox 管 |
 
 工具的权限语言仍不是安全边界；实际文件和网络隔离由 sandbox worker 提供。
 
@@ -91,7 +92,7 @@ yolo 同时绕过普通 approval/approver/session allow-deny 和 `shell`/`apply_
 
 危险警告会写入启动 stderr，并显示在 TUI transcript、状态栏和 `/permissions` 报告中。成功的 shell/apply_patch yolo 结果带有 `SandboxOutcome` 元数据（`mode=yolo`、`backend=host`、`bypassed=true`），便于 tool lifecycle/artifact 审计。yolo 只存在当前进程，不写 TOML、session ledger 或 resume 数据。
 
-`model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。`model.context` 只有一个设置：`window_tokens`，即模型的完整物理上下文窗口。它必须与实际部署相符；状态栏和 `/context` 都以这个完整窗口为分母，绝不会显示“窗口减输出预留”这一误导性的容量。
+`model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。`model.reasoning_effort` 省略时固定为 `medium`：启动、恢复会话和模型选择都会把该值作为实际请求传给 provider，并写入会话账本，而不是只在状态栏显示。`model.context` 只有一个设置：`window_tokens`，即模型的完整物理上下文窗口。它必须与实际部署相符；状态栏和 `/context` 都以这个完整窗口为分母，绝不会显示“窗口减输出预留”这一误导性的容量。
 
 使用 Anthropic 时，配置其公开的 Messages API（不是 Claude Code 的本地会话、OAuth 或订阅协议）：
 

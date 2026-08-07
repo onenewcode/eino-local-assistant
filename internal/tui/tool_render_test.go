@@ -61,6 +61,15 @@ func TestFormatToolCardSummarizesShellWithoutSandboxJSON(t *testing.T) {
 	}
 }
 
+func TestFormatToolCardExplainsUpdatePlanResult(t *testing.T) {
+	card := formatToolCardWithInput("update_plan", `{"plan":[{"step":"inspect","status":"completed"}]}`, `{"ok":true,"run_state":"active","complete":false,"message":"Plan updated","display_hint":"Plan updated"}`, "ok")
+	for _, want := range []string{"update_plan", "accepted", "Plan updated"} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("update_plan card missing %q: %q", want, card)
+		}
+	}
+}
+
 func TestUpdateOpenToolCardInPlace(t *testing.T) {
 	m := newTestModel(t)
 	m.turnID = 1

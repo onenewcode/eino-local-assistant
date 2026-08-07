@@ -300,8 +300,9 @@ func assertAnthropicRequest(t *testing.T, request anthropicRequest) {
 	if got, ok := request.body["stream"].(bool); !ok || !got {
 		t.Errorf("stream = %#v, want true", request.body["stream"])
 	}
-	if _, ok := request.body["output_config"]; ok {
-		t.Errorf("output_config = %#v, want omitted by default", request.body["output_config"])
+	outputConfig := objectValue(t, request.body["output_config"])
+	if got, want := stringValue(t, outputConfig["effort"]), config.DefaultReasoningEffort; got != want {
+		t.Errorf("output_config.effort = %q, want %q", got, want)
 	}
 
 	system := arrayValue(t, request.body["system"])

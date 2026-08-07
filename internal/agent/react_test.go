@@ -17,8 +17,6 @@ import (
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/tools"
 
-	"github.com/cloudwego/eino/callbacks"
-	"github.com/cloudwego/eino/components"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
@@ -1237,7 +1235,7 @@ func TestReActSteerIsDeliveredOnlyAtNextModelBoundary(t *testing.T) {
 	}
 }
 
-func TestReActTaskCallbackCreatesPlanRequiredGateAfterUnplannedPatch(t *testing.T) {
+func TestReActUnplannedPatchDoesNotArmCompletionGate(t *testing.T) {
 	workspace := t.TempDir()
 	patchTool, err := tools.NewApplyPatch(tools.ApplyPatchOptions{
 		WorkspaceRoot: workspace,
@@ -1259,9 +1257,7 @@ func TestReActTaskCallbackCreatesPlanRequiredGateAfterUnplannedPatch(t *testing.
 				},
 			}},
 		}},
-		{message: schema.AssistantMessage("premature delivery", nil)},
-		{message: schema.AssistantMessage("still not planned", nil)},
-		{message: schema.AssistantMessage("still not planned", nil)},
+		{message: schema.AssistantMessage("done without task trap", nil)},
 	}}
 	reactModel, err := NewReActModelWithOptions(context.Background(), fake, []tool.BaseTool{patchTool}, ReActOptions{
 		MaxModelSteps:  6,
@@ -1275,65 +1271,14 @@ func TestReActTaskCallbackCreatesPlanRequiredGateAfterUnplannedPatch(t *testing.
 		t.Fatalf("NewSession: %v", err)
 	}
 
-	err = session.Ask(context.Background(), "edit the file", nil)
-	if !errors.Is(err, chat.ErrTaskCompletionUnresolved) {
-		t.Fatalf("Ask error = %v, want unresolved task completion", err)
+	if err := session.Ask(context.Background(), "edit the file", nil); err != nil {
+		t.Fatalf("Ask error = %v, want success under soft plan", err)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "changed.txt")); err != nil {
 		t.Fatalf("apply_patch did not run: %v", err)
 	}
-	status := session.TaskStatus()
-	if status.State != taskRunActive || !strings.Contains(strings.Join(status.Gaps, " "), "before a task plan") {
-		t.Fatalf("task status after callback = %#v", status)
-	}
-	if len(fake.requests) < 3 || !containsTaskPacket(fake.requests[2], "Create a fresh task_plan") {
-		t.Fatalf("continuation request missing controller packet: %#v", fake.requests)
-	}
-}
-
-func TestReActTaskCallbackInvalidatesProofAfterApplyPatchError(t *testing.T) {
-	controller := NewTaskController()
-	ctx := taskTestContext(t, "task-callback-patch-error")
-	if result, err := controller.SetPlan(ctx, simpleTaskPlan()); err != nil || !result.OK {
-		t.Fatalf("SetPlan = %#v, %v", result, err)
-	}
-	if result, err := controller.StartTask(ctx, "implement"); err != nil || !result.OK {
-		t.Fatalf("StartTask = %#v, %v", result, err)
-	}
-	controller.RecordToolResult(ctx, "shell", "proof", "", `{"command":"go test ./internal/example","exit_code":0}`)
-	if result, err := controller.RecordProof(ctx, "implement", "unit", "proof"); err != nil || !result.OK {
-		t.Fatalf("RecordProof = %#v, %v", result, err)
-	}
-
-	toolEventCallback(nil, controller).OnError(ctx, &callbacks.RunInfo{
-		Component: components.ComponentOfTool,
-		Name:      "apply_patch",
-	}, errors.New("write second file: disk full"))
-	if status := controller.TaskExecutionStatus(ctx); status.DoneTasks != 0 || len(status.Gaps) == 0 {
-		t.Fatalf("apply_patch callback error must invalidate evidence: %#v", status)
-	}
-}
-
-func TestReActTaskCallbackInvalidatesProofAfterShellError(t *testing.T) {
-	controller := NewTaskController()
-	ctx := taskTestContext(t, "task-callback-shell-error")
-	if result, err := controller.SetPlan(ctx, simpleTaskPlan()); err != nil || !result.OK {
-		t.Fatalf("SetPlan = %#v, %v", result, err)
-	}
-	if result, err := controller.StartTask(ctx, "implement"); err != nil || !result.OK {
-		t.Fatalf("StartTask = %#v, %v", result, err)
-	}
-	controller.RecordToolResult(ctx, "shell", "proof", "", `{"command":"go test ./internal/example","exit_code":0}`)
-	if result, err := controller.RecordProof(ctx, "implement", "unit", "proof"); err != nil || !result.OK {
-		t.Fatalf("RecordProof = %#v, %v", result, err)
-	}
-
-	toolEventCallback(nil, controller).OnError(ctx, &callbacks.RunInfo{
-		Component: components.ComponentOfTool,
-		Name:      "shell",
-	}, errors.New("wait command: transport lost after process start"))
-	if status := controller.TaskExecutionStatus(ctx); status.DoneTasks != 0 || len(status.Gaps) == 0 {
-		t.Fatalf("shell callback error must invalidate evidence: %#v", status)
+	if status := session.TaskStatus(); status.Available {
+		t.Fatalf("soft plan must not invent a checklist after unplanned patch: %#v", status)
 	}
 }
 
@@ -1344,6 +1289,110 @@ func containsTaskPacket(messages []*schema.Message, fragment string) bool {
 		}
 	}
 	return false
+}
+
+func TestReActInjectsChecklistPacketWhilePlanActive(t *testing.T) {
+	controller := NewTaskController()
+	ctx := taskTestContext(t, "react-plan-packet")
+	if result, err := controller.UpdatePlan(ctx, samplePlan()); err != nil || !result.OK {
+		t.Fatalf("UpdatePlan = %#v, %v", result, err)
+	}
+	fake := &scriptedToolModel{responses: []modelResponse{
+		{message: schema.AssistantMessage("working from checklist", nil)},
+	}}
+	model, err := NewReActModelWithOptions(context.Background(), fake, []tool.BaseTool{&recordingTool{name: "unused"}}, ReActOptions{MaxModelSteps: 1, TaskController: controller})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions: %v", err)
+	}
+	stream, err := model.Stream(ctx, []*schema.Message{schema.UserMessage("continue")})
+	if err != nil {
+		t.Fatalf("Stream = %v", err)
+	}
+	for {
+		_, receiveErr := stream.Recv()
+		if errors.Is(receiveErr, io.EOF) {
+			break
+		}
+		if receiveErr != nil {
+			t.Fatalf("Recv = %v", receiveErr)
+		}
+	}
+	if len(fake.requests) != 1 || !containsTaskPacket(fake.requests[0], "implement the change") {
+		t.Fatalf("expected checklist packet in model request: %#v", fake.requests)
+	}
+}
+
+func TestReActUpdatePlanMixedBatchRequestsSequentialRetry(t *testing.T) {
+	controller := NewTaskController()
+	taskTools, err := NewTaskTools(controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary := &recordingTool{name: "ordinary"}
+	allTools := append(taskTools, ordinary)
+	model, err := NewReActModelWithOptions(context.Background(), &scriptedToolModel{}, allTools, ReActOptions{TaskController: controller})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions: %v", err)
+	}
+	response := &schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{
+		{ID: "control", Type: "function", Function: schema.FunctionCall{Name: "update_plan", Arguments: `{"plan":[{"step":"a","status":"pending"}]}`}},
+		{ID: "ordinary", Type: "function", Function: schema.FunctionCall{Name: "ordinary", Arguments: `{}`}},
+	}}
+	decisions, err := model.admitToolBatch(taskTestContext(t, "react-mixed-batch"), response)
+	if err != nil {
+		t.Fatalf("admitToolBatch = %v", err)
+	}
+	for _, decision := range decisions {
+		if decision.denialReason != "requires_sequential_execution" {
+			t.Fatalf("mixed plan batch admission = %#v", decisions)
+		}
+	}
+	results, err := model.invokeAdmittedToolBatch(context.Background(), response, decisions, nil)
+	if err != nil {
+		t.Fatalf("invokeAdmittedToolBatch = %v", err)
+	}
+	if ordinary.Calls() != 0 {
+		t.Fatalf("mixed plan batch executed ordinary tool %d times", ordinary.Calls())
+	}
+	for _, result := range results {
+		if !strings.Contains(result.Content, `"retry_next_model_call":true`) || strings.Contains(result.Content, `"stop_retrying":true`) {
+			t.Fatalf("sequential retry result = %s", result.Content)
+		}
+	}
+}
+
+func TestReActSoftPlanDoesNotReportRepairBudgetExhausted(t *testing.T) {
+	controller := NewTaskController()
+	fake := &scriptedToolModel{responses: []modelResponse{{message: schema.AssistantMessage("final answer", nil)}}}
+	model, err := NewReActModelWithOptions(context.Background(), fake, []tool.BaseTool{&recordingTool{name: "unused"}}, ReActOptions{MaxModelSteps: 1, TaskController: controller})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions: %v", err)
+	}
+	taskCtx := taskTestContext(t, "react-soft-plan-budget")
+	if result, err := controller.UpdatePlan(taskCtx, samplePlan()); err != nil || !result.OK {
+		t.Fatalf("UpdatePlan = %#v, %v", result, err)
+	}
+	turnCtx, cancel, err := runtimeguard.WithTurnContext(taskCtx, runtimeguard.TurnOptions{MaxModelSteps: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if err := runtimeguard.AcquireModelStep(turnCtx); err != nil {
+		t.Fatalf("consume model step = %v", err)
+	}
+	stream, err := model.Stream(turnCtx, []*schema.Message{schema.UserMessage("continue")})
+	if err != nil {
+		t.Fatalf("Stream = %v, want final path under soft plan", err)
+	}
+	for {
+		_, receiveErr := stream.Recv()
+		if errors.Is(receiveErr, io.EOF) {
+			break
+		}
+		if receiveErr != nil {
+			t.Fatalf("Recv = %v", receiveErr)
+		}
+	}
 }
 
 func TestContentThenToolStreamToolCallCheckerFindsLaterToolCalls(t *testing.T) {

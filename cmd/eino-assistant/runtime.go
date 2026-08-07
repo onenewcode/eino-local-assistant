@@ -14,6 +14,7 @@ import (
 	"eino-local-assistant/internal/chat"
 	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/contextbuild"
+	"eino-local-assistant/internal/logging"
 	"eino-local-assistant/internal/memory"
 	"eino-local-assistant/internal/provider"
 	"eino-local-assistant/internal/sandbox"
@@ -51,6 +52,7 @@ type commandRuntime struct {
 	session               *chat.Session
 	sessionStore          *store.ThreadStore
 	ephemeralStoreRoot    string
+	logger                *logging.Logger
 	chatModel             model.ToolCallingChatModel
 	modelMu               sync.RWMutex
 	registry              *tools.Registry
@@ -256,6 +258,14 @@ func (r *commandRuntime) Close() error {
 		return nil
 	}
 	var closeErrs []error
+	if r.session != nil {
+		logging.L().Info("runtime closing",
+			"component", "runtime",
+			"session_id", r.session.ID(),
+		)
+	} else {
+		logging.L().Info("runtime closing", "component", "runtime")
+	}
 	if r.sandboxRunner != nil {
 		if err := r.sandboxRunner.Close(); err != nil {
 			closeErrs = append(closeErrs, fmt.Errorf("close sandbox runner: %w", err))
@@ -273,6 +283,11 @@ func (r *commandRuntime) Close() error {
 	}
 	if err := joinEphemeralStoreCleanupError(nil, r.ephemeralStoreRoot); err != nil {
 		closeErrs = append(closeErrs, err)
+	}
+	if r.logger != nil {
+		if err := r.logger.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close logger: %w", err))
+		}
 	}
 	return errors.Join(closeErrs...)
 }
@@ -410,6 +425,18 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
+	// Durable process logs live under the configured storage root (or an
+	// explicit logging.dir). Ephemeral exec still uses the durable data root
+	// for diagnostics so a temp ledger does not hide operational logs.
+	logger, err := openRuntimeLogger(cfg, dataDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil && logger != nil {
+			_ = logger.Close()
+		}
+	}()
 	sourceDataDir := dataDir
 	sourceThreadPath := ""
 	var sourceStore *store.ThreadStore
@@ -591,6 +618,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		cfg:                cfg,
 		sessionStore:       sessionStore,
 		ephemeralStoreRoot: ephemeralStoreRoot,
+		logger:             logger,
 		registry:           registry,
 		taskController:     taskController,
 		modelFactory:       defaultRuntimeModelFactory(),
@@ -653,7 +681,52 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	runtime.rulesSnapshotReady = start.resumeID == ""
 	runtime.rulesSnapshotStatus = initialRulesSnapshotStatus(start.resumeID == "")
 	runtime.composePrompt = runtime.composeSystemPrompt
+
+	mode := "chat"
+	if start.ephemeral {
+		mode = "exec-ephemeral"
+	} else if strings.TrimSpace(start.resumeID) != "" {
+		mode = "resume"
+	}
+	logging.L().Info("runtime started",
+		"component", "runtime",
+		"mode", mode,
+		"session_id", session.ID(),
+		"model", cfg.Model.Name,
+		"provider", cfg.Model.Provider,
+		"workspace", workspaceRoot,
+		"approval_policy", string(approvalMode),
+		"sandbox_mode", cfg.Sandbox.ModeNormalized(),
+		"ephemeral", start.ephemeral,
+		"log_path", logger.Path(),
+		"yolo", start.yolo,
+	)
 	return runtime, nil
+}
+
+// openRuntimeLogger installs the process default slog logger. File logs use the
+// durable storage root (not an ephemeral exec ledger) so diagnostics survive a
+// one-shot run. Failure to open logging fails startup: silent loss of
+// observability is worse than a clear configuration error.
+func openRuntimeLogger(cfg config.Config, dataDir string) (*logging.Logger, error) {
+	enabled := cfg.Logging.LoggingEnabled()
+	logger, err := logging.Open(logging.Options{
+		Enabled:       &enabled,
+		Level:         cfg.Logging.Level,
+		Dir:           cfg.Logging.Dir,
+		Format:        cfg.Logging.Format,
+		Stderr:        cfg.Logging.Stderr,
+		RetentionDays: cfg.Logging.RetentionDays,
+		AddSource:     cfg.Logging.AddSource,
+		DataDir:       dataDir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open process logger: %w", err)
+	}
+	if logger != nil && logger.Logger != nil {
+		logging.SetDefault(logger.Logger)
+	}
+	return logger, nil
 }
 
 func initialRulesSnapshotStatus(ready bool) string {
@@ -701,6 +774,12 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Normalize the request before it reaches both the provider factory and the
+	// durable session binding. This keeps the selected effort from becoming a
+	// TUI-only value when a caller supplied an omitted or legacy empty setting.
+	if err := cfg.Model.Validate(); err != nil {
+		return runtimeModelBundle{}, fmt.Errorf("validate model configuration: %w", err)
 	}
 	contextCfg := contextConfigFromModel(cfg.Model)
 	rawModel, err := factory.newChatModel(ctx, cfg.Model)
@@ -851,7 +930,8 @@ func (r *commandRuntime) openSession(ctx context.Context, id string, recoverInte
 		if err := applyModelOverride(&cfg, durableName); err != nil {
 			return runtimeSessionOpenResult{}, err
 		}
-		// Restore the stored request, including empty provider-default semantics.
+		// Restore the stored request. Legacy empty values normalize to medium when
+		// the candidate bundle is built below.
 		cfg.Model.ReasoningEffort = strings.TrimSpace(meta.ReasoningEffort)
 	}
 	candidate, err := r.buildModelBundle(ctx, cfg, recoverInterrupted)

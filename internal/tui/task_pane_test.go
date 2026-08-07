@@ -12,18 +12,19 @@ import (
 
 func TestCtrlTTogglesTaskProgressPane(t *testing.T) {
 	backend := &taskControlModel{status: chat.TaskRunStatus{
-		Available:    true,
-		State:        "active",
-		Goal:         "add task progress to the terminal UI",
-		Requirements: 2,
-		Scenarios:    3,
-		Tasks:        3,
-		DoneTasks:    1,
-		ActiveTask:   "render-progress",
-		Gaps: []string{
-			"bind the task state to the UI",
-			"verify the TUI layout",
-			"this third gap stays out of the compact pane",
+		Available:   true,
+		State:       "active",
+		Goal:        "add task progress to the terminal UI",
+		Tasks:       3,
+		DoneTasks:   1,
+		ActiveTasks: []string{"step-2"},
+		Items: []chat.TaskListItem{
+			{ID: "step-1", Goal: "bind the task state to the UI", State: "done"},
+			{ID: "step-2", Goal: "render the task list", State: "working"},
+			{ID: "step-3", Goal: "verify the TUI layout", State: "pending"},
+			{ID: "step-4", Goal: "test the empty state", State: "pending"},
+			{ID: "step-5", Goal: "document the result", State: "pending"},
+			{ID: "step-6", Goal: "this item stays in /goal", State: "pending"},
 		},
 	}}
 	session := mustSession(t, backend, "system")
@@ -44,19 +45,18 @@ func TestCtrlTTogglesTaskProgressPane(t *testing.T) {
 	view := opened.View()
 	for _, want := range []string{
 		"Tasks · active · 1/3",
-		"Goal: add task progress to the terminal UI",
-		"Scope: 2 requirements · 3 scenarios",
-		"Current: render-progress",
-		"Gap: bind the task state to the UI",
-		"Gap: verify the TUI layout",
+		"bind the task state to the UI",
+		"render the task list",
+		"verify the TUI layout",
+		"+1 more via /goal",
 		"ctrl+t hide task progress",
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("task pane missing %q:\n%s", want, view)
 		}
 	}
-	if strings.Contains(view, "this third gap stays out") {
-		t.Fatalf("task pane must stay compact:\n%s", view)
+	if strings.Contains(view, "this item stays in /goal") {
+		t.Fatalf("task pane must keep overflow in /goal:\n%s", view)
 	}
 
 	next, _ = opened.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
