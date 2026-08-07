@@ -94,32 +94,46 @@ func FormatContextSnapshot(snapshot *store.ContextSnapshot) string {
 	if snapshot == nil {
 		return "context=unknown"
 	}
-	if snapshot.BudgetTokens <= 0 {
+	if snapshot.WindowTokens <= 0 {
 		return "context=" + FormatTokens(snapshot.PromptTokens)
 	}
-	pct := snapshot.PromptTokens * 100 / snapshot.BudgetTokens
+	pct := snapshot.PromptTokens * 100 / snapshot.WindowTokens
 	return fmt.Sprintf("context=%s/%s (%d%%)",
 		FormatTokens(snapshot.PromptTokens),
-		FormatTokens(snapshot.BudgetTokens),
+		FormatTokens(snapshot.WindowTokens),
 		pct,
 	)
 }
 
-// FormatCompactContextSnapshot is the status-bar form of a measured context
-// snapshot. Returns "" when no trustworthy measurement exists so callers can
-// omit the fragment instead of showing a placeholder.
+// FormatCompactContextSnapshot is the status-bar form of the last measured
+// provider request. Returns "" when no trustworthy measurement exists so
+// callers can omit the fragment instead of showing a placeholder.
 // Uses full PromptTokens for window occupancy (not uncached input).
 func FormatCompactContextSnapshot(snapshot *store.ContextSnapshot) string {
 	if snapshot == nil {
 		return ""
 	}
-	if snapshot.BudgetTokens <= 0 {
+	if snapshot.WindowTokens <= 0 {
 		return "ctx=" + FormatTokens(snapshot.PromptTokens)
 	}
-	pct := snapshot.PromptTokens * 100 / snapshot.BudgetTokens
+	pct := snapshot.PromptTokens * 100 / snapshot.WindowTokens
 	return fmt.Sprintf("ctx=%s/%s (%d%%)",
 		FormatTokens(snapshot.PromptTokens),
-		FormatTokens(snapshot.BudgetTokens),
+		FormatTokens(snapshot.WindowTokens),
+		pct,
+	)
+}
+
+// FormatCompactEstimatedContext is the status-bar form of a locally planned
+// request. The approximate marker distinguishes it from provider usage.
+func FormatCompactEstimatedContext(tokens, windowTokens int) string {
+	if windowTokens <= 0 {
+		return "ctx≈" + FormatTokens(tokens)
+	}
+	pct := tokens * 100 / windowTokens
+	return fmt.Sprintf("ctx≈%s/%s (%d%%)",
+		FormatTokens(tokens),
+		FormatTokens(windowTokens),
 		pct,
 	)
 }

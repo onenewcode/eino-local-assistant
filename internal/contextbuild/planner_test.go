@@ -15,17 +15,11 @@ func TestDefaultConfigIncludesPlanningDefaults(t *testing.T) {
 	if cfg.WindowTokens != 32_000 {
 		t.Fatalf("WindowTokens = %d, want 32000", cfg.WindowTokens)
 	}
-	if cfg.MaxOutputTokens != 4_096 {
-		t.Fatalf("MaxOutputTokens = %d, want 4096", cfg.MaxOutputTokens)
+	if cfg.AutoCompactTriggerTokens() != 27_200 || cfg.RequestAdmissionCeilingTokens() != 30_400 || cfg.PostCompactTargetTokens() != 16_000 {
+		t.Fatalf("fixed policy = trigger %d ceiling %d target %d", cfg.AutoCompactTriggerTokens(), cfg.RequestAdmissionCeilingTokens(), cfg.PostCompactTargetTokens())
 	}
-	if cfg.AutoCompactTriggerPercent != 75 || cfg.PostCompactTargetPercent != 45 {
-		t.Fatalf("trigger/target = %d/%d", cfg.AutoCompactTriggerPercent, cfg.PostCompactTargetPercent)
-	}
-	if cfg.SummaryMaxTokens != 2_048 || cfg.KeepRecentTurns != 12 {
-		t.Fatalf("summary/recent = %d/%d", cfg.SummaryMaxTokens, cfg.KeepRecentTurns)
-	}
-	if cfg.LowGainThresholdPercent != 15 {
-		t.Fatalf("low gain threshold = %d", cfg.LowGainThresholdPercent)
+	if cfg.KeepRecentTurnGroups() != 12 || cfg.CheckpointTargetTokens() != 2_000 || cfg.MinimumCompactionGainPercent() != 20 {
+		t.Fatalf("fixed compaction policy is inconsistent: %+v", cfg)
 	}
 }
 
@@ -37,20 +31,39 @@ func TestConfigNormalizeTreatsZeroAsProductDefault(t *testing.T) {
 	}
 }
 
-func TestContextPlannerRejectsOutputAtOrAboveWindow(t *testing.T) {
-	planner := NewContextPlanner(Config{WindowTokens: 4_096, MaxOutputTokens: 4_096})
+func TestContextPlannerRejectsNegativeWindow(t *testing.T) {
+	planner := NewContextPlanner(Config{WindowTokens: -1})
 	if err := planner.ValidateConfig(); err == nil {
 		t.Fatal("ValidateConfig() error = nil, want an invalid budget error")
 	}
 }
 
+func TestAdmissionPolicyCountsBoundToolSchemas(t *testing.T) {
+	messages := []*schema.Message{schema.SystemMessage("system"), schema.UserMessage("inspect this")}
+	tool := &schema.ToolInfo{
+		Name: "read_large_evidence",
+		Desc: strings.Repeat("schema description ", 80),
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"artifact_id": {Type: schema.String, Desc: "Content-addressed artifact identifier.", Required: true},
+		}),
+	}
+	withoutTools := NewAdmissionPolicy(32_000, nil)
+	withTools := NewAdmissionPolicy(32_000, []*schema.ToolInfo{tool})
+
+	if withTools.ToolSchemaTokens <= 0 {
+		t.Fatalf("tool schema estimate = %d, want positive", withTools.ToolSchemaTokens)
+	}
+	if withTools.EstimateRequestTokens(messages) <= withoutTools.EstimateRequestTokens(messages) {
+		t.Fatalf("tool-enabled request estimate = %d, want greater than no-tools estimate %d", withTools.EstimateRequestTokens(messages), withoutTools.EstimateRequestTokens(messages))
+	}
+	if withTools.MaxResponseTokens(messages) >= withoutTools.MaxResponseTokens(messages) {
+		t.Fatalf("tool-enabled remaining output = %d, want less than no-tools remaining output %d", withTools.MaxResponseTokens(messages), withoutTools.MaxResponseTokens(messages))
+	}
+}
+
 func TestContextPlannerKeepsCompleteRecentSuffixAndCurrentLast(t *testing.T) {
 	planner := NewContextPlanner(Config{
-		WindowTokens:              1_000,
-		MaxOutputTokens:           100,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
-		SummaryMaxTokens:          256,
+		WindowTokens: 900,
 	})
 
 	toolIndex := 0
@@ -120,8 +133,7 @@ func TestArtifactEstimateIncludesRenderedMessageFraming(t *testing.T) {
 
 func TestContextPlannerRejectsImmutableOverBudget(t *testing.T) {
 	planner := NewContextPlanner(Config{
-		WindowTokens:    400,
-		MaxOutputTokens: 100,
+		WindowTokens: 400,
 	})
 	_, err := planner.Plan(PlannerInput{
 		ImmutableMessages: []*schema.Message{schema.SystemMessage(strings.Repeat("s", 2_000))},
@@ -133,7 +145,7 @@ func TestContextPlannerRejectsImmutableOverBudget(t *testing.T) {
 }
 
 func TestContextPlannerArtifactReferencesStayOutsideSourceMessages(t *testing.T) {
-	planner := NewContextPlanner(Config{WindowTokens: 2_000, MaxOutputTokens: 200})
+	planner := NewContextPlanner(Config{WindowTokens: 2_000})
 	plan, err := planner.Plan(PlannerInput{
 		ImmutableMessages: []*schema.Message{schema.SystemMessage("system")},
 		CurrentMessages:   []*schema.Message{schema.UserMessage("question")},

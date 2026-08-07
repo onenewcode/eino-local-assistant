@@ -22,12 +22,16 @@ type sourceFingerprint [sha256.Size]byte
 // withReadOnlyThread locks the journal file itself. There is no separate lock
 // file, so a session has no lock-file lifecycle to clean up.
 func (s *ThreadStore) withReadOnlyThread(ctx context.Context, id string, fn func(string, bool) error) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	path, err := s.threadJournalPath(id)
 	if err != nil {
 		return err
+	}
+	return s.withReadOnlyThreadPath(ctx, id, path, fn)
+}
+
+func (s *ThreadStore) withReadOnlyThreadPath(ctx context.Context, id, path string, fn func(string, bool) error) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	info, err := os.Lstat(path)
 	if err != nil {

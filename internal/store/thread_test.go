@@ -482,15 +482,7 @@ func TestThreadStoreHonorsWriterLockContext(t *testing.T) {
 	}
 }
 
-func TestThreadStoreArtifactTruncationAndCheckpointRecovery(t *testing.T) {
-	oldArtifactLimit, oldThreadLimit := artifactRetentionLimit, threadRetentionLimit
-	artifactRetentionLimit = 32
-	threadRetentionLimit = 48
-	t.Cleanup(func() {
-		artifactRetentionLimit = oldArtifactLimit
-		threadRetentionLimit = oldThreadLimit
-	})
-
+func TestThreadStoreArtifactPayloadAndCheckpointRecovery(t *testing.T) {
 	store, err := NewThreadStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -504,11 +496,8 @@ func TestThreadStoreArtifactTruncationAndCheckpointRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutArtifact: %v", err)
 	}
-	if !artifact.Truncated || artifact.OriginalSize != 80 || artifact.StoredSize > artifactRetentionLimit || artifact.Digest == "" {
+	if artifact.Size != 80 || artifact.Digest == "" || len(artifact.Data) != 80 {
 		t.Fatalf("artifact = %#v", artifact)
-	}
-	if len(artifact.Head)+len(artifact.Tail) != int(artifact.StoredSize) {
-		t.Fatalf("artifact excerpts = %d, stored = %d", len(artifact.Head)+len(artifact.Tail), artifact.StoredSize)
 	}
 
 	payload := json.RawMessage(`{"decisions":["keep system","summarize old work"]}`)
@@ -599,15 +588,7 @@ func TestThreadStoreCheckpointLineageKeepsDirectSourcesSeparate(t *testing.T) {
 	}
 }
 
-func TestThreadStoreReadsRetentionTruncatedArtifactInBoundedPages(t *testing.T) {
-	oldArtifactLimit, oldThreadLimit := artifactRetentionLimit, threadRetentionLimit
-	artifactRetentionLimit = 8
-	threadRetentionLimit = 8
-	t.Cleanup(func() {
-		artifactRetentionLimit = oldArtifactLimit
-		threadRetentionLimit = oldThreadLimit
-	})
-
+func TestThreadStoreReadsFullArtifactInBoundedPages(t *testing.T) {
 	threadStore, err := NewThreadStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -621,17 +602,17 @@ func TestThreadStoreReadsRetentionTruncatedArtifactInBoundedPages(t *testing.T) 
 	if err != nil {
 		t.Fatalf("PutArtifact: %v", err)
 	}
-	if !artifact.Truncated || string(artifact.Head) != "0123" || string(artifact.Tail) != "wxyz" {
-		t.Fatalf("truncated artifact = %#v", artifact)
+	if string(artifact.Data) != "0123456789abcdefghijklmnopqrstuvwxyz" {
+		t.Fatalf("full artifact = %#v", artifact)
 	}
 	state = persistArtifactForThreadTest(ctx, t, threadStore, state, artifact, "artifact-pages")
-	want := "0123" + artifactTruncationMarker + "wxyz"
+	want := "0123456789abcdefghijklmnopqrstuvwxyz"
 
 	first, err := threadStore.ReadArtifact(ctx, state.ID, artifact.ID, 0, 3)
 	if err != nil {
 		t.Fatalf("first ReadArtifact: %v", err)
 	}
-	if got := string(first.Data); got != "012" || !first.HasMore || !first.Ref.Truncated {
+	if got := string(first.Data); got != "012" || !first.HasMore {
 		t.Fatalf("first page = %#v, data=%q", first, got)
 	}
 
@@ -649,15 +630,12 @@ func TestThreadStoreReadsRetentionTruncatedArtifactInBoundedPages(t *testing.T) 
 			break
 		}
 		if len(page.Data) == 0 {
-			t.Fatal("truncated artifact page reported more bytes without data")
+			t.Fatal("artifact page reported more bytes without data")
 		}
 		offset += int64(len(page.Data))
 	}
 	if string(got) != want {
-		t.Fatalf("paged truncated excerpt = %q, want %q", got, want)
-	}
-	if strings.Contains(string(got), "456789abcdefghijklmnopqrstuv") {
-		t.Fatalf("truncated excerpt exposed omitted middle: %q", got)
+		t.Fatalf("paged artifact = %q, want %q", got, want)
 	}
 
 	lastOffset := int64(len(want) - 2)
@@ -673,19 +651,11 @@ func TestThreadStoreReadsRetentionTruncatedArtifactInBoundedPages(t *testing.T) 
 		t.Fatalf("ReadArtifact beyond retained excerpt: %v", err)
 	}
 	if len(beyond.Data) != 0 || beyond.HasMore {
-		t.Fatalf("beyond retained excerpt = %#v", beyond)
+		t.Fatalf("beyond artifact = %#v", beyond)
 	}
 }
 
-func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
-	oldArtifactLimit, oldThreadLimit := artifactRetentionLimit, threadRetentionLimit
-	artifactRetentionLimit = 64
-	threadRetentionLimit = 12
-	t.Cleanup(func() {
-		artifactRetentionLimit = oldArtifactLimit
-		threadRetentionLimit = oldThreadLimit
-	})
-
+func TestThreadStoreMultipleArtifactsRemainComplete(t *testing.T) {
 	store, err := NewThreadStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -699,9 +669,6 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Truncated {
-		t.Fatalf("first artifact unexpectedly truncated: %#v", first)
-	}
 	state = persistArtifactForThreadTest(ctx, t, store, state, first, "artifact-full")
 	read, err := store.ReadArtifact(ctx, state.ID, first.ID, 2, 4)
 	if err != nil {
@@ -714,16 +681,16 @@ func TestThreadStoreThreadCapStillCreatesTruncatedArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second artifact: %v", err)
 	}
-	if !second.Truncated || second.StoredSize != 0 {
-		t.Fatalf("thread-cap artifact = %#v", second)
+	if second.Size != int64(len("abcdefghijklmnopqrstuvwxyz")) {
+		t.Fatalf("second full artifact = %#v", second)
 	}
-	state = persistArtifactForThreadTest(ctx, t, store, state, second, "artifact-truncated")
+	state = persistArtifactForThreadTest(ctx, t, store, state, second, "artifact-full-2")
 	read, err = store.ReadArtifact(ctx, state.ID, second.ID, 0, 16)
 	if err != nil {
-		t.Fatalf("ReadArtifact truncated range: %v", err)
+		t.Fatalf("ReadArtifact full range: %v", err)
 	}
-	if !read.Ref.Truncated || len(read.Data) != 0 || read.HasMore {
-		t.Fatalf("truncated artifact range = %#v", read)
+	if string(read.Data) != "abcdefghijklmnop" || !read.HasMore {
+		t.Fatalf("full second artifact range = %#v", read)
 	}
 }
 

@@ -47,9 +47,11 @@ func (c *recordingCheckpointCompactor) Compact(_ context.Context, request Compac
 type scriptedCompactorModel struct {
 	response *schema.Message
 	err      error
+	calls    int
 }
 
 func (m *scriptedCompactorModel) Generate(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	m.calls++
 	return m.response, m.err
 }
 
@@ -137,6 +139,59 @@ func TestModelCompactorDoesNotReportUsageForEmptyResponse(t *testing.T) {
 	}
 }
 
+func TestModelCompactorClassifiesBlankResponseAndPreservesUsage(t *testing.T) {
+	expected := usage.Turn{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}
+	chatModel := &scriptedCompactorModel{response: &schema.Message{
+		Role: schema.Assistant,
+		ResponseMeta: &schema.ResponseMeta{
+			FinishReason: "length",
+			Usage: &schema.TokenUsage{
+				PromptTokens:     expected.PromptTokens,
+				CompletionTokens: expected.CompletionTokens,
+				TotalTokens:      expected.TotalTokens,
+			},
+		},
+	}}
+	compactor, err := NewModelCompactor(chatModel, DefaultConfig())
+	if err != nil {
+		t.Fatalf("NewModelCompactor: %v", err)
+	}
+	var observed []usage.Turn
+	_, err = compactor.Compact(context.Background(), compactionTestRequest(), func(_ string, turn usage.Turn, available bool) {
+		if !available {
+			t.Fatal("blank provider response lost reported usage")
+		}
+		observed = append(observed, turn)
+	})
+	if !errors.Is(err, ErrEmptyCheckpointResponse) {
+		t.Fatalf("Compact() error = %v, want empty checkpoint response", err)
+	}
+	var empty *EmptyCheckpointResponseError
+	if !errors.As(err, &empty) || empty.FinishReason != "length" {
+		t.Fatalf("empty response detail = %#v, want finish reason length", empty)
+	}
+	if len(observed) != 1 || observed[0] != expected {
+		t.Fatalf("usage reports = %#v, want %#v", observed, []usage.Turn{expected})
+	}
+}
+
+func TestModelCompactorBlocksOverBudgetRequestBeforeProvider(t *testing.T) {
+	chatModel := &scriptedCompactorModel{}
+	compactor, err := NewModelCompactor(chatModel, Config{WindowTokens: 500})
+	if err != nil {
+		t.Fatalf("NewModelCompactor: %v", err)
+	}
+	request := compactionTestRequest()
+	request.SourceGroups[0].Messages = []*schema.Message{schema.UserMessage(strings.Repeat("source ", 2_000))}
+	_, err = compactor.Compact(context.Background(), request, nil)
+	if !errors.Is(err, ErrRequestAdmissionExceeded) {
+		t.Fatalf("Compact() error = %v, want prompt budget admission failure", err)
+	}
+	if chatModel.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0 after local admission rejection", chatModel.calls)
+	}
+}
+
 func TestModelCompactorReportsExactUsageWhenGenerateFailsWithResponse(t *testing.T) {
 	expected := usage.Turn{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12}
 	chatModel := &scriptedCompactorModel{
@@ -197,12 +252,7 @@ func TestRecursiveCompactorNormalizesEveryChunkIdentity(t *testing.T) {
 		},
 	}
 	cfg := Config{
-		WindowTokens:              7_000,
-		MaxOutputTokens:           1_000,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 7_000,
 	}
 	recursive, err := NewRecursiveCompactor(compactor, cfg)
 	if err != nil {
@@ -272,11 +322,7 @@ func TestRecursiveCompactorPropagatesCancellation(t *testing.T) {
 func TestRecursiveCompactorReturnsProviderFailureWithoutFallback(t *testing.T) {
 	compactor := &recordingCheckpointCompactor{err: errors.New("provider unavailable")}
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              2_000,
-		MaxOutputTokens:           1_000,
-		SummaryMaxTokens:          1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 2_000,
 	})
 	if err != nil {
 		t.Fatalf("NewRecursiveCompactor: %v", err)
@@ -295,12 +341,7 @@ func TestRecursiveCompactorReturnsProviderFailureWithoutFallback(t *testing.T) {
 
 func TestRecursiveCompactorRejectsLowGainWithoutCheckpoint(t *testing.T) {
 	recursive, err := NewRecursiveCompactor(&recordingCheckpointCompactor{}, Config{
-		WindowTokens:              8_000,
-		MaxOutputTokens:           1_000,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   100,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 8_000,
 	})
 	if err != nil {
 		t.Fatalf("NewRecursiveCompactor: %v", err)
@@ -447,12 +488,7 @@ func TestRecursiveCompactorSeparatesParentFromSingleOverflowedGroup(t *testing.T
 
 	compactor := &recordingCheckpointCompactor{}
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              budget + 128,
-		MaxOutputTokens:           128,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: budget + 128,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -540,12 +576,7 @@ func TestRecursiveCompactorRejectsOversizedSingleSyntheticMerge(t *testing.T) {
 
 	compactor := &recordingCheckpointCompactor{}
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              budget + 128,
-		MaxOutputTokens:           128,
-		SummaryMaxTokens:          parent.EstimatedTokens() + 2_048,
-		LowGainThresholdPercent:   1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: budget + 128,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -581,12 +612,7 @@ func TestRecursiveMergeAllowsVerifiedInteriorDirectEventReferences(t *testing.T)
 		return checkpoint, nil
 	})
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              24_000,
-		MaxOutputTokens:           500,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 24_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -645,12 +671,7 @@ func TestRecursiveMergeRejectsUnexposedInteriorEventReference(t *testing.T) {
 		return checkpoint, nil
 	})
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              12_000,
-		MaxOutputTokens:           500,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 12_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -681,12 +702,7 @@ func TestRecursiveCompactorDefersLowGainUntilFinalMerge(t *testing.T) {
 		return checkpoint, nil
 	})
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              6_000,
-		MaxOutputTokens:           500,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   75,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 6_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -715,12 +731,7 @@ func TestRecursiveCompactorCountsPreviousCheckpointInFinalGain(t *testing.T) {
 		t.Fatalf("validate parent: %v", err)
 	}
 	recursive, err := NewRecursiveCompactor(&recordingCheckpointCompactor{}, Config{
-		WindowTokens:              64_000,
-		MaxOutputTokens:           500,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   15,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 64_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -744,12 +755,7 @@ func TestRecursiveCompactorCountsPreviousCheckpointInFinalGain(t *testing.T) {
 func TestRecursiveCompactorRejectsSecondMergeOfDerivedCheckpoints(t *testing.T) {
 	compactor := &recordingCheckpointCompactor{}
 	recursive, err := NewRecursiveCompactor(compactor, Config{
-		WindowTokens:              1_500,
-		MaxOutputTokens:           200,
-		SummaryMaxTokens:          2_048,
-		LowGainThresholdPercent:   1,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
+		WindowTokens: 1_500,
 	})
 	if err != nil {
 		t.Fatal(err)

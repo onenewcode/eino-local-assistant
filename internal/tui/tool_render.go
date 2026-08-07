@@ -7,54 +7,42 @@ import (
 	"unicode/utf8"
 )
 
-// toolBodyMaxLines caps how many result/arg lines are shown under a tool call.
-const toolBodyMaxLines = 10
-
-// toolBodyMaxRunes caps a single displayed tool body (after pretty-print).
-const toolBodyMaxRunes = 800
-
 // toolHeaderArgMaxRunes caps the one-line arg summary on the tool header.
 const toolHeaderArgMaxRunes = 48
 
-// formatToolCard builds a multi-line tool transcript body (without the leading glyph).
-// phase is "run" | "ok" | "err".
-//
-//	get_current_time  timezone=UTC
-//	  ⎿  {
-//	       "datetime": "…"
-//	     }
+// formatToolCard builds the default compact tool transcript (without its glyph).
+// phase is "run" | "ok" | "err". Completion callers should preserve the
+// original input with formatToolCardWithInput so the finished line remains useful.
 func formatToolCard(name, detail, phase string) string {
+	return formatToolCardWithInput(name, "", detail, phase)
+}
+
+func formatToolCardWithInput(name, input, detail, phase string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "tool"
 	}
 
-	header := name
-	body := strings.TrimSpace(detail)
-
+	parts := make([]string, 0, 4)
 	switch phase {
 	case "run":
-		// Args on the header (Claude/Codex call line); body is running marker.
-		if body != "" {
-			if sum := compactToolArgs(body); sum != "" {
-				header = name + "  " + sum
-			}
+		if summary := compactToolInput(name, detail); summary != "" {
+			parts = append(parts, summary)
 		}
-		body = "running…"
+		parts = append(parts, "running…")
 	case "err":
-		if body == "" {
-			body = "error"
+		if summary := compactToolInput(name, input); summary != "" {
+			parts = append(parts, summary)
 		}
-	default: // ok
-		if body == "" {
-			body = "done"
-		} else {
-			body = prettyToolText(body)
+		parts = append(parts, "failed: "+compactToolText(detail))
+	default:
+		if summary := compactToolInput(name, input); summary != "" {
+			parts = append(parts, summary)
 		}
+		parts = append(parts, compactToolResult(detail))
 	}
 
-	body = clampToolBody(body)
-	return header + "\n" + indentToolBody(body, phase)
+	return name + "  " + strings.Join(parts, " · ")
 }
 
 // compactToolArgs produces a single-line summary for the tool header.
@@ -96,58 +84,113 @@ func compactToolArgs(raw string) string {
 	return raw
 }
 
-func prettyToolText(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return s
+func compactToolInput(name, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
 	}
-	if (strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}")) ||
-		(strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]")) {
-		var v any
-		if json.Unmarshal([]byte(s), &v) == nil {
-			if b, err := json.MarshalIndent(v, "", "  "); err == nil {
-				return string(b)
-			}
+	if name == "shell" {
+		var input struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal([]byte(raw), &input) == nil && strings.TrimSpace(input.Command) != "" {
+			return compactToolText(input.Command)
 		}
 	}
-	return s
+	return compactToolArgs(raw)
 }
 
-func clampToolBody(s string) string {
-	if s == "" {
-		return s
+func compactToolResult(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "done"
 	}
-	if utf8.RuneCountInString(s) > toolBodyMaxRunes {
-		runes := []rune(s)
-		s = string(runes[:toolBodyMaxRunes-1]) + "…"
+	var result map[string]any
+	if json.Unmarshal([]byte(raw), &result) != nil {
+		return "done"
 	}
-	lines := strings.Split(s, "\n")
-	if len(lines) <= toolBodyMaxLines {
-		return s
-	}
-	kept := lines[:toolBodyMaxLines-1]
-	omitted := len(lines) - (toolBodyMaxLines - 1)
-	kept = append(kept, fmt.Sprintf("… +%d lines", omitted))
-	return strings.Join(kept, "\n")
-}
 
-func indentToolBody(body, phase string) string {
-	marker := "  ⎿  "
-	if phase == "err" {
-		marker = "  ✗  "
+	if boolField(result, "denied") {
+		return "denied" + resultMetadata(result, false)
 	}
-	lines := strings.Split(body, "\n")
-	for i, line := range lines {
-		if i == 0 {
-			lines[i] = marker + line
-			continue
+	if boolField(result, "cancelled") {
+		return "cancelled" + resultMetadata(result, false)
+	}
+	if exitCode, ok := integerField(result, "exit_code"); ok {
+		return fmt.Sprintf("exit %d", exitCode) + resultMetadata(result, true)
+	}
+
+	for _, key := range []string{"datetime", "status", "count", "matches", "path"} {
+		if value, ok := scalarField(result, key); ok {
+			return key + "=" + compactToolText(value)
 		}
-		lines[i] = "     " + line
 	}
-	return strings.Join(lines, "\n")
+	return "done"
 }
 
-// renderToolCard styles a multi-line tool card for the viewport.
+func resultMetadata(result map[string]any, includeDuration bool) string {
+	parts := make([]string, 0, 2)
+	if includeDuration {
+		if duration, ok := integerField(result, "duration_ms"); ok && duration >= 0 {
+			parts = append(parts, fmt.Sprintf("%dms", duration))
+		}
+	}
+	if impact, ok := scalarField(result, "impact"); ok {
+		parts = append(parts, strings.ReplaceAll(impact, "_", "-"))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(parts, " · ")
+}
+
+func boolField(result map[string]any, key string) bool {
+	value, ok := result[key].(bool)
+	return ok && value
+}
+
+func integerField(result map[string]any, key string) (int, bool) {
+	value, ok := result[key]
+	if !ok {
+		return 0, false
+	}
+	float, ok := value.(float64)
+	if !ok || float != float64(int(float)) {
+		return 0, false
+	}
+	return int(float), true
+}
+
+func scalarField(result map[string]any, key string) (string, bool) {
+	value, ok := result[key]
+	if !ok {
+		return "", false
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed), strings.TrimSpace(typed) != ""
+	case float64:
+		return fmt.Sprintf("%v", typed), true
+	case bool:
+		return fmt.Sprintf("%t", typed), true
+	default:
+		return "", false
+	}
+}
+
+func compactToolText(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if value == "" {
+		return "error"
+	}
+	if utf8.RuneCountInString(value) <= toolHeaderArgMaxRunes {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:toolHeaderArgMaxRunes-1]) + "…"
+}
+
+// renderToolCard styles a compact tool card for the viewport.
 func renderToolCard(text string) string {
 	lines := strings.Split(text, "\n")
 	if len(lines) == 0 {
@@ -164,15 +207,6 @@ func renderToolCard(text string) string {
 		b.WriteString(toolBodyStyle.Render(header[i:]))
 	} else {
 		b.WriteString(headerStyle.Render(header))
-	}
-	for _, line := range lines[1:] {
-		b.WriteByte('\n')
-		trim := strings.TrimLeft(line, " ")
-		if strings.HasPrefix(trim, "✗") {
-			b.WriteString(errorStyle.Render(line))
-		} else {
-			b.WriteString(toolBodyStyle.Render(line))
-		}
 	}
 	return b.String()
 }

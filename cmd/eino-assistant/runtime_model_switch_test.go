@@ -69,11 +69,7 @@ func validRuntimeConfig(modelName string) config.Config {
 			Name:           modelName,
 			TimeoutSeconds: 30,
 			Context: config.ModelContextConfig{
-				WindowTokens:              16000,
-				MaxOutputTokens:           2000,
-				AutoCompactTriggerPercent: 75,
-				PostCompactTargetPercent:  45,
-				LowGainThresholdPercent:   10,
+				WindowTokens: 16000,
 			},
 			Pricing: config.PricingConfig{InputPerMillion: 1, OutputPerMillion: 2},
 		},

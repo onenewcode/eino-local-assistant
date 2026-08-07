@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/contextbuild"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/usage"
 
@@ -39,6 +40,9 @@ type ReActOptions struct {
 	// MaxModelSteps bounds tool-enabled model decisions in one ReAct turn.
 	// A response with multiple parallel tool calls still consumes one step.
 	MaxModelSteps int
+	// Admission is the private full-window request policy. A zero window leaves
+	// admission disabled for standalone embeddings that manage their own limit.
+	Admission contextbuild.AdmissionPolicy
 	// EnableSteer opts this ReAct implementation into the explicit
 	// chat.TurnSteerModel contract. The production default is enabled so the
 	// formal runtime constructor does not leave Session.Steer unreachable.
@@ -65,6 +69,7 @@ type ReActModel struct {
 	toolsNode           *compose.ToolsNode
 	executableToolNames map[string]struct{}
 	maxModelSteps       int
+	admission           contextbuild.AdmissionPolicy
 	taskController      *TaskController
 	steer               *turnSteerRegistry
 }
@@ -105,6 +110,10 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 		toolInfos = append(toolInfos, info)
 		executableToolNames[info.Name] = struct{}{}
 	}
+	admission := opts.Admission
+	if admission.Enabled() {
+		admission = contextbuild.NewAdmissionPolicy(admission.WindowTokens, toolInfos)
+	}
 	toolModel, err := chatModel.WithTools(toolInfos)
 	if err != nil {
 		return nil, fmt.Errorf("bind tool-calling model: %w", err)
@@ -131,6 +140,7 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 		toolsNode:           toolsNode,
 		executableToolNames: executableToolNames,
 		maxModelSteps:       opts.MaxModelSteps,
+		admission:           admission,
 		taskController:      opts.TaskController,
 		steer:               steer,
 	}, nil
@@ -139,6 +149,9 @@ func NewReActModelWithOptions(ctx context.Context, chatModel model.ToolCallingCh
 func normalizeReActOptions(opts ReActOptions) (ReActOptions, error) {
 	if opts.MaxModelSteps < 0 {
 		return ReActOptions{}, fmt.Errorf("max model steps must be >= 0")
+	}
+	if opts.Admission.WindowTokens < 0 {
+		return ReActOptions{}, fmt.Errorf("admission window tokens must be >= 0")
 	}
 	if opts.MaxModelSteps == 0 {
 		opts.MaxModelSteps = DefaultReActOptions().MaxModelSteps
@@ -159,6 +172,14 @@ func (m *ReActModel) MaxModelSteps() int {
 		return 0
 	}
 	return m.maxModelSteps
+}
+
+// AdmissionPolicy returns the locally enforced full-window safety policy.
+func (m *ReActModel) AdmissionPolicy() contextbuild.AdmissionPolicy {
+	if m == nil {
+		return contextbuild.AdmissionPolicy{}
+	}
+	return m.admission
 }
 
 // RegisterTurnSteer opts one durable turn into this model's turn-local
@@ -227,6 +248,9 @@ func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, em
 			return nil, nil, fmt.Errorf("acquire model step: %w", err)
 		}
 		history = m.rewriteMessages(toolContext, history)
+		if err := contextbuild.CheckRequestAdmission(history, m.admission); err != nil {
+			return nil, nil, fmt.Errorf("admit model request: %w", err)
+		}
 		modelCallNumber++
 		// Session owns durable model-call IDs. Keeping this empty lets its
 		// turn-scoped usage tracker allocate IDs across task continuations.
@@ -256,10 +280,16 @@ func (m *ReActModel) runTurn(ctx context.Context, messages []*schema.Message, em
 			return nil, nil, fmt.Errorf("persist tool lifecycle: %w", err)
 		}
 		history = append(history, projectToolResultMessages(toolContext, results)...)
+		// A tool batch is an active transaction. Its results are durable before
+		// the next model call, but compaction cannot safely run in the middle of
+		// it; the next admission check fails the turn rather than rerunning tools.
 	}
 
 	history = withFinalModelInstruction(history)
 	history = m.rewriteMessages(toolContext, history)
+	if err := contextbuild.CheckRequestAdmission(history, m.admission.WithoutTools()); err != nil {
+		return nil, nil, fmt.Errorf("admit final model request: %w", err)
+	}
 	if err := runtimeguard.AcquireFinalResponse(toolContext); err != nil {
 		return nil, nil, fmt.Errorf("acquire final response: %w", err)
 	}
@@ -281,21 +311,7 @@ func completedEventStream() <-chan struct{} {
 // large raw tool result in the same ReAct turn. The full result remains in the
 // artifact ledger and can be read deliberately through read_artifact.
 func projectToolResultMessages(ctx context.Context, results []*schema.Message) []*schema.Message {
-	projected := make([]*schema.Message, len(results))
-	for index, result := range results {
-		if result == nil {
-			continue
-		}
-		content := chat.ProjectToolResultForModel(ctx, result.ToolCallID, result.Content)
-		if content == result.Content {
-			projected[index] = result
-			continue
-		}
-		copyResult := *result
-		copyResult.Content = content
-		projected[index] = &copyResult
-	}
-	return projected
+	return chat.ProjectToolResultsForModel(ctx, results)
 }
 
 func (m *ReActModel) rewriteMessages(ctx context.Context, messages []*schema.Message) []*schema.Message {

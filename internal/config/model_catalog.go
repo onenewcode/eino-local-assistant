@@ -29,7 +29,6 @@ type ModelCatalogEntry struct {
 // or rejection.
 type ModelCatalogCapabilities struct {
 	ContextWindowTokens int      `toml:"context_window_tokens"`
-	MaxOutputTokens     int      `toml:"max_output_tokens"`
 	SupportsReasoning   *bool    `toml:"supports_reasoning"`
 	ReasoningEfforts    []string `toml:"reasoning_efforts"`
 	// DefaultReasoningEffort is the declared default requested effort for this
@@ -184,12 +183,6 @@ func normalizeCatalogCapabilities(capabilities *ModelCatalogCapabilities, entryI
 	}
 	if capabilities.ContextWindowTokens < 0 {
 		return fmt.Errorf("model.catalog[%d].capabilities.context_window_tokens must be >= 0", entryIndex)
-	}
-	if capabilities.MaxOutputTokens < 0 {
-		return fmt.Errorf("model.catalog[%d].capabilities.max_output_tokens must be >= 0", entryIndex)
-	}
-	if capabilities.ContextWindowTokens > 0 && capabilities.MaxOutputTokens >= capabilities.ContextWindowTokens && capabilities.MaxOutputTokens > 0 {
-		return fmt.Errorf("model.catalog[%d].capabilities.max_output_tokens must be smaller than context_window_tokens", entryIndex)
 	}
 	capabilities.DefaultReasoningEffort = strings.TrimSpace(capabilities.DefaultReasoningEffort)
 	if capabilities.DefaultReasoningEffort != "" {

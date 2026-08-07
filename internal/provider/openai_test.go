@@ -18,15 +18,14 @@ import (
 
 func TestOpenAIModelStreamsSSE(t *testing.T) {
 	tests := []struct {
-		name                    string
-		modelName               string
-		reasoningEffort         string
-		wantReasoningEffort     string
-		wantMaxCompletionTokens bool
+		name                string
+		modelName           string
+		reasoningEffort     string
+		wantReasoningEffort string
 	}{
 		{name: "standard chat model", modelName: "test-model"},
-		{name: "o-series model", modelName: "o3-mini", wantMaxCompletionTokens: true},
-		{name: "versioned GPT-5 model", modelName: "gpt-5.1-codex", wantMaxCompletionTokens: true},
+		{name: "o-series model", modelName: "o3-mini"},
+		{name: "versioned GPT-5 model", modelName: "gpt-5.1-codex"},
 		{
 			name:                "explicit provider value",
 			modelName:           "test-model",
@@ -36,28 +35,8 @@ func TestOpenAIModelStreamsSSE(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			testOpenAIModelStreamsSSE(t, tt.modelName, tt.reasoningEffort, tt.wantReasoningEffort, tt.wantMaxCompletionTokens)
+			testOpenAIModelStreamsSSE(t, tt.modelName, tt.reasoningEffort, tt.wantReasoningEffort)
 		})
-	}
-}
-
-func TestUsesMaxCompletionTokens(t *testing.T) {
-	for _, tt := range []struct {
-		model string
-		want  bool
-	}{
-		{model: "o1", want: true},
-		{model: "o3-mini", want: true},
-		{model: "O4-MINI", want: true},
-		{model: "gpt-5", want: true},
-		{model: "gpt-5.1-codex", want: true},
-		{model: "gpt-50"},
-		{model: "gpt-4.1"},
-		{model: "deepseek-v4-flash"},
-	} {
-		if got := usesMaxCompletionTokens(tt.model); got != tt.want {
-			t.Errorf("usesMaxCompletionTokens(%q) = %v, want %v", tt.model, got, tt.want)
-		}
 	}
 }
 
@@ -85,7 +64,7 @@ func TestOpenAIModelWithToolsCanRestoreUnboundFinalModel(t *testing.T) {
 		APIKey:         "test-key",
 		Name:           "test-model",
 		TimeoutSeconds: 5,
-		Context:        config.ModelContextConfig{WindowTokens: 1_000, MaxOutputTokens: 321},
+		Context:        config.ModelContextConfig{WindowTokens: 1_000},
 	})
 	if err != nil {
 		t.Fatalf("NewOpenAIModel() error = %v", err)
@@ -130,7 +109,7 @@ func TestOpenAIModelWithToolsCanRestoreUnboundFinalModel(t *testing.T) {
 	}
 }
 
-func testOpenAIModelStreamsSSE(t *testing.T, modelName, reasoningEffort, wantReasoningEffort string, wantMaxCompletionTokens bool) {
+func testOpenAIModelStreamsSSE(t *testing.T, modelName, reasoningEffort, wantReasoningEffort string) {
 	t.Helper()
 	requests := make(chan completionRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -172,8 +151,7 @@ func testOpenAIModelStreamsSSE(t *testing.T, modelName, reasoningEffort, wantRea
 		ReasoningEffort: reasoningEffort,
 		TimeoutSeconds:  5,
 		Context: config.ModelContextConfig{
-			WindowTokens:    1_000,
-			MaxOutputTokens: 321,
+			WindowTokens: 1_000,
 		},
 	})
 	if err != nil {
@@ -236,20 +214,8 @@ func testOpenAIModelStreamsSSE(t *testing.T, modelName, reasoningEffort, wantRea
 			}
 			t.Errorf("reasoning_effort = %q, want %q", got, wantReasoningEffort)
 		}
-		if wantMaxCompletionTokens {
-			if request.MaxCompletionTokens == nil || *request.MaxCompletionTokens != 321 {
-				t.Errorf("max_completion_tokens = %v, want 321", request.MaxCompletionTokens)
-			}
-			if request.MaxTokens != nil {
-				t.Errorf("max_tokens = %v, want omitted", request.MaxTokens)
-			}
-		} else {
-			if request.MaxTokens == nil || *request.MaxTokens != 321 {
-				t.Errorf("max_tokens = %v, want 321", request.MaxTokens)
-			}
-			if request.MaxCompletionTokens != nil {
-				t.Errorf("max_completion_tokens = %v, want omitted", request.MaxCompletionTokens)
-			}
+		if request.MaxTokens != nil || request.MaxCompletionTokens != nil {
+			t.Errorf("OpenAI output limit fields = max_tokens:%v max_completion_tokens:%v, want both omitted", request.MaxTokens, request.MaxCompletionTokens)
 		}
 		if got, want := len(request.Messages), 2; got != want {
 			t.Fatalf("messages = %d, want %d", got, want)

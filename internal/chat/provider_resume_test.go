@@ -86,8 +86,7 @@ func TestRecoveredToolHistoryReplaysThroughAnthropicProvider(t *testing.T) {
 		APIKey:   "test-key",
 		Name:     "claude-test",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 128,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})

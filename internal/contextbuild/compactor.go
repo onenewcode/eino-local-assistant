@@ -30,7 +30,28 @@ var (
 	// ErrCompactionRecursionLimit prevents malformed chunking from silently
 	// falling back to a lossy checkpoint after repeated recursive merges.
 	ErrCompactionRecursionLimit = errors.New("compaction recursion limit exceeded")
+	// ErrEmptyCheckpointResponse means a provider completed the checkpoint call
+	// without any text to parse. It is distinct from malformed JSON so callers
+	// can report an actionable provider/output failure without exposing EOF.
+	ErrEmptyCheckpointResponse = errors.New("compactor returned an empty checkpoint response")
 )
+
+// EmptyCheckpointResponseError retains the provider's safe completion signal
+// when available. It deliberately excludes raw response content and metadata.
+type EmptyCheckpointResponseError struct {
+	FinishReason string
+}
+
+func (e *EmptyCheckpointResponseError) Error() string {
+	if e != nil && strings.TrimSpace(e.FinishReason) != "" {
+		return fmt.Sprintf("%s (finish reason: %s)", ErrEmptyCheckpointResponse, e.FinishReason)
+	}
+	return ErrEmptyCheckpointResponse.Error()
+}
+
+func (e *EmptyCheckpointResponseError) Unwrap() error {
+	return ErrEmptyCheckpointResponse
+}
 
 // MaxCheckpointEvidenceRefs bounds the source IDs embedded in a model-visible
 // checkpoint. The complete source manifest is retained by the thread ledger;
@@ -243,11 +264,15 @@ func (c *ModelCompactor) Compact(ctx context.Context, request CompactionRequest,
 	if strings.TrimSpace(systemPrompt) == "" {
 		systemPrompt = defaultCompactionSystemPrompt
 	}
-	callID := newCompactionCallID()
-	response, err := c.Model.Generate(ctx, []*schema.Message{
+	requestMessages := []*schema.Message{
 		schema.SystemMessage(systemPrompt),
 		schema.UserMessage(input),
-	})
+	}
+	if err := CheckRequestAdmission(requestMessages, NewAdmissionPolicy(planner.normalizedConfig().WindowTokens, nil)); err != nil {
+		return Checkpoint{}, fmt.Errorf("admit checkpoint request: %w", err)
+	}
+	callID := newCompactionCallID()
+	response, err := c.Model.Generate(ctx, requestMessages)
 	if err != nil {
 		// Some providers return a response plus an error after charging the
 		// request. Preserve only an explicit provider usage report in that case.
@@ -263,14 +288,24 @@ func (c *ModelCompactor) Compact(ctx context.Context, request CompactionRequest,
 	if len(response.ToolCalls) > 0 {
 		return Checkpoint{}, ErrUnexpectedCompactorToolCall
 	}
+	if strings.TrimSpace(response.Content) == "" {
+		return Checkpoint{}, emptyCheckpointResponseError(response)
+	}
 	checkpoint, err := ParseCheckpointJSONForSourceWithClaimScope([]byte(response.Content), provenance, scope.EventIDs, claimScope)
 	if err != nil {
 		return Checkpoint{}, fmt.Errorf("parse generated checkpoint: %w", err)
 	}
-	if checkpoint.EstimatedTokens() > planner.normalizedConfig().SummaryMaxTokens {
-		return Checkpoint{}, fmt.Errorf("%w: %d > %d", ErrCheckpointTooLarge, checkpoint.EstimatedTokens(), planner.normalizedConfig().SummaryMaxTokens)
+	if checkpoint.EstimatedTokens() > planner.normalizedConfig().CheckpointTargetTokens() {
+		return Checkpoint{}, fmt.Errorf("%w: %d > %d", ErrCheckpointTooLarge, checkpoint.EstimatedTokens(), planner.normalizedConfig().CheckpointTargetTokens())
 	}
 	return checkpoint, nil
+}
+
+func emptyCheckpointResponseError(response *schema.Message) error {
+	if response == nil || response.ResponseMeta == nil {
+		return &EmptyCheckpointResponseError{}
+	}
+	return &EmptyCheckpointResponseError{FinishReason: strings.TrimSpace(response.ResponseMeta.FinishReason)}
 }
 
 func reportCompactionUsage(observer CompactionUsageObserver, callID string, response *schema.Message) {
@@ -412,8 +447,8 @@ func (c *RecursiveCompactor) CompactWithResult(ctx context.Context, request Comp
 	if err != nil {
 		return CompactionResult{}, err
 	}
-	if checkpoint.EstimatedTokens() > planner.normalizedConfig().SummaryMaxTokens {
-		return CompactionResult{}, fmt.Errorf("%w: %d > %d", ErrCheckpointTooLarge, checkpoint.EstimatedTokens(), planner.normalizedConfig().SummaryMaxTokens)
+	if checkpoint.EstimatedTokens() > planner.normalizedConfig().CheckpointTargetTokens() {
+		return CompactionResult{}, fmt.Errorf("%w: %d > %d", ErrCheckpointTooLarge, checkpoint.EstimatedTokens(), planner.normalizedConfig().CheckpointTargetTokens())
 	}
 	rawSourceTokens := turnGroupsTokens(request.SourceGroups)
 	replacedTokens := rawSourceTokens
@@ -421,7 +456,7 @@ func (c *RecursiveCompactor) CompactWithResult(ctx context.Context, request Comp
 		replacedTokens += request.Previous.EstimatedTokens()
 	}
 	resultTokens := checkpoint.EstimatedTokens()
-	if gainPercent(replacedTokens, resultTokens) < planner.normalizedConfig().LowGainThresholdPercent {
+	if gainPercent(replacedTokens, resultTokens) < planner.normalizedConfig().MinimumCompactionGainPercent() {
 		return CompactionResult{}, ErrCompactionLowGain
 	}
 	return CompactionResult{
@@ -459,7 +494,7 @@ func (c *RecursiveCompactor) compactRecursive(ctx context.Context, request Compa
 	if depth > maxRecursiveCompactionDepth {
 		return Checkpoint{}, ErrCompactionRecursionLimit
 	}
-	budget := NewContextPlanner(c.Config).PromptBudgetTokens()
+	budget := NewContextPlanner(c.Config).RequestAdmissionCeilingTokens()
 	chunks, err := c.chunkForCompaction(request, budget)
 	if err != nil {
 		return Checkpoint{}, err
@@ -496,8 +531,8 @@ func (c *RecursiveCompactor) compactRecursive(ctx context.Context, request Compa
 			return Checkpoint{}, err
 		}
 		checkpoint = checkpoint.withDirectSourceScope(scope.EventIDs)
-		if checkpoint.EstimatedTokens() > cfg.SummaryMaxTokens {
-			return Checkpoint{}, fmt.Errorf("%w: %d > %d", ErrCheckpointTooLarge, checkpoint.EstimatedTokens(), cfg.SummaryMaxTokens)
+		if checkpoint.EstimatedTokens() > cfg.CheckpointTargetTokens() {
+			return Checkpoint{}, fmt.Errorf("%w: %d > %d", ErrCheckpointTooLarge, checkpoint.EstimatedTokens(), cfg.CheckpointTargetTokens())
 		}
 		return checkpoint, nil
 	}

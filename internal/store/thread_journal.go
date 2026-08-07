@@ -356,7 +356,7 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 			if usage.HasProviderUsage {
 				state.Meta.LastContext = &ContextSnapshot{
 					PromptTokens: usage.PromptTokens,
-					BudgetTokens: usage.ContextBudgetTokens,
+					WindowTokens: usage.ContextWindowTokens,
 				}
 			} else {
 				state.Meta.LastContext = nil

@@ -1,6 +1,7 @@
 package contextbuild
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,7 +18,127 @@ var (
 	// ErrRequiredGroupOverBudget means a group explicitly marked Required cannot
 	// fit without splitting a turn or tool transaction.
 	ErrRequiredGroupOverBudget = errors.New("required context group exceeds prompt budget")
+	// ErrRequestAdmissionExceeded means an outbound model request was blocked
+	// before calling the provider because its conservative local estimate exceeds
+	// the fixed full-window safety ceiling.
+	ErrRequestAdmissionExceeded = errors.New("model request exceeds context safety ceiling")
 )
+
+// RequestAdmissionExceededError records the local estimate used to reject one
+// outbound request. It is intentionally an estimate: provider token accounting
+// remains the source of truth for reported usage.
+type RequestAdmissionExceededError struct {
+	EstimatedTokens int
+	CeilingTokens   int
+}
+
+func (e *RequestAdmissionExceededError) Error() string {
+	return fmt.Sprintf("%s: estimated %d tokens exceeds %d-token ceiling", ErrRequestAdmissionExceeded, e.EstimatedTokens, e.CeilingTokens)
+}
+
+func (e *RequestAdmissionExceededError) Unwrap() error {
+	return ErrRequestAdmissionExceeded
+}
+
+// AdmissionPolicy estimates all material that reaches a model request: prompt
+// messages, serialized tool schemas, protocol framing, and a tokenizer guard.
+// It is deliberately local and conservative; provider usage remains the
+// observable source of truth after a request completes.
+type AdmissionPolicy struct {
+	WindowTokens     int
+	ToolSchemaTokens int
+}
+
+const (
+	admissionBaseFramingTokens    = 32
+	admissionMessageFramingTokens = 8
+	admissionToolFramingTokens    = 16
+	admissionGuardPercent         = 10
+)
+
+// NewAdmissionPolicy creates an immutable policy for one model binding. Tool
+// schemas are serialized once because providers include them in every
+// tool-enabled request even though they are not regular chat messages.
+func NewAdmissionPolicy(windowTokens int, tools []*schema.ToolInfo) AdmissionPolicy {
+	policy := AdmissionPolicy{WindowTokens: windowTokens}
+	if len(tools) == 0 {
+		return policy
+	}
+	for _, tool := range tools {
+		if tool == nil {
+			continue
+		}
+		encoded, err := json.Marshal(tool)
+		if err != nil {
+			// The provider will still validate the schema. Count a conservative
+			// fixed fallback instead of allowing a marshal anomaly to disable
+			// local safety admission.
+			policy.ToolSchemaTokens += admissionToolFramingTokens * 4
+			continue
+		}
+		policy.ToolSchemaTokens += usage.EstimateText(string(encoded)) + admissionToolFramingTokens
+	}
+	return policy
+}
+
+// WithoutTools returns the same window policy for an unbound final response.
+func (p AdmissionPolicy) WithoutTools() AdmissionPolicy {
+	p.ToolSchemaTokens = 0
+	return p
+}
+
+// Enabled reports whether an embedding configured a physical context window.
+func (p AdmissionPolicy) Enabled() bool { return p.WindowTokens > 0 }
+
+// CeilingTokens returns the fixed local request-admission ceiling.
+func (p AdmissionPolicy) CeilingTokens() int {
+	if !p.Enabled() {
+		return 0
+	}
+	return percentTokens(p.WindowTokens, requestAdmissionCeilingPercent)
+}
+
+// EstimateRequestTokens includes non-message material that generic message
+// counters cannot observe. The guard covers provider-specific serialization
+// and the fact that the local tokenizer is intentionally only an estimate.
+func (p AdmissionPolicy) EstimateRequestTokens(messages []*schema.Message) int {
+	raw := usage.EstimateMessages(messages) + p.ToolSchemaTokens + admissionBaseFramingTokens
+	for _, message := range messages {
+		if message != nil {
+			raw += admissionMessageFramingTokens
+		}
+	}
+	guard := max(admissionBaseFramingTokens, raw*admissionGuardPercent/100)
+	return raw + guard
+}
+
+// MaxResponseTokens computes the required Anthropic Messages API value. This
+// is a transport constraint, not a public response-length preference.
+func (p AdmissionPolicy) MaxResponseTokens(messages []*schema.Message) int {
+	remaining := p.CeilingTokens() - p.EstimateRequestTokens(messages)
+	if remaining < 1 {
+		return 1
+	}
+	return remaining
+}
+
+// CheckRequestAdmission rejects an outbound request before it can reach a
+// provider. A disabled policy preserves the standalone component's explicit
+// no-window mode.
+func CheckRequestAdmission(messages []*schema.Message, policy AdmissionPolicy) error {
+	if !policy.Enabled() {
+		return nil
+	}
+	estimatedTokens := policy.EstimateRequestTokens(messages)
+	ceilingTokens := policy.CeilingTokens()
+	if estimatedTokens <= ceilingTokens {
+		return nil
+	}
+	return &RequestAdmissionExceededError{
+		EstimatedTokens: estimatedTokens,
+		CeilingTokens:   ceilingTokens,
+	}
+}
 
 // Confidence states how directly a checkpoint claim is supported by its sources.
 type Confidence string
@@ -200,7 +321,7 @@ type PlanFallback struct {
 // decisions. Turn groups are never partially included.
 type PromptPlan struct {
 	Messages          []*schema.Message
-	BudgetTokens      int
+	CeilingTokens     int
 	TriggerTokens     int
 	TargetTokens      int
 	OriginalTokens    int

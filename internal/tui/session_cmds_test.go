@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,29 @@ type tuiCheckpointCompactor func(context.Context, contextbuild.CompactionRequest
 func (f tuiCheckpointCompactor) Compact(ctx context.Context, request contextbuild.CompactionRequest, observer contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
 	return f(ctx, request, observer)
 }
+
+// contextPressureModel creates one oversized completed turn without making the
+// incoming user request itself exceed the pre-turn admission gate.
+type contextPressureModel struct{}
+
+func (contextPressureModel) Stream(context.Context, []*schema.Message) (chat.Stream, error) {
+	return &contextPressureStream{message: schema.AssistantMessage(strings.Repeat("retained evidence ", 700), nil)}, nil
+}
+
+type contextPressureStream struct {
+	message *schema.Message
+}
+
+func (s *contextPressureStream) Recv() (*schema.Message, error) {
+	if s.message == nil {
+		return nil, io.EOF
+	}
+	message := s.message
+	s.message = nil
+	return message, nil
+}
+
+func (*contextPressureStream) Close() {}
 
 const validLegacyV1CheckpointJSON = `{"schema_version":1,"source_range":{"from":"event-1","to":"event-1","content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event_ids":["event-1"]},"source_event_ids":["event-1"],"source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task_goal":"resume legacy task","constraints":[{"text":"constraint","source_event_ids":["event-1"],"confidence":"observed"}],"confirmed_facts":[{"text":"fact","source_event_ids":["event-1"],"confidence":"observed"}],"decisions":[{"decision":"decision","reason":"reason","source_event_ids":["event-1"],"confidence":"observed"}],"attempts_and_results":[{"text":"attempt","result":"result","source_event_ids":["event-1"],"confidence":"observed"}],"files_or_artifacts":[{"ref":"event://event-1","description":"source","source_event_ids":["event-1"],"confidence":"observed"}],"open_questions":[{"text":"question","source_event_ids":["event-1"],"confidence":"unknown"}],"next_actions":[{"text":"next","source_event_ids":["event-1"],"confidence":"inferred"}]}`
 
@@ -54,7 +78,7 @@ func TestSessionsListIncludesAPIUsageContextAndCost(t *testing.T) {
 		PromptTokens:        1200,
 		CompletionTokens:    300,
 		TotalTokens:         1500,
-		ContextBudgetTokens: 4000,
+		ContextWindowTokens: 4000,
 	})
 	if err != nil {
 		t.Fatalf("RecordUsage: %v", err)
@@ -100,8 +124,8 @@ func TestContextCommandSeparatesAPISnapshotFromPlannerEstimate(t *testing.T) {
 	m := newTestModel(t)
 	next, _ := m.submit("/context")
 	mm := next.(*model)
-	if !hasLineContaining(mm.lines, lineSystem, "API snapshot: context=unknown") {
-		t.Fatalf("/context should identify an unavailable API snapshot: %#v", mm.lines)
+	if !hasLineContaining(mm.lines, lineSystem, "Last provider request: context=unknown") {
+		t.Fatalf("/context should identify an unavailable provider request: %#v", mm.lines)
 	}
 	if !hasLineContaining(mm.lines, lineSystem, "Planner estimate (local truncation/compaction only; not API usage)") {
 		t.Fatalf("/context should label the planner estimate: %#v", mm.lines)
@@ -137,7 +161,7 @@ func TestStatusReportUsesAPISnapshotRatherThanPlannerTokens(t *testing.T) {
 		PromptTokens:        1200,
 		CompletionTokens:    34,
 		TotalTokens:         1234,
-		ContextBudgetTokens: 4000,
+		ContextWindowTokens: 4000,
 	})
 	if err != nil {
 		t.Fatalf("RecordUsage: %v", err)
@@ -325,15 +349,11 @@ func TestAutomaticCompactionBlocksQueueDrain(t *testing.T) {
 	compactor := tuiCheckpointCompactor(func(_ context.Context, request contextbuild.CompactionRequest, _ contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
 		return contextbuild.DeterministicCheckpoint(request)
 	})
-	session, err := chat.NewSession(&staticModel{}, "system", chat.SessionOptions{
+	session, err := chat.NewSession(contextPressureModel{}, "system", chat.SessionOptions{
 		Store:     st,
 		Compactor: compactor,
 		Context: contextbuild.Config{
-			WindowTokens:              1_000,
-			MaxOutputTokens:           100,
-			AutoCompactTriggerPercent: 1,
-			PostCompactTargetPercent:  1,
-			KeepRecentTurns:           1,
+			WindowTokens: 1_000,
 		},
 	})
 	if err != nil {
@@ -341,9 +361,6 @@ func TestAutomaticCompactionBlocksQueueDrain(t *testing.T) {
 	}
 	if err := session.Ask(ctx, "first", nil); err != nil {
 		t.Fatalf("first Ask: %v", err)
-	}
-	if err := session.Ask(ctx, "second", nil); err != nil {
-		t.Fatalf("second Ask: %v", err)
 	}
 	if !session.NeedsAutoCompaction() {
 		t.Fatal("expected token-pressure auto compaction signal")
@@ -411,24 +428,17 @@ func TestAutomaticCompactionStaleIsSilentAndDefersRetry(t *testing.T) {
 	compactor := tuiCheckpointCompactor(func(_ context.Context, request contextbuild.CompactionRequest, _ contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
 		return contextbuild.DeterministicCheckpoint(request)
 	})
-	session, err := chat.NewSession(&staticModel{}, "system", chat.SessionOptions{
+	session, err := chat.NewSession(contextPressureModel{}, "system", chat.SessionOptions{
 		Store:     st,
 		Compactor: compactor,
 		Context: contextbuild.Config{
-			WindowTokens:              1_000,
-			MaxOutputTokens:           100,
-			AutoCompactTriggerPercent: 1,
-			PostCompactTargetPercent:  1,
-			KeepRecentTurns:           1,
+			WindowTokens: 1_000,
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := session.Ask(ctx, "first", nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.Ask(ctx, "second", nil); err != nil {
 		t.Fatal(err)
 	}
 	if !session.NeedsAutoCompaction() {
@@ -471,24 +481,17 @@ func TestAutomaticCompactionFailurePausesThenDrainsQueue(t *testing.T) {
 	compactor := tuiCheckpointCompactor(func(context.Context, contextbuild.CompactionRequest, contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
 		return contextbuild.Checkpoint{}, errors.New("provider unavailable")
 	})
-	session, err := chat.NewSession(&staticModel{}, "system", chat.SessionOptions{
+	session, err := chat.NewSession(contextPressureModel{}, "system", chat.SessionOptions{
 		Store:     st,
 		Compactor: compactor,
 		Context: contextbuild.Config{
-			WindowTokens:              1_000,
-			MaxOutputTokens:           100,
-			AutoCompactTriggerPercent: 1,
-			PostCompactTargetPercent:  1,
-			KeepRecentTurns:           1,
+			WindowTokens: 1_000,
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := session.Ask(ctx, "first", nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.Ask(ctx, "second", nil); err != nil {
 		t.Fatal(err)
 	}
 	if !session.NeedsAutoCompaction() {
@@ -665,6 +668,20 @@ func TestAutomaticCompactionCancellationIsReportedAsInterrupted(t *testing.T) {
 	}
 	if hasLineContaining(m.lines, lineSystem, "automatic context compaction failed") {
 		t.Fatalf("automatic cancellation was reported as failure: %#v", m.lines)
+	}
+}
+
+func TestBlankCheckpointResponseHasActionableCompactionFeedback(t *testing.T) {
+	m := newTestModel(t)
+	m.mode = modeCompacting
+	_ = m.finishCompaction(compactDoneMsg{err: &contextbuild.EmptyCheckpointResponseError{FinishReason: "length"}})
+	if !hasLineContaining(m.lines, lineError, "produced no checkpoint") ||
+		!hasLineContaining(m.lines, lineError, "finish reason: length") ||
+		!hasLineContaining(m.lines, lineError, "check provider/model output limits") {
+		t.Fatalf("blank response feedback = %#v", m.lines)
+	}
+	if hasLineContaining(m.lines, lineError, "decode checkpoint: EOF") {
+		t.Fatalf("blank response leaked parser implementation detail: %#v", m.lines)
 	}
 }
 

@@ -194,7 +194,7 @@ func TestThreadStoreSetThreadModelPreservesThreadProjection(t *testing.T) {
 		HasProviderUsage:    true,
 		PromptTokens:        10,
 		CompletionTokens:    3,
-		ContextBudgetTokens: 100,
+		ContextWindowTokens: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func TestThreadStoreSetThreadModelPreservesThreadProjection(t *testing.T) {
 		HasProviderUsage:    true,
 		PromptTokens:        20,
 		CompletionTokens:    4,
-		ContextBudgetTokens: 120,
+		ContextWindowTokens: 120,
 	})
 	if err != nil {
 		t.Fatal(err)

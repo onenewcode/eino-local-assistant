@@ -49,7 +49,7 @@ func TestReadArtifactIsScopedAndRangeBounded(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &output); err != nil {
 		t.Fatalf("decode output: %v", err)
 	}
-	if output.Content != "cde" || !output.HasMore || output.Truncated {
+	if output.Content != "cde" || !output.HasMore {
 		t.Fatalf("output = %+v", output)
 	}
 	if _, err := readTool.InvokableRun(context.Background(), `{"artifact_id":"`+artifact.ID+`"}`); err == nil {

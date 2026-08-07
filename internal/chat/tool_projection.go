@@ -3,6 +3,8 @@ package chat
 import (
 	"context"
 	"strings"
+
+	"github.com/cloudwego/eino/schema"
 )
 
 // toolResultProjectionStore is owned by the session recorder. It bridges a
@@ -10,6 +12,13 @@ import (
 // giving the agent access to the ledger or artifact store.
 type toolResultProjectionStore interface {
 	modelToolResultProjection(toolCallID string) (string, bool)
+}
+
+// toolResultBatchProjectionStore lets the recorder allocate a bounded model
+// preview across a parallel tool batch instead of giving every result an
+// independent large allowance.
+type toolResultBatchProjectionStore interface {
+	modelToolResultBatchProjections(toolCallIDs []string) map[string]string
 }
 
 // toolResultProjectionFailureStore is intentionally separate from the
@@ -48,6 +57,49 @@ func ProjectToolResultForModel(ctx context.Context, toolCallID, fallback string)
 		return projection
 	}
 	return fallback
+}
+
+// ProjectToolResultsForModel substitutes one durable bounded projection per
+// tool result. A batch-aware recorder shares a fixed preview budget across the
+// completed calls; full raw results remain referenced as artifacts.
+func ProjectToolResultsForModel(ctx context.Context, results []*schema.Message) []*schema.Message {
+	if len(results) == 0 {
+		return nil
+	}
+	projected := make([]*schema.Message, len(results))
+	var store toolResultBatchProjectionStore
+	if ctx != nil {
+		store, _ = ctx.Value(toolResultProjectionContextKey{}).(toolResultBatchProjectionStore)
+	}
+	projections := map[string]string(nil)
+	if store != nil {
+		ids := make([]string, 0, len(results))
+		for _, result := range results {
+			if result != nil && strings.TrimSpace(result.ToolCallID) != "" {
+				ids = append(ids, result.ToolCallID)
+			}
+		}
+		projections = store.modelToolResultBatchProjections(ids)
+	}
+	for index, result := range results {
+		if result == nil {
+			continue
+		}
+		content := result.Content
+		if projection, ok := projections[result.ToolCallID]; ok {
+			content = projection
+		} else {
+			content = ProjectToolResultForModel(ctx, result.ToolCallID, content)
+		}
+		if content == result.Content {
+			projected[index] = result
+			continue
+		}
+		copyResult := *result
+		copyResult.Content = content
+		projected[index] = &copyResult
+	}
+	return projected
 }
 
 // ToolResultProjectionFailure reports a durable recorder failure from the

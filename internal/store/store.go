@@ -106,14 +106,16 @@ type ThreadOpenSnapshotRepository interface {
 	LoadThreadOpenSnapshot(ctx context.Context, id string, messageLimit int) (ThreadOpenSnapshot, error)
 }
 
-// ThreadResumeSnapshot is the bounded view needed to resume a long-lived
-// session. TurnGroups contains only the raw tail not covered by CheckpointLineage.
-// The complete transcript remains available from the canonical JSONL on demand.
+// ThreadResumeSnapshot is the bounded model-facing view needed to resume a
+// long-lived session. TurnGroups contains only the raw tail not covered by
+// CheckpointLineage. CheckpointEvidence holds only direct cold sources used to
+// verify that lineage during session open; it must never enter a model prompt.
 type ThreadResumeSnapshot struct {
-	State             ThreadState
-	Transcript        []*schema.Message
-	TurnGroups        []TurnGroup
-	CheckpointLineage []Checkpoint
+	State              ThreadState
+	Transcript         []*schema.Message
+	TurnGroups         []TurnGroup
+	CheckpointLineage  []Checkpoint
+	CheckpointEvidence []TurnGroup
 }
 
 // ThreadResumeSnapshotRepository lets a store avoid replaying a complete

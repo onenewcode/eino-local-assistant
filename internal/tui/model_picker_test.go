@@ -29,7 +29,6 @@ func TestModelPickerAltPOpensWithCapabilitiesAndAppliesCanonicalName(t *testing.
 			Provenance:    "config",
 			Capabilities: ModelCatalogCapabilities{
 				ContextWindowTokens: 128000,
-				MaxOutputTokens:     8192,
 				ReasoningEfforts:    []string{"low", "high"},
 				InputModalities:     []string{"text", "image"},
 				SupportsTools:       boolPointer(true),

@@ -29,7 +29,7 @@ const (
 
 // ThreadStore persists revisioned, append-only local agent sessions. Each
 // active session is one date-partitioned JSONL file with a rebuildable SQLite
-// projection.
+// catalog used only for discovery and ordering.
 type ThreadStore struct {
 	root     string
 	db       *sql.DB
@@ -139,6 +139,9 @@ func (s *ThreadStore) threadJournalPath(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if err := validateThreadID(id); err != nil {
 		return "", err
+	}
+	if path, ok := s.catalogJournalPath(id); ok {
+		return path, nil
 	}
 	var datedCandidate string
 	if createdAt, ok := threadIDDate(id); ok {
@@ -349,7 +352,7 @@ func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 		return fmt.Errorf("delete session journal: %w", err)
 	}
 	if s.db != nil {
-		_, _ = s.db.Exec(`DELETE FROM thread_catalog WHERE id=?`, id)
+		_, _ = s.db.Exec(`DELETE FROM session_catalog WHERE id=?`, id)
 	}
 	return nil
 }
@@ -360,31 +363,30 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list threads: %w", err)
 	}
-
+	entries, catalogErr := s.sessionCatalogEntries()
 	metas := make([]ThreadMeta, 0, len(paths))
-	for id := range paths {
-		meta, fresh, loadErr := s.projectedMetaIfFresh(id)
-		if loadErr != nil {
-			// The catalog is a convenience index. A failed query must not hide
-			// canonical JSONL sessions from --last or session listing.
-			fresh = false
-			loadErr = nil
+	for id, path := range paths {
+		if catalogErr == nil {
+			if entry, ok := entries[id]; ok && s.catalogEntryIsFresh(entry, path) {
+				metas = append(metas, entry.Meta)
+				continue
+			}
 		}
-		if !fresh {
-			meta, loadErr = s.LoadThreadMeta(ctx, id)
-		}
+		state, loadErr := s.loadThreadAtPath(ctx, id, path)
 		if loadErr != nil {
 			return nil, fmt.Errorf("load thread %q metadata: %w", id, loadErr)
 		}
-		metas = append(metas, meta)
+		metas = append(metas, state.Meta)
 	}
-	sort.Slice(metas, func(i, j int) bool {
-		if metas[i].UpdatedAt.Equal(metas[j].UpdatedAt) {
-			return metas[i].ID > metas[j].ID
+	// A failed catalog read never hides journals. Pruning is only a best-effort
+	// cleanup after the single authoritative filesystem scan.
+	if catalogErr == nil {
+		_ = s.pruneSessionCatalog(paths)
+		if ordered, ok := s.orderedCatalogMetas(paths); ok {
+			return ordered, nil
 		}
-		return metas[i].UpdatedAt.After(metas[j].UpdatedAt)
-	})
-	return metas, nil
+	}
+	return sortThreadMetas(metas), nil
 }
 
 // ListThreadsReadOnly returns journal-derived metadata without repairing the
@@ -397,20 +399,24 @@ func (s *ThreadStore) ListThreadsReadOnly(ctx context.Context) ([]ThreadMeta, er
 	}
 
 	metas := make([]ThreadMeta, 0, len(paths))
-	for id := range paths {
-		meta, loadErr := s.loadThreadMetaReadOnly(ctx, id)
+	for id, path := range paths {
+		meta, loadErr := s.loadThreadMetaReadOnlyAtPath(ctx, id, path)
 		if loadErr != nil {
 			return nil, fmt.Errorf("load thread %q metadata: %w", id, loadErr)
 		}
 		metas = append(metas, meta)
 	}
+	return sortThreadMetas(metas), nil
+}
+
+func sortThreadMetas(metas []ThreadMeta) []ThreadMeta {
 	sort.Slice(metas, func(i, j int) bool {
 		if metas[i].UpdatedAt.Equal(metas[j].UpdatedAt) {
 			return metas[i].ID > metas[j].ID
 		}
 		return metas[i].UpdatedAt.After(metas[j].UpdatedAt)
 	})
-	return metas, nil
+	return metas
 }
 
 // activeThreadPaths discovers date-partitioned JSONL session files in the
@@ -502,8 +508,16 @@ func (s *ThreadStore) ensureThreadIDAbsent(id, candidate string) error {
 }
 
 func (s *ThreadStore) loadThreadMetaReadOnly(ctx context.Context, id string) (ThreadMeta, error) {
+	path, err := s.threadJournalPath(id)
+	if err != nil {
+		return ThreadMeta{}, err
+	}
+	return s.loadThreadMetaReadOnlyAtPath(ctx, id, path)
+}
+
+func (s *ThreadStore) loadThreadMetaReadOnlyAtPath(ctx context.Context, id, path string) (ThreadMeta, error) {
 	var meta ThreadMeta
-	err := s.withReadOnlyThread(ctx, id, func(dir string, locked bool) error {
+	err := s.withReadOnlyThreadPath(ctx, id, path, func(dir string, locked bool) error {
 		var state ThreadState
 		var err error
 		if locked {
@@ -904,17 +918,34 @@ func (s *ThreadStore) loadThreadLocked(dir, id string) (ThreadState, []ThreadEve
 	return state, events, nil
 }
 
-func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func(), error) {
-	if ctx == nil {
-		ctx = context.Background()
+func (s *ThreadStore) loadThreadAtPath(ctx context.Context, id, path string) (ThreadState, error) {
+	dir, unlock, err := s.lockThreadPath(ctx, id, path)
+	if err != nil {
+		return ThreadState{}, err
 	}
-	dir, err := s.threadDayDir(id)
+	defer unlock()
+	state, _, err := s.loadThreadLocked(dir, id)
+	return state, err
+}
+
+func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func(), error) {
+	path, err := s.threadJournalPath(id)
 	if err != nil {
 		return "", nil, err
 	}
-	path := journalPath(dir, id)
-	if _, err := os.Stat(path); err != nil {
+	return s.lockThreadPath(ctx, id, path)
+}
+
+func (s *ThreadStore) lockThreadPath(ctx context.Context, id, path string) (string, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
 		return "", nil, fmt.Errorf("session journal: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", nil, errors.New("session journal must be a regular file")
 	}
 	unlockLocal, err := s.holdLocalThreadLock(ctx, id)
 	if err != nil {
@@ -938,7 +969,7 @@ func (s *ThreadStore) lockThread(ctx context.Context, id string) (string, func()
 		_ = fileLock.Close()
 		unlockLocal()
 	}
-	return dir, unlock, nil
+	return dirForJournal(path), unlock, nil
 }
 
 func (s *ThreadStore) holdLocalThreadLock(ctx context.Context, id string) (func(), error) {

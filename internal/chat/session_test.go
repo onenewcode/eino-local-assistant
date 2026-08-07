@@ -875,9 +875,9 @@ func TestCompletedToolImpactReadsOnlyStructuredToolResults(t *testing.T) {
 }
 
 func TestArtifactToolOutputPreviewBoundsModelVisibleContent(t *testing.T) {
-	head := strings.Repeat("H", maxModelToolOutputPreviewBytes)
-	omitted := strings.Repeat("M", maxInlineToolOutputBytes)
-	tail := strings.Repeat("T", maxModelToolOutputPreviewBytes)
+	head := strings.Repeat("H", maxModelToolOutputPreviewBytes/2)
+	omitted := strings.Repeat("M", maxModelToolOutputPreviewBytes)
+	tail := strings.Repeat("T", maxModelToolOutputPreviewBytes-maxModelToolOutputPreviewBytes/2)
 	raw := head + omitted + tail
 	ref := store.ArtifactRef{
 		ID:     "sha256-preview",
@@ -896,6 +896,33 @@ func TestArtifactToolOutputPreviewBoundsModelVisibleContent(t *testing.T) {
 	}
 	if strings.Contains(got, omitted) || strings.Contains(got, raw) {
 		t.Fatalf("artifact preview leaked omitted raw output")
+	}
+}
+
+func TestThreadTurnRecorderSharesPreviewBudgetAcrossParallelTools(t *testing.T) {
+	firstRaw := strings.Repeat("A", 12_000)
+	secondRaw := strings.Repeat("B", 12_000)
+	recorder := &threadTurnRecorder{
+		rawOutputs: map[string]string{
+			"call-first":  firstRaw,
+			"call-second": secondRaw,
+		},
+		artifacts: map[string]store.ArtifactRef{
+			"call-first":  {ID: "sha256-first", SHA256: "first", Size: int64(len(firstRaw))},
+			"call-second": {ID: "sha256-second", SHA256: "second", Size: int64(len(secondRaw))},
+		},
+	}
+
+	projections := recorder.modelToolResultBatchProjections([]string{"call-first", "call-second"})
+	if len(projections) != 2 {
+		t.Fatalf("batch projections = %#v", projections)
+	}
+	// A shared 12 KiB budget gives each of these equally-sized results 6 KiB;
+	// an independent 8 KiB preview would omit only 3,808 bytes instead.
+	for id, projection := range projections {
+		if !strings.Contains(projection, "[... 5856 bytes omitted ...]") {
+			t.Fatalf("%s did not receive its shared batch allowance: %q", id, projection)
+		}
 	}
 }
 
@@ -1010,11 +1037,7 @@ func TestSessionSendsBudgetedViewNotFullTranscript(t *testing.T) {
 		}})
 	}
 	cfg := contextbuild.Config{
-		WindowTokens:              500,
-		MaxOutputTokens:           100,
-		AutoCompactTriggerPercent: 75,
-		PostCompactTargetPercent:  45,
-		KeepRecentTurns:           2,
+		WindowTokens: 10_000,
 	}
 	seed, err := NewSession(seedModel, "system instructions", SessionOptions{
 		Store:   st,
@@ -1038,34 +1061,19 @@ func TestSessionSendsBudgetedViewNotFullTranscript(t *testing.T) {
 	session, err := OpenSession(model, st, seed.ID(), SessionOptions{
 		Store: st,
 		Context: contextbuild.Config{
-			WindowTokens:              500,
-			MaxOutputTokens:           100,
-			AutoCompactTriggerPercent: 75,
-			PostCompactTargetPercent:  45,
-			KeepRecentTurns:           2,
+			WindowTokens: 500,
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := session.Ask(ctx, "latest question", nil); err != nil {
-		t.Fatalf("Ask: %v", err)
+	err = session.Ask(ctx, "latest question", nil)
+	if !errors.Is(err, ErrContextCompactionRequired) {
+		t.Fatalf("Ask() error = %v, want required compaction", err)
 	}
-	if len(model.requests) != 1 {
-		t.Fatalf("model calls=%d", len(model.requests))
-	}
-	// The durable planner omits whole old turn groups, never a hand-mutated
-	// message prefix, before sending the request to the model.
-	if len(model.requests[0]) >= 18 {
-		t.Fatalf("model received all durable messages (%d); want bounded view", len(model.requests[0]))
-	}
-	if model.requests[0][0].Role != schema.System {
-		t.Fatalf("first role=%s", model.requests[0][0].Role)
-	}
-	status := session.ContextStatus()
-	if status.OmittedTurnGroups == 0 || status.CurrentTokens > status.BudgetTokens {
-		t.Fatalf("bounded prompt status = %+v", status)
+	if len(model.requests) != 0 {
+		t.Fatalf("model calls=%d, want no silently truncated request", len(model.requests))
 	}
 }
 

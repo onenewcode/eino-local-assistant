@@ -76,8 +76,7 @@ func TestApplyModelOverrideChangesOnlyInvocationModel(t *testing.T) {
 			Name:           "configured-model",
 			TimeoutSeconds: 60,
 			Context: config.ModelContextConfig{
-				WindowTokens:    32000,
-				MaxOutputTokens: 4096,
+				WindowTokens: 32000,
 			},
 		},
 	}
@@ -98,8 +97,7 @@ func TestApplyModelOverrideResolvesConfiguredCatalogAlias(t *testing.T) {
 			Name:           "configured-model",
 			TimeoutSeconds: 60,
 			Context: config.ModelContextConfig{
-				WindowTokens:    32000,
-				MaxOutputTokens: 4096,
+				WindowTokens: 32000,
 			},
 			Catalog: []config.ModelCatalogEntry{
 				{Name: "gpt-5.2-coding", DisplayName: "Coding 5.2", Aliases: []string{"coding"}},

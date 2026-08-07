@@ -77,7 +77,7 @@ func TestFormatContextSnapshotSeparatesUnknownAndActual(t *testing.T) {
 	if got := FormatContextSnapshot(nil); got != "context=unknown" {
 		t.Fatalf("unknown context=%q", got)
 	}
-	snapshot := &store.ContextSnapshot{PromptTokens: 125, BudgetTokens: 100}
+	snapshot := &store.ContextSnapshot{PromptTokens: 125, WindowTokens: 100}
 	if got := FormatContextSnapshot(snapshot); got != "context=125/100 (125%)" {
 		t.Fatalf("context=%q", got)
 	}
@@ -89,6 +89,9 @@ func TestFormatContextSnapshotSeparatesUnknownAndActual(t *testing.T) {
 	}
 	if got := FormatCompactContextSnapshot(&store.ContextSnapshot{PromptTokens: 754}); got != "ctx=754" {
 		t.Fatalf("no-budget compact=%q", got)
+	}
+	if got := FormatCompactEstimatedContext(80, 100); got != "ctx≈80/100 (80%)" {
+		t.Fatalf("estimated context=%q", got)
 	}
 }
 

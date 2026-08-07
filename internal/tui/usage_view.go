@@ -30,9 +30,9 @@ func sessionContextSnapshot(session *chat.Session) *store.ContextSnapshot {
 	if !status.MeasuredKnown {
 		return nil
 	}
-	budget := status.MeasuredBudgetTokens
+	budget := status.MeasuredWindowTokens
 	if budget == 0 {
-		budget = session.ContextConfig().UsableInputTokens()
+		budget = session.ContextConfig().WindowTokens
 	}
-	return &store.ContextSnapshot{PromptTokens: status.MeasuredTokens, BudgetTokens: budget}
+	return &store.ContextSnapshot{PromptTokens: status.MeasuredTokens, WindowTokens: budget}
 }

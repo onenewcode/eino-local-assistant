@@ -39,7 +39,7 @@ func TestThreadStoreRecordUsageAggregatesExactCallsAndIsIdempotent(t *testing.T)
 		CompletionTokens:    1,
 		TotalTokens:         11,
 		CachedTokens:        2,
-		ContextBudgetTokens: 100,
+		ContextWindowTokens: 100,
 		CostUSD:             0.001,
 	}
 	state, err = threadStore.RecordUsage(ctx, state.ID, first)
@@ -67,7 +67,7 @@ func TestThreadStoreRecordUsageAggregatesExactCallsAndIsIdempotent(t *testing.T)
 		CompletionTokens:    5,
 		CachedTokens:        1,
 		ReasoningTokens:     2,
-		ContextBudgetTokens: 100,
+		ContextWindowTokens: 100,
 		CostUSD:             0.002,
 	}
 	state, err = threadStore.RecordUsage(ctx, state.ID, second)
@@ -80,7 +80,7 @@ func TestThreadStoreRecordUsageAggregatesExactCallsAndIsIdempotent(t *testing.T)
 	if state.Meta.CachedTokens != 3 || state.Meta.ReasoningTokens != 2 || state.Meta.ModelCallCount != 2 {
 		t.Fatalf("usage details = %#v", state.Meta)
 	}
-	if state.Meta.UsageStatus != UsageStatusExact || state.Meta.LastContext == nil || state.Meta.LastContext.PromptTokens != 20 || state.Meta.LastContext.BudgetTokens != 100 {
+	if state.Meta.UsageStatus != UsageStatusExact || state.Meta.LastContext == nil || state.Meta.LastContext.PromptTokens != 20 || state.Meta.LastContext.WindowTokens != 100 {
 		t.Fatalf("usage trust/context = %#v", state.Meta)
 	}
 	if math.Abs(state.Meta.CostUSD-0.003) > 1e-12 {
@@ -273,7 +273,7 @@ func TestThreadStoreCreateClearsCallerUsageProjection(t *testing.T) {
 		ModelCallCount:   3,
 		CostUSD:          0.02,
 		UsageStatus:      UsageStatusUnavailable,
-		LastContext:      &ContextSnapshot{PromptTokens: 10, BudgetTokens: 100},
+		LastContext:      &ContextSnapshot{PromptTokens: 10, WindowTokens: 100},
 	}, "system")
 	if err != nil {
 		t.Fatal(err)
@@ -321,7 +321,7 @@ func TestThreadStoreRecordUsageMarksIncompleteAndCompactionClearsContext(t *test
 		HasProviderUsage:    true,
 		PromptTokens:        10,
 		CompletionTokens:    2,
-		ContextBudgetTokens: 64,
+		ContextWindowTokens: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -379,7 +379,7 @@ func TestThreadStoreRecordUsageMarksIncompleteAndCompactionClearsContext(t *test
 		PromptTokens:        999,
 		CompletionTokens:    888,
 		TotalTokens:         1887,
-		ContextBudgetTokens: 64,
+		ContextWindowTokens: 64,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -432,7 +432,7 @@ func TestThreadStoreRecordUsageSurvivesFailedTurn(t *testing.T) {
 		HasProviderUsage:    true,
 		PromptTokens:        12,
 		CompletionTokens:    3,
-		ContextBudgetTokens: 80,
+		ContextWindowTokens: 80,
 	})
 	if err != nil {
 		t.Fatal(err)

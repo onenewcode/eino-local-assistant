@@ -27,13 +27,21 @@ func shortSessionID(id string) string {
 	return id[:8] + "…"
 }
 
-// sessionCtxFragment returns a status-bar ctx segment when a measurement is
-// available, otherwise "".
+// sessionCtxFragment shows provider-reported window occupancy when available.
+// Before the first response, it can only show a clearly marked local estimate.
 func sessionCtxFragment(session *chat.Session) string {
 	if session == nil {
 		return ""
 	}
-	return usage.FormatCompactContextSnapshot(sessionContextSnapshot(session))
+	snapshot := sessionContextSnapshot(session)
+	if snapshot != nil {
+		return usage.FormatCompactContextSnapshot(snapshot)
+	}
+	status := session.ContextStatus()
+	if status.CurrentTokens > 0 {
+		return usage.FormatCompactEstimatedContext(status.CurrentTokens, session.ContextConfig().WindowTokens)
+	}
+	return ""
 }
 
 // taskStatusFragment gives complex work a compact progress signal without

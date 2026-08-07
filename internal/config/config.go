@@ -448,23 +448,6 @@ type StorageConfig struct {
 type ModelContextConfig struct {
 	// WindowTokens is the model's total context capacity.
 	WindowTokens int `toml:"window_tokens"`
-	// MaxOutputTokens limits one model response and is reserved from the prompt.
-	MaxOutputTokens int `toml:"max_output_tokens"`
-	// KeepRecentTurns keeps this many trailing complete turn groups in the hot window.
-	KeepRecentTurns int `toml:"keep_recent_turns"`
-	// AutoCompactTriggerPercent starts automatic compaction at this percentage
-	// of the usable input budget (default 75).
-	AutoCompactTriggerPercent int `toml:"auto_compact_trigger_percent"`
-	// PostCompactTargetPercent is the target utilization after compaction (default 45).
-	PostCompactTargetPercent int `toml:"post_compact_target_percent"`
-	// SummaryMaxTokens caps a structured checkpoint's model-visible rendering.
-	SummaryMaxTokens int `toml:"summary_max_tokens"`
-	// MaxLowGainAttempts is consecutive automatic low-gain failures before
-	// auto-compaction pauses (default 2). Zero uses the product default.
-	// Hard failures still pause immediately.
-	MaxLowGainAttempts int `toml:"max_low_gain_attempts"`
-	// LowGainThresholdPercent defines the minimum useful token release percentage.
-	LowGainThresholdPercent int `toml:"low_gain_threshold_percent"`
 }
 
 // PricingConfig is USD per 1M tokens for cost display.
@@ -528,6 +511,13 @@ func Load(path string) (Config, error) {
 			case "runtime":
 				if len(key) > 1 && key[1] == "max_react_steps" {
 					return Config{}, errors.New("parse TOML configuration: runtime.max_react_steps is no longer supported; replace it with runtime.max_model_steps. One tool-enabled model response consumes a model step; individual tool executions use runtime.max_tool_calls")
+				}
+			case "model":
+				if len(key) > 2 && key[1] == "context" && isRemovedContextKey(key[2]) {
+					return Config{}, fmt.Errorf("parse TOML configuration: model.context.%s was removed; context policy is product-owned and only model.context.window_tokens is supported", key[2])
+				}
+				if len(key) > 3 && key[1] == "catalog" && key[2] == "capabilities" && key[3] == "max_output_tokens" {
+					return Config{}, errors.New("parse TOML configuration: model.catalog.capabilities.max_output_tokens was removed; output limits are not catalog metadata")
 				}
 			}
 		}
@@ -968,32 +958,17 @@ func (c PricingConfig) Validate() error {
 
 // Validate checks the model-specific context budget and compaction settings.
 func (c ModelContextConfig) Validate() error {
-	if c.WindowTokens <= 0 {
-		return errors.New("model.context.window_tokens must be greater than zero")
-	}
-	if c.MaxOutputTokens <= 0 {
-		return errors.New("model.context.max_output_tokens must be greater than zero")
-	}
-	if c.MaxOutputTokens >= c.WindowTokens {
-		return errors.New("model.context.max_output_tokens must be smaller than model.context.window_tokens")
-	}
-	if c.KeepRecentTurns < 0 {
-		return errors.New("model.context.keep_recent_turns must be >= 0")
-	}
-	if err := validatePercent("model.context.auto_compact_trigger_percent", c.AutoCompactTriggerPercent); err != nil {
-		return err
-	}
-	if err := validatePercent("model.context.post_compact_target_percent", c.PostCompactTargetPercent); err != nil {
-		return err
-	}
-	if err := validatePercent("model.context.low_gain_threshold_percent", c.LowGainThresholdPercent); err != nil {
-		return err
-	}
-	if c.SummaryMaxTokens < 0 {
-		return errors.New("model.context.summary_max_tokens must be >= 0")
-	}
-	if c.MaxLowGainAttempts < 0 {
-		return errors.New("model.context.max_low_gain_attempts must be >= 0")
+	if c.WindowTokens < 2 {
+		return errors.New("model.context.window_tokens must be at least 2")
 	}
 	return nil
+}
+
+func isRemovedContextKey(key string) bool {
+	switch key {
+	case "max_output_tokens", "keep_recent_turns", "auto_compact_trigger_percent", "post_compact_target_percent", "summary_max_tokens", "max_low_gain_attempts", "low_gain_threshold_percent":
+		return true
+	default:
+		return false
+	}
 }

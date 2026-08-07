@@ -28,8 +28,7 @@ func TestNewChatModelSelectsConfiguredProvider(t *testing.T) {
 				APIKey:   "test-key",
 				Name:     "test-model",
 				Context: config.ModelContextConfig{
-					WindowTokens:    32_000,
-					MaxOutputTokens: 256,
+					WindowTokens: 32_000,
 				},
 				TimeoutSeconds: 5,
 			})

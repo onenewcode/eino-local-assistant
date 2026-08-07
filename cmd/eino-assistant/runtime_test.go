@@ -9,6 +9,7 @@ import (
 
 	"eino-local-assistant/internal/agent"
 	"eino-local-assistant/internal/config"
+	"eino-local-assistant/internal/contextbuild"
 )
 
 func TestCaptureStartupCWDReadsTheProcessDirectoryOnce(t *testing.T) {
@@ -29,12 +30,15 @@ func TestCaptureStartupCWDReadsTheProcessDirectoryOnce(t *testing.T) {
 }
 
 func TestRuntimeReActOptionsEnableExplicitSteer(t *testing.T) {
-	options := runtimeReActOptions(4, nil)
+	options := runtimeReActOptions(4, nil, contextbuild.Config{WindowTokens: 6_000})
 	if !options.EnableSteer {
 		t.Fatal("production ReAct options must enable explicit steer")
 	}
 	if options.MaxModelSteps != 4 {
 		t.Fatalf("max model steps = %d, want 4", options.MaxModelSteps)
+	}
+	if got, want := options.Admission.CeilingTokens(), 5_700; got != want {
+		t.Fatalf("request admission ceiling = %d, want %d", got, want)
 	}
 }
 

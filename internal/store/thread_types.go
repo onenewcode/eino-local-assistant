@@ -8,18 +8,9 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-const (
-	// SessionJournalFormatVersion is the on-disk format used by ThreadStore. Version 6
-	// stores each active session as one date-partitioned JSONL file.
-	SessionJournalFormatVersion = 6
-
-	// MaxArtifactBytes bounds full payload retention for one artifact. Larger
-	// inputs are retained as digest plus head/tail metadata.
-	MaxArtifactBytes int64 = 4 << 20
-	// MaxThreadArtifactBytes bounds aggregate payload retention for one thread;
-	// inputs beyond it still produce truncated metadata artifacts.
-	MaxThreadArtifactBytes int64 = 64 << 20
-)
+// SessionJournalFormatVersion is the on-disk format used by ThreadStore.
+// Version 6 stores each active session as one date-partitioned JSONL file.
+const SessionJournalFormatVersion = 6
 
 var (
 	// ErrRevisionConflict means a writer used a stale thread revision.
@@ -163,7 +154,7 @@ const (
 // ThreadMeta.LastContext means that no trustworthy measurement is available.
 type ContextSnapshot struct {
 	PromptTokens int `json:"prompt_tokens"`
-	BudgetTokens int `json:"budget_tokens,omitempty"`
+	WindowTokens int `json:"window_tokens,omitempty"`
 }
 
 // CompactionOutcomeStatus classifies the last completed compaction lifecycle
@@ -186,6 +177,15 @@ const CompactionFailureReasonLowGain = "low_gain"
 // frozen candidate lost a CAS race. It closes the durable operation without
 // latching automatic compaction as failed.
 const CompactionFailureReasonStale = "stale"
+
+// CompactionFailureReasonEmptyCheckpointResponse marks a completed provider
+// call that produced no checkpoint text. Retrying remains an explicit action
+// because the original request may have consumed provider capacity.
+const CompactionFailureReasonEmptyCheckpointResponse = "empty_checkpoint_response"
+
+// CompactionFailureReasonPromptBudgetExceeded marks a locally blocked
+// compaction request that would have exceeded the configured input budget.
+const CompactionFailureReasonPromptBudgetExceeded = "prompt_budget_exceeded"
 
 // CompactionOutcome is a durable, user-visible summary of one compaction
 // result. Detailed model usage remains in usage.recorded events linked by
@@ -224,7 +224,7 @@ type ModelUsage struct {
 	TotalTokens         int     `json:"total_tokens,omitempty"`
 	CachedTokens        int     `json:"cached_tokens,omitempty"`
 	ReasoningTokens     int     `json:"reasoning_tokens,omitempty"`
-	ContextBudgetTokens int     `json:"context_budget_tokens,omitempty"`
+	ContextWindowTokens int     `json:"context_window_tokens,omitempty"`
 	CostUSD             float64 `json:"cost_usd,omitempty"`
 }
 
@@ -293,24 +293,17 @@ type ArtifactInput struct {
 
 // ArtifactRef is a stable reference stored in events and checkpoints.
 type ArtifactRef struct {
-	ID           string `json:"id"`
-	SHA256       string `json:"sha256"`
-	Digest       string `json:"digest"`
-	Kind         string `json:"kind"`
-	MediaType    string `json:"media_type"`
-	Size         int64  `json:"size"`
-	OriginalSize int64  `json:"original_size"`
-	StoredSize   int64  `json:"stored_size"`
-	Truncated    bool   `json:"truncated,omitempty"`
-	Head         []byte `json:"head,omitempty"`
-	Tail         []byte `json:"tail,omitempty"`
-	// Data is retained with non-truncated evidence in the same JSONL event.
-	Data []byte `json:"data,omitempty"`
+	ID        string `json:"id"`
+	SHA256    string `json:"sha256"`
+	Digest    string `json:"digest"`
+	Kind      string `json:"kind"`
+	MediaType string `json:"media_type"`
+	Size      int64  `json:"size"`
+	// Data is retained in full in the same JSONL event.
+	Data []byte `json:"data"`
 }
 
-// ArtifactRead is one bounded range from a retained artifact. For a truncated
-// Ref, Offset and HasMore address the virtual head/omission-marker/tail
-// excerpt; Ref.Truncated means bytes outside that excerpt are unavailable.
+// ArtifactRead is one bounded range from a complete retained artifact.
 type ArtifactRead struct {
 	Ref     ArtifactRef `json:"ref"`
 	Offset  int64       `json:"offset"`
@@ -385,9 +378,10 @@ type Checkpoint struct {
 	Hash            string `json:"hash"`
 }
 
-// DefaultMaxLowGainAttempts is consecutive automatic low-gain failures before
-// auto-compaction pauses when MaxLowGainAttempts is unset or zero.
-const DefaultMaxLowGainAttempts = 2
+// DefaultMaxLowGainAttempts is one: after an automatic compaction has reached
+// a provider call and cannot produce a useful checkpoint, do not retry and
+// risk another billed request. Manual /compact remains available.
+const DefaultMaxLowGainAttempts = 1
 
 // CompactionFailure appends an unsuccessful compaction result. It is separate
 // from a checkpoint commit so failed model output can never alter the active

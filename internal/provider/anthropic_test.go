@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,8 +58,7 @@ func TestAnthropicModelStreamsMessagesAPIWithTools(t *testing.T) {
 		APIKey:   "test-key",
 		Name:     "claude-test",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 777,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})
@@ -182,8 +182,7 @@ func TestAnthropicModelPassesReasoningEffortWithoutDroppingOutputFormat(t *testi
 		Name:            "claude-test",
 		ReasoningEffort: " high ",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 777,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})
@@ -210,6 +209,49 @@ func TestAnthropicModelPassesReasoningEffortWithoutDroppingOutputFormat(t *testi
 	schemaObject := objectValue(t, format["schema"])
 	if got, want := stringValue(t, schemaObject["type"]), "object"; got != want {
 		t.Errorf("output_config.format.schema.type = %q, want %q", got, want)
+	}
+}
+
+func TestAnthropicModelReducesRequiredMaxTokensForLargerPrompt(t *testing.T) {
+	requests := make(chan anthropicRequest, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		requests <- anthropicRequest{body: body}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"msg_limit","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-test","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	chatModel, err := NewAnthropicModel(context.Background(), config.ModelConfig{
+		Provider: config.ProviderAnthropic,
+		BaseURL:  server.URL,
+		APIKey:   "test-key",
+		Name:     "claude-test",
+		Context: config.ModelContextConfig{
+			WindowTokens: 32_000,
+		},
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("NewAnthropicModel: %v", err)
+	}
+	if _, err := chatModel.Generate(context.Background(), []*schema.Message{schema.UserMessage("short")}); err != nil {
+		t.Fatalf("Generate short prompt: %v", err)
+	}
+	if _, err := chatModel.Generate(context.Background(), []*schema.Message{schema.UserMessage(strings.Repeat("long prompt ", 2_000))}); err != nil {
+		t.Fatalf("Generate long prompt: %v", err)
+	}
+
+	shortRequest := receiveAnthropicRequest(t, requests)
+	longRequest := receiveAnthropicRequest(t, requests)
+	shortLimit := integerValue(t, shortRequest.body["max_tokens"])
+	longLimit := integerValue(t, longRequest.body["max_tokens"])
+	if longLimit >= shortLimit {
+		t.Fatalf("max_tokens for long prompt = %d, want less than short prompt limit %d", longLimit, shortLimit)
 	}
 }
 
@@ -252,8 +294,8 @@ func assertAnthropicRequest(t *testing.T, request anthropicRequest) {
 	if got, want := stringValue(t, request.body["model"]), "claude-test"; got != want {
 		t.Errorf("model = %q, want %q", got, want)
 	}
-	if got, want := integerValue(t, request.body["max_tokens"]), 777; got != want {
-		t.Errorf("max_tokens = %d, want %d", got, want)
+	if got := integerValue(t, request.body["max_tokens"]); got < 1 || got > 30_400 {
+		t.Errorf("max_tokens = %d, want a dynamically computed positive limit within the 95%% ceiling", got)
 	}
 	if got, ok := request.body["stream"].(bool); !ok || !got {
 		t.Errorf("stream = %#v, want true", request.body["stream"])
@@ -378,8 +420,7 @@ func TestAnthropicModelSendsEmptyToolResult(t *testing.T) {
 		APIKey:   "test-key",
 		Name:     "claude-test",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 777,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})
@@ -470,8 +511,7 @@ func TestAnthropicModelNormalizesInvalidAndBlankHistoricalToolArguments(t *testi
 		APIKey:   "test-key",
 		Name:     "claude-test",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 777,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})
@@ -555,8 +595,7 @@ func TestAnthropicModelMergesAdjacentToolResultsWithoutLosingIDs(t *testing.T) {
 		APIKey:   "test-key",
 		Name:     "claude-test",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 777,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})
@@ -636,8 +675,7 @@ func TestAnthropicModelWithToolsDoesNotMutateBaseModelOrFinalOnlyBinding(t *test
 		APIKey:   "test-key",
 		Name:     "claude-test",
 		Context: config.ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 777,
+			WindowTokens: 32_000,
 		},
 		TimeoutSeconds: 5,
 	})

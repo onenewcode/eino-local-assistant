@@ -25,8 +25,7 @@ type ReadArtifactInput struct {
 	MaxBytes   int    `json:"max_bytes,omitempty" jsonschema:"description=Maximum bytes to return (default 16384, maximum 65536)."`
 }
 
-// ReadArtifactOutput describes the evidence range without claiming that a
-// retention-truncated artifact is complete.
+// ReadArtifactOutput describes a bounded range from complete artifact evidence.
 type ReadArtifactOutput struct {
 	ArtifactID string `json:"artifact_id"`
 	SHA256     string `json:"sha256"`
@@ -34,7 +33,6 @@ type ReadArtifactOutput struct {
 	Content    string `json:"content"`
 	Encoding   string `json:"encoding"`
 	HasMore    bool   `json:"has_more"`
-	Truncated  bool   `json:"truncated"`
 }
 
 // NewReadArtifact creates the read-only evidence tool. chat.Session installs a
@@ -73,7 +71,6 @@ func NewReadArtifact() (tool.InvokableTool, error) {
 				Content:    content,
 				Encoding:   encoding,
 				HasMore:    read.HasMore,
-				Truncated:  read.Ref.Truncated,
 			}, nil
 		},
 	)

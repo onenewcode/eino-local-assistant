@@ -16,8 +16,8 @@ func TestEmitFromTurnEventPreservesRawToolPayload(t *testing.T) {
 	ch := make(chan tea.Msg, 2)
 	emit := emitFromTurnEvent(context.Background(), 17, 23, ch)
 
-	input := strings.Repeat("i", toolBodyMaxRunes+200)
-	output := strings.Repeat("o", toolBodyMaxRunes+200)
+	input := strings.Repeat("i", toolHeaderArgMaxRunes+200)
+	output := strings.Repeat("o", toolHeaderArgMaxRunes+200)
 	emit(chat.TurnEvent{Kind: chat.TurnEventToolStart, Tool: "read_file", Input: input})
 	emit(chat.TurnEvent{Kind: chat.TurnEventToolEnd, Tool: "read_file", Output: output})
 

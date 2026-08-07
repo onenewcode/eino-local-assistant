@@ -20,7 +20,6 @@ timeout_seconds = 60
 
 [model.context]
 window_tokens = 32000
-max_output_tokens = 4096
 
 [model.pricing]
 input_per_million = 0.0
@@ -44,14 +43,21 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 			Name:           "test-model",
 			TimeoutSeconds: 60,
 			Context: ModelContextConfig{
-				WindowTokens:    32_000,
-				MaxOutputTokens: 4_096,
+				WindowTokens: 32_000,
 			},
 		},
 		Assistant: AssistantConfig{SystemPrompt: "You are a helpful assistant."},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadRejectsRemovedContextTuning(t *testing.T) {
+	doc := strings.Replace(validConfiguration, "window_tokens = 32000", "window_tokens = 32000\nmax_output_tokens = 1024", 1)
+	_, err := Load(writeConfiguration(t, doc))
+	if err == nil || !strings.Contains(err.Error(), "was removed") {
+		t.Fatalf("Load(removed context key) error = %v", err)
 	}
 }
 
@@ -85,7 +91,6 @@ lifecycle = "ACTIVE"
 
 [model.catalog.capabilities]
 context_window_tokens = 128000
-max_output_tokens = 8192
 reasoning_efforts = ["low", " medium ", "low"]
 default_reasoning_effort = " custom-effort "
 input_modalities = ["text", "image"]
@@ -146,14 +151,6 @@ func TestModelCatalogRejectsAmbiguousOrContradictoryMetadata(t *testing.T) {
 			name:    "invalid token",
 			entries: []ModelCatalogEntry{{Name: "two words"}},
 			want:    "single token",
-		},
-		{
-			name: "output exceeds context",
-			entries: []ModelCatalogEntry{{Name: "one", Capabilities: ModelCatalogCapabilities{
-				ContextWindowTokens: 100,
-				MaxOutputTokens:     100,
-			}}},
-			want: "smaller than context_window_tokens",
 		},
 		{
 			name: "reasoning contradiction",
@@ -245,8 +242,7 @@ func TestModelValidateNormalizesBlankReasoningEffort(t *testing.T) {
 		ReasoningEffort: " \t",
 		TimeoutSeconds:  60,
 		Context: ModelContextConfig{
-			WindowTokens:    32_000,
-			MaxOutputTokens: 4_096,
+			WindowTokens: 32_000,
 		},
 	}
 	if err := model.Validate(); err != nil {

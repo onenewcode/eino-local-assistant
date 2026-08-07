@@ -89,7 +89,7 @@ func normalizeModelUsage(input ModelUsage) (ModelUsage, error) {
 	if input.Operation != UsageOperationCompaction && input.OperationID != "" {
 		return ModelUsage{}, fmt.Errorf("model usage operation id is only valid for compaction")
 	}
-	if input.PromptTokens < 0 || input.CompletionTokens < 0 || input.TotalTokens < 0 || input.CachedTokens < 0 || input.ReasoningTokens < 0 || input.ContextBudgetTokens < 0 {
+	if input.PromptTokens < 0 || input.CompletionTokens < 0 || input.TotalTokens < 0 || input.CachedTokens < 0 || input.ReasoningTokens < 0 || input.ContextWindowTokens < 0 {
 		return ModelUsage{}, fmt.Errorf("model usage token counts must not be negative")
 	}
 	if input.CostUSD < 0 || math.IsNaN(input.CostUSD) || math.IsInf(input.CostUSD, 0) {
@@ -102,7 +102,7 @@ func normalizeModelUsage(input ModelUsage) (ModelUsage, error) {
 		input.TotalTokens = 0
 		input.CachedTokens = 0
 		input.ReasoningTokens = 0
-		input.ContextBudgetTokens = 0
+		input.ContextWindowTokens = 0
 		input.CostUSD = 0
 		return input, nil
 	}

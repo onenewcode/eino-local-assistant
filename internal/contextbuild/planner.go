@@ -27,24 +27,22 @@ func PlanContext(input PlannerInput, cfg Config) (PromptPlan, error) {
 	return NewContextPlanner(cfg).Plan(input)
 }
 
-// PromptBudgetTokens returns the input capacity after reserving output space.
-func (p *ContextPlanner) PromptBudgetTokens() int {
-	cfg := p.normalizedConfig()
-	return cfg.WindowTokens - cfg.MaxOutputTokens
+// RequestAdmissionCeilingTokens returns the full-window safety ceiling used by
+// the planner. It does not subtract a fictional fixed response budget.
+func (p *ContextPlanner) RequestAdmissionCeilingTokens() int {
+	return p.normalizedConfig().RequestAdmissionCeilingTokens()
 }
 
-// AutoCompactTriggerTokens is the soft-watermark threshold for planning an
-// asynchronous compaction at a turn boundary.
+// AutoCompactTriggerTokens is the fixed soft watermark at which a stable
+// boundary should create a checkpoint.
 func (p *ContextPlanner) AutoCompactTriggerTokens() int {
-	cfg := p.normalizedConfig()
-	return percentTokens(p.PromptBudgetTokens(), cfg.AutoCompactTriggerPercent)
+	return p.normalizedConfig().AutoCompactTriggerTokens()
 }
 
-// PostCompactTargetTokens is the desired prompt size after a successful
-// compaction. It gives the caller a stable target for anti-thrashing logic.
+// PostCompactTargetTokens is the product-owned desired prompt size after a
+// successful compaction.
 func (p *ContextPlanner) PostCompactTargetTokens() int {
-	cfg := p.normalizedConfig()
-	return percentTokens(p.PromptBudgetTokens(), cfg.PostCompactTargetPercent)
+	return p.normalizedConfig().PostCompactTargetTokens()
 }
 
 // ValidateConfig reports invalid planner settings.
@@ -56,24 +54,9 @@ func (p *ContextPlanner) ValidateConfig() error {
 	if cfg.WindowTokens < 0 {
 		return errors.New("context window tokens must be >= 0")
 	}
-	if cfg.MaxOutputTokens < 0 {
-		return errors.New("max output tokens must be >= 0")
-	}
 	normalized := cfg.Normalize()
-	if normalized.MaxOutputTokens >= normalized.WindowTokens {
-		return errors.New("max output tokens must be smaller than context window tokens")
-	}
-	if cfg.AutoCompactTriggerPercent < 0 || cfg.AutoCompactTriggerPercent > 100 {
-		return errors.New("auto compact trigger percent must be between 0 and 100")
-	}
-	if cfg.PostCompactTargetPercent < 0 || cfg.PostCompactTargetPercent > 100 {
-		return errors.New("post compact target percent must be between 0 and 100")
-	}
-	if cfg.SummaryMaxTokens < 0 {
-		return errors.New("summary max tokens must be >= 0")
-	}
-	if cfg.LowGainThresholdPercent < 0 || cfg.LowGainThresholdPercent > 100 {
-		return errors.New("low gain threshold percent must be between 0 and 100")
+	if normalized.WindowTokens < 2 {
+		return errors.New("context window tokens must be at least 2")
 	}
 	return nil
 }
@@ -101,11 +84,11 @@ func (p *ContextPlanner) Plan(input PlannerInput) (PromptPlan, error) {
 		}
 	}
 
-	budget := p.PromptBudgetTokens()
+	ceiling := p.RequestAdmissionCeilingTokens()
 	trigger := p.AutoCompactTriggerTokens()
 	target := p.PostCompactTargetTokens()
 	plan := PromptPlan{
-		BudgetTokens:  budget,
+		CeilingTokens: ceiling,
 		TriggerTokens: trigger,
 		TargetTokens:  target,
 	}
@@ -114,8 +97,8 @@ func (p *ContextPlanner) Plan(input PlannerInput) (PromptPlan, error) {
 	current := cloneMsgs(input.CurrentMessages)
 	mandatory := append(cloneMsgs(prefix), current...)
 	immutableTokens := usage.EstimateMessages(mandatory)
-	if immutableTokens > budget {
-		return PromptPlan{}, &ImmutableOverBudgetError{Tokens: immutableTokens, Budget: budget}
+	if immutableTokens > ceiling {
+		return PromptPlan{}, &ImmutableOverBudgetError{Tokens: immutableTokens, Budget: ceiling}
 	}
 
 	// OriginalTokens measures the full candidate set before any planner fallback.
@@ -136,7 +119,7 @@ func (p *ContextPlanner) Plan(input PlannerInput) (PromptPlan, error) {
 	if input.Checkpoint != nil {
 		checkpointMessage := schema.SystemMessage(input.Checkpoint.PromptText())
 		checkpointTokens := usage.EstimateMessages([]*schema.Message{checkpointMessage})
-		if used+checkpointTokens <= budget {
+		if used+checkpointTokens <= ceiling {
 			messages = append(messages, checkpointMessage)
 			used += checkpointTokens
 		} else {
@@ -155,7 +138,7 @@ func (p *ContextPlanner) Plan(input PlannerInput) (PromptPlan, error) {
 		}
 		artifactMessage := schema.UserMessage(artifact.PromptText())
 		artifactTokens := usage.EstimateMessages([]*schema.Message{artifactMessage})
-		if used+artifactTokens > budget {
+		if used+artifactTokens > ceiling {
 			return PromptPlan{}, fmt.Errorf("%w: artifact %q", ErrRequiredGroupOverBudget, artifact.ID)
 		}
 		messages = append(messages, artifactMessage)
@@ -172,7 +155,7 @@ func (p *ContextPlanner) Plan(input PlannerInput) (PromptPlan, error) {
 	for i := len(input.TurnGroups) - 1; i >= 0; i-- {
 		group := input.TurnGroups[i]
 		groupTokens := group.EstimatedTokens()
-		if cut || used+groupTokens > budget {
+		if cut || used+groupTokens > ceiling {
 			if group.Required {
 				return PromptPlan{}, fmt.Errorf("%w: group %q", ErrRequiredGroupOverBudget, group.ID)
 			}
@@ -199,7 +182,7 @@ func (p *ContextPlanner) Plan(input PlannerInput) (PromptPlan, error) {
 		}
 		artifactMessage := schema.UserMessage(artifact.PromptText())
 		artifactTokens := usage.EstimateMessages([]*schema.Message{artifactMessage})
-		if used+artifactTokens > budget {
+		if used+artifactTokens > ceiling {
 			plan.Fallbacks = append(plan.Fallbacks, PlanFallback{
 				Kind:    "artifact_omitted",
 				Details: "artifact " + artifact.ID + " did not fit",

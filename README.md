@@ -17,7 +17,7 @@
 
 需要交互式终端（`sessions` / `version` / `help` 除外）；管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
 
-**工具职责（Codex 子集）**：
+## 内置工具
 
 | 工具 | 用途 | 权限 |
 | --- | --- | --- |
@@ -29,12 +29,6 @@
 
 工具的权限语言仍不是安全边界；实际文件和网络隔离由 sandbox worker 提供。
 
-## 准备条件
-
-- 可用的 Go 工具链
-- 支持 OpenAI Chat Completions 或 Anthropic Messages API 的流式模型服务；服务端需支持 tool calling
-- 交互式终端（stdin/stdout 均为 TTY；仅 TUI 子命令需要）
-- macOS 的 `sandbox-exec`，或 Linux 的 `bwrap`（bubblewrap）；缺少可用后端时有副作用工具 fail-closed。Windows 在 V1 不支持强制 sandbox。
 
 ## 配置
 
@@ -60,28 +54,11 @@ yolo 同时绕过普通 approval/approver/session allow-deny 和 `shell`/`apply_
 
 危险警告会写入启动 stderr，并显示在 TUI transcript、状态栏和 `/permissions` 报告中。成功的 shell/apply_patch yolo 结果带有 `SandboxOutcome` 元数据（`mode=yolo`、`backend=host`、`network=host`、`bypassed=true`），便于 tool lifecycle/artifact 审计。yolo 只存在当前进程，不写 TOML、session ledger 或 resume 数据。
 
-`model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。模型的 token 边界和压缩策略统一位于 `model.context`：`window_tokens` 与 `max_output_tokens` 都是必填正整数，且后者必须小于前者。输入 prompt 的可用预算固定为 `window_tokens - max_output_tokens`，因此不存在第二个 reserve 配置可以与实际输出上限漂移。
-
-OpenAI adapter 按模型能力选择 Chat Completions 字段：已知 o 系列和 GPT-5 使用 `max_completion_tokens`，其他模型使用 `max_tokens`。这个协议细节不是用户配置，且每次只发送其中一个字段。Anthropic adapter 则在内部使用其 Messages API 的 `max_tokens` 字段。`model.pricing` 是该模型的本地费用估算参数，不是服务商账单。
+`model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。`model.context` 只有一个设置：`window_tokens`，即模型的完整物理上下文窗口。它必须与实际部署相符；状态栏和 `/context` 都以这个完整窗口为分母，绝不会显示“窗口减输出预留”这一误导性的容量。
 
 使用 Anthropic 时，配置其公开的 Messages API（不是 Claude Code 的本地会话、OAuth 或订阅协议）：
 
-```toml
-[model]
-provider = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key = "replace-with-your-anthropic-api-key"
-name = "claude-your-model"
-timeout_seconds = 60
-
-[model.context]
-window_tokens = 32000
-max_output_tokens = 4096
-```
-
-OpenAI Chat Completions endpoint 的 `base_url` 通常包含 `/v1`；Anthropic `base_url` 则填写 API 根地址，适配器会调用 `/v1/messages`。
-
-`model.context` 的压缩策略数值设为 `0` 表示采用产品默认值，不表示关闭对应能力；例如 `keep_recent_turns = 0` 仍使用默认的 12 个完整 turn。窗口和输出上限不会默认推断，必须明确配置。
+为什么没有 `max_output_tokens`、Anthropic 的必填 `max_tokens` 如何处理，以及固定的上下文/压缩与恢复合同，见 [上下文管理](docs/context-management.md)。`model.pricing` 只是本地费用估算，不是服务商账单。
 
 ### 沙盒与运行时护栏
 
@@ -95,18 +72,4 @@ OpenAI Chat Completions endpoint 的 `base_url` 通常包含 `/v1`；Anthropic `
 
 交互 TUI 的显式 yolo 是另一条明确的 host bypass：它不等待 sandbox worker，也不把普通 sandbox 失败当作 yolo；shell 与 apply_patch 都直接执行。它仍会运行规则、workspace/path/symlink 与字符串级命令检查，但这些不是 yolo 下的强制宿主安全边界，`[sandbox.network].allowed_domains` 也不再限制 yolo 的 host 网络。退出 yolo 后，已配置的普通 sandbox 状态仍会恢复用于后续工具调用。
 
-`[runtime]` 同时限制一个完整 agent turn：`max_turn_seconds` 默认 600（最大 3600）、`max_model_steps` 默认 8（最大 32）、`max_tool_calls` 默认 16（最大 128），以及 `max_consecutive_equivalent_tool_calls` 默认 3。一次 tool-enabled 模型响应只消耗一个 model step；其中的 0..N 条工具调用仍各自计入 tool-call 预算，并可并行执行。达到模型决策预算后，系统还会发起一次已解绑工具的最终答复请求；它不能再执行工具，也不消耗 `max_model_steps`。重复调用按工具名与规范化 JSON 参数识别；同一参数在实际工作区或外部状态变更前最多允许阈值次数执行，下一次重试会被拒绝并带 `stop_retrying`。重复调用阈值的非零值不得超过 `max_tool_calls`；省略或设为 `0` 时使用默认 3，但当 `max_tool_calls` 小于 3 时自动收紧到该总预算。超过 16 KiB 的工具输出会完整持久化为 artifact，当前回合与重放只接收 artifact 引用、4 KiB 头部、4 KiB 尾部和省略标记；artifact 本身不是工具调用，只有模型主动调用 `read_artifact` 才消耗一次 tool-call 预算。超时会停止该 turn，耗尽 tool-call 预算会拒绝后续工具调用并返回不可重试结果。它们与 `[tools.shell]` 的单命令 timeout / 输出上限互补，不是 CPU、内存或磁盘 cgroup 配额。
-
-取消、超时与输出上限会对原始命令进程组依次发送 TERM/KILL，能清理仍留在该组的常规前后台进程。macOS 的通用 Seatbelt shell 不是进程树或容器级终止机制：子进程可通过 `setsid(2)` / `setpgid(2)` 脱离该组，并可能在工具返回后继续以原 sandbox 权限工作；脱离本身不会扩大文件/网络权限。宿主升级没有 Seatbelt，分离后代还会保留宿主权限。不要把工具返回视为所有后代已停止；需要可证明的任意 shell 后代清理时，请使用 Linux PID namespace、容器或 VM 后端。
-
-
-
-| 子命令 | 说明 |
-|--------|------|
-| `chat` / `new` | 新建交互会话（默认）；可显式加 `--yolo` 旁路 approval 与 OS sandbox |
-| `exec [PROMPT]` | 创建无 TTY 的单轮持久执行；`--ephemeral` 使用进程临时 `ThreadStore`，关闭时删除 session ledger，不回滚工具副作用或清除 semantic memory；`--output-format text`（默认）仅在成功提交后将最终回复写到 stdout，`--output-format json` 写单个 v1 最终结果对象，`--output-format stream-json` 写版本化 JSONL 生命周期记录；`--output-schema FILE` 在 turn commit 前于本地把最终 assistant Content 解析为 JSON 实例并按 FILE 校验，不注入 provider `response_format`，也不约束 ReAct 中间步骤；schema 错误是 input error，响应校验失败是 turn failure；`-o FILE` 是 `--output-last-message FILE` 的同一选项别名，仍仅在 schema 校验成功且 turn 成功提交后用同目录临时文件和 `rename` 原子替换最终回复，失败/取消或写入失败不覆盖旧文件；同时提供两种写法是 input error；无参数或参数为 `-` 时从 stdin 读取（最多 10 MiB），显式 prompt 与管道 stdin 同时存在时将 stdin 追加为 JSON reference envelope |
-| `exec resume [<id>\|--last] [PROMPT] [--recover]` | 打开精确指定的 durable session，或在显式 `--last` 下选择最近 session，再追加一条新 prompt；支持与 fresh exec 相同的 `--output-schema FILE` 本地最终 JSON 校验和 `-o FILE` / `--output-last-message FILE` 成功提交后原子写文件契约。这两种写法是同一选项，同时提供会在打开 session 前报告 input error。显式 ID 是稳定身份；`--last` 不做 cwd/project 过滤、不排除活动会话，也不隐式恢复。普通打开拒绝活动 turn / pending compaction；只有显式 `--recover` 才会在 CAS 下终止其未完成状态。成功打开后将 session ID 与 `exec resume <id>` 提示写到 stderr |
-| `resume <id>` | 恢复已保存会话并进入 TUI；活动 turn 必须等待完成或显式使用 `--recover` 接管 |
-| `sessions` / `ls` | 列出本地会话 |
-| `version` | 打印版本 |
-| `help [command]` | 帮助 |
+`[runtime]` 同时限制一个完整 agent turn：`max_turn_seconds` 默认 600（最大 3600）、`max_model_steps` 默认 8（最大 32）、`max_tool_calls` 默认 16（最大 128），以及 `max_consecutive_equivalent_tool_calls` 默认 3。一次 tool-enabled 模型响应只消耗一个 model step；其中的 0..N 条工具调用仍各自计入 tool-call 预算，并可并行执行。达到模型决策预算后，系统还会发起一次已解绑工具的最终答复请求；它不能再执行工具，也不消耗 `max_model_steps`。重复调用按工具名与规范化 JSON 参数识别；同一参数在实际工作区或外部状态变更前最多允许阈值次数执行，下一次重试会被拒绝并带 `stop_retrying`。重复调用阈值的非零值不得超过 `max_tool_calls`；省略或设为 `0` 时使用默认 3，但当 `max_tool_calls` 小于 3 时自动收紧到该总预算。每个完成工具结果都会持久化为会话 artifact；普通模型视图只接收有界预览和 artifact 引用，并行批次共享预览额度。artifact 本身不是工具调用，只有模型主动调用 `read_artifact` 才消耗一次 tool-call 预算。超时会停止该 turn，耗尽 tool-call 预算会拒绝后续工具调用并返回不可重试结果。它们与 `[tools.shell]` 的单命令 timeout / 输出上限互补，不是 CPU、内存或磁盘 cgroup 配额。

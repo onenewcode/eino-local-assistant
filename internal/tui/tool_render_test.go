@@ -20,43 +20,44 @@ func TestRenderErrorWrapsLongProviderMessage(t *testing.T) {
 	}
 }
 
-func TestFormatToolCardPrettyJSON(t *testing.T) {
+func TestFormatToolCardUsesCompactJSONSummary(t *testing.T) {
 	card := formatToolCard("get_current_time", `{"datetime":"2026-07-14","tz":"UTC"}`, "ok")
-	if !strings.HasPrefix(card, "get_current_time\n") {
-		t.Fatalf("header: %q", card)
+	if card != "get_current_time  datetime=2026-07-14" {
+		t.Fatalf("card: %q", card)
 	}
-	if !strings.Contains(card, "  ⎿  {") {
-		t.Fatalf("expected indented JSON start: %q", card)
-	}
-	if !strings.Contains(card, `"datetime"`) {
-		t.Fatalf("expected pretty field: %q", card)
+	if strings.Contains(card, "\n") || strings.Contains(card, `"tz"`) {
+		t.Fatalf("default card must not dump JSON: %q", card)
 	}
 }
 
 func TestFormatToolCardRunningArgsOnHeader(t *testing.T) {
 	run := formatToolCard("get_current_time", `{"timezone":"UTC"}`, "run")
 	if !strings.Contains(run, "running…") {
-		t.Fatalf("run card body: %q", run)
+		t.Fatalf("run card: %q", run)
 	}
-	// Args should appear on the header line.
-	first := strings.SplitN(run, "\n", 2)[0]
-	if !strings.Contains(first, "timezone=") {
-		t.Fatalf("expected arg summary on header: %q", first)
+	if !strings.Contains(run, "timezone=") || strings.Contains(run, "\n") {
+		t.Fatalf("expected compact running summary: %q", run)
 	}
 	errCard := formatToolCard("t", "boom", "err")
-	if !strings.Contains(errCard, "  ✗  boom") {
+	if !strings.Contains(errCard, "failed: boom") || strings.Contains(errCard, "\n") {
 		t.Fatalf("err card: %q", errCard)
 	}
 }
 
-func TestFormatToolCardClampsRawOutputForDisplay(t *testing.T) {
-	raw := strings.Repeat("x", toolBodyMaxRunes+200)
-	card := formatToolCard("large_output", raw, "ok")
-	if strings.Contains(card, raw) {
-		t.Fatalf("tool card should not render the full raw payload")
+func TestFormatToolCardSummarizesShellWithoutSandboxJSON(t *testing.T) {
+	card := formatToolCardWithInput("shell", `{"command":"ls -la /workspace"}`, `{"cancelled":false,"command":"ls -la /workspace","decision":"allow","denied":false,"duration_ms":14,"exit_code":0,"impact":"read_only","sandbox":{"network":"denied"}}`, "ok")
+	for _, want := range []string{"shell", "ls -la /workspace", "exit 0", "14ms", "read-only"} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("shell card %q missing %q", card, want)
+		}
 	}
-	if !strings.Contains(card, "…") {
-		t.Fatalf("clamped tool card should mark omitted output: %q", card)
+	if strings.Contains(card, "sandbox") || strings.Contains(card, "\n") || strings.Contains(card, `"`) {
+		t.Fatalf("shell card leaked raw result JSON: %q", card)
+	}
+
+	errCard := formatToolCardWithInput("shell", `{"command":"rm -rf tmp"}`, "permission denied\nmore diagnostic data", "err")
+	if !strings.Contains(errCard, "rm -rf tmp · failed: permission denied more diagnostic data") || strings.Contains(errCard, "\n") {
+		t.Fatalf("shell error card: %q", errCard)
 	}
 }
 
@@ -89,7 +90,7 @@ func TestUpdateOpenToolCardInPlace(t *testing.T) {
 	if len(mm.openToolCards) != 0 {
 		t.Fatalf("open tool cards should clear, got %#v", mm.openToolCards)
 	}
-	if !strings.Contains(mm.lines[startIdx].text, "datetime") {
+	if !strings.Contains(mm.lines[startIdx].text, "datetime=2026-07-14") || strings.Contains(mm.lines[startIdx].text, "\n") {
 		t.Fatalf("result missing: %q", mm.lines[startIdx].text)
 	}
 }
@@ -103,9 +104,9 @@ func TestToolCardsUseCallIDForReverseCompletion(t *testing.T) {
 	mm := next.(*model)
 	next, _ = mm.Update(turnToolStartMsg{turnID: 1, tool: "search", callID: "call-b", input: "B"})
 	mm = next.(*model)
-	next, _ = mm.Update(turnToolEndMsg{turnID: 1, tool: "search", callID: "call-b", output: "result B"})
+	next, _ = mm.Update(turnToolEndMsg{turnID: 1, tool: "search", callID: "call-b", output: `{"status":"B"}`})
 	mm = next.(*model)
-	next, _ = mm.Update(turnToolEndMsg{turnID: 1, tool: "search", callID: "call-a", output: "result A"})
+	next, _ = mm.Update(turnToolEndMsg{turnID: 1, tool: "search", callID: "call-a", output: `{"status":"A"}`})
 	mm = next.(*model)
 
 	var cardA, cardB string
@@ -113,14 +114,14 @@ func TestToolCardsUseCallIDForReverseCompletion(t *testing.T) {
 		if line.kind != lineTool {
 			continue
 		}
-		if strings.Contains(line.text, "result A") {
+		if strings.Contains(line.text, "status=A") {
 			cardA = line.text
 		}
-		if strings.Contains(line.text, "result B") {
+		if strings.Contains(line.text, "status=B") {
 			cardB = line.text
 		}
 	}
-	if cardA == "" || cardB == "" || strings.Contains(cardA, "result B") || strings.Contains(cardB, "result A") {
+	if cardA == "" || cardB == "" || strings.Contains(cardA, "status=B") || strings.Contains(cardB, "status=A") {
 		t.Fatalf("reverse completion cards were mixed: %#v", mm.lines)
 	}
 }

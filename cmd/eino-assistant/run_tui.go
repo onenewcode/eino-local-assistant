@@ -519,7 +519,6 @@ func modelCatalogFromConfig(entries []config.ModelCatalogEntry) []tui.ModelCatal
 			Provenance:    "config",
 			Capabilities: tui.ModelCatalogCapabilities{
 				ContextWindowTokens:    entry.Capabilities.ContextWindowTokens,
-				MaxOutputTokens:        entry.Capabilities.MaxOutputTokens,
 				SupportsReasoning:      copyBoolPointer(entry.Capabilities.SupportsReasoning),
 				ReasoningEfforts:       append([]string(nil), entry.Capabilities.ReasoningEfforts...),
 				DefaultReasoningEffort: strings.TrimSpace(entry.Capabilities.DefaultReasoningEffort),

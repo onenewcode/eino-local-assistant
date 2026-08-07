@@ -654,23 +654,18 @@ func initialRulesSnapshotStatus(ready bool) string {
 	return "resumed session; active system prompt is frozen"
 }
 
-func runtimeReActOptions(maxModelSteps int, taskController *agent.TaskController) agent.ReActOptions {
+func runtimeReActOptions(maxModelSteps int, taskController *agent.TaskController, contextCfg contextbuild.Config) agent.ReActOptions {
 	return agent.ReActOptions{
 		MaxModelSteps:  maxModelSteps,
+		Admission:      contextbuild.NewAdmissionPolicy(contextCfg.WindowTokens, nil),
 		EnableSteer:    true,
 		TaskController: taskController,
 	}
 }
 
-func contextConfigFromModel(cfg config.ModelContextConfig) contextbuild.Config {
+func contextConfigFromModel(cfg config.ModelConfig) contextbuild.Config {
 	return contextbuild.Config{
-		WindowTokens:              cfg.WindowTokens,
-		MaxOutputTokens:           cfg.MaxOutputTokens,
-		KeepRecentTurns:           cfg.KeepRecentTurns,
-		AutoCompactTriggerPercent: cfg.AutoCompactTriggerPercent,
-		PostCompactTargetPercent:  cfg.PostCompactTargetPercent,
-		SummaryMaxTokens:          cfg.SummaryMaxTokens,
-		LowGainThresholdPercent:   cfg.LowGainThresholdPercent,
+		WindowTokens: cfg.Context.WindowTokens,
 	}
 }
 
@@ -698,6 +693,7 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	contextCfg := contextConfigFromModel(cfg.Model)
 	rawModel, err := factory.newChatModel(ctx, cfg.Model)
 	if err != nil {
 		return runtimeModelBundle{}, fmt.Errorf("create chat model: %w", err)
@@ -709,7 +705,7 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 		ctx,
 		rawModel,
 		r.registry.All(),
-		runtimeReActOptions(r.runtimeCfg.MaxModelSteps, r.taskController),
+		runtimeReActOptions(r.runtimeCfg.MaxModelSteps, r.taskController, contextCfg),
 	)
 	if err != nil {
 		return runtimeModelBundle{}, fmt.Errorf("create ReAct model: %w", err)
@@ -717,7 +713,6 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 	if reactModel == nil {
 		return runtimeModelBundle{}, errors.New("create ReAct model: factory returned nil model")
 	}
-	contextCfg := contextConfigFromModel(cfg.Model.Context)
 	compactor, err := factory.newCompactor(rawModel, contextCfg)
 	if err != nil {
 		return runtimeModelBundle{}, fmt.Errorf("create context compactor: %w", err)
@@ -725,7 +720,6 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 	if compactor == nil {
 		return runtimeModelBundle{}, errors.New("create context compactor: factory returned nil compactor")
 	}
-	modelContext := cfg.Model.Context
 	return runtimeModelBundle{
 		cfg:        cfg,
 		chatModel:  rawModel,
@@ -740,7 +734,6 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 				OutputPerMillion: cfg.Model.Pricing.OutputPerMillion,
 			},
 			Context:            contextCfg,
-			MaxLowGainAttempts: modelContext.MaxLowGainAttempts,
 			Compactor:          compactor,
 			RecoverInterrupted: recoverInterrupted,
 		},

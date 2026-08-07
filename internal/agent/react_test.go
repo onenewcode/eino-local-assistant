@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/contextbuild"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/tools"
@@ -96,6 +97,31 @@ func TestNewReActModelWithOptionsDefaultsZeroAndRejectsNegativeMaxModelSteps(t *
 	_, err = NewReActModelWithOptions(context.Background(), &scriptedToolModel{}, []tool.BaseTool{timeTool}, ReActOptions{MaxModelSteps: -1})
 	if err == nil {
 		t.Fatal("NewReActModelWithOptions() error = nil, want invalid max step error")
+	}
+	_, err = NewReActModelWithOptions(context.Background(), &scriptedToolModel{}, []tool.BaseTool{timeTool}, ReActOptions{Admission: contextbuild.NewAdmissionPolicy(-1, nil)})
+	if err == nil {
+		t.Fatal("NewReActModelWithOptions() error = nil, want invalid prompt budget")
+	}
+}
+
+func TestReActModelBlocksOverBudgetRequestBeforeProvider(t *testing.T) {
+	timeTool, err := tools.NewGetCurrentTime(time.Now)
+	if err != nil {
+		t.Fatalf("NewGetCurrentTime() error = %v", err)
+	}
+	fake := &scriptedToolModel{}
+	reactModel, err := NewReActModelWithOptions(context.Background(), fake, []tool.BaseTool{timeTool}, ReActOptions{
+		Admission: contextbuild.NewAdmissionPolicy(1, nil),
+	})
+	if err != nil {
+		t.Fatalf("NewReActModelWithOptions() error = %v", err)
+	}
+	_, err = reactModel.Stream(context.Background(), []*schema.Message{schema.UserMessage("request that cannot fit")})
+	if !errors.Is(err, contextbuild.ErrRequestAdmissionExceeded) {
+		t.Fatalf("Stream() error = %v, want prompt budget admission failure", err)
+	}
+	if fake.calls != 0 {
+		t.Fatalf("provider calls = %d, want 0 after local admission rejection", fake.calls)
 	}
 }
 

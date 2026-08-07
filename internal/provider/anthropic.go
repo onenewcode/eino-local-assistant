@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/config"
+	"eino-local-assistant/internal/contextbuild"
 
 	claude "github.com/cloudwego/eino-ext/components/model/claude"
 	"github.com/cloudwego/eino/components"
@@ -31,10 +32,12 @@ func NewAnthropicModel(ctx context.Context, cfg config.ModelConfig) (model.ToolC
 		}
 	}
 	client, err := claude.NewChatModel(ctx, &claude.Config{
-		APIKey:                  cfg.APIKey,
-		BaseURL:                 &baseURL,
-		Model:                   cfg.Name,
-		MaxTokens:               cfg.Context.MaxOutputTokens,
+		APIKey:  cfg.APIKey,
+		BaseURL: &baseURL,
+		Model:   cfg.Name,
+		// The adapter needs a positive constructor value, but every actual
+		// request overrides it from the full-window admission policy below.
+		MaxTokens:               1,
 		RequestTimeout:          time.Duration(cfg.TimeoutSeconds) * time.Second,
 		AdditionalRequestFields: additionalRequestFields,
 	})
@@ -42,14 +45,18 @@ func NewAnthropicModel(ctx context.Context, cfg config.ModelConfig) (model.ToolC
 		return nil, fmt.Errorf("create Anthropic Messages chat model: %w", err)
 	}
 
-	return &anthropicModel{delegate: client}, nil
+	return &anthropicModel{
+		delegate:  client,
+		admission: contextbuild.NewAdmissionPolicy(cfg.Context.WindowTokens, nil),
+	}, nil
 }
 
 // anthropicModel applies the small amount of canonical-message normalization
 // that the generic Eino ledger needs before entering the Claude adapter.
 // The adapter itself owns Anthropic HTTP, SSE, tools, and usage conversion.
 type anthropicModel struct {
-	delegate model.ToolCallingChatModel
+	delegate  model.ToolCallingChatModel
+	admission contextbuild.AdmissionPolicy
 	// unbound is the original no-tools binding. Eino's Claude adapter rejects
 	// WithTools(nil), while the agent needs that operation to reserve a final
 	// response that cannot request another tool batch.
@@ -59,11 +66,13 @@ type anthropicModel struct {
 var _ model.ToolCallingChatModel = (*anthropicModel)(nil)
 
 func (m *anthropicModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	return m.delegate.Generate(ctx, normalizeAnthropicMessages(input), opts...)
+	input = normalizeAnthropicMessages(input)
+	return m.delegate.Generate(ctx, input, withAnthropicOutputLimit(input, m.admission, opts)...)
 }
 
 func (m *anthropicModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	return m.delegate.Stream(ctx, normalizeAnthropicMessages(input), opts...)
+	input = normalizeAnthropicMessages(input)
+	return m.delegate.Stream(ctx, input, withAnthropicOutputLimit(input, m.admission, opts)...)
 }
 
 func (m *anthropicModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
@@ -78,7 +87,20 @@ func (m *anthropicModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingC
 	if err != nil {
 		return nil, err
 	}
-	return &anthropicModel{delegate: bound, unbound: base}, nil
+	return &anthropicModel{
+		delegate:  bound,
+		unbound:   base,
+		admission: contextbuild.NewAdmissionPolicy(base.admission.WindowTokens, tools),
+	}, nil
+}
+
+func withAnthropicOutputLimit(input []*schema.Message, policy contextbuild.AdmissionPolicy, opts []model.Option) []model.Option {
+	// Anthropic's Messages API requires max_tokens. Compute it from the
+	// remaining local safety ceiling rather than exposing an answer-length knob.
+	limited := make([]model.Option, 0, len(opts)+1)
+	limited = append(limited, opts...)
+	limited = append(limited, model.WithMaxTokens(policy.MaxResponseTokens(input)))
+	return limited
 }
 
 func (m *anthropicModel) GetType() string {

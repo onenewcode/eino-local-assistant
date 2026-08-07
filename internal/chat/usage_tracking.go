@@ -75,7 +75,9 @@ func (s *Session) normalizedModelUsage(turnID string, event ModelUsageEvent) (Mo
 		CostUSD:          event.Usage.CostUSD,
 	}
 	if event.Operation == ModelUsageOperationAgent && event.Available {
-		record.ContextBudgetTokens = s.contextCfg.UsableInputTokens()
+		// Provider usage describes occupancy of the complete model window, not
+		// the smaller local input admission budget.
+		record.ContextWindowTokens = s.contextCfg.WindowTokens
 	}
 	return event, record
 }

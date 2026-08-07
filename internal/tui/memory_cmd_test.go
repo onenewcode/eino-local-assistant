@@ -292,12 +292,7 @@ func TestCompactPreservesCreateTimeSystemPrompt(t *testing.T) {
 		Store:     st,
 		Compactor: compactor,
 		Context: contextbuild.Config{
-			WindowTokens:              8_000,
-			MaxOutputTokens:           1_000,
-			KeepRecentTurns:           1,
-			LowGainThresholdPercent:   1,
-			AutoCompactTriggerPercent: 75,
-			PostCompactTargetPercent:  45,
+			WindowTokens: 8_000,
 		},
 	})
 	if err != nil {

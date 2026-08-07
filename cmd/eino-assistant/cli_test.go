@@ -255,7 +255,7 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 		PromptTokens:        1000,
 		CompletionTokens:    30,
 		TotalTokens:         1030,
-		ContextBudgetTokens: 4000,
+		ContextWindowTokens: 4000,
 		CostUSD:             0.01,
 	})
 	if err != nil {
@@ -269,7 +269,7 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 		PromptTokens:        200,
 		CompletionTokens:    4,
 		TotalTokens:         204,
-		ContextBudgetTokens: 4000,
+		ContextWindowTokens: 4000,
 		CostUSD:             0.0023,
 	})
 	if err != nil {
@@ -293,7 +293,6 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 		"timeout_seconds = 60\n" +
 		"[model.context]\n" +
 		"window_tokens = 32000\n" +
-		"max_output_tokens = 4096\n" +
 		"[assistant]\n" +
 		"system_prompt = \"system\"\n" +
 		"[storage]\n" +

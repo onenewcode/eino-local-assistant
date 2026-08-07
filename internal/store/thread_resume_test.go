@@ -8,7 +8,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-func TestResumeSnapshotUsesCheckpointTailAndRepairsBadOffset(t *testing.T) {
+func TestResumeSnapshotUsesCheckpointTailDespiteCatalogTampering(t *testing.T) {
 	ctx := context.Background()
 	st, err := NewThreadStore(t.TempDir())
 	if err != nil {
@@ -50,20 +50,27 @@ func TestResumeSnapshotUsesCheckpointTailAndRepairsBadOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(snapshot.TurnGroups) != 1 || snapshot.TurnGroups[0].TurnID != "turn-two" {
-		t.Fatalf("indexed resume groups = %#v, want only uncovered tail", snapshot.TurnGroups)
+		t.Fatalf("resume groups = %#v, want only uncovered tail", snapshot.TurnGroups)
 	}
 	if len(snapshot.CheckpointLineage) != 1 || snapshot.CheckpointLineage[0].ID != "checkpoint-tail" {
 		t.Fatalf("checkpoint lineage = %#v", snapshot.CheckpointLineage)
 	}
 
-	if _, err := st.db.Exec(`UPDATE resume_index SET tail_start_offset=999999 WHERE thread_id=?`, state.ID); err != nil {
+	if _, err := st.db.Exec(`UPDATE session_catalog SET head_sequence=0,head_hash='forged',meta_json='{}' WHERE id=?`, state.ID); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err = st.LoadThreadResumeSnapshot(ctx, state.ID, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.TurnGroups) != 2 || len(snapshot.CheckpointLineage) != 0 {
-		t.Fatalf("bad offset must fall back to canonical replay: %#v", snapshot)
+	if len(snapshot.TurnGroups) != 1 || snapshot.TurnGroups[0].TurnID != "turn-two" || len(snapshot.CheckpointLineage) != 1 {
+		t.Fatalf("catalog tampering changed JSONL resume: %#v", snapshot)
+	}
+	state, err = st.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: "turn-three", Input: "three"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.HeadSequence != state.Revision {
+		t.Fatalf("append sequence %d and revision %d diverged", state.HeadSequence, state.Revision)
 	}
 }

@@ -641,9 +641,6 @@ func modelPickerCapabilitySummary(entry ModelCatalogEntry) string {
 	if caps.ContextWindowTokens > 0 {
 		parts = append(parts, "ctx="+formatPickerTokens(caps.ContextWindowTokens))
 	}
-	if caps.MaxOutputTokens > 0 {
-		parts = append(parts, "out="+formatPickerTokens(caps.MaxOutputTokens))
-	}
 	if caps.SupportsReasoning != nil {
 		parts = append(parts, "reasoning="+yesNo(*caps.SupportsReasoning))
 	}

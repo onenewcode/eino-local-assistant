@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/contextbuild"
 	"eino-local-assistant/internal/memory"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
@@ -67,7 +68,6 @@ func cloneStatusInfo(info StatusInfo) StatusInfo {
 // metadata. Unknown values are omitted rather than inferred from the provider.
 type ModelCatalogCapabilities struct {
 	ContextWindowTokens int
-	MaxOutputTokens     int
 	SupportsReasoning   *bool
 	ReasoningEfforts    []string
 	// DefaultReasoningEffort is a catalog-declared default requested effort.
@@ -262,6 +262,8 @@ type model struct {
 	// openToolCards maps stable tool call IDs to in-flight transcript cards.
 	openToolCards map[string]int
 	openToolNames map[string]string
+	// openToolInputs retains the concise invocation while its card is replaced.
+	openToolInputs map[string]string
 	// queue holds follow-ups submitted while a turn is running (FIFO).
 	queue []string
 	// queuePaused blocks automatic FIFO promotion after a non-cancel turn error.
@@ -773,6 +775,7 @@ func (m *model) resetSessionTransientState() {
 	m.openReasoning = noOpenReasoning
 	m.openToolCards = make(map[string]int)
 	m.openToolNames = make(map[string]string)
+	m.openToolInputs = make(map[string]string)
 	m.turnUsage = usage.APIUsage{}
 	m.turnUsageSeen = false
 	m.turnUsageCallIDs = nil
@@ -880,6 +883,7 @@ func newModel(deps Deps) *model {
 		inputHist:               newInputHistory(),
 		openToolCards:           make(map[string]int),
 		openToolNames:           make(map[string]string),
+		openToolInputs:          make(map[string]string),
 		openReasoning:           noOpenReasoning,
 		reasoningDetailsVisible: true,
 		sessionGeneration:       1,
@@ -1144,6 +1148,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		key := toolCardKey(msg.callID, msg.tool)
 		m.openToolCards[key] = len(m.lines) - 1
 		m.openToolNames[key] = msg.tool
+		m.openToolInputs[key] = msg.input
 		return m, m.nextEventCmd()
 
 	case turnToolEndMsg:
@@ -1152,12 +1157,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.streamingAssistant = false
 		key := toolCardKey(msg.callID, msg.tool)
-		card := formatToolCard(msg.tool, msg.output, "ok")
+		card := formatToolCardWithInput(msg.tool, m.openToolInputs[key], msg.output, "ok")
 		if !m.updateOpenToolCard(key, card) {
 			m.appendLine(lineTool, card)
 		}
 		delete(m.openToolCards, key)
 		delete(m.openToolNames, key)
+		delete(m.openToolInputs, key)
 		m.currentTool = m.firstOpenToolName()
 		return m, m.nextEventCmd()
 
@@ -1171,12 +1177,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			errText = msg.err.Error()
 		}
-		card := formatToolCard(msg.tool, errText, "err")
+		card := formatToolCardWithInput(msg.tool, m.openToolInputs[key], errText, "err")
 		if !m.updateOpenToolCard(key, card) {
 			m.appendLine(lineTool, card)
 		}
 		delete(m.openToolCards, key)
 		delete(m.openToolNames, key)
+		delete(m.openToolInputs, key)
 		m.currentTool = m.firstOpenToolName()
 		return m, m.nextEventCmd()
 
@@ -2379,10 +2386,10 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 	}
 	status := session.ContextStatus()
 	cfg := session.ContextConfig()
-	if status.BudgetTokens == 0 {
-		status.BudgetTokens = cfg.UsableInputTokens()
-		status.TriggerTokens = status.BudgetTokens * cfg.AutoCompactTriggerPercent / 100
-		status.TargetTokens = status.BudgetTokens * cfg.PostCompactTargetPercent / 100
+	if status.CeilingTokens == 0 {
+		status.CeilingTokens = cfg.RequestAdmissionCeilingTokens()
+		status.TriggerTokens = cfg.AutoCompactTriggerTokens()
+		status.TargetTokens = cfg.PostCompactTargetTokens()
 	}
 	checkpoint := "none"
 	if status.ActiveCheckpointID != "" {
@@ -2390,12 +2397,12 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Context\n")
-	fmt.Fprintf(&b, "API snapshot: %s\n", usage.FormatContextSnapshot(sessionContextSnapshot(session)))
+	fmt.Fprintf(&b, "Last provider request: %s\n", usage.FormatContextSnapshot(sessionContextSnapshot(session)))
 	b.WriteString("Planner estimate (local truncation/compaction only; not API usage)\n")
-	fmt.Fprintf(&b, "budget=%s  max_output=%s  trigger=%s  target=%s\n",
-		usage.FormatTokens(status.BudgetTokens),
-		usage.FormatTokens(cfg.MaxOutputTokens),
+	fmt.Fprintf(&b, "window=%s  auto_compact=%s (85%%)  safety_ceiling=%s (95%%)  target<=%s (50%%)\n",
+		usage.FormatTokens(cfg.WindowTokens),
 		usage.FormatTokens(status.TriggerTokens),
+		usage.FormatTokens(status.CeilingTokens),
 		usage.FormatTokens(status.TargetTokens),
 	)
 	fmt.Fprintf(&b, "planned_view=%s  source_estimate=%s  hot_groups=%d  omitted_groups=%d\n",
@@ -2404,14 +2411,10 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 		status.HotTurnGroups,
 		status.OmittedTurnGroups,
 	)
-	fmt.Fprintf(&b, "checkpoint=%s  summary_max=%s  auto_paused=%v\n",
+	fmt.Fprintf(&b, "checkpoint=%s  auto_paused=%v\n",
 		checkpoint,
-		usage.FormatTokens(cfg.SummaryMaxTokens),
 		status.AutoCompactionPaused,
 	)
-	if status.LowGainStreak > 0 {
-		fmt.Fprintf(&b, "legacy_low_gain_streak=%d\n", status.LowGainStreak)
-	}
 	if status.AutoCompactionPauseReason != "" {
 		fmt.Fprintf(&b, "auto_pause_reason=%s\n", status.AutoCompactionPauseReason)
 	}
@@ -2633,7 +2636,22 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 				status = session.ContextStatus()
 			}
 			line := "automatic context compaction failed; active checkpoint unchanged"
-			if errors.Is(msg.err, context.Canceled) || isCanceled(msg.err) {
+			if errors.Is(msg.err, contextbuild.ErrEmptyCheckpointResponse) {
+				line = "automatic context compaction produced no checkpoint; active checkpoint unchanged"
+				if reason := checkpointResponseFinishReason(msg.err); reason != "" {
+					line += " (finish reason: " + reason + ")"
+				}
+				if status.AutoCompactionPaused {
+					line += "; automatic compaction paused"
+				}
+				line += "; check provider/model output limits; use /compact [focus] to retry"
+			} else if errors.Is(msg.err, contextbuild.ErrRequestAdmissionExceeded) {
+				line = "automatic context compaction was blocked before calling the provider; active checkpoint unchanged"
+				if status.AutoCompactionPaused {
+					line += "; automatic compaction paused"
+				}
+				line += "; reduce the compaction source or increase model.context.window_tokens"
+			} else if errors.Is(msg.err, context.Canceled) || isCanceled(msg.err) {
 				line = "automatic context compaction interrupted; active checkpoint unchanged"
 				if status.AutoCompactionPaused {
 					line += "; automatic compaction paused"
@@ -2648,6 +2666,14 @@ func (m *model) finishCompaction(msg compactDoneMsg) tea.Cmd {
 			m.appendLine(lineSystem, line)
 		case errors.Is(msg.err, context.Canceled), isCanceled(msg.err):
 			m.appendLine(lineSystem, "context compaction interrupted; active checkpoint unchanged")
+		case errors.Is(msg.err, contextbuild.ErrEmptyCheckpointResponse):
+			line := "context compaction produced no checkpoint; active checkpoint unchanged"
+			if reason := checkpointResponseFinishReason(msg.err); reason != "" {
+				line += " (finish reason: " + reason + ")"
+			}
+			m.appendLine(lineError, line+"; check provider/model output limits before retrying")
+		case errors.Is(msg.err, contextbuild.ErrRequestAdmissionExceeded):
+			m.appendLine(lineError, "context compaction was blocked before calling the provider; active checkpoint unchanged; reduce the source or increase model.context.window_tokens")
 		default:
 			m.appendLine(lineError, "context compaction failed; active checkpoint unchanged: "+msg.err.Error())
 		}
@@ -2784,6 +2810,7 @@ func (m *model) finishTurn(err error) tea.Cmd {
 	m.currentTool = ""
 	m.openToolCards = make(map[string]int)
 	m.openToolNames = make(map[string]string)
+	m.openToolInputs = make(map[string]string)
 	m.interruptFeedbackShown = false
 	m.setIdlePlaceholder()
 
@@ -3096,35 +3123,31 @@ func (m *model) statusReport() string {
 		apiUsage := sessionAPIUsage(session)
 		usageLine = "\n" + usage.FormatAPIUsage(apiUsage) + "  " +
 			usage.FormatCostEstimate(apiUsage.CostUSD, apiUsage.Status)
-		ctxLine = "\n" + usage.FormatContextSnapshot(sessionContextSnapshot(session))
+		ctxLine = "\nlast provider request: " + usage.FormatContextSnapshot(sessionContextSnapshot(session))
 		cfg := session.ContextConfig()
 		contextStatus := session.ContextStatus()
-		if budget := contextStatus.BudgetTokens; budget > 0 {
+		if contextStatus.CeilingTokens > 0 {
 			if contextStatus.OriginalTokens > 0 || contextStatus.CurrentTokens > 0 {
 				pct := 0
 				if contextStatus.CurrentTokens > 0 {
-					pct = contextStatus.CurrentTokens * 100 / budget
+					pct = contextStatus.CurrentTokens * 100 / cfg.WindowTokens
 				}
-				ctxLine += fmt.Sprintf("\ncontext planner estimate: view=%s/%s (%d%%) source_estimate=%s omitted_groups=%d fallbacks=%d",
+				ctxLine += fmt.Sprintf("\ncontext planner estimate: window=%s view=%s (%d%%) auto_compact=85%% safety_ceiling=95%% source_estimate=%s omitted_groups=%d fallbacks=%d",
+					usage.FormatTokens(cfg.WindowTokens),
 					usage.FormatTokens(contextStatus.CurrentTokens),
-					usage.FormatTokens(budget),
 					pct,
 					usage.FormatTokens(contextStatus.OriginalTokens),
 					contextStatus.OmittedTurnGroups,
 					len(contextStatus.LastFallbacks),
 				)
 			} else {
-				ctxLine += fmt.Sprintf("\ncontext planner estimate: budget=%s keep_recent=%d summary_max=%s",
-					usage.FormatTokens(budget),
-					cfg.KeepRecentTurns,
-					usage.FormatTokens(cfg.SummaryMaxTokens),
+				ctxLine += fmt.Sprintf("\ncontext planner estimate: window=%s auto_compact=85%% safety_ceiling=95%% target=50%%",
+					usage.FormatTokens(cfg.WindowTokens),
 				)
 			}
-		} else if budget := cfg.UsableInputTokens(); budget > 0 {
-			ctxLine += fmt.Sprintf("\ncontext planner estimate: budget=%s keep_recent=%d summary_max=%s",
-				usage.FormatTokens(budget),
-				cfg.KeepRecentTurns,
-				usage.FormatTokens(cfg.SummaryMaxTokens),
+		} else if cfg.WindowTokens > 0 {
+			ctxLine += fmt.Sprintf("\ncontext planner estimate: window=%s auto_compact=85%% safety_ceiling=95%% target=50%%",
+				usage.FormatTokens(cfg.WindowTokens),
 			)
 		}
 	}
@@ -3210,6 +3233,14 @@ func tickStatus() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return statusTickMsg(t)
 	})
+}
+
+func checkpointResponseFinishReason(err error) string {
+	var response *contextbuild.EmptyCheckpointResponseError
+	if !errors.As(err, &response) || response == nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(response.FinishReason), " ")
 }
 
 func isCanceled(err error) bool {

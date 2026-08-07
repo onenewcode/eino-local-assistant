@@ -81,9 +81,10 @@ func TestThreadStoreAutomaticLowGainFailureMayRemainUnpaused(t *testing.T) {
 	}
 
 	state, err = threadStore.RecordCompactionFailure(ctx, state.ID, state.Revision, CompactionFailure{
-		OperationID: "low-gain-1",
-		Automatic:   true,
-		Reason:      CompactionFailureReasonLowGain,
+		OperationID:        "low-gain-1",
+		Automatic:          true,
+		Reason:             CompactionFailureReasonLowGain,
+		MaxLowGainAttempts: 2,
 	})
 	if err != nil {
 		t.Fatalf("first low-gain failure: %v", err)
@@ -93,9 +94,10 @@ func TestThreadStoreAutomaticLowGainFailureMayRemainUnpaused(t *testing.T) {
 	}
 
 	state, err = threadStore.RecordCompactionFailure(ctx, state.ID, state.Revision, CompactionFailure{
-		OperationID: "low-gain-2",
-		Automatic:   true,
-		Reason:      CompactionFailureReasonLowGain,
+		OperationID:        "low-gain-2",
+		Automatic:          true,
+		Reason:             CompactionFailureReasonLowGain,
+		MaxLowGainAttempts: 2,
 		// AutoPaused is recomputed under the write lock; caller must not supply it.
 	})
 	if err != nil {
@@ -257,7 +259,7 @@ func TestCompactionFailureJournalsAbsoluteLowGainStreak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.LowGainStreak != 1 || reloaded.AutoCompactionPaused {
+	if reloaded.LowGainStreak != 1 || !reloaded.AutoCompactionPaused {
 		t.Fatalf("reloaded state = %#v", reloaded)
 	}
 }

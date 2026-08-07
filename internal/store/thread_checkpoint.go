@@ -230,8 +230,6 @@ func cloneArtifactRef(ref *ArtifactRef) *ArtifactRef {
 		return nil
 	}
 	refCopy := *ref
-	refCopy.Head = append([]byte(nil), ref.Head...)
-	refCopy.Tail = append([]byte(nil), ref.Tail...)
 	refCopy.Data = append([]byte(nil), ref.Data...)
 	return &refCopy
 }

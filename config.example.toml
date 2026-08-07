@@ -30,7 +30,6 @@ timeout_seconds = 60
 #
 # [model.catalog.capabilities]
 # context_window_tokens = 128000
-# max_output_tokens = 8192
 # supports_reasoning = true
 # reasoning_efforts = ["low", "medium", "high"]
 # input_modalities = ["text", "image"]
@@ -39,13 +38,8 @@ timeout_seconds = 60
 
 [model.context]
 window_tokens = 32000
-max_output_tokens = 4096
-keep_recent_turns = 12
-auto_compact_trigger_percent = 75
-post_compact_target_percent = 45
-summary_max_tokens = 2048
-max_low_gain_attempts = 2
-low_gain_threshold_percent = 15
+# This is the only context setting. The product owns request admission and
+# checkpoint policy so every session follows the same recoverable contract.
 
 [model.pricing]
 input_per_million = 0.0

@@ -30,7 +30,7 @@ func TestSessionForkOpensChildWithProvenanceAndPreservesSource(t *testing.T) {
 		ModelName:              "source-model",
 		ReasoningEffort:        "high",
 		Pricing:                usage.Pricing{InputPerMillion: 1.25, OutputPerMillion: 4.5},
-		Context:                contextbuild.Config{WindowTokens: 1200, MaxOutputTokens: 180, KeepRecentTurns: 3, AutoCompactTriggerPercent: 70, PostCompactTargetPercent: 40, SummaryMaxTokens: 160, LowGainThresholdPercent: 5},
+		Context:                contextbuild.Config{WindowTokens: 1200},
 		MaxLowGainAttempts:     7,
 		Compactor:              compactor,
 		FinalResponseValidator: validator,
