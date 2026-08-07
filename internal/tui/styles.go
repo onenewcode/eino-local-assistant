@@ -39,6 +39,25 @@ var (
 	statusStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("245"))
 
+	statusModelStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("230")).
+				Bold(true)
+
+	statusEffortStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("215"))
+
+	statusContextStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("111"))
+
+	statusActivityStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("114"))
+
+	statusPolicyStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("221"))
+
+	statusTaskStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("180"))
+
 	spinnerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("114"))
 
@@ -163,15 +182,41 @@ func renderSeparator(width int) string {
 	return separatorStyle.Render(strings.Repeat("─", width))
 }
 
-// renderStatusBar is a quiet single line (no reverse-video strip).
+// renderStatusLine gives each footer field a stable semantic color while
+// leaving separators subdued, like Codex's compact bottom metadata.
+func renderStatusLine(segments []statusLineSegment) string {
+	parts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		parts = append(parts, statusStyleForField(segment.field).Render(segment.text))
+	}
+	return strings.Join(parts, separatorStyle.Render(" · "))
+}
+
+func statusStyleForField(field string) lipgloss.Style {
+	switch field {
+	case statusFieldModel:
+		return statusModelStyle
+	case statusFieldEffort:
+		return statusEffortStyle
+	case statusFieldContext:
+		return statusContextStyle
+	case statusFieldActivity:
+		return statusActivityStyle
+	case statusFieldPolicy:
+		return statusPolicyStyle
+	case statusFieldTask:
+		return statusTaskStyle
+	default:
+		return statusStyle
+	}
+}
+
+// renderStatusBar is a quiet single line anchored below the composer.
 func renderStatusBar(width int, label string) string {
 	if width < 8 {
 		width = 8
 	}
-	// Dim rule above status to separate transcript from chrome, Claude-style.
-	rule := separatorStyle.Render(strings.Repeat("─", width))
-	line := statusStyle.Width(width).MaxWidth(width).Render(label)
-	return rule + "\n" + line
+	return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(label)
 }
 
 func renderComposer(width int, view string) string {

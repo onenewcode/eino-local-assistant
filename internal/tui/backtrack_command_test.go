@@ -58,6 +58,7 @@ func TestBusyInputClassificationKeepsExistingBoundaries(t *testing.T) {
 		{input: "/help", want: busyInputExecuteImmediately},
 		{input: "/context", want: busyInputExecuteImmediately},
 		{input: "/status", want: busyInputExecuteImmediately},
+		{input: "/statusline", want: busyInputExecuteImmediately},
 		{input: "/goal", want: busyInputExecuteImmediately},
 		{input: "/tasks", want: busyInputExecuteImmediately},
 		{input: "/rules", want: busyInputExecuteImmediately},

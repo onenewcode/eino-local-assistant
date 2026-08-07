@@ -505,6 +505,7 @@ func TestQueueResumeEmptyAndRepeatedAreSafe(t *testing.T) {
 
 func TestQueueListAndStatusExposePause(t *testing.T) {
 	m := newTestModel(t)
+	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldQueue}
 	m.queuePaused = true
 	m.queue = []string{"one"}
 

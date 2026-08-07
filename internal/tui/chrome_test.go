@@ -14,17 +14,16 @@ func TestViewHasComposerBorderAndSinglePrompt(t *testing.T) {
 	if !strings.Contains(view, "╭") {
 		t.Fatalf("expected rounded border in view:\n%s", view)
 	}
-	// No reverse-video status strip: should still show ready text.
-	if !strings.Contains(view, "ready") {
+	// The model footer remains visible beneath the composer.
+	if !strings.Contains(view, "test-model") {
 		t.Fatalf("status missing:\n%s", view)
 	}
 	// Single-line empty composer: at most one › prompt glyph in chrome.
 	if c := strings.Count(view, "›"); c > 2 {
 		t.Fatalf("too many › prompts (%d):\n%s", c, view)
 	}
-	// Separator rule above status.
-	if !strings.Contains(view, "─") {
-		t.Fatalf("expected separator rule:\n%s", view)
+	if strings.LastIndex(view, "test-model") < strings.LastIndex(view, "╰") {
+		t.Fatalf("status footer must follow composer:\n%s", view)
 	}
 	t.Log("\n" + view)
 }

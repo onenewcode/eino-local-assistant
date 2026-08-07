@@ -19,6 +19,7 @@ const (
 	slashSteer
 	slashContext
 	slashCompact
+	slashStatusLine
 	slashNew
 	slashSessions
 	slashResume
@@ -62,6 +63,7 @@ func slashCatalog() []slashCommand {
 		{Name: "/btw", Aliases: []string{"/side"}, Description: "ask a temporary side question without interrupting the current turn", NeedsArg: true},
 		{Name: "/steer", Description: "redirect the current regular turn without starting another turn", NeedsArg: true},
 		{Name: "/usage", Description: "toggle turn usage footer (on|off|toggle)", NeedsArg: true},
+		{Name: "/statusline", Description: "persistently show, hide, order, or reset bottom status fields", NeedsArg: true},
 		{Name: "/context", Description: "context budget, checkpoints, and compaction status"},
 		{Name: "/compact", Description: "summarize stable turns and free context", NeedsArg: true},
 		{Name: "/sessions", Description: "list saved sessions (tokens/cost)"},
@@ -183,6 +185,8 @@ func parseSlash(input string) (slashAction, string) {
 		return slashSteer, arg
 	case "/usage":
 		return slashUsage, arg
+	case "/statusline":
+		return slashStatusLine, arg
 	case "/context":
 		return slashContext, arg
 	case "/compact":
@@ -227,6 +231,7 @@ func helpText() string {
 		"  /btw <question>    ask a temporary side question without interrupting the current turn (alias: /side)",
 		"  /steer <text>      steer only the active regular busy turn; failures are not queued",
 		"  /usage [on|off]    show/toggle per-turn API usage footer (default on)",
+		"  /statusline [show <field>|hide <field>|set <fields...>|reset]  persist bottom status fields",
 		"  /context           context budget, checkpoints, and compaction status",
 		"  /compact [focus]   summarize stable turns and free context",
 		"  /sessions          list saved sessions (tokens/cost)",
@@ -266,7 +271,7 @@ func helpText() string {
 		"            backtrack requires an empty composer; Esc leaves a non-empty draft unchanged",
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
-		"While busy, /steer <text> targets only the active regular turn and failed admission is never queued; /help /context /status /goal /tasks /diff /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; /review is idle-only and never queued; /plan and /permissions ask|auto|plan|yolo changes or prompts are idle-only, never queued, and retain the draft when rejected; the model picker and /model changes also require idle; while busy/compacting, retry after the current operation finishes and the queue remains paused; side questions and reviews never enter the FIFO queue.",
+		"While busy, /steer <text> targets only the active regular turn and failed admission is never queued; /help /context /status /statusline /goal /tasks /diff /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; /review is idle-only and never queued; /plan and /permissions ask|auto|plan|yolo changes or prompts are idle-only, never queued, and retain the draft when rejected; the model picker and /model changes also require idle; while busy/compacting, retry after the current operation finishes and the queue remains paused; side questions and reviews never enter the FIFO queue.",
 		"Mutative commands (/compact /clear /new /resume /model /fork /title /delete /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny); plan keeps the existing read-only tool boundary. Status shows cmd=ask|auto|plan or cmd=yolo. Shift+Tab never enters yolo and never changes mode while busy, compacting, awaiting approval, or serving a side question.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",

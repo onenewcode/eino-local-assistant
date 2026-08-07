@@ -50,6 +50,65 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 	}
 }
 
+func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
+	got, err := Load(writeConfiguration(t, validConfiguration))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := []string{"model", "effort", "context", "activity"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+		t.Fatalf("default status line = %#v, want %#v", got.UI.StatusLineFields(), want)
+	}
+
+	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\" Model \", \"CONTEXT\", \"policy\"]\n"))
+	if err != nil {
+		t.Fatalf("Load(configured status line) error = %v", err)
+	}
+	if want := []string{"model", "context", "policy"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+		t.Fatalf("configured status line = %#v, want %#v", got.UI.StatusLineFields(), want)
+	}
+
+	for _, doc := range []string{
+		"[ui]\nstatus_line = [\"model\", \"unknown\"]\n",
+		"[ui]\nstatus_line = [\"model\", \"model\"]\n",
+	} {
+		if _, err := Load(writeConfiguration(t, validConfiguration+"\n"+doc)); err == nil {
+			t.Fatalf("Load(%q) succeeded for an invalid status line", doc)
+		}
+	}
+}
+
+func TestSaveStatusLineFieldsPreservesUISettingsAndSourceComments(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`# keep this comment
+[ui]
+# keep this UI comment
+show_turn_usage = false
+status_line = [
+  "session",
+  "model",
+]
+`)
+	if err := SaveStatusLineFields(path, []string{"model", "effort", "context", "policy"}); err != nil {
+		t.Fatalf("SaveStatusLineFields() error = %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(saved configuration) error = %v", err)
+	}
+	if got.UI.TurnUsageEnabled() {
+		t.Fatal("SaveStatusLineFields changed ui.show_turn_usage")
+	}
+	if want := []string{"model", "effort", "context", "policy"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+		t.Fatalf("saved status line = %#v, want %#v", got.UI.StatusLineFields(), want)
+	}
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(source), "# keep this UI comment") || !strings.Contains(string(source), `status_line = ["model", "effort", "context", "policy"]`) {
+		t.Fatalf("saved source did not preserve unrelated UI content:\n%s", source)
+	}
+}
+
 func TestLoadRejectsRemovedSystemPromptSetting(t *testing.T) {
 	doc := validConfiguration + "\n[assistant]\nsystem_prompt = \"custom\"\n"
 	_, err := Load(writeConfiguration(t, doc))

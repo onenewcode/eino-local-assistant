@@ -104,23 +104,25 @@ func TestJoinStatusSuffix(t *testing.T) {
 	}
 }
 
-func TestStatusLineIdleContainsModelAndID(t *testing.T) {
+func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 	m := newTestModel(t)
+	m.deps.Status.Model = "openai/test-model"
 	line := m.statusLine()
-	if !strings.Contains(line, "ready") {
-		t.Fatalf("idle status should contain ready: %q", line)
+	if strings.Contains(line, "openai/") {
+		t.Fatalf("status must omit provider prefix: %q", line)
 	}
 	if !strings.Contains(line, "test-model") {
 		t.Fatalf("idle status should contain model: %q", line)
 	}
-	// Fresh session has no measured context; do not pollute with ctx=?.
+	// The Codex-like footer never exposes the internal ctx= rendering.
 	if strings.Contains(line, "ctx=") {
-		t.Fatalf("idle status without measurement must omit ctx: %q", line)
+		t.Fatalf("status must use human-facing context text: %q", line)
 	}
 }
 
 func TestStatusLineFollowHint(t *testing.T) {
 	m := newTestModel(t)
+	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldFollow}
 	// Build tall content so not-at-bottom is possible.
 	for range 40 {
 		m.appendLine(lineSystem, strings.Repeat("x", 20))
@@ -141,11 +143,12 @@ func TestStatusLineFollowHint(t *testing.T) {
 
 func TestStatusLabelBusyUsesSharedSuffix(t *testing.T) {
 	m := newTestModel(t)
+	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
 	m.mode = modeBusy
 	m.queue = []string{"next"}
 	line := m.statusLabel()
-	if !strings.Contains(line, "Working") {
-		t.Fatalf("busy status missing Working: %q", line)
+	if !strings.Contains(line, "thinking") {
+		t.Fatalf("busy status missing activity: %q", line)
 	}
 	if !strings.Contains(line, "queued:1") {
 		t.Fatalf("busy status should include queue via shared extras: %q", line)

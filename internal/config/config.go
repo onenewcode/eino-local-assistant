@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -258,6 +259,9 @@ type UIConfig struct {
 	// ShowTurnUsage controls the post-turn API usage footer in the transcript.
 	// Nil (omitted) defaults to true. Set show_turn_usage: false to hide.
 	ShowTurnUsage *bool `toml:"show_turn_usage"`
+	// StatusLine controls the visible footer fields and their order. Omit it
+	// to use the Codex-like default: model, effort, context, activity.
+	StatusLine []string `toml:"status_line"`
 }
 
 // TurnUsageEnabled reports whether the per-turn usage footer should be shown.
@@ -266,6 +270,42 @@ func (c UIConfig) TurnUsageEnabled() bool {
 		return true
 	}
 	return *c.ShowTurnUsage
+}
+
+var defaultStatusLineFields = []string{"model", "effort", "context", "activity"}
+
+// StatusLineFields returns an owned, normalized footer field list.
+func (c UIConfig) StatusLineFields() []string {
+	if len(c.StatusLine) == 0 {
+		return append([]string(nil), defaultStatusLineFields...)
+	}
+	fields := make([]string, 0, len(c.StatusLine))
+	for _, field := range c.StatusLine {
+		fields = append(fields, strings.ToLower(strings.TrimSpace(field)))
+	}
+	return fields
+}
+
+// Validate verifies display-only UI settings. Status-line fields are kept in
+// user configuration so /statusline choices survive restarts and sessions.
+func (c UIConfig) Validate() error {
+	seen := make(map[string]struct{}, len(c.StatusLine))
+	for _, raw := range c.StatusLine {
+		field := strings.ToLower(strings.TrimSpace(raw))
+		if _, ok := statusLineFieldSet[field]; !ok {
+			return fmt.Errorf("ui.status_line contains unknown field %q", raw)
+		}
+		if _, duplicate := seen[field]; duplicate {
+			return fmt.Errorf("ui.status_line contains duplicate field %q", field)
+		}
+		seen[field] = struct{}{}
+	}
+	return nil
+}
+
+var statusLineFieldSet = map[string]struct{}{
+	"model": {}, "effort": {}, "context": {}, "activity": {}, "session": {},
+	"title": {}, "policy": {}, "task": {}, "queue": {}, "follow": {},
 }
 
 // ToolsConfig holds runtime limits for Codex-subset tools (not permission language).
@@ -548,6 +588,10 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("read configuration: %w", err)
 	}
 
+	return parseConfig(data)
+}
+
+func parseConfig(data []byte) (Config, error) {
 	var cfg Config
 	meta, err := toml.Decode(string(data), &cfg)
 	if err != nil {
@@ -588,6 +632,176 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+// SaveStatusLineFields updates only ui.status_line in the user configuration.
+// It keeps unrelated settings and comments intact, and atomically replaces the
+// file only after the updated TOML passes the regular configuration validator.
+func SaveStatusLineFields(path string, fields []string) error {
+	if strings.ToLower(filepath.Ext(path)) != ".toml" {
+		return errors.New("configuration file must use the .toml extension")
+	}
+	normalized := normalizeStatusLineFields(fields)
+	if err := (UIConfig{StatusLine: normalized}).Validate(); err != nil {
+		return err
+	}
+	if len(normalized) == 0 {
+		return errors.New("ui.status_line must contain at least one field")
+	}
+
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect configuration: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to update a symbolic-link configuration file")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("configuration file must be a regular file")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration: %w", err)
+	}
+	if _, err := parseConfig(data); err != nil {
+		return err
+	}
+	updated, err := replaceStatusLineSetting(string(data), normalized)
+	if err != nil {
+		return err
+	}
+	if _, err := parseConfig([]byte(updated)); err != nil {
+		return fmt.Errorf("validate updated configuration: %w", err)
+	}
+	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+func normalizeStatusLineFields(fields []string) []string {
+	normalized := make([]string, 0, len(fields))
+	for _, field := range fields {
+		normalized = append(normalized, strings.ToLower(strings.TrimSpace(field)))
+	}
+	return normalized
+}
+
+func replaceStatusLineSetting(source string, fields []string) (string, error) {
+	setting := "status_line = " + formatTOMLStringList(fields)
+	lines := strings.SplitAfter(source, "\n")
+	tableStart, tableEnd, found := uiTableBounds(lines)
+	if !found {
+		if source != "" && !strings.HasSuffix(source, "\n") {
+			source += "\n"
+		}
+		return source + "\n[ui]\n" + setting + "\n", nil
+	}
+
+	for i := tableStart + 1; i < tableEnd; i++ {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "status_line") {
+			continue
+		}
+		key, value, ok := strings.Cut(strings.TrimSpace(lines[i]), "=")
+		if !ok || strings.TrimSpace(key) != "status_line" {
+			continue
+		}
+		end := i + 1
+		if strings.Count(value, "[") > strings.Count(value, "]") {
+			for end < tableEnd && strings.Count(strings.Join(lines[i:end], ""), "[") > strings.Count(strings.Join(lines[i:end], ""), "]") {
+				end++
+			}
+			if strings.Count(strings.Join(lines[i:end], ""), "[") > strings.Count(strings.Join(lines[i:end], ""), "]") {
+				return "", errors.New("ui.status_line has an unclosed array")
+			}
+		}
+		lines[i] = setting + "\n"
+		lines = append(lines[:i+1], lines[end:]...)
+		return strings.Join(lines, ""), nil
+	}
+
+	lines = append(lines[:tableStart+1], append([]string{setting + "\n"}, lines[tableStart+1:]...)...)
+	return strings.Join(lines, ""), nil
+}
+
+func uiTableBounds(lines []string) (start, end int, found bool) {
+	for i, line := range lines {
+		if !isTOMLTableHeader(line, "ui") {
+			continue
+		}
+		end = len(lines)
+		for j := i + 1; j < len(lines); j++ {
+			if isAnyTOMLTableHeader(lines[j]) {
+				end = j
+				break
+			}
+		}
+		return i, end, true
+	}
+	return 0, 0, false
+}
+
+func isTOMLTableHeader(line, name string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "["+name+"]") {
+		return false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "["+name+"]"))
+	return rest == "" || strings.HasPrefix(rest, "#")
+}
+
+func isAnyTOMLTableHeader(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return (strings.HasPrefix(trimmed, "[") && strings.Contains(trimmed, "]")) && !strings.HasPrefix(trimmed, "#")
+}
+
+func formatTOMLStringList(fields []string) string {
+	quoted := make([]string, 0, len(fields))
+	for _, field := range fields {
+		quoted = append(quoted, strconv.Quote(field))
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+func writeConfigAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".config-*")
+	if err != nil {
+		return fmt.Errorf("create temporary configuration: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set temporary configuration permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary configuration: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary configuration: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary configuration: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("replace configuration atomically: %w", err)
+	}
+	cleanup = false
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open configuration directory for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync configuration directory: %w", err)
+	}
+	return nil
+}
+
 // Validate checks configuration without including sensitive values in errors.
 func (c *Config) Validate() error {
 	if err := c.Model.Validate(); err != nil {
@@ -620,6 +834,9 @@ func (c *Config) Validate() error {
 	}
 	c.Rules.ProjectDocFallbackFilenames = fallbackFilenames
 	if err := c.Memory.Validate(); err != nil {
+		return err
+	}
+	if err := c.UI.Validate(); err != nil {
 		return err
 	}
 	return c.Runtime.Validate()

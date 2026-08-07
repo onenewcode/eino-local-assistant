@@ -87,7 +87,7 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 		// Steering targets the existing regular turn directly. It is never a
 		// FIFO follow-up, including when the core rejects the admission.
 		return busyInputSteer
-	case slashHelp, slashContext, slashStatus, slashGoal, slashTasks, slashDiff, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
+	case slashHelp, slashContext, slashStatus, slashStatusLine, slashGoal, slashTasks, slashDiff, slashRules, slashSide, slashUsage, slashSessions, slashQueue:
 		return busyInputExecuteImmediately
 	case slashReview:
 		return busyInputReject

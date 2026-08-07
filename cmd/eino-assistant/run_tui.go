@@ -189,10 +189,14 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 			MaxConsecutiveEquivalentToolCalls: runtime.runtimeCfg.MaxConsecutiveEquivalentToolCalls,
 			Timeout:                           time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
 		},
-		HideTurnUsage: !modelCfg.UI.TurnUsageEnabled(),
-		Approval:      approvalBridge,
-		PolicyInfo:    policyInfo,
-		Memory:        runtime.memStore,
+		HideTurnUsage:    !modelCfg.UI.TurnUsageEnabled(),
+		StatusLineFields: modelCfg.UI.StatusLineFields(),
+		SaveStatusLineFields: func(fields []string) error {
+			return config.SaveStatusLineFields(configPath, fields)
+		},
+		Approval:   approvalBridge,
+		PolicyInfo: policyInfo,
+		Memory:     runtime.memStore,
 		NotifyActiveSession: func(id string) {
 			activeSessionID.Store(id)
 		},

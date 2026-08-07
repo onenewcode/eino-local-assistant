@@ -34,6 +34,8 @@ func TestParseSlash(t *testing.T) {
 		{"/StEeR  change   direction  ", slashSteer, "change   direction"},
 		{"/usage", slashUsage, ""},
 		{"/usage off", slashUsage, "off"},
+		{"/statusline", slashStatusLine, ""},
+		{"/STATUSLINE set model context", slashStatusLine, "set model context"},
 		{"/context", slashContext, ""},
 		{"/CONTEXT", slashContext, ""},
 		{"/compact", slashCompact, ""},
@@ -97,7 +99,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/goal", "/tasks", "/diff", "/rules", "/btw", "/side", "/steer", "/usage",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/statusline", "/goal", "/tasks", "/diff", "/rules", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact", "/review",
 		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue", "/plan",
 		"/model",
@@ -129,7 +131,7 @@ func TestSlashCatalogNeedsArg(t *testing.T) {
 		"/help": false, "/status": false, "/goal": false, "/tasks": false, "/diff": false, "/review": false, "/rules": false, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/plan": false, "/permissions": true,
 		"/btw": true, "/steer": true,
-		"/usage": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
+		"/usage": true, "/statusline": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
 		"/delete": true, "/queue": true, "/model": true, "/memory": true,
 	}
 	for _, cmd := range slashCatalog() {
@@ -232,11 +234,11 @@ func TestFilterSlashCommandsMatrix(t *testing.T) {
 		{"/cl", []string{"/clear"}},
 		{"/cle", []string{"/clear"}},
 		{"/clear", []string{"/clear"}},
-		{"/s", []string{"/status", "/btw", "/steer", "/sessions"}},
+		{"/s", []string{"/status", "/btw", "/steer", "/statusline", "/sessions"}},
 		{"/si", []string{"/btw"}},
-		{"/st", []string{"/status", "/steer"}},
+		{"/st", []string{"/status", "/steer", "/statusline"}},
 		{"/se", []string{"/sessions"}},
-		{"/stat", []string{"/status"}},
+		{"/stat", []string{"/status", "/statusline"}},
 		{"/sess", []string{"/sessions"}},
 		{"/n", []string{"/new"}},
 		{"/new", []string{"/new"}},

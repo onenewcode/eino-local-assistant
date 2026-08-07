@@ -185,6 +185,12 @@ type Deps struct {
 	// HideTurnUsage skips the post-turn API usage footer when true.
 	// Default (false) shows the footer. Wired from ui.show_turn_usage.
 	HideTurnUsage bool
+	// StatusLineFields controls the visible footer fields and their order.
+	// An empty list uses the Codex-like default.
+	StatusLineFields []string
+	// SaveStatusLineFields persists a validated status-line selection in the
+	// user configuration. It is optional for embedders that do not own config.
+	SaveStatusLineFields func([]string) error
 	// Approval is the TUI bridge for run_command ask decisions. Optional.
 	Approval *ApprovalBridge
 	// PolicyInfo drives /permissions and the cmd= status badge.
@@ -840,6 +846,7 @@ func newModel(deps Deps) *model {
 		deps.SessionOpts.Store = deps.Store
 	}
 	deps.Status = cloneStatusInfo(deps.Status)
+	deps.StatusLineFields = normalizeStatusLineFields(deps.StatusLineFields)
 	ta := textarea.New()
 	ta.Placeholder = "Message the assistant…  (/help)"
 	ta.ShowLineNumbers = false
@@ -1294,7 +1301,7 @@ func (m *model) View() string {
 		return ""
 	}
 
-	status := renderStatusBar(m.width, m.statusLabel())
+	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegments()))
 	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	if m.hasPendingApproval() {
 		if approvalAllowsSession(m.pendingApproval.Request) {
@@ -1319,13 +1326,15 @@ func (m *model) View() string {
 	composer := renderComposer(m.width, m.textarea.View())
 
 	// Transcript
-	// ────────
-	// status
 	// [task progress]
 	// [approval modal | slash menu]
 	// ╭ composer ╮
 	// help
-	parts := []string{m.viewport.View(), status}
+	// status
+	//
+	// Keep the status footer below the composer, matching Codex's visual
+	// hierarchy and leaving the conversation area free of static metadata.
+	parts := []string{m.viewport.View()}
 	if m.taskPaneOpen {
 		parts = append(parts, m.taskPaneView())
 	}
@@ -1340,7 +1349,7 @@ func (m *model) View() string {
 	} else if m.backtrackState.mode == backtrackSelecting {
 		parts = append(parts, m.backtrackOverlayView())
 	}
-	parts = append(parts, composer, help)
+	parts = append(parts, composer, help, status)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
@@ -1351,59 +1360,9 @@ func (m *model) reasoningToggleHint() string {
 	return "ctrl+o show reasoning"
 }
 
-// statusLabel is the unstyled status text (spinner glyphs included when busy).
+// statusLabel is the unstyled configurable footer text.
 func (m *model) statusLabel() string {
-	follow := !m.stickBottom && !m.viewport.AtBottom()
-	cmdPolicy := m.statusPolicyFragment()
-	session := m.activeSession()
-	extras := collectStatusExtras(session, len(m.queue), follow, cmdPolicy)
-	if m.queuePaused {
-		extras.paused = "queue:paused"
-	}
-
-	if m.mode == modeIdle {
-		parts := collectIdleStatus(session, m.deps.Status.Model, len(m.queue), follow, cmdPolicy)
-		if m.queuePaused {
-			parts.paused = "queue:paused"
-		}
-		// Leave a little room for bar padding.
-		label := formatIdleStatus(max(20, m.width-4), parts)
-		if backtrack := m.backtrackStatus(); backtrack != "" {
-			label += " · " + backtrack
-		}
-		return label
-	}
-
-	suffix := joinStatusSuffix(extras)
-	if m.hasPendingApproval() {
-		elapsed := time.Since(m.turnStart).Round(time.Second)
-		return m.spinner.View() + " " +
-			fmt.Sprintf("Awaiting approval · tool (%s · esc deny)%s", elapsed, suffix)
-	}
-	if m.mode == modeCompacting {
-		elapsed := time.Since(m.compactStart).Round(time.Second)
-		kind := "manual"
-		if m.compactAutomatic {
-			kind = "automatic"
-		}
-		return m.spinner.View() + " " +
-			fmt.Sprintf("Compacting context · %s (%s · esc)%s", kind, elapsed, suffix)
-	}
-	if m.mode == modeBusy && m.interruptFeedbackShown {
-		elapsed := time.Since(m.turnStart).Round(time.Second)
-		return m.spinner.View() + " " +
-			fmt.Sprintf("Stopping · waiting for turn cleanup (%s · esc)%s", elapsed, suffix)
-	}
-	activity := "thinking"
-	if m.currentTool != "" {
-		activity = m.currentTool
-	} else if m.streamingAssistant {
-		activity = "streaming"
-	}
-	// Open reasoning keeps the default "thinking" activity label.
-	elapsed := time.Since(m.turnStart).Round(time.Second)
-	return m.spinner.View() + " " +
-		fmt.Sprintf("Working · %s (%s · esc)%s", activity, elapsed, suffix)
+	return plainStatusLine(m.statusLineSegments())
 }
 
 func (m *model) statusPolicyFragment() string {
@@ -1437,7 +1396,7 @@ func (m *model) statusPolicyFragment() string {
 
 // statusLine keeps a styled single-line form for tests and lightweight callers.
 func (m *model) statusLine() string {
-	return statusStyle.Render(m.statusLabel())
+	return renderStatusLine(m.statusLineSegments())
 }
 
 func (m *model) layout() {
@@ -1454,8 +1413,9 @@ func (m *model) layout() {
 		innerW = 10
 	}
 	m.textarea.SetWidth(innerW)
-	// viewport = total - composer border - status(rule+line) - help - optional
-	// task pane - slash/approval/backtrack. Border +2; status rule+label +2; help +1.
+	// viewport = total - composer border - status - help - optional task pane -
+	// slash/approval/backtrack. Keep one spare row so modal pages retain their
+	// historical safety margin at small terminal heights.
 	composerHeight := m.textarea.Height() + 2
 	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
@@ -1640,6 +1600,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdSteer(arg)
 	case slashUsage:
 		return m.cmdUsage(arg)
+	case slashStatusLine:
+		return m.cmdStatusLine(arg)
 	case slashContext:
 		return m.cmdContext(arg)
 	case slashCompact:

@@ -8,6 +8,188 @@ import (
 	"eino-local-assistant/internal/usage"
 )
 
+const (
+	statusFieldModel    = "model"
+	statusFieldEffort   = "effort"
+	statusFieldContext  = "context"
+	statusFieldActivity = "activity"
+	statusFieldSession  = "session"
+	statusFieldTitle    = "title"
+	statusFieldPolicy   = "policy"
+	statusFieldTask     = "task"
+	statusFieldQueue    = "queue"
+	statusFieldFollow   = "follow"
+)
+
+var defaultStatusLineFields = []string{
+	statusFieldModel,
+	statusFieldEffort,
+	statusFieldContext,
+	statusFieldActivity,
+}
+
+var statusLineFieldSet = map[string]struct{}{
+	statusFieldModel: {}, statusFieldEffort: {}, statusFieldContext: {}, statusFieldActivity: {},
+	statusFieldSession: {}, statusFieldTitle: {}, statusFieldPolicy: {}, statusFieldTask: {},
+	statusFieldQueue: {}, statusFieldFollow: {},
+}
+
+type statusLineSegment struct {
+	field string
+	text  string
+}
+
+// normalizeStatusLineFields keeps direct TUI embedders safe when they bypass
+// config validation. The production configuration rejects invalid values.
+func normalizeStatusLineFields(fields []string) []string {
+	if len(fields) == 0 {
+		return append([]string(nil), defaultStatusLineFields...)
+	}
+	seen := make(map[string]struct{}, len(fields))
+	normalized := make([]string, 0, len(fields))
+	for _, raw := range fields {
+		field := strings.ToLower(strings.TrimSpace(raw))
+		if _, ok := statusLineFieldSet[field]; !ok {
+			continue
+		}
+		if _, duplicate := seen[field]; duplicate {
+			continue
+		}
+		seen[field] = struct{}{}
+		normalized = append(normalized, field)
+	}
+	if len(normalized) == 0 {
+		return append([]string(nil), defaultStatusLineFields...)
+	}
+	return normalized
+}
+
+func statusLineModelName(modelName string) string {
+	modelName = strings.TrimSpace(modelName)
+	if i := strings.LastIndex(modelName, "/"); i >= 0 {
+		modelName = modelName[i+1:]
+	}
+	return modelName
+}
+
+func statusLineContext(session *chat.Session) string {
+	fragment := sessionCtxFragment(session)
+	if fragment == "" {
+		return ""
+	}
+	if start := strings.LastIndex(fragment, "("); start >= 0 && strings.HasSuffix(fragment, ")") {
+		return "Context " + fragment[start+1:len(fragment)-1] + " used"
+	}
+	return "Context " + strings.TrimPrefix(strings.TrimPrefix(fragment, "ctx≈"), "ctx=")
+}
+
+func (m *model) statusActivity() string {
+	switch {
+	case m.backtrackStatus() != "":
+		return m.backtrackStatus()
+	case m.hasPendingApproval():
+		return "awaiting approval"
+	case m.mode == modeCompacting:
+		return "compacting"
+	case m.mode == modeBusy && m.interruptFeedbackShown:
+		return "stopping"
+	case m.mode == modeBusy && m.currentTool != "":
+		return m.currentTool
+	case m.mode == modeBusy && m.streamingAssistant:
+		return "streaming"
+	case m.mode == modeBusy:
+		return "thinking"
+	default:
+		return ""
+	}
+}
+
+func (m *model) statusLineSegments() []statusLineSegment {
+	session := m.activeSession()
+	follow := !m.stickBottom && !m.viewport.AtBottom()
+	extras := collectStatusExtras(session, len(m.queue), follow, m.statusPolicyFragment())
+	if m.queuePaused {
+		extras.paused = "queue:paused"
+	}
+
+	values := map[string]string{
+		statusFieldModel:    statusLineModelName(m.deps.Status.Model),
+		statusFieldEffort:   strings.TrimSpace(m.deps.Status.ReasoningEffort),
+		statusFieldContext:  statusLineContext(session),
+		statusFieldActivity: m.statusActivity(),
+		statusFieldPolicy:   extras.cmdPolicy,
+		statusFieldTask:     extras.task,
+		statusFieldQueue:    joinStatusFields(extras.paused, extras.queued),
+		statusFieldFollow:   extras.follow,
+	}
+	if session != nil {
+		values[statusFieldSession] = shortSessionID(session.ID())
+		values[statusFieldTitle] = compactStatusTitle(session.Title())
+	}
+
+	segments := make([]statusLineSegment, 0, len(m.deps.StatusLineFields))
+	for _, field := range m.deps.StatusLineFields {
+		if text := values[field]; text != "" {
+			segments = append(segments, statusLineSegment{field: field, text: text})
+		}
+	}
+	return fitStatusLineSegments(max(20, m.width-2), segments)
+}
+
+func joinStatusFields(values ...string) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+func compactStatusTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if len([]rune(title)) <= 24 {
+		return title
+	}
+	runes := []rune(title)
+	return string(runes[:23]) + "…"
+}
+
+func fitStatusLineSegments(width int, segments []statusLineSegment) []statusLineSegment {
+	if width <= 0 || len(segments) == 0 {
+		return segments
+	}
+	kept := append([]statusLineSegment(nil), segments...)
+	for len(kept) > 1 && statusLineSegmentsWidth(kept) > width {
+		// Preserve the first configured field (normally model) and remove the
+		// least important trailing field at a constrained terminal width.
+		kept = kept[:len(kept)-1]
+	}
+	if len(kept) == 1 && statusLineSegmentsWidth(kept) > width && width > 1 {
+		runes := []rune(kept[0].text)
+		if len(runes) > width-1 {
+			kept[0].text = string(runes[:width-1]) + "…"
+		}
+	}
+	return kept
+}
+
+func statusLineSegmentsWidth(segments []statusLineSegment) int {
+	parts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		parts = append(parts, segment.text)
+	}
+	return len([]rune(strings.Join(parts, " · ")))
+}
+
+func plainStatusLine(segments []statusLineSegment) string {
+	parts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		parts = append(parts, segment.text)
+	}
+	return strings.Join(parts, " · ")
+}
+
 // shortSessionID shortens a session id for the status bar.
 // Prefer the trailing random suffix when the ID carries one.
 func shortSessionID(id string) string {
