@@ -189,10 +189,13 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 			MaxConsecutiveEquivalentToolCalls: runtime.runtimeCfg.MaxConsecutiveEquivalentToolCalls,
 			Timeout:                           time.Duration(runtime.runtimeCfg.MaxTurnSeconds) * time.Second,
 		},
-		HideTurnUsage:    !modelCfg.UI.TurnUsageEnabled(),
-		StatusLineFields: modelCfg.UI.StatusLineFields(),
-		SaveStatusLineFields: func(fields []string) error {
-			return config.SaveStatusLineFields(configPath, fields)
+		HideTurnUsage: !modelCfg.UI.TurnUsageEnabled(),
+		StatusLine: tui.StatusLineConfig{
+			Fields:         modelCfg.UI.StatusLineFields(),
+			UseThemeColors: modelCfg.UI.StatusLineThemeColorsEnabled(),
+		},
+		SaveStatusLineConfig: func(statusLine tui.StatusLineConfig) error {
+			return config.SaveStatusLineConfig(configPath, statusLine.Fields, statusLine.UseThemeColors)
 		},
 		Approval:   approvalBridge,
 		PolicyInfo: policyInfo,

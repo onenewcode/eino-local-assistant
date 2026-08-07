@@ -131,7 +131,7 @@ func TestSlashCatalogNeedsArg(t *testing.T) {
 		"/help": false, "/status": false, "/goal": false, "/tasks": false, "/diff": false, "/review": false, "/rules": false, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/plan": false, "/permissions": true,
 		"/btw": true, "/steer": true,
-		"/usage": true, "/statusline": true, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
+		"/usage": true, "/statusline": false, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
 		"/delete": true, "/queue": true, "/model": true, "/memory": true,
 	}
 	for _, cmd := range slashCatalog() {

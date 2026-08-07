@@ -5,66 +5,123 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
-func TestStatusLineCommandSavesSelectedFieldsAndHidesProvider(t *testing.T) {
+func TestStatusLineCommandOpensCodexStylePickerAndSavesDraft(t *testing.T) {
 	m := newTestModel(t)
 	m.deps.Status.Model = "openai/gpt-5.6-terra"
-	var saved []string
-	m.deps.SaveStatusLineFields = func(fields []string) error {
-		saved = append([]string(nil), fields...)
+	m.deps.Status.ReasoningEffort = "xhigh"
+	var saved StatusLineConfig
+	m.deps.SaveStatusLineConfig = func(config StatusLineConfig) error {
+		saved = copyStatusLineConfig(config)
 		return nil
 	}
 
-	next, cmd := m.submit("/statusline set model, effort context policy")
-	mm := next.(*model)
+	next, cmd := m.submit("/statusline")
+	m = next.(*model)
 	if cmd != nil {
 		t.Fatalf("/statusline should not start a turn: %v", cmd)
 	}
-	want := []string{statusFieldModel, statusFieldEffort, statusFieldContext, statusFieldPolicy}
-	if !reflect.DeepEqual(mm.deps.StatusLineFields, want) || !reflect.DeepEqual(saved, want) {
-		t.Fatalf("status-line fields = %#v, saved=%#v, want=%#v", mm.deps.StatusLineFields, saved, want)
+	if !m.statusLinePickerOpen() {
+		t.Fatal("/statusline did not open the picker")
 	}
-	line := mm.statusLabel()
-	if !strings.Contains(line, "gpt-5.6-terra") || strings.Contains(line, "openai/") {
-		t.Fatalf("model footer did not hide provider: %q", line)
+	view := m.View()
+	for _, want := range []string{
+		"Configure Status Line", "Type to search", "Use theme colors",
+		"model-with-reasoning", "context-used", "used-tokens", "task-progress",
+		"gpt-5.6-terra xhigh", "Context 0% used", "0 used", "Tasks 0/0",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("picker view missing %q:\n%s", want, view)
+		}
 	}
-	next, _ = mm.submit("/statusline hide policy")
-	mm = next.(*model)
-	if strings.Contains(mm.statusLabel(), "cmd=") {
-		t.Fatalf("hidden policy still appears: %q", mm.statusLabel())
+	if strings.Contains(view, "openai/gpt-5.6-terra") {
+		t.Fatalf("picker preview leaked provider prefix:\n%s", view)
 	}
-	if want := []string{statusFieldModel, statusFieldEffort, statusFieldContext}; !reflect.DeepEqual(saved, want) {
-		t.Fatalf("hide save = %#v, want=%#v", saved, want)
+
+	// Theme colors is selected initially. Turn it off, then remove task-progress
+	// from the private draft before committing it with Enter.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = next.(*model)
+	for range 4 {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = next.(*model)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = next.(*model)
+	if !m.statusLinePickerOpen() || !m.deps.StatusLine.UseThemeColors {
+		t.Fatal("draft changes must not apply before Enter")
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(*model)
+	if m.statusLinePickerOpen() {
+		t.Fatal("successful save left picker open")
+	}
+	want := StatusLineConfig{
+		Fields:         []string{statusFieldModelWithReasoning, statusFieldContextUsed, statusFieldUsedTokens},
+		UseThemeColors: false,
+	}
+	if !reflect.DeepEqual(m.deps.StatusLine, want) || !reflect.DeepEqual(saved, want) {
+		t.Fatalf("saved status line = %#v, callback=%#v, want=%#v", m.deps.StatusLine, saved, want)
 	}
 }
 
-func TestStatusLineCommandDoesNotApplyUnsavedChange(t *testing.T) {
+func TestStatusLinePickerSearchAndCancelDiscardDraft(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldContext}
-	m.deps.SaveStatusLineFields = func([]string) error { return errors.New("read-only config") }
+	m.deps.SaveStatusLineConfig = func(StatusLineConfig) error { return nil }
+	committed := copyStatusLineConfig(m.deps.StatusLine)
 
-	next, _ := m.submit("/statusline show policy")
-	mm := next.(*model)
-	if want := []string{statusFieldModel, statusFieldContext}; !reflect.DeepEqual(mm.deps.StatusLineFields, want) {
-		t.Fatalf("failed save changed fields = %#v, want=%#v", mm.deps.StatusLineFields, want)
-	}
-	if !hasLineContaining(mm.lines, lineError, "save status-line settings: read-only config") {
-		t.Fatalf("save failure missing from transcript: %#v", mm.lines)
-	}
-}
-
-func TestStatusLineCommandReportsAndValidatesFields(t *testing.T) {
-	m := newTestModel(t)
 	next, _ := m.submit("/statusline")
-	mm := next.(*model)
-	if !hasLineContaining(mm.lines, lineSystem, "Status line fields (persistent)") || !hasLineContaining(mm.lines, lineSystem, "Available: model") {
-		t.Fatalf("status-line report missing: %#v", mm.lines)
+	m = next.(*model)
+	for _, r := range "used" {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(*model)
 	}
+	view := m.View()
+	if !strings.Contains(view, "used-tokens") || strings.Contains(view, "Use theme colors") {
+		t.Fatalf("search did not filter picker rows:\n%s", view)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = next.(*model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(*model)
+	if m.statusLinePickerOpen() {
+		t.Fatal("esc did not close picker")
+	}
+	if !reflect.DeepEqual(m.deps.StatusLine, committed) {
+		t.Fatalf("esc applied draft: got %#v want %#v", m.deps.StatusLine, committed)
+	}
+}
 
-	next, _ = mm.submit("/statusline set model model")
-	mm = next.(*model)
-	if !hasLineContaining(mm.lines, lineError, "duplicate status-line field: model") {
-		t.Fatalf("duplicate validation missing: %#v", mm.lines)
+func TestStatusLinePickerFailedSaveKeepsDraftAndCommittedSettings(t *testing.T) {
+	m := newTestModel(t)
+	m.deps.StatusLine = StatusLineConfig{Fields: []string{statusFieldModel}, UseThemeColors: true}
+	m.deps.SaveStatusLineConfig = func(StatusLineConfig) error { return errors.New("read-only config") }
+
+	next, _ := m.submit("/statusline")
+	m = next.(*model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = next.(*model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(*model)
+	if !m.statusLinePickerOpen() {
+		t.Fatal("failed save should keep picker open")
+	}
+	if want := []string{statusFieldModel}; !reflect.DeepEqual(m.deps.StatusLine.Fields, want) {
+		t.Fatalf("failed save applied fields = %#v, want %#v", m.deps.StatusLine.Fields, want)
+	}
+	if !hasLineContaining(m.lines, lineError, "save status-line settings: read-only config") {
+		t.Fatalf("save failure missing from transcript: %#v", m.lines)
+	}
+}
+
+func TestStatusLineCommandRejectsTextArguments(t *testing.T) {
+	m := newTestModel(t)
+	next, _ := m.submit("/statusline set model")
+	m = next.(*model)
+	if m.statusLinePickerOpen() || !hasLineContaining(m.lines, lineError, statusLineCommandUsage) {
+		t.Fatalf("text argument should be rejected: %#v", m.lines)
 	}
 }

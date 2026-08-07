@@ -122,7 +122,7 @@ func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 
 func TestStatusLineFollowHint(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldFollow}
+	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldFollow}
 	// Build tall content so not-at-bottom is possible.
 	for range 40 {
 		m.appendLine(lineSystem, strings.Repeat("x", 20))
@@ -143,7 +143,7 @@ func TestStatusLineFollowHint(t *testing.T) {
 
 func TestStatusLabelBusyUsesSharedSuffix(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
+	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
 	m.mode = modeBusy
 	m.queue = []string{"next"}
 	line := m.statusLabel()

@@ -9,7 +9,15 @@ import (
 )
 
 const (
-	statusFieldModel    = "model"
+	statusFieldModelWithReasoning = "model-with-reasoning"
+	statusFieldContextUsed        = "context-used"
+	statusFieldUsedTokens         = "used-tokens"
+	statusFieldTaskProgress       = "task-progress"
+	statusFieldModel              = "model"
+	statusFieldReasoning          = "reasoning"
+
+	// Legacy fields remain supported for user configurations written before
+	// the picker adopted Codex's names and grouping.
 	statusFieldEffort   = "effort"
 	statusFieldContext  = "context"
 	statusFieldActivity = "activity"
@@ -22,16 +30,23 @@ const (
 )
 
 var defaultStatusLineFields = []string{
-	statusFieldModel,
-	statusFieldEffort,
-	statusFieldContext,
-	statusFieldActivity,
+	statusFieldModelWithReasoning,
+	statusFieldContextUsed,
+	statusFieldUsedTokens,
+	statusFieldTaskProgress,
 }
 
 var statusLineFieldSet = map[string]struct{}{
-	statusFieldModel: {}, statusFieldEffort: {}, statusFieldContext: {}, statusFieldActivity: {},
-	statusFieldSession: {}, statusFieldTitle: {}, statusFieldPolicy: {}, statusFieldTask: {},
-	statusFieldQueue: {}, statusFieldFollow: {},
+	statusFieldModelWithReasoning: {}, statusFieldContextUsed: {}, statusFieldUsedTokens: {}, statusFieldTaskProgress: {},
+	statusFieldModel: {}, statusFieldReasoning: {}, statusFieldEffort: {}, statusFieldContext: {}, statusFieldActivity: {},
+	statusFieldSession: {}, statusFieldTitle: {}, statusFieldPolicy: {}, statusFieldTask: {}, statusFieldQueue: {}, statusFieldFollow: {},
+}
+
+// StatusLineConfig is the full persisted selection controlled by /statusline.
+// Fields and theme colors are intentionally committed together.
+type StatusLineConfig struct {
+	Fields         []string
+	UseThemeColors bool
 }
 
 type statusLineSegment struct {
@@ -64,6 +79,19 @@ func normalizeStatusLineFields(fields []string) []string {
 	return normalized
 }
 
+func normalizeStatusLineConfig(config StatusLineConfig) StatusLineConfig {
+	useThemeColors := config.UseThemeColors
+	// The zero Deps value is used by lightweight embedders and tests. It should
+	// get the same default as omitted TOML configuration.
+	if len(config.Fields) == 0 {
+		useThemeColors = true
+	}
+	return StatusLineConfig{
+		Fields:         normalizeStatusLineFields(config.Fields),
+		UseThemeColors: useThemeColors,
+	}
+}
+
 func statusLineModelName(modelName string) string {
 	modelName = strings.TrimSpace(modelName)
 	if i := strings.LastIndex(modelName, "/"); i >= 0 {
@@ -75,12 +103,36 @@ func statusLineModelName(modelName string) string {
 func statusLineContext(session *chat.Session) string {
 	fragment := sessionCtxFragment(session)
 	if fragment == "" {
-		return ""
+		return "Context 0% used"
 	}
 	if start := strings.LastIndex(fragment, "("); start >= 0 && strings.HasSuffix(fragment, ")") {
 		return "Context " + fragment[start+1:len(fragment)-1] + " used"
 	}
 	return "Context " + strings.TrimPrefix(strings.TrimPrefix(fragment, "ctx≈"), "ctx=")
+}
+
+func (m *model) statusLineModelWithReasoning() string {
+	modelName := statusLineModelName(m.deps.Status.Model)
+	effort := strings.TrimSpace(m.deps.Status.ReasoningEffort)
+	if modelName == "" {
+		return effort
+	}
+	if effort == "" {
+		return modelName
+	}
+	return modelName + " " + effort
+}
+
+func statusLineUsedTokens(session *chat.Session) string {
+	return fmt.Sprintf("%d used", sessionAPIUsage(session).TotalTokens)
+}
+
+func statusLineTaskProgress(session *chat.Session) string {
+	status := sessionTaskStatus(session)
+	if !hasTaskStatus(status) {
+		return "Tasks 0/0"
+	}
+	return fmt.Sprintf("Tasks %d/%d", status.DoneTasks, status.Tasks)
 }
 
 func (m *model) statusActivity() string {
@@ -105,6 +157,10 @@ func (m *model) statusActivity() string {
 }
 
 func (m *model) statusLineSegments() []statusLineSegment {
+	return m.statusLineSegmentsForConfig(m.deps.StatusLine)
+}
+
+func (m *model) statusLineSegmentsForConfig(config StatusLineConfig) []statusLineSegment {
 	session := m.activeSession()
 	follow := !m.stickBottom && !m.viewport.AtBottom()
 	extras := collectStatusExtras(session, len(m.queue), follow, m.statusPolicyFragment())
@@ -113,22 +169,27 @@ func (m *model) statusLineSegments() []statusLineSegment {
 	}
 
 	values := map[string]string{
-		statusFieldModel:    statusLineModelName(m.deps.Status.Model),
-		statusFieldEffort:   strings.TrimSpace(m.deps.Status.ReasoningEffort),
-		statusFieldContext:  statusLineContext(session),
-		statusFieldActivity: m.statusActivity(),
-		statusFieldPolicy:   extras.cmdPolicy,
-		statusFieldTask:     extras.task,
-		statusFieldQueue:    joinStatusFields(extras.paused, extras.queued),
-		statusFieldFollow:   extras.follow,
+		statusFieldModelWithReasoning: m.statusLineModelWithReasoning(),
+		statusFieldContextUsed:        statusLineContext(session),
+		statusFieldUsedTokens:         statusLineUsedTokens(session),
+		statusFieldTaskProgress:       joinStatusFields(statusLineTaskProgress(session), m.statusActivity()),
+		statusFieldModel:              statusLineModelName(m.deps.Status.Model),
+		statusFieldReasoning:          strings.TrimSpace(m.deps.Status.ReasoningEffort),
+		statusFieldEffort:             strings.TrimSpace(m.deps.Status.ReasoningEffort),
+		statusFieldContext:            statusLineContext(session),
+		statusFieldActivity:           m.statusActivity(),
+		statusFieldPolicy:             extras.cmdPolicy,
+		statusFieldTask:               extras.task,
+		statusFieldQueue:              joinStatusFields(extras.paused, extras.queued),
+		statusFieldFollow:             extras.follow,
 	}
 	if session != nil {
 		values[statusFieldSession] = shortSessionID(session.ID())
 		values[statusFieldTitle] = compactStatusTitle(session.Title())
 	}
 
-	segments := make([]statusLineSegment, 0, len(m.deps.StatusLineFields))
-	for _, field := range m.deps.StatusLineFields {
+	segments := make([]statusLineSegment, 0, len(config.Fields))
+	for _, field := range config.Fields {
 		if text := values[field]; text != "" {
 			segments = append(segments, statusLineSegment{field: field, text: text})
 		}

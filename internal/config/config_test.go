@@ -55,16 +55,22 @@ func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if want := []string{"model", "effort", "context", "activity"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+	if want := []string{"model-with-reasoning", "context-used", "used-tokens", "task-progress"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
 		t.Fatalf("default status line = %#v, want %#v", got.UI.StatusLineFields(), want)
 	}
+	if !got.UI.StatusLineThemeColorsEnabled() {
+		t.Fatal("theme colors should default to enabled")
+	}
 
-	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\" Model \", \"CONTEXT\", \"policy\"]\n"))
+	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\" Model \", \"context-used\", \"policy\"]\nstatus_line_use_theme_colors = false\n"))
 	if err != nil {
 		t.Fatalf("Load(configured status line) error = %v", err)
 	}
-	if want := []string{"model", "context", "policy"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+	if want := []string{"model", "context-used", "policy"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
 		t.Fatalf("configured status line = %#v, want %#v", got.UI.StatusLineFields(), want)
+	}
+	if got.UI.StatusLineThemeColorsEnabled() {
+		t.Fatal("explicitly disabled theme colors were ignored")
 	}
 
 	for _, doc := range []string{
@@ -77,7 +83,7 @@ func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
 	}
 }
 
-func TestSaveStatusLineFieldsPreservesUISettingsAndSourceComments(t *testing.T) {
+func TestSaveStatusLineConfigPreservesUISettingsAndSourceComments(t *testing.T) {
 	path := writeConfiguration(t, validConfiguration+`# keep this comment
 [ui]
 # keep this UI comment
@@ -87,8 +93,8 @@ status_line = [
   "model",
 ]
 `)
-	if err := SaveStatusLineFields(path, []string{"model", "effort", "context", "policy"}); err != nil {
-		t.Fatalf("SaveStatusLineFields() error = %v", err)
+	if err := SaveStatusLineConfig(path, []string{"model-with-reasoning", "context-used", "used-tokens"}, false); err != nil {
+		t.Fatalf("SaveStatusLineConfig() error = %v", err)
 	}
 	got, err := Load(path)
 	if err != nil {
@@ -97,14 +103,17 @@ status_line = [
 	if got.UI.TurnUsageEnabled() {
 		t.Fatal("SaveStatusLineFields changed ui.show_turn_usage")
 	}
-	if want := []string{"model", "effort", "context", "policy"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+	if want := []string{"model-with-reasoning", "context-used", "used-tokens"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
 		t.Fatalf("saved status line = %#v, want %#v", got.UI.StatusLineFields(), want)
+	}
+	if got.UI.StatusLineThemeColorsEnabled() {
+		t.Fatal("SaveStatusLineConfig did not persist ui.status_line_use_theme_colors")
 	}
 	source, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(source), "# keep this UI comment") || !strings.Contains(string(source), `status_line = ["model", "effort", "context", "policy"]`) {
+	if !strings.Contains(string(source), "# keep this UI comment") || !strings.Contains(string(source), `status_line = ["model-with-reasoning", "context-used", "used-tokens"]`) || !strings.Contains(string(source), "status_line_use_theme_colors = false") {
 		t.Fatalf("saved source did not preserve unrelated UI content:\n%s", source)
 	}
 }

@@ -260,8 +260,11 @@ type UIConfig struct {
 	// Nil (omitted) defaults to true. Set show_turn_usage: false to hide.
 	ShowTurnUsage *bool `toml:"show_turn_usage"`
 	// StatusLine controls the visible footer fields and their order. Omit it
-	// to use the Codex-like default: model, effort, context, activity.
+	// to use the Codex-like default shown by /statusline.
 	StatusLine []string `toml:"status_line"`
+	// StatusLineUseThemeColors controls semantic footer colors. Omitted defaults
+	// to true, matching Codex's colored status metadata.
+	StatusLineUseThemeColors *bool `toml:"status_line_use_theme_colors"`
 }
 
 // TurnUsageEnabled reports whether the per-turn usage footer should be shown.
@@ -272,7 +275,12 @@ func (c UIConfig) TurnUsageEnabled() bool {
 	return *c.ShowTurnUsage
 }
 
-var defaultStatusLineFields = []string{"model", "effort", "context", "activity"}
+var defaultStatusLineFields = []string{
+	"model-with-reasoning",
+	"context-used",
+	"used-tokens",
+	"task-progress",
+}
 
 // StatusLineFields returns an owned, normalized footer field list.
 func (c UIConfig) StatusLineFields() []string {
@@ -284,6 +292,14 @@ func (c UIConfig) StatusLineFields() []string {
 		fields = append(fields, strings.ToLower(strings.TrimSpace(field)))
 	}
 	return fields
+}
+
+// StatusLineThemeColorsEnabled reports whether semantic footer colors are on.
+func (c UIConfig) StatusLineThemeColorsEnabled() bool {
+	if c.StatusLineUseThemeColors == nil {
+		return true
+	}
+	return *c.StatusLineUseThemeColors
 }
 
 // Validate verifies display-only UI settings. Status-line fields are kept in
@@ -304,8 +320,12 @@ func (c UIConfig) Validate() error {
 }
 
 var statusLineFieldSet = map[string]struct{}{
-	"model": {}, "effort": {}, "context": {}, "activity": {}, "session": {},
-	"title": {}, "policy": {}, "task": {}, "queue": {}, "follow": {},
+	"model-with-reasoning": {}, "context-used": {}, "used-tokens": {}, "task-progress": {},
+	"model": {}, "reasoning": {},
+	// Keep fields written by the first status-line release valid so upgrading
+	// does not make an existing user configuration unloadable.
+	"effort": {}, "context": {}, "activity": {}, "session": {}, "title": {},
+	"policy": {}, "task": {}, "queue": {}, "follow": {},
 }
 
 // ToolsConfig holds runtime limits for Codex-subset tools (not permission language).
@@ -632,15 +652,15 @@ func parseConfig(data []byte) (Config, error) {
 	return cfg, nil
 }
 
-// SaveStatusLineFields updates only ui.status_line in the user configuration.
-// It keeps unrelated settings and comments intact, and atomically replaces the
-// file only after the updated TOML passes the regular configuration validator.
-func SaveStatusLineFields(path string, fields []string) error {
+// SaveStatusLineConfig updates the /statusline settings atomically. It keeps
+// unrelated settings and comments intact, and replaces the file only after the
+// updated TOML passes the regular configuration validator.
+func SaveStatusLineConfig(path string, fields []string, useThemeColors bool) error {
 	if strings.ToLower(filepath.Ext(path)) != ".toml" {
 		return errors.New("configuration file must use the .toml extension")
 	}
 	normalized := normalizeStatusLineFields(fields)
-	if err := (UIConfig{StatusLine: normalized}).Validate(); err != nil {
+	if err := (UIConfig{StatusLine: normalized, StatusLineUseThemeColors: &useThemeColors}).Validate(); err != nil {
 		return err
 	}
 	if len(normalized) == 0 {
@@ -665,7 +685,7 @@ func SaveStatusLineFields(path string, fields []string) error {
 	if _, err := parseConfig(data); err != nil {
 		return err
 	}
-	updated, err := replaceStatusLineSetting(string(data), normalized)
+	updated, err := replaceStatusLineSettings(string(data), normalized, useThemeColors)
 	if err != nil {
 		return err
 	}
@@ -673,6 +693,13 @@ func SaveStatusLineFields(path string, fields []string) error {
 		return fmt.Errorf("validate updated configuration: %w", err)
 	}
 	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+// SaveStatusLineFields remains for callers compiled against the initial
+// persistent status-line API. New TUI code should use SaveStatusLineConfig so
+// the color preference is committed with the selected fields.
+func SaveStatusLineFields(path string, fields []string) error {
+	return SaveStatusLineConfig(path, fields, true)
 }
 
 func normalizeStatusLineFields(fields []string) []string {
@@ -683,8 +710,16 @@ func normalizeStatusLineFields(fields []string) []string {
 	return normalized
 }
 
-func replaceStatusLineSetting(source string, fields []string) (string, error) {
-	setting := "status_line = " + formatTOMLStringList(fields)
+func replaceStatusLineSettings(source string, fields []string, useThemeColors bool) (string, error) {
+	updated, err := replaceUISetting(source, "status_line", formatTOMLStringList(fields))
+	if err != nil {
+		return "", err
+	}
+	return replaceUISetting(updated, "status_line_use_theme_colors", strconv.FormatBool(useThemeColors))
+}
+
+func replaceUISetting(source, name, value string) (string, error) {
+	setting := name + " = " + value
 	lines := strings.SplitAfter(source, "\n")
 	tableStart, tableEnd, found := uiTableBounds(lines)
 	if !found {
@@ -695,11 +730,11 @@ func replaceStatusLineSetting(source string, fields []string) (string, error) {
 	}
 
 	for i := tableStart + 1; i < tableEnd; i++ {
-		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "status_line") {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), name) {
 			continue
 		}
 		key, value, ok := strings.Cut(strings.TrimSpace(lines[i]), "=")
-		if !ok || strings.TrimSpace(key) != "status_line" {
+		if !ok || strings.TrimSpace(key) != name {
 			continue
 		}
 		end := i + 1
@@ -708,7 +743,7 @@ func replaceStatusLineSetting(source string, fields []string) (string, error) {
 				end++
 			}
 			if strings.Count(strings.Join(lines[i:end], ""), "[") > strings.Count(strings.Join(lines[i:end], ""), "]") {
-				return "", errors.New("ui.status_line has an unclosed array")
+				return "", errors.New("ui." + name + " has an unclosed array")
 			}
 		}
 		lines[i] = setting + "\n"

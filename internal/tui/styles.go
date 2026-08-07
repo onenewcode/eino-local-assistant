@@ -183,28 +183,35 @@ func renderSeparator(width int) string {
 }
 
 // renderStatusLine gives each footer field a stable semantic color while
-// leaving separators subdued, like Codex's compact bottom metadata.
-func renderStatusLine(segments []statusLineSegment) string {
+// leaving separators subdued. /statusline can disable those colors for a
+// monochrome terminal theme.
+func renderStatusLine(segments []statusLineSegment, useThemeColors bool) string {
 	parts := make([]string, 0, len(segments))
 	for _, segment := range segments {
-		parts = append(parts, statusStyleForField(segment.field).Render(segment.text))
+		style := statusStyle
+		if useThemeColors {
+			style = statusStyleForField(segment.field)
+		}
+		parts = append(parts, style.Render(segment.text))
 	}
 	return strings.Join(parts, separatorStyle.Render(" · "))
 }
 
 func statusStyleForField(field string) lipgloss.Style {
 	switch field {
-	case statusFieldModel:
+	case statusFieldModelWithReasoning, statusFieldModel:
 		return statusModelStyle
-	case statusFieldEffort:
+	case statusFieldReasoning, statusFieldEffort:
 		return statusEffortStyle
-	case statusFieldContext:
+	case statusFieldContextUsed, statusFieldContext:
 		return statusContextStyle
+	case statusFieldUsedTokens:
+		return statusPolicyStyle
 	case statusFieldActivity:
 		return statusActivityStyle
 	case statusFieldPolicy:
 		return statusPolicyStyle
-	case statusFieldTask:
+	case statusFieldTaskProgress, statusFieldTask:
 		return statusTaskStyle
 	default:
 		return statusStyle
@@ -271,6 +278,24 @@ var (
 	modelPickerEffortMetaStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("243"))
 	modelPickerEffortFooterStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("245"))
+
+	statusLinePickerTitleStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("114")).
+					Bold(true)
+	statusLinePickerSearchStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("243"))
+	statusLinePickerRowStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("250"))
+	statusLinePickerSelectedStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("252")).
+					Background(lipgloss.Color("236")).
+					Bold(true)
+	statusLinePickerPreviewLabelStyle = lipgloss.NewStyle().
+						Foreground(lipgloss.Color("245"))
+	statusLinePickerPreviewStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("252"))
+	statusLinePickerFooterStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("245"))
 
 	taskPaneTitleStyle = lipgloss.NewStyle().

@@ -54,7 +54,7 @@ func TestBusyInterruptShowsCleanupFeedbackOnce(t *testing.T) {
 
 func TestStatusLabelShowsStoppingUntilTurnCleanup(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLineFields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
+	m.deps.StatusLine.Fields = []string{statusFieldModel, statusFieldActivity, statusFieldQueue}
 	m.mode = modeBusy
 	m.interruptFeedbackShown = true
 	m.queue = []string{"next"}

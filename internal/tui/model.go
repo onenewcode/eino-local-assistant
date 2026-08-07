@@ -185,12 +185,12 @@ type Deps struct {
 	// HideTurnUsage skips the post-turn API usage footer when true.
 	// Default (false) shows the footer. Wired from ui.show_turn_usage.
 	HideTurnUsage bool
-	// StatusLineFields controls the visible footer fields and their order.
-	// An empty list uses the Codex-like default.
-	StatusLineFields []string
-	// SaveStatusLineFields persists a validated status-line selection in the
-	// user configuration. It is optional for embedders that do not own config.
-	SaveStatusLineFields func([]string) error
+	// StatusLine controls the persisted footer fields and semantic colors. An
+	// empty field list uses the Codex-like default.
+	StatusLine StatusLineConfig
+	// SaveStatusLineConfig persists a complete status-line selection in the user
+	// configuration. It is optional for embedders that do not own config.
+	SaveStatusLineConfig func(StatusLineConfig) error
 	// Approval is the TUI bridge for run_command ask decisions. Optional.
 	Approval *ApprovalBridge
 	// PolicyInfo drives /permissions and the cmd= status badge.
@@ -286,6 +286,9 @@ type model struct {
 	modelPickerSel       int
 	modelPickerEfforts   []string
 	modelPickerEffortSel int
+	// statusLinePicker keeps a private draft until Enter succeeds. Esc leaves
+	// the durable status line and current footer untouched.
+	statusLinePicker *statusLinePickerState
 	// taskPaneOpen exposes a compact, read-only task projection without making
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
@@ -799,6 +802,7 @@ func (m *model) resetSessionTransientState() {
 	m.modelPickerSel = 0
 	m.modelPickerEfforts = nil
 	m.modelPickerEffortSel = 0
+	m.statusLinePicker = nil
 	m.clearBacktrack()
 	m.clearSlashMenu()
 	m.closeTaskPane()
@@ -846,7 +850,7 @@ func newModel(deps Deps) *model {
 		deps.SessionOpts.Store = deps.Store
 	}
 	deps.Status = cloneStatusInfo(deps.Status)
-	deps.StatusLineFields = normalizeStatusLineFields(deps.StatusLineFields)
+	deps.StatusLine = normalizeStatusLineConfig(deps.StatusLine)
 	ta := textarea.New()
 	ta.Placeholder = "Message the assistant…  (/help)"
 	ta.ShowLineNumbers = false
@@ -974,6 +978,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyEsc && m.mode == modeCompacting {
 			m.interruptCompaction()
 			return m, nil
+		}
+		if m.statusLinePickerOpen() {
+			return m.handleStatusLinePickerKey(msg)
 		}
 		if m.backtrackState.mode == backtrackSelecting {
 			return m.handleBacktrackKey(msg)
@@ -1301,7 +1308,7 @@ func (m *model) View() string {
 		return ""
 	}
 
-	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegments()))
+	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegments(), m.deps.StatusLine.UseThemeColors))
 	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	if m.hasPendingApproval() {
 		if approvalAllowsSession(m.pendingApproval.Request) {
@@ -1315,6 +1322,8 @@ func (m *model) View() string {
 		helpTextLine = "↑↓/jk select effort · enter apply · esc back · alt+p close"
 	} else if m.modelPickerOpen() {
 		helpTextLine = "↑↓/jk select model · enter choose/apply · esc cancel · alt+p close"
+	} else if m.statusLinePickerOpen() {
+		helpTextLine = "type to search · space toggle · ↑↓/jk move · enter save · esc cancel"
 	} else if m.backtrackState.mode == backtrackSelecting {
 		helpTextLine = "↑↓/jk select prompt · enter fork before prompt · esc cancel"
 	} else if m.backtrackState.mode == backtrackArmed {
@@ -1346,6 +1355,8 @@ func (m *model) View() string {
 		parts = append(parts, renderModelEffortPicker(m.width, m.selectedModelPickerEntry(), m.modelPickerEfforts, m.modelPickerEffortSel, m.deps.Status.ReasoningEffort))
 	} else if m.modelPickerOpen() {
 		parts = append(parts, renderModelPicker(m.width, m.modelPickerItems, m.modelPickerSel, m.currentModelIdentity()))
+	} else if m.statusLinePickerOpen() {
+		parts = append(parts, m.statusLinePickerView())
 	} else if m.backtrackState.mode == backtrackSelecting {
 		parts = append(parts, m.backtrackOverlayView())
 	}
@@ -1396,7 +1407,7 @@ func (m *model) statusPolicyFragment() string {
 
 // statusLine keeps a styled single-line form for tests and lightweight callers.
 func (m *model) statusLine() string {
-	return renderStatusLine(m.statusLineSegments())
+	return renderStatusLine(m.statusLineSegments(), m.deps.StatusLine.UseThemeColors)
 }
 
 func (m *model) layout() {
@@ -1414,10 +1425,10 @@ func (m *model) layout() {
 	}
 	m.textarea.SetWidth(innerW)
 	// viewport = total - composer border - status - help - optional task pane -
-	// slash/approval/backtrack. Keep one spare row so modal pages retain their
+	// slash/approval/backtrack/status-line picker. Keep one spare row so modal pages retain their
 	// historical safety margin at small terminal heights.
 	composerHeight := m.textarea.Height() + 2
-	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.backtrackOverlayHeight()
+	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.statusLinePickerHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
 		extra = m.taskPaneHeight() + m.approvalModalHeight()
 	}
