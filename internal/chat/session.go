@@ -1939,7 +1939,10 @@ func (s *Session) beginInFlightContext(messages []*schema.Message) {
 	s.mu.Lock()
 	s.inFlightMessages = cloneMessages(messages)
 	s.inFlightContextEpoch++
-	s.currentEstimateIsNewer = len(messages) > 0
+	// The initial user message is already included in threadPrompt's plan. It
+	// has not added a tool observation, so keep the last provider snapshot
+	// authoritative until the request reports fresh usage.
+	s.currentEstimateIsNewer = false
 	s.mu.Unlock()
 }
 

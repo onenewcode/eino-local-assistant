@@ -26,7 +26,6 @@ type Config struct {
 	Model ModelConfig `toml:"model"`
 	// ApprovalPolicy is Codex-style: on-request | never (also accepts on_request).
 	ApprovalPolicy string          `toml:"approval_policy"`
-	Assistant      AssistantConfig `toml:"assistant"`
 	Storage        StorageConfig   `toml:"storage"`
 	Workspace      WorkspaceConfig `toml:"workspace"`
 	Tools          ToolsConfig     `toml:"tools"`
@@ -490,11 +489,6 @@ type ModelConfig struct {
 	Pricing         PricingConfig       `toml:"pricing"`
 }
 
-// AssistantConfig controls the local assistant's initial conversation state.
-type AssistantConfig struct {
-	SystemPrompt string `toml:"system_prompt"`
-}
-
 // Load reads a strict TOML file and validates the values needed to run.
 // Unknown keys are rejected (strict decode). Only the .toml extension is accepted.
 func Load(path string) (Config, error) {
@@ -553,9 +547,6 @@ func Load(path string) (Config, error) {
 func (c *Config) Validate() error {
 	if err := c.Model.Validate(); err != nil {
 		return err
-	}
-	if strings.TrimSpace(c.Assistant.SystemPrompt) == "" {
-		return errors.New("assistant.system_prompt is required")
 	}
 	// storage.data_dir may be empty (default applied by ResolveDataDir).
 	switch c.ApprovalPolicyNormalized() {

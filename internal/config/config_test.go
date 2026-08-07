@@ -24,9 +24,6 @@ window_tokens = 32000
 [model.pricing]
 input_per_million = 0.0
 output_per_million = 0.0
-
-[assistant]
-system_prompt = "You are a helpful assistant."
 `
 
 func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
@@ -46,10 +43,17 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 				WindowTokens: 32_000,
 			},
 		},
-		Assistant: AssistantConfig{SystemPrompt: "You are a helpful assistant."},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load() = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadRejectsRemovedSystemPromptSetting(t *testing.T) {
+	doc := validConfiguration + "\n[assistant]\nsystem_prompt = \"custom\"\n"
+	_, err := Load(writeConfiguration(t, doc))
+	if err == nil || !strings.Contains(err.Error(), "unknown field assistant") {
+		t.Fatalf("Load(removed system prompt) error = %v", err)
 	}
 }
 

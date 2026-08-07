@@ -45,9 +45,6 @@ window_tokens = 32000
 input_per_million = 0.0
 output_per_million = 0.0
 
-[assistant]
-system_prompt = "你是一个严谨、实用的编程助手。"
-
 [workspace]
 root = ""
 

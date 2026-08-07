@@ -293,8 +293,6 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 		"timeout_seconds = 60\n" +
 		"[model.context]\n" +
 		"window_tokens = 32000\n" +
-		"[assistant]\n" +
-		"system_prompt = \"system\"\n" +
 		"[storage]\n" +
 		"data_dir = \"" + dataDir + "\"\n"
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {

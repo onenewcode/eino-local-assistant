@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -115,6 +116,47 @@ func TestSessionPublishesNewerContextEstimateAfterToolResult(t *testing.T) {
 	}
 }
 
+func TestSessionKeepsMeasuredContextDuringInitialRequest(t *testing.T) {
+	model := &initialRequestGateModel{
+		waiting: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	session, err := NewSession(model, "system", SessionOptions{Store: newDurableThreadStore(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Ask(context.Background(), "first", nil); err != nil {
+		t.Fatalf("initial Ask: %v", err)
+	}
+	if status := session.ContextStatus(); !status.MeasuredKnown || status.MeasuredTokens != 120 {
+		t.Fatalf("initial provider snapshot = %+v", status)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Ask(context.Background(), "second", nil)
+	}()
+	select {
+	case <-model.waiting:
+	case <-time.After(time.Second):
+		t.Fatal("second model request did not reach the gate")
+	}
+
+	status := session.ContextStatus()
+	if !status.MeasuredKnown || status.MeasuredTokens != 120 || status.CurrentEstimateIsNewer {
+		t.Fatalf("initial request replaced the measured context snapshot: %+v", status)
+	}
+	close(model.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("second Ask: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Ask did not finish after releasing the gate")
+	}
+}
+
 func TestSessionAskRejectsConflictingUsageCallID(t *testing.T) {
 	model := &usageEventModel{
 		stream: &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("done", nil)}}},
@@ -186,6 +228,40 @@ type usageEventModel struct {
 
 type inFlightToolEventModel struct {
 	stream Stream
+}
+
+type initialRequestGateModel struct {
+	mu      sync.Mutex
+	calls   int
+	waiting chan struct{}
+	release chan struct{}
+}
+
+func (m *initialRequestGateModel) Stream(_ context.Context, _ []*schema.Message) (Stream, error) {
+	return &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("done", nil)}}}, nil
+}
+
+func (m *initialRequestGateModel) StreamWithEvents(ctx context.Context, _ []*schema.Message, emit EventEmitter) (Stream, <-chan struct{}, error) {
+	m.mu.Lock()
+	m.calls++
+	call := m.calls
+	m.mu.Unlock()
+	if call == 2 {
+		close(m.waiting)
+		select {
+		case <-m.release:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	emit(TurnEvent{Kind: TurnEventModelUsage, ModelUsage: &ModelUsageEvent{
+		CallID:    "request-usage",
+		Available: true,
+		Usage:     usage.Turn{PromptTokens: 120, CompletionTokens: 8, TotalTokens: 128},
+	}})
+	done := make(chan struct{})
+	close(done)
+	return &scriptedStream{events: []streamEvent{{message: schema.AssistantMessage("done", nil)}}}, done, nil
 }
 
 func (m *inFlightToolEventModel) Stream(_ context.Context, _ []*schema.Message) (Stream, error) {

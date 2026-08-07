@@ -104,14 +104,12 @@ func TestSystemPromptComposerUsesWorkspaceToStartupInstructionHierarchy(t *testi
 		t.Fatal(err)
 	}
 
-	compose := newSystemPromptComposer(config.Config{
-		Assistant: config.AssistantConfig{SystemPrompt: "persona"},
-	}, workspaceRoot, startupDir, "", nil)
+	compose := newSystemPromptComposer(config.Config{}, workspaceRoot, startupDir, "", nil)
 	got, err := compose()
 	if err != nil {
 		t.Fatalf("compose() error = %v", err)
 	}
-	for _, want := range []string{"persona", "root instruction", "startup instruction"} {
+	for _, want := range []string{agent.DefaultPersona, "root instruction", "startup instruction"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("composed prompt missing %q:\n%s", want, got)
 		}
@@ -125,7 +123,6 @@ func TestSystemPromptComposerPassesProjectFallbackFilenames(t *testing.T) {
 	}
 
 	compose := newSystemPromptComposer(config.Config{
-		Assistant: config.AssistantConfig{SystemPrompt: "persona"},
 		Rules: config.RulesConfig{
 			ProjectDocFallbackFilenames: []string{"CLAUDE.md"},
 		},
@@ -178,8 +175,7 @@ func TestSystemPromptComposerReloadsGlobalInstructionsForFreshCompose(t *testing
 		t.Fatal(err)
 	}
 	compose := newSystemPromptComposer(config.Config{
-		Assistant: config.AssistantConfig{SystemPrompt: "persona"},
-		Rules:     config.RulesConfig{GlobalMaxTokens: 100},
+		Rules: config.RulesConfig{GlobalMaxTokens: 100},
 	}, workspaceRoot, workspaceRoot, globalRoot, nil)
 	first, err := compose()
 	if err != nil {

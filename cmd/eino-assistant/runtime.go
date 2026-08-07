@@ -368,7 +368,7 @@ func newSystemPromptSnapshotComposer(
 				return "", agent.PromptLayerSnapshot{}, err
 			}
 		}
-		return agent.ComposeWithLayersSnapshot(cfg.Assistant.SystemPrompt, agent.LayerOptions{
+		return agent.ComposeWithLayersSnapshot(agent.DefaultPersona, agent.LayerOptions{
 			WorkspaceRoot:                        workspaceRoot,
 			UserInstructionsRoot:                 userInstructionsRoot,
 			UserInstructionsTokens:               cfg.Rules.RulesGlobalMaxTokens(),
