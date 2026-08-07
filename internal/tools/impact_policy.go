@@ -10,14 +10,16 @@ import (
 	"sort"
 	"strings"
 
+	"eino-local-assistant/internal/config"
+
 	"github.com/BurntSushi/toml"
 	"go.starlark.net/starlark"
 )
 
 const (
 	defaultToolRulesRelativePath = "rules/default.rules"
-	toolRulesDirectory           = ".eino-assistant"
-	toolPolicyConfigFile         = "config.toml"
+	toolRulesDirectory           = config.UserConfigDirectory
+	toolPolicyConfigFile         = config.UserConfigFileName
 )
 
 //go:embed rules/default.rules
@@ -68,11 +70,7 @@ type ToolPolicy struct {
 // setting, even though their defaults currently share ~/.eino-assistant, so
 // callers can protect it whenever it falls below a workspace.
 func UserToolPolicyRoot() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve user home for tool rules: %w", err)
-	}
-	return filepath.Join(home, toolRulesDirectory), nil
+	return config.UserConfigDir()
 }
 
 // InitializeUserToolRulesAt creates the embedded zero-authorization starter
@@ -143,8 +141,7 @@ func LoadToolPolicyAt(userRoot, workspaceRoot string) (*ToolPolicy, error) {
 
 // projectRulesTrusted mirrors Codex's project trust boundary: repository-owned
 // files cannot authorize tools unless the user records the workspace as trusted
-// in the product's user configuration. The execution config may live in the
-// workspace, so it is deliberately not a trust source.
+// in the product's global configuration.
 func projectRulesTrusted(userRoot, workspaceRoot string) (bool, error) {
 	path := filepath.Join(userRoot, toolPolicyConfigFile)
 	info, err := os.Lstat(path)

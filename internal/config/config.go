@@ -24,6 +24,9 @@ import (
 //   - [tools.shell] / [tools.apply_patch]: per-tool limits
 type Config struct {
 	Model ModelConfig `toml:"model"`
+	// Projects records the user's trust decision for repository-owned rules.
+	// It is interpreted by the tools package, not as project-local runtime config.
+	Projects map[string]ProjectTrustConfig `toml:"projects"`
 	// ApprovalPolicy is Codex-style: on-request | never (also accepts on_request).
 	ApprovalPolicy string          `toml:"approval_policy"`
 	Storage        StorageConfig   `toml:"storage"`
@@ -36,6 +39,50 @@ type Config struct {
 	Rules RulesConfig `toml:"rules"`
 	// Memory is project-scoped semantic memory (not session resume).
 	Memory MemoryConfig `toml:"memory"`
+}
+
+// ProjectTrustConfig records whether a user trusts a workspace's own rules.
+// It deliberately lives in the user-level config file so repository contents
+// cannot authorize themselves.
+type ProjectTrustConfig struct {
+	TrustLevel string `toml:"trust_level"`
+}
+
+const (
+	// UserConfigDirectory holds Eino's user-owned configuration and rules.
+	UserConfigDirectory = ".eino-assistant"
+	// UserConfigFileName is the global runtime configuration file name.
+	UserConfigFileName = "config.toml"
+)
+
+// UserConfigDir returns the user-owned directory that holds Eino settings.
+func UserConfigDir() (string, error) {
+	return userConfigDir(os.UserHomeDir)
+}
+
+func userConfigDir(homeDir func() (string, error)) (string, error) {
+	home, err := homeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home for configuration: %w", err)
+	}
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("resolve user home for configuration: path %q is not absolute", home)
+	}
+	return filepath.Join(home, UserConfigDirectory), nil
+}
+
+// UserConfigPath returns the global configuration path. Runtime configuration
+// is intentionally user-scoped rather than discovered from the workspace.
+func UserConfigPath() (string, error) {
+	return userConfigPath(os.UserHomeDir)
+}
+
+func userConfigPath(homeDir func() (string, error)) (string, error) {
+	dir, err := userConfigDir(homeDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, UserConfigFileName), nil
 }
 
 // RulesConfig controls loading of user-home and project AGENTS.md instructions.
@@ -514,8 +561,6 @@ func Load(path string) (Config, error) {
 			switch key[0] {
 			case "permissions":
 				return Config{}, errors.New("parse TOML configuration: [permissions] is no longer supported; delete it. Move shell prefix approvals to ~/.eino-assistant/rules/*.rules (default.rules is initialized before runtime configuration is validated); configure apply_patch through approval_policy and [sandbox].protected_paths. This table is not migrated automatically")
-			case "projects":
-				return Config{}, errors.New("parse TOML configuration: [projects] is only read from the user-owned ~/.eino-assistant/config.toml tool-policy trust file; remove it from the runtime configuration passed to --config")
 			case "sandbox":
 				if len(key) > 1 && key[1] == "network" {
 					return Config{}, errors.New("parse TOML configuration: [sandbox.network] is no longer supported; sandbox network access is always open; remove sandbox.network.allowed_domains")

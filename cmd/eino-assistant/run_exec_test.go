@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/runtimeguard"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/tools"
@@ -1445,8 +1446,12 @@ func TestExecResumeLastDispatchesSelectorAndRecovery(t *testing.T) {
 				},
 				selectLastSession: func(_ context.Context, configPath string) (string, error) {
 					selectorCalls++
-					if configPath != "config.toml" {
-						t.Fatalf("config path=%q, want config.toml", configPath)
+					wantConfigPath, err := config.UserConfigPath()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if configPath != wantConfigPath {
+						t.Fatalf("config path=%q, want %q", configPath, wantConfigPath)
 					}
 					return selectedID, nil
 				},

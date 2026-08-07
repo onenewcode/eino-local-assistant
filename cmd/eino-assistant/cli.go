@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
@@ -19,13 +20,14 @@ import (
 // version is overridden at link time with -ldflags "-X main.version=...".
 var version = "dev"
 
-const appName = "eino-assistant"
+const appName = "eino"
 
 // rootOptions holds flags shared by all subcommands.
 type rootOptions struct {
-	configPath string
-	modelName  string
-	yolo       bool
+	configPath    string
+	configPathErr error
+	modelName     string
+	yolo          bool
 }
 
 // commandDeps is immutable after construction. Tests create a fresh command
@@ -42,7 +44,8 @@ func newRootCommand() *cobra.Command {
 }
 
 func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
-	opts := &rootOptions{}
+	configPath, configPathErr := config.UserConfigPath()
+	opts := &rootOptions{configPath: configPath, configPathErr: configPathErr}
 	if deps.interactive == nil {
 		deps.interactive = runTUI
 	}
@@ -52,7 +55,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		Short: "Eino local coding assistant",
 		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat and resume. Use --yolo only when you explicitly accept host-side tool execution without approval prompts.",
 		Example: fmt.Sprintf(
-			"  %[1]s\n  %[1]s chat --config config.toml\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
+			"  %[1]s\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
 			appName,
 		),
 		Args:          cobra.NoArgs,
@@ -64,16 +67,18 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		},
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		if !opts.yolo {
+		if opts.yolo && cmd != cmd.Root() && (cmd.Parent() != cmd.Root() || (cmd.Name() != "chat" && cmd.Name() != "resume")) {
+			return errors.New("--yolo is only supported for interactive chat/new/resume; headless and informational commands cannot use it")
+		}
+		if cmd.Name() == "version" {
 			return nil
 		}
-		if cmd == cmd.Root() || (cmd.Parent() == cmd.Root() && (cmd.Name() == "chat" || cmd.Name() == "resume")) {
-			return nil
+		if opts.configPathErr != nil {
+			return fmt.Errorf("resolve global configuration path: %w", opts.configPathErr)
 		}
-		return errors.New("--yolo is only supported for interactive chat/new/resume; headless and informational commands cannot use it")
+		return nil
 	}
 
-	root.PersistentFlags().StringVar(&opts.configPath, "config", "config.toml", "path to the TOML configuration file")
 	root.PersistentFlags().BoolVar(&opts.yolo, "yolo", false, "DANGEROUS: interactive tools bypass approval prompts and the OS sandbox")
 	root.Flags().StringVarP(&opts.modelName, "model", "m", "", "model name for this interactive session (startup override)")
 

@@ -17,6 +17,31 @@
 
 需要交互式终端（`sessions` / `version` / `help` 除外）；管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
 
+## 安装
+
+在 macOS 或 Linux 上，从仓库根目录执行：
+
+```sh
+./scripts/install.sh
+```
+
+脚本会为当前系统编译 `cmd/eino-assistant` 并安装为 `/usr/local/bin/eino`；该目录不可写时会请求
+`sudo` 权限。首次安装还会创建用户级配置 `~/.eino-assistant/config.toml`（权限为 `0600`），已有
+配置绝不覆盖。先填写其中的 `[model]`，再直接运行：
+
+```sh
+eino version
+eino
+```
+
+若要安装到用户目录而不使用 `sudo`，请指定一个已在 `PATH` 中的目录，例如：
+
+```sh
+./scripts/install.sh --install-dir "$HOME/.local/bin"
+```
+
+若目标目录不在 `PATH` 中，脚本会输出需添加到 shell profile 的命令。
+
 ## 内置工具
 
 | 工具 | 用途 | 权限 |
@@ -32,11 +57,23 @@
 
 ## 配置
 
+运行配置始终从 `~/.eino-assistant/config.toml` 加载，和当前工作目录无关；项目内的
+`config.toml` 不会被自动读取，也不能覆盖模型或 API key。安装脚本会在该文件不存在时复制
+`config.example.toml` 作为模板。未使用安装脚本时，可手动执行：
+
 ```sh
-cp config.example.toml config.toml
+mkdir -p ~/.eino-assistant
+install -m 600 config.example.toml ~/.eino-assistant/config.toml
 ```
 
-`config.toml` 含密钥，已被 Git 忽略，不要提交。配置格式为 **TOML**；shell 授权使用
+全局 `config.toml` 含密钥，不要提交或复制到项目中。它也保存项目规则信任记录，例如：
+
+```toml
+[projects."/absolute/workspace"]
+trust_level = "trusted"
+```
+
+配置格式为 **TOML**；shell 授权使用
 Codex-compatible Starlark `.rules` 前缀规则子集，不再支持 TOML `[permissions]`。首次运行
 会在 `~/.eino-assistant/rules/default.rules` 初始化 Eino 自有的零授权说明模板，已有用户
 文件绝不覆盖；它不复制 Codex 用户规则或个人批准历史。项目规则须由用户目录配置中的

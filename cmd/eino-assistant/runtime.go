@@ -331,7 +331,7 @@ func resolveUserInstructionsRoot(homeDir func() (string, error)) (string, error)
 	if !filepath.IsAbs(home) {
 		return "", fmt.Errorf("resolve user home: path %q is not absolute", home)
 	}
-	return filepath.Join(home, ".eino-assistant"), nil
+	return filepath.Join(home, config.UserConfigDirectory), nil
 }
 
 // newSystemPromptComposer creates the prompt closure shared by fresh session

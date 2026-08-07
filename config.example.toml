@@ -1,4 +1,5 @@
-# 复制为 config.toml 后填写；不要提交含密钥的 config.toml。
+# 安装脚本会将本文件复制到 ~/.eino-assistant/config.toml；不要提交含密钥的 config.toml。
+# 运行时始终读取该用户级文件，不会自动加载当前项目的 config.toml。
 #
 # 工具面 = Codex 子集：shell + apply_patch（另加 get_current_time / read_artifact）
 # 工具授权规则使用 Codex-compatible Starlark 子集：~/.eino-assistant/rules/*.rules，项目层为
@@ -101,3 +102,8 @@ generate = true             # idle auto-extract candidates from session journals
 # idle_after = "6h"
 # max_rollouts_per_scan = 2
 # scan_max_age = "10d"
+
+# 项目规则只会在用户显式信任后加载。该记录与模型设置同在用户级配置中，
+# 不能由项目自身的文件授予。
+# [projects."/absolute/workspace"]
+# trust_level = "trusted"

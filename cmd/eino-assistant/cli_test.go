@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/store"
 
 	"github.com/cloudwego/eino/schema"
@@ -123,10 +124,12 @@ func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var got sessionStart
+			var gotConfigPath string
 			called := false
 			root := newRootCommandWithDeps(commandDeps{
-				interactive: func(_ string, start sessionStart, _ io.Writer) error {
+				interactive: func(configPath string, start sessionStart, _ io.Writer) error {
 					called = true
+					gotConfigPath = configPath
 					got = start
 					return nil
 				},
@@ -141,7 +144,22 @@ func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("session start = %#v, want %#v", got, tc.want)
 			}
+			wantConfigPath, err := config.UserConfigPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotConfigPath != wantConfigPath {
+				t.Fatalf("config path = %q, want %q", gotConfigPath, wantConfigPath)
+			}
 		})
+	}
+}
+
+func TestConfigFlagIsRejected(t *testing.T) {
+	t.Parallel()
+	_, _, err := executeForTest("--config", "project-config.toml", "version")
+	if err == nil || !strings.Contains(err.Error(), "unknown flag: --config") {
+		t.Fatalf("error = %v, want unknown --config flag", err)
 	}
 }
 
@@ -298,23 +316,25 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	stdout, _, err := executeForTest("--config", configPath, "sessions")
+	var stdout bytes.Buffer
+	err = listSessions(configPath, &stdout)
 	if err != nil {
 		t.Fatalf("sessions: %v", err)
 	}
-	if !strings.Contains(stdout, "20260715-120000-abc123") || !strings.Contains(stdout, "v2 ledger") {
-		t.Fatalf("sessions output omitted v2 thread:\n%s", stdout)
+	output := stdout.String()
+	if !strings.Contains(output, "20260715-120000-abc123") || !strings.Contains(output, "v2 ledger") {
+		t.Fatalf("sessions output omitted v2 thread:\n%s", output)
 	}
 	for _, want := range []string{
 		"API USAGE", "CONTEXT", "COST~",
 		"API usage (exact): input=1.2k completion=34 cached=0 total=1.2k calls=2",
 		"context=200/4.0k (5%)", "cost~=$0.012",
 	} {
-		if !strings.Contains(stdout, want) {
-			t.Fatalf("sessions output missing %q:\n%s", want, stdout)
+		if !strings.Contains(output, want) {
+			t.Fatalf("sessions output missing %q:\n%s", want, output)
 		}
 	}
-	if strings.Contains(stdout, "\tTOKENS\t") {
-		t.Fatalf("sessions should not label API usage as TOKENS:\n%s", stdout)
+	if strings.Contains(output, "\tTOKENS\t") {
+		t.Fatalf("sessions should not label API usage as TOKENS:\n%s", output)
 	}
 }

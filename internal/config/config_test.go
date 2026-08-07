@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -292,14 +293,42 @@ allow = ["NotATool(foo)"]
 	}
 }
 
-func TestLoadRejectsProjectTrustRecordInRuntimeConfig(t *testing.T) {
+func TestLoadAcceptsProjectTrustRecordInGlobalConfig(t *testing.T) {
 	doc := validConfiguration + `
-[projects."relative-workspace"]
+[projects."/absolute/workspace"]
 trust_level = "trusted"
 `
-	_, err := Load(writeConfiguration(t, doc))
-	if err == nil || !strings.Contains(err.Error(), "[projects] is only read") || !strings.Contains(err.Error(), "~/.eino-assistant/config.toml") {
-		t.Fatalf("Load() error = %v, want user trust source guidance", err)
+	got, err := Load(writeConfiguration(t, doc))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got.Projects["/absolute/workspace"].TrustLevel != "trusted" {
+		t.Fatalf("project trust = %#v", got.Projects)
+	}
+}
+
+func TestUserConfigPathUsesUserApplicationDirectory(t *testing.T) {
+	path, err := userConfigPath(func() (string, error) { return "/home/tester", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join("/home/tester", UserConfigDirectory, UserConfigFileName); path != want {
+		t.Fatalf("config path = %q, want %q", path, want)
+	}
+}
+
+func TestUserConfigDirReturnsHomeResolutionError(t *testing.T) {
+	want := errors.New("home unavailable")
+	_, err := userConfigDir(func() (string, error) { return "", want })
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+}
+
+func TestUserConfigDirRejectsRelativeHome(t *testing.T) {
+	_, err := userConfigDir(func() (string, error) { return "relative-home", nil })
+	if err == nil || !strings.Contains(err.Error(), "not absolute") {
+		t.Fatalf("error = %v, want relative-home rejection", err)
 	}
 }
 
