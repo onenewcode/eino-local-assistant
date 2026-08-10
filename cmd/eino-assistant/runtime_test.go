@@ -50,9 +50,10 @@ func TestMCPServerOptionsFilterDisabledAndPreserveConfiguration(t *testing.T) {
 		{Name: "default", Command: "default-server", Args: []string{"--stdio"}, Env: map[string]string{"TOKEN": "secret"}},
 		{Name: "disabled", Command: "disabled-server", Enabled: &disabled},
 		{Name: "configured", Command: "configured-server", Args: []string{"--port", "3000"}, Enabled: &enabled, WorkingDir: "/workspace", ConnectTimeoutSeconds: 7},
+		{Name: "remote", Type: config.MCPTransportStreamableHTTP, URL: "https://mcp.example.test/v1", ConnectTimeoutSeconds: 8},
 	}
 	options := mcpServerOptions(servers)
-	if len(options) != 2 {
+	if len(options) != 3 {
 		t.Fatalf("MCP options = %#v, want disabled server filtered", options)
 	}
 	if options[0].Name != "default" || options[0].ConnectTimeout != 15*time.Second || options[0].Env["TOKEN"] != "secret" {
@@ -60,6 +61,9 @@ func TestMCPServerOptionsFilterDisabledAndPreserveConfiguration(t *testing.T) {
 	}
 	if options[1].Name != "configured" || options[1].WorkingDir != "/workspace" || options[1].ConnectTimeout != 7*time.Second {
 		t.Fatalf("configured MCP option = %#v", options[1])
+	}
+	if options[2].Name != "remote" || options[2].Type != config.MCPTransportStreamableHTTP || options[2].URL != "https://mcp.example.test/v1" || options[2].ConnectTimeout != 8*time.Second {
+		t.Fatalf("remote MCP option = %#v", options[2])
 	}
 	servers[0].Args[0] = "changed"
 	if options[0].Args[0] != "--stdio" {

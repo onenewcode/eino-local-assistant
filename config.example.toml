@@ -93,7 +93,8 @@ max_consecutive_equivalent_tool_calls = 3
 data_dir = ""
 
 # MCP configuration is static: `eino mcp list` displays these entries without
-# starting a process or printing environment values.
+# starting a local process, connecting a remote endpoint, or printing
+# environment values.
 # [[mcp.servers]]
 # name = "local-tools"
 # command = "npx"
@@ -104,6 +105,17 @@ data_dir = ""
 #
 # [mcp.servers.env]
 # API_TOKEN = "replace-with-your-token"
+#
+# [[mcp.servers]]
+# name = "remote-tools"
+# type = "streamable_http"
+# url = "https://mcp.example.com/mcp"
+# enabled = true
+# connect_timeout_seconds = 15
+#
+# Streamable HTTP URLs must be absolute http(s) endpoints without user info,
+# query strings, or fragments. Remote headers, bearer tokens, and OAuth are
+# intentionally not configured here.
 
 # Process diagnostics (log/slog). Session journals remain the product ledger;
 # these files are operational only and never replace resume/replay.

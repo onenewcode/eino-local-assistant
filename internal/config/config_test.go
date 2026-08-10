@@ -94,6 +94,45 @@ connect_timeout_seconds = `+timeout+`
 	}
 }
 
+func TestMCPStreamableHTTPConfigurationAndValidation(t *testing.T) {
+	got, err := Load(writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "remote-tools"
+type = "streamable_http"
+url = "https://mcp.example.test/v1/tools"
+connect_timeout_seconds = 7
+`))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(got.MCP.Servers) != 1 {
+		t.Fatalf("MCP server count = %d, want 1", len(got.MCP.Servers))
+	}
+	server := got.MCP.Servers[0]
+	if server.TransportType() != MCPTransportStreamableHTTP || server.URL != "https://mcp.example.test/v1/tools" || server.Command != "" || server.ConnectTimeout() != 7*time.Second {
+		t.Fatalf("remote MCP server = %#v", server)
+	}
+
+	for name, source := range map[string]string{
+		"missing URL":      `type = "streamable_http"`,
+		"unsupported type": `type = "sse"` + "\n" + `url = "https://mcp.example.test"`,
+		"stdio URL":        `command = "mcp-server"` + "\n" + `url = "https://mcp.example.test"`,
+		"remote command":   `type = "streamable_http"` + "\n" + `url = "https://mcp.example.test"` + "\n" + `command = "mcp-server"`,
+		"bad scheme":       `type = "streamable_http"` + "\n" + `url = "file:///tmp/mcp"`,
+		"credential URL":   `type = "streamable_http"` + "\n" + `url = "https://token@example.test/mcp"`,
+		"query URL":        `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp?token=secret"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, loadErr := Load(writeConfiguration(t, validConfiguration+"\n[mcp]\n\n[[mcp.servers]]\nname = \"invalid\"\n"+source+"\n"))
+			if loadErr == nil || !strings.Contains(loadErr.Error(), "mcp.servers") {
+				t.Fatalf("Load() error = %v, want MCP validation failure", loadErr)
+			}
+		})
+	}
+}
+
 func TestLoggingConfigDefaultsAndValidates(t *testing.T) {
 	got, err := Load(writeConfiguration(t, validConfiguration))
 	if err != nil {

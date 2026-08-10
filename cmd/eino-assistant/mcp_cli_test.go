@@ -90,6 +90,44 @@ enabled = false
 	}
 }
 
+func TestMCPListAndGetShowStreamableHTTPEndpointsWithoutProcessFields(t *testing.T) {
+	configPath := writeMCPListConfig(t, `[mcp]
+
+[[mcp.servers]]
+name = "remote-tools"
+type = "streamable_http"
+url = "https://mcp.example.test/v1/tools"
+enabled = false
+`)
+	jsonOutput, err := listMCPServersForTest(configPath, true)
+	if err != nil {
+		t.Fatalf("mcp list --json failed: %v", err)
+	}
+	if strings.Contains(jsonOutput, `"command"`) || strings.Contains(jsonOutput, `"args"`) || strings.Contains(jsonOutput, `"env_vars"`) {
+		t.Fatalf("remote MCP JSON included stdio fields: %s", jsonOutput)
+	}
+	var entries []mcpServerEntry
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatalf("decode MCP list JSON: %v\n%s", err, jsonOutput)
+	}
+	if len(entries) != 1 || entries[0].Name != "remote-tools" || entries[0].Enabled || entries[0].Transport.Type != "streamable_http" || entries[0].Transport.URL != "https://mcp.example.test/v1/tools" {
+		t.Fatalf("remote MCP entry = %+v", entries)
+	}
+
+	textOutput, err := getMCPServerForTest(configPath, "remote-tools", false)
+	if err != nil {
+		t.Fatalf("mcp get failed: %v", err)
+	}
+	for _, want := range []string{"remote-tools", "enabled: false", "transport: streamable_http", "url: https://mcp.example.test/v1/tools"} {
+		if !strings.Contains(textOutput, want) {
+			t.Fatalf("mcp get missing %q:\n%s", want, textOutput)
+		}
+	}
+	if strings.Contains(textOutput, "command:") || strings.Contains(textOutput, "env_vars:") {
+		t.Fatalf("remote MCP text included stdio fields:\n%s", textOutput)
+	}
+}
+
 func TestMCPListEmptyAndHelp(t *testing.T) {
 	configPath := writeMCPListConfig(t, "")
 	stdout, err := listMCPServersForTest(configPath, false)
@@ -218,7 +256,7 @@ func TestMCPAddWritesStdioServerWithoutStartingItOrPrintingSecrets(t *testing.T)
 
 func TestMCPAddRejectsInvalidCommandShapeAndEnvironment(t *testing.T) {
 	stdout, _, err := executeMCPCommandForTest("mcp", "add", "--help")
-	if err != nil || !strings.Contains(stdout, "Add one stdio MCP server") || !strings.Contains(stdout, "--env") || !strings.Contains(stdout, "Use -- before the command") {
+	if err != nil || !strings.Contains(stdout, "Add one stdio MCP server") || !strings.Contains(stdout, "--env") || !strings.Contains(stdout, "--url") || !strings.Contains(stdout, "Use -- before a stdio command") {
 		t.Fatalf("mcp add help = %q, err=%v", stdout, err)
 	}
 	for _, args := range [][]string{
@@ -231,6 +269,44 @@ func TestMCPAddRejectsInvalidCommandShapeAndEnvironment(t *testing.T) {
 	} {
 		if _, _, err := executeMCPCommandForTest(args...); err == nil {
 			t.Fatalf("mcp add %q should reject invalid input", args)
+		}
+	}
+}
+
+func TestMCPAddWritesStreamableHTTPEndpointWithoutConnecting(t *testing.T) {
+	configPath := writeMCPListConfig(t, "# retain this configuration comment\n")
+	stdout, _, err := executeMCPCommandWithConfigForTest(configPath, "mcp", "add", " remote-tools ", "--url", "https://does-not-resolve.invalid/mcp")
+	if err != nil {
+		t.Fatalf("mcp add --url error = %v", err)
+	}
+	if strings.TrimSpace(stdout) != `Added MCP server "remote-tools".` {
+		t.Fatalf("mcp add --url output = %q", stdout)
+	}
+	jsonOutput, err := listMCPServersForTest(configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []mcpServerEntry
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Transport.Type != "streamable_http" || entries[0].Transport.URL != "https://does-not-resolve.invalid/mcp" {
+		t.Fatalf("added remote MCP entry = %+v", entries)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "# retain this configuration comment") || !strings.Contains(string(data), `type = "streamable_http"`) || !strings.Contains(string(data), `url = "https://does-not-resolve.invalid/mcp"`) || strings.Contains(string(data), "command =") {
+		t.Fatalf("added remote MCP config =\n%s", data)
+	}
+	for _, args := range [][]string{
+		{"mcp", "add", "remote", "--url", "https://example.test/mcp", "--env", "TOKEN=secret"},
+		{"mcp", "add", "remote", "--url", "https://example.test/mcp", "--", "command"},
+		{"mcp", "add", "remote", "--url", "file:///tmp/mcp"},
+	} {
+		if _, _, commandErr := executeMCPCommandForTest(args...); commandErr == nil {
+			t.Fatalf("mcp add %q should reject invalid remote input", args)
 		}
 	}
 }

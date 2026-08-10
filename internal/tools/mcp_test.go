@@ -3,9 +3,13 @@ package tools
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -14,15 +18,19 @@ func TestMCPServerProcess(t *testing.T) {
 	if os.Getenv("EINO_MCP_HELPER") != "1" {
 		return
 	}
+	if err := newMCPServerForTest().Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newMCPServerForTest() *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "1"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "echo", Description: "Echo a value"}, func(_ context.Context, _ *mcp.CallToolRequest, input struct {
 		Value string `json:"value"`
 	}) (*mcp.CallToolResult, any, error) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: input.Value}}}, nil, nil
 	})
-	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
-		t.Fatal(err)
-	}
+	return server
 }
 
 func TestConnectMCPServersDiscoversAndCallsTool(t *testing.T) {
@@ -53,6 +61,58 @@ func TestConnectMCPServersDiscoversAndCallsTool(t *testing.T) {
 	output, err := set.Tools[0].InvokableRun(allowedCtx, `{"value":"hello"}`)
 	if err != nil || output != "hello" {
 		t.Fatalf("MCP call output=%q err=%v", output, err)
+	}
+}
+
+func TestConnectStreamableHTTPMCPServerDiscoversCallsAndClosesSession(t *testing.T) {
+	server := newMCPServerForTest()
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, &mcp.StreamableHTTPOptions{JSONResponse: true})
+	var deleteRequests atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			deleteRequests.Add(1)
+		}
+		handler.ServeHTTP(w, request)
+	}))
+	defer httpServer.Close()
+
+	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name:           "remote",
+		Type:           mcpTransportStreamableHTTP,
+		URL:            httpServer.URL,
+		ConnectTimeout: time.Second,
+	}})
+	if err != nil {
+		t.Fatalf("ConnectMCPServers() error = %v", err)
+	}
+	if len(set.Tools) != 1 || len(set.Servers) != 1 || set.Servers[0].Name != "remote" {
+		set.Close()
+		t.Fatalf("remote MCP discovery = tools=%d servers=%+v", len(set.Tools), set.Servers)
+	}
+	allowedCtx := WithPermissionHandler(context.Background(), func(context.Context, PermissionRequest) (bool, error) {
+		return true, nil
+	})
+	output, err := set.Tools[0].InvokableRun(allowedCtx, `{"value":"remote hello"}`)
+	if err != nil || output != "remote hello" {
+		set.Close()
+		t.Fatalf("remote MCP call output=%q err=%v", output, err)
+	}
+	if err := set.Close(); err != nil {
+		t.Fatalf("close remote MCP session: %v", err)
+	}
+	if deleteRequests.Load() != 1 {
+		t.Fatalf("remote session DELETE requests = %d, want 1", deleteRequests.Load())
+	}
+}
+
+func TestMCPClientTransportRejectsInvalidStreamableHTTPEndpoints(t *testing.T) {
+	for _, endpoint := range []string{"", "file:///tmp/mcp", "https://token@example.test/mcp", "https://example.test/mcp?token=secret"} {
+		_, err := mcpClientTransport(MCPServerOptions{Type: mcpTransportStreamableHTTP, URL: endpoint})
+		if err == nil {
+			t.Fatalf("mcpClientTransport(%q) succeeded", endpoint)
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -16,15 +17,23 @@ import (
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// MCPServerOptions describes one explicitly configured stdio MCP server.
+// MCPServerOptions describes one explicitly configured MCP server. An empty
+// Type is kept as a stdio default for embedding callers using the older API.
 type MCPServerOptions struct {
 	Name           string
+	Type           string
 	Command        string
 	Args           []string
 	WorkingDir     string
 	Env            map[string]string
+	URL            string
 	ConnectTimeout time.Duration
 }
+
+const (
+	mcpTransportStdio          = "stdio"
+	mcpTransportStreamableHTTP = "streamable_http"
+)
 
 // MCPConnectionOptions gives external tools the same runtime approval state
 // as shell and apply_patch. Leaving it unset preserves the library-level
@@ -67,28 +76,22 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions, connecti
 	seen := make(map[string]struct{})
 	for _, opts := range servers {
 		name := strings.TrimSpace(opts.Name)
-		command := strings.TrimSpace(opts.Command)
-		if name == "" || command == "" {
+		if name == "" {
 			set.Close()
-			return nil, errors.New("MCP server name and command are required")
+			return nil, errors.New("MCP server name is required")
+		}
+		transport, err := mcpClientTransport(opts)
+		if err != nil {
+			set.Close()
+			return nil, fmt.Errorf("configure MCP server %q: %w", name, err)
 		}
 		client := mcp.NewClient(&mcp.Implementation{Name: "eino-local-assistant", Version: "dev"}, nil)
-		cmd := exec.Command(command, opts.Args...)
-		if strings.TrimSpace(opts.WorkingDir) != "" {
-			cmd.Dir = opts.WorkingDir
-		}
-		if len(opts.Env) > 0 {
-			cmd.Env = os.Environ()
-			for key, value := range opts.Env {
-				cmd.Env = append(cmd.Env, key+"="+value)
-			}
-		}
 		serverCtx := ctx
 		cancel := func() {}
 		if opts.ConnectTimeout > 0 {
 			serverCtx, cancel = context.WithTimeout(ctx, opts.ConnectTimeout)
 		}
-		session, err := client.Connect(serverCtx, &mcp.CommandTransport{Command: cmd}, nil)
+		session, err := client.Connect(serverCtx, transport, nil)
 		if err != nil {
 			cancel()
 			set.Close()
@@ -133,6 +136,60 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions, connecti
 		set.Servers = append(set.Servers, serverInfo)
 	}
 	return set, nil
+}
+
+func mcpClientTransport(opts MCPServerOptions) (mcp.Transport, error) {
+	transport := strings.TrimSpace(opts.Type)
+	if transport == "" {
+		transport = mcpTransportStdio
+	}
+	switch transport {
+	case mcpTransportStdio:
+		command := strings.TrimSpace(opts.Command)
+		if command == "" {
+			return nil, errors.New("stdio MCP command is required")
+		}
+		cmd := exec.Command(command, opts.Args...)
+		if strings.TrimSpace(opts.WorkingDir) != "" {
+			cmd.Dir = opts.WorkingDir
+		}
+		if len(opts.Env) > 0 {
+			cmd.Env = os.Environ()
+			for key, value := range opts.Env {
+				cmd.Env = append(cmd.Env, key+"="+value)
+			}
+		}
+		return &mcp.CommandTransport{Command: cmd}, nil
+	case mcpTransportStreamableHTTP:
+		endpoint, err := validStreamableMCPEndpoint(opts.URL)
+		if err != nil {
+			return nil, err
+		}
+		return &mcp.StreamableClientTransport{Endpoint: endpoint}, nil
+	default:
+		return nil, fmt.Errorf("unsupported MCP transport %q", transport)
+	}
+}
+
+func validStreamableMCPEndpoint(raw string) (string, error) {
+	endpoint := strings.TrimSpace(raw)
+	if endpoint == "" {
+		return "", errors.New("streamable HTTP MCP URL is required")
+	}
+	parsed, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid streamable HTTP MCP URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("streamable HTTP MCP URL must use http or https")
+	}
+	if parsed.Hostname() == "" {
+		return "", errors.New("streamable HTTP MCP URL must include a host")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("streamable HTTP MCP URL must not include credentials, a query, or a fragment")
+	}
+	return endpoint, nil
 }
 
 // Close shuts down all external MCP sessions. It is safe to call repeatedly.

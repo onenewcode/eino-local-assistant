@@ -57,7 +57,7 @@ eino
 
 ## MCP
 
-在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio MCP server。TUI 和 `exec` 运行时会启动启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动 server 或打印环境变量值；`eino mcp enable <name>` / `eino mcp disable <name>` 为未来 runtime 更新启用状态，`eino mcp remove <name>` 会原子删除该配置。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
+在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio 或 Streamable HTTP MCP server。TUI 和 `exec` 运行时会连接启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动本地 server、不连接远程端点，也不打印环境变量值；`eino mcp enable <name>` / `eino mcp disable <name>` 为未来 runtime 更新启用状态，`eino mcp remove <name>` 会原子删除该配置。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
 
 可用显式命令行快速添加本地 stdio server（`--` 后才是要保存、但不会立即执行的 command）：
 
@@ -66,6 +66,14 @@ eino mcp add local-tools --env LOG_LEVEL=debug -- npx -y @example/mcp-server
 ```
 
 `--env` 的值会写入用户级配置；不要把短期敏感 token 直接放入 shell history。
+
+远程 Streamable HTTP endpoint 使用 `--url`，同样只写配置而不在添加时联网：
+
+```sh
+eino mcp add remote-tools --url https://mcp.example.com/mcp
+```
+
+远程 URL 只接受绝对 `http` 或 `https` 地址，且不接受 URL 用户信息、query 或 fragment，避免把凭据变成可展示的端点字段。本轮尚未实现远程静态 headers、bearer token、OAuth 登录/登出或凭据存储；需要认证的服务会在运行时连接失败，而不会暗中发送配置中的 secret。
 
 ```toml
 [[mcp.servers]]
@@ -78,6 +86,15 @@ working_dir = "/absolute/workspace"
 
 [mcp.servers.env]
 API_TOKEN = "set-a-secret-here"
+```
+
+```toml
+[[mcp.servers]]
+name = "remote-tools"
+type = "streamable_http"
+url = "https://mcp.example.com/mcp"
+# enabled = true                 # 省略时也会启用
+# connect_timeout_seconds = 15   # 可设为 1-60
 ```
 
 

@@ -739,10 +739,12 @@ func mcpServerOptions(servers []config.MCPServerConfig) []tools.MCPServerOptions
 		}
 		options = append(options, tools.MCPServerOptions{
 			Name:           server.Name,
+			Type:           server.TransportType(),
 			Command:        server.Command,
 			Args:           append([]string(nil), server.Args...),
 			WorkingDir:     server.WorkingDir,
 			Env:            server.Env,
+			URL:            server.URL,
 			ConnectTimeout: server.ConnectTimeout(),
 		})
 	}

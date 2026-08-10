@@ -44,8 +44,8 @@ type Config struct {
 	Rules RulesConfig `toml:"rules"`
 	// Memory is project-scoped semantic memory (not session resume).
 	Memory MemoryConfig `toml:"memory"`
-	// MCP declares external stdio MCP servers. Runtime entry points connect
-	// enabled servers before constructing their tool registries.
+	// MCP declares external MCP servers. Runtime entry points connect enabled
+	// servers before constructing their tool registries.
 	MCP MCPConfig `toml:"mcp"`
 }
 
@@ -54,19 +54,38 @@ type MCPConfig struct {
 	Servers []MCPServerConfig `toml:"servers"`
 }
 
-// MCPServerConfig describes a local stdio MCP server without exposing its
-// environment values in status output.
+// MCPServerConfig describes an MCP server without exposing environment values
+// in status output. An omitted Type remains compatible with a local stdio
+// server; Streamable HTTP servers use Type and URL instead of process fields.
 type MCPServerConfig struct {
 	Name                  string            `toml:"name"`
+	Type                  string            `toml:"type"`
 	Command               string            `toml:"command"`
 	Args                  []string          `toml:"args"`
 	WorkingDir            string            `toml:"working_dir"`
 	Env                   map[string]string `toml:"env"`
+	URL                   string            `toml:"url"`
 	Enabled               *bool             `toml:"enabled"`
 	ConnectTimeoutSeconds int               `toml:"connect_timeout_seconds"`
 }
 
-const defaultMCPConnectTimeoutSeconds = 15
+const (
+	defaultMCPConnectTimeoutSeconds = 15
+	// MCPTransportStdio identifies a local command-based MCP server.
+	MCPTransportStdio = "stdio"
+	// MCPTransportStreamableHTTP identifies a remote Streamable HTTP MCP endpoint.
+	MCPTransportStreamableHTTP = "streamable_http"
+)
+
+// TransportType returns the effective MCP transport. Existing configurations
+// omitted this field while stdio was the only supported transport.
+func (c MCPServerConfig) TransportType() string {
+	transport := strings.TrimSpace(c.Type)
+	if transport == "" {
+		return MCPTransportStdio
+	}
+	return transport
+}
 
 // IsEnabled reports whether the server starts with a new runtime. Omitted
 // values preserve the expected enabled-by-default behavior.
@@ -946,15 +965,17 @@ func replaceTOMLBooleanSetting(line, name string, value bool) string {
 	return replacement + ending
 }
 
-// AddMCPServer appends one validated stdio MCP server to a user-owned TOML
-// config without reformatting unrelated settings or comments.
+// AddMCPServer appends one validated MCP server to a user-owned TOML config
+// without reformatting unrelated settings or comments.
 func AddMCPServer(path string, server MCPServerConfig) error {
 	if strings.ToLower(filepath.Ext(path)) != ".toml" {
 		return errors.New("configuration file must use the .toml extension")
 	}
 	server.Name = strings.TrimSpace(server.Name)
+	server.Type = strings.TrimSpace(server.Type)
 	server.Command = strings.TrimSpace(server.Command)
 	server.WorkingDir = strings.TrimSpace(server.WorkingDir)
+	server.URL = strings.TrimSpace(server.URL)
 	if err := (MCPConfig{Servers: []MCPServerConfig{server}}).Validate(); err != nil {
 		return err
 	}
@@ -1005,6 +1026,22 @@ func formatMCPServerTOML(server MCPServerConfig) (string, error) {
 	name, err := formatMCPServerTOMLString(server.Name)
 	if err != nil {
 		return "", fmt.Errorf("format mcp server name: %w", err)
+	}
+	if server.TransportType() == MCPTransportStreamableHTTP {
+		endpoint, endpointErr := formatMCPServerTOMLString(server.URL)
+		if endpointErr != nil {
+			return "", fmt.Errorf("format mcp server URL: %w", endpointErr)
+		}
+		var out strings.Builder
+		out.WriteString("[[mcp.servers]]\n")
+		fmt.Fprintf(&out, "name = %s\ntype = %q\nurl = %s\n", name, MCPTransportStreamableHTTP, endpoint)
+		if server.Enabled != nil {
+			fmt.Fprintf(&out, "enabled = %t\n", *server.Enabled)
+		}
+		if server.ConnectTimeoutSeconds > 0 {
+			fmt.Fprintf(&out, "connect_timeout_seconds = %d\n", server.ConnectTimeoutSeconds)
+		}
+		return out.String(), nil
 	}
 	command, err := formatMCPServerTOMLString(server.Command)
 	if err != nil {
@@ -1392,16 +1429,14 @@ func (c *Config) Validate() error {
 	return c.Runtime.Validate()
 }
 
-// Validate checks MCP server identities and optional working directories.
+// Validate checks MCP server identities, transport-specific fields, and
+// optional stdio working directories.
 func (c MCPConfig) Validate() error {
 	seen := make(map[string]struct{}, len(c.Servers))
 	for i, server := range c.Servers {
 		name := strings.TrimSpace(server.Name)
 		if name == "" {
 			return fmt.Errorf("mcp.servers[%d].name is required", i)
-		}
-		if strings.TrimSpace(server.Command) == "" {
-			return fmt.Errorf("mcp.servers[%d].command is required", i)
 		}
 		if server.ConnectTimeoutSeconds < 0 || server.ConnectTimeoutSeconds > 60 {
 			return fmt.Errorf("mcp.servers[%d].connect_timeout_seconds must be between 1 and 60 when set", i)
@@ -1410,15 +1445,57 @@ func (c MCPConfig) Validate() error {
 			return fmt.Errorf("mcp server name %q is duplicated", name)
 		}
 		seen[name] = struct{}{}
-		if dir := strings.TrimSpace(server.WorkingDir); dir != "" {
-			info, err := os.Stat(dir)
-			if err != nil {
-				return fmt.Errorf("mcp.servers[%d].working_dir: %w", i, err)
+		switch server.TransportType() {
+		case MCPTransportStdio:
+			if strings.TrimSpace(server.Command) == "" {
+				return fmt.Errorf("mcp.servers[%d].command is required", i)
 			}
-			if !info.IsDir() {
-				return fmt.Errorf("mcp.servers[%d].working_dir is not a directory", i)
+			if strings.TrimSpace(server.URL) != "" {
+				return fmt.Errorf("mcp.servers[%d].url is only valid for type %q", i, MCPTransportStreamableHTTP)
 			}
+			if dir := strings.TrimSpace(server.WorkingDir); dir != "" {
+				info, err := os.Stat(dir)
+				if err != nil {
+					return fmt.Errorf("mcp.servers[%d].working_dir: %w", i, err)
+				}
+				if !info.IsDir() {
+					return fmt.Errorf("mcp.servers[%d].working_dir is not a directory", i)
+				}
+			}
+		case MCPTransportStreamableHTTP:
+			if strings.TrimSpace(server.Command) != "" || len(server.Args) > 0 || strings.TrimSpace(server.WorkingDir) != "" || len(server.Env) > 0 {
+				return fmt.Errorf("mcp.servers[%d] type %q cannot set command, args, working_dir, or env", i, MCPTransportStreamableHTTP)
+			}
+			if err := validateMCPStreamableHTTPURL(server.URL); err != nil {
+				return fmt.Errorf("mcp.servers[%d].url: %w", i, err)
+			}
+		default:
+			return fmt.Errorf("mcp.servers[%d].type must be %q or %q", i, MCPTransportStdio, MCPTransportStreamableHTTP)
 		}
+	}
+	return nil
+}
+
+func validateMCPStreamableHTTPURL(raw string) error {
+	endpoint := strings.TrimSpace(raw)
+	if endpoint == "" {
+		return errors.New("is required")
+	}
+	parsed, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return fmt.Errorf("must be a valid URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("must use http or https")
+	}
+	if parsed.Hostname() == "" {
+		return errors.New("must include a host")
+	}
+	if parsed.User != nil {
+		return errors.New("must not include user credentials")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("must not include a query or fragment")
 	}
 	return nil
 }

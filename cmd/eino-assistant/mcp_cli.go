@@ -22,10 +22,33 @@ type mcpServerEntry struct {
 
 type mcpTransportView struct {
 	Type       string   `json:"type"`
-	Command    string   `json:"command"`
+	Command    string   `json:"command,omitempty"`
 	Args       []string `json:"args"`
 	WorkingDir string   `json:"working_dir,omitempty"`
 	EnvVars    []string `json:"env_vars,omitempty"`
+	URL        string   `json:"url,omitempty"`
+}
+
+func (v mcpTransportView) MarshalJSON() ([]byte, error) {
+	if v.Type == config.MCPTransportStreamableHTTP {
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		}{Type: v.Type, URL: v.URL})
+	}
+	return json.Marshal(struct {
+		Type       string   `json:"type"`
+		Command    string   `json:"command"`
+		Args       []string `json:"args"`
+		WorkingDir string   `json:"working_dir,omitempty"`
+		EnvVars    []string `json:"env_vars,omitempty"`
+	}{
+		Type:       v.Type,
+		Command:    v.Command,
+		Args:       v.Args,
+		WorkingDir: v.WorkingDir,
+		EnvVars:    v.EnvVars,
+	})
 }
 
 func newMCPCommand(opts *rootOptions) *cobra.Command {
@@ -86,13 +109,23 @@ func newMCPGetCommand(opts *rootOptions) *cobra.Command {
 
 func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 	var environment []string
+	var endpoint string
 	cmd := &cobra.Command{
-		Use:   "add <name> -- <command> [args...]",
-		Short: "Add one configured stdio MCP server",
-		Long:  "Add one stdio MCP server to the user-level TOML configuration. Use -- before the command. Environment values are written to the configuration and are never printed.",
+		Use:   "add <name> (--url <url> | -- <command> [args...])",
+		Short: "Add one configured MCP server",
+		Long:  "Add one stdio MCP server or one Streamable HTTP MCP server to the user-level TOML configuration. Use -- before a stdio command or --url for a remote endpoint. Environment values are only valid for stdio and are never printed.",
 		Args: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("url") {
+				if cmd.Flags().ArgsLenAtDash() >= 0 || len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+					return fmt.Errorf("mcp add with --url requires <name> and no command")
+				}
+				if len(environment) > 0 {
+					return fmt.Errorf("mcp add --env is only valid with a stdio command")
+				}
+				return nil
+			}
 			if cmd.Flags().ArgsLenAtDash() != 1 || len(args) < 2 {
-				return fmt.Errorf("mcp add requires <name> -- <command> [args...]")
+				return fmt.Errorf("mcp add requires <name> --url <url> or <name> -- <command> [args...]")
 			}
 			if strings.TrimSpace(args[0]) == "" || strings.TrimSpace(args[1]) == "" {
 				return fmt.Errorf("mcp server name and command are required")
@@ -100,24 +133,28 @@ func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			env, err := parseMCPEnvironment(environment)
-			if err != nil {
-				return err
-			}
-			server := config.MCPServerConfig{
-				Name:    strings.TrimSpace(args[0]),
-				Command: strings.TrimSpace(args[1]),
-				Args:    append([]string(nil), args[2:]...),
-				Env:     env,
+			server := config.MCPServerConfig{Name: strings.TrimSpace(args[0])}
+			if cmd.Flags().Changed("url") {
+				server.Type = config.MCPTransportStreamableHTTP
+				server.URL = strings.TrimSpace(endpoint)
+			} else {
+				env, err := parseMCPEnvironment(environment)
+				if err != nil {
+					return err
+				}
+				server.Command = strings.TrimSpace(args[1])
+				server.Args = append([]string(nil), args[2:]...)
+				server.Env = env
 			}
 			if err := config.AddMCPServer(opts.configPath, server); err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Added MCP server %q.\n", server.Name)
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "Added MCP server %q.\n", server.Name)
 			return err
 		},
 	}
 	cmd.Flags().StringArrayVarP(&environment, "env", "e", nil, "environment variable to set (KEY=VALUE; repeatable)")
+	cmd.Flags().StringVar(&endpoint, "url", "", "Streamable HTTP MCP endpoint URL")
 	return cmd
 }
 
@@ -198,8 +235,9 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		return err
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tTRANSPORT\tCOMMAND\tARGS\tENV\tWORKING DIR")
+	fmt.Fprintln(tw, "NAME\tTRANSPORT\tCOMMAND/URL\tARGS\tENV\tWORKING DIR")
 	for _, entry := range entries {
+		endpoint := mcpTransportEndpoint(entry.Transport)
 		args := quotedArguments(entry.Transport.Args)
 		env := strings.Join(entry.Transport.EnvVars, ",")
 		workingDir := entry.Transport.WorkingDir
@@ -212,7 +250,7 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		if workingDir == "" {
 			workingDir = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.Name, entry.Transport.Type, entry.Transport.Command, args, env, workingDir)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.Name, entry.Transport.Type, endpoint, args, env, workingDir)
 	}
 	return tw.Flush()
 }
@@ -241,6 +279,16 @@ func getMCPServer(configPath, name string, jsonOutput bool, stdout io.Writer) er
 func mcpServerEntries(servers []config.MCPServerConfig) []mcpServerEntry {
 	entries := make([]mcpServerEntry, 0, len(servers))
 	for _, server := range servers {
+		transport := mcpTransportView{Type: server.TransportType()}
+		if transport.Type == config.MCPTransportStreamableHTTP {
+			transport.URL = strings.TrimSpace(server.URL)
+			entries = append(entries, mcpServerEntry{
+				Name:      strings.TrimSpace(server.Name),
+				Enabled:   server.IsEnabled(),
+				Transport: transport,
+			})
+			continue
+		}
 		envVars := make([]string, 0, len(server.Env))
 		for name := range server.Env {
 			envVars = append(envVars, name)
@@ -250,7 +298,7 @@ func mcpServerEntries(servers []config.MCPServerConfig) []mcpServerEntry {
 			Name:    strings.TrimSpace(server.Name),
 			Enabled: server.IsEnabled(),
 			Transport: mcpTransportView{
-				Type:       "stdio",
+				Type:       transport.Type,
 				Command:    strings.TrimSpace(server.Command),
 				Args:       append([]string{}, server.Args...),
 				WorkingDir: strings.TrimSpace(server.WorkingDir),
@@ -261,7 +309,18 @@ func mcpServerEntries(servers []config.MCPServerConfig) []mcpServerEntry {
 	return entries
 }
 
+func mcpTransportEndpoint(transport mcpTransportView) string {
+	if transport.Type == config.MCPTransportStreamableHTTP {
+		return transport.URL
+	}
+	return transport.Command
+}
+
 func writeMCPServerDetails(stdout io.Writer, entry mcpServerEntry) error {
+	if entry.Transport.Type == config.MCPTransportStreamableHTTP {
+		_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL)
+		return err
+	}
 	args := quotedArguments(entry.Transport.Args)
 	env := strings.Join(entry.Transport.EnvVars, ",")
 	workingDir := entry.Transport.WorkingDir
