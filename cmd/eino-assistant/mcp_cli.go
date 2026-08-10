@@ -35,7 +35,7 @@ func newMCPCommand(opts *rootOptions) *cobra.Command {
 		Long:  "Inspect configured MCP servers from the user-level TOML configuration.",
 		Args:  cobra.NoArgs,
 	}
-	cmd.AddCommand(newMCPListCommand(opts), newMCPGetCommand(opts))
+	cmd.AddCommand(newMCPListCommand(opts), newMCPGetCommand(opts), newMCPRemoveCommand(opts))
 	return cmd
 }
 
@@ -74,6 +74,32 @@ func newMCPGetCommand(opts *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output the configured server as JSON")
+	return cmd
+}
+
+func newMCPRemoveCommand(opts *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "remove <name>",
+		Short: "Remove one configured MCP server",
+		Long:  "Remove one configured MCP server from the user-level TOML configuration without starting it.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+				return err
+			}
+			if strings.TrimSpace(args[0]) == "" {
+				return fmt.Errorf("MCP server name is required")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := strings.TrimSpace(args[0])
+			if err := config.RemoveMCPServer(opts.configPath, name); err != nil {
+				return err
+			}
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "Removed MCP server %q.\n", name)
+			return err
+		},
+	}
 	return cmd
 }
 

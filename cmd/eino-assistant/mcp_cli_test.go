@@ -100,7 +100,7 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 		t.Fatalf("empty JSON list = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "--help")
-	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") {
+	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "remove") {
 		t.Fatalf("mcp help = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "list", "--help")
@@ -182,6 +182,59 @@ command = "mcp-server"
 	}
 }
 
+func TestMCPRemoveUpdatesConfigurationWithoutStartingServer(t *testing.T) {
+	configPath := writeMCPListConfig(t, `[mcp]
+
+[[mcp.servers]]
+name = "remove-me"
+command = "does-not-exist"
+
+[mcp.servers.env]
+TOKEN = "secret"
+
+[[mcp.servers]]
+name = "keep-me"
+command = "keep-command"
+`)
+	stdout, _, err := executeMCPCommandWithConfigForTest(configPath, "mcp", "remove", " remove-me ")
+	if err != nil {
+		t.Fatalf("mcp remove error = %v", err)
+	}
+	if strings.TrimSpace(stdout) != `Removed MCP server "remove-me".` {
+		t.Fatalf("mcp remove output = %q", stdout)
+	}
+	jsonOutput, err := listMCPServersForTest(configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []mcpServerEntry
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "keep-me" {
+		t.Fatalf("MCP list after remove = %+v", entries)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "secret") || strings.Contains(string(data), "does-not-exist") {
+		t.Fatalf("removed MCP configuration remains:\n%s", data)
+	}
+}
+
+func TestMCPRemoveRejectsInvalidNamesAndDocumentsCommand(t *testing.T) {
+	stdout, _, err := executeMCPCommandForTest("mcp", "remove", "--help")
+	if err != nil || !strings.Contains(stdout, "Remove one configured MCP server") || !strings.Contains(stdout, "without starting") {
+		t.Fatalf("mcp remove help = %q, err=%v", stdout, err)
+	}
+	for _, args := range [][]string{{"mcp", "remove"}, {"mcp", "remove", "first", "second"}, {"mcp", "remove", " "}} {
+		if _, _, err := executeMCPCommandForTest(args...); err == nil {
+			t.Fatalf("mcp remove %q should reject invalid arguments", args)
+		}
+	}
+}
+
 func writeMCPListConfig(t *testing.T, extra string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
@@ -216,8 +269,12 @@ func getMCPServerForTest(configPath, name string, jsonOutput bool) (string, erro
 }
 
 func executeMCPCommandForTest(args ...string) (stdout, stderr string, err error) {
+	return executeMCPCommandWithConfigForTest("", args...)
+}
+
+func executeMCPCommandWithConfigForTest(configPath string, args ...string) (stdout, stderr string, err error) {
 	root := &cobra.Command{Use: appName}
-	root.AddCommand(newMCPCommand(&rootOptions{}))
+	root.AddCommand(newMCPCommand(&rootOptions{configPath: configPath}))
 	var outBuf, errBuf bytes.Buffer
 	root.SetOut(&outBuf)
 	root.SetErr(&errBuf)

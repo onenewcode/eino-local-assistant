@@ -57,7 +57,7 @@ eino
 
 ## MCP
 
-在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio MCP server。TUI 和 `exec` 运行时会启动启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；连接/发现默认最多等待 15 秒。`eino mcp list` 与 `eino mcp get <name>` 则只读取并显示静态配置，不启动 server 或打印环境变量值；`--json` 输出稳定的 name/enabled/transport 结构。
+在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio MCP server。TUI 和 `exec` 运行时会启动启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动 server 或打印环境变量值；`eino mcp remove <name>` 会原子删除该配置但同样不会启动 server。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
 
 ```toml
 [[mcp.servers]]

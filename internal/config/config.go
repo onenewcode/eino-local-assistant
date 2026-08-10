@@ -785,6 +785,133 @@ func SaveStatusLineConfig(path string, fields []string) error {
 	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
 }
 
+// RemoveMCPServer removes one named MCP server from a user-owned TOML config.
+// It preserves unrelated text and comments, and validates before replacing the
+// original regular file atomically.
+func RemoveMCPServer(path, name string) error {
+	if strings.ToLower(filepath.Ext(path)) != ".toml" {
+		return errors.New("configuration file must use the .toml extension")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("mcp server name is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect configuration: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to update a symbolic-link configuration file")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("configuration file must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration: %w", err)
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		return err
+	}
+	updated, err := removeMCPServerSource(string(data), cfg.MCP.Servers, name)
+	if err != nil {
+		return err
+	}
+	if _, err := parseConfig([]byte(updated)); err != nil {
+		return fmt.Errorf("validate updated configuration: %w", err)
+	}
+	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+type tomlSourceBlock struct {
+	start int
+	end   int
+}
+
+func removeMCPServerSource(source string, servers []MCPServerConfig, name string) (string, error) {
+	// Table header scanning below is deliberately line-oriented to preserve
+	// surrounding text. Refuse multiline strings rather than risking a header
+	// token inside a value being treated as a configuration boundary.
+	if strings.Contains(source, `"""`) || strings.Contains(source, `'''`) {
+		return "", errors.New("cannot update MCP configuration containing multiline TOML strings")
+	}
+	target := -1
+	for i, server := range servers {
+		if strings.TrimSpace(server.Name) == name {
+			target = i
+			break
+		}
+	}
+	if target < 0 {
+		return "", fmt.Errorf("mcp server %q is not configured", name)
+	}
+	lines := strings.SplitAfter(source, "\n")
+	blocks := mcpServerSourceBlocks(lines)
+	if len(blocks) != len(servers) {
+		return "", errors.New("could not locate MCP server configuration block")
+	}
+	block := blocks[target]
+	return strings.Join(append(lines[:block.start], lines[block.end:]...), ""), nil
+}
+
+func mcpServerSourceBlocks(lines []string) []tomlSourceBlock {
+	starts := make([]int, 0)
+	for i, line := range lines {
+		if isTOMLArrayTableHeader(line, "mcp.servers") {
+			starts = append(starts, i)
+		}
+	}
+	blocks := make([]tomlSourceBlock, 0, len(starts))
+	for _, start := range starts {
+		end := len(lines)
+		for i := start + 1; i < len(lines); i++ {
+			if !isAnyTOMLTableHeader(lines[i]) || isMCPServerOwnedTableHeader(lines[i]) {
+				continue
+			}
+			end = i
+			break
+		}
+		blocks = append(blocks, tomlSourceBlock{start: start, end: end})
+	}
+	return blocks
+}
+
+func isTOMLArrayTableHeader(line, name string) bool {
+	headerName, array, ok := tomlTableHeaderName(line)
+	return ok && array && headerName == name
+}
+
+func isMCPServerOwnedTableHeader(line string) bool {
+	headerName, _, ok := tomlTableHeaderName(line)
+	return ok && strings.HasPrefix(headerName, "mcp.servers.")
+}
+
+func tomlTableHeaderName(line string) (name string, array bool, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "[") {
+		return "", false, false
+	}
+	array = strings.HasPrefix(trimmed, "[[")
+	openLen := 1
+	closingDelimiter := "]"
+	if array {
+		openLen = 2
+		closingDelimiter = "]]"
+	}
+	remainder := trimmed[openLen:]
+	closeAt := strings.Index(remainder, closingDelimiter)
+	if closeAt < 0 {
+		return "", false, false
+	}
+	name = strings.TrimSpace(remainder[:closeAt])
+	rest := strings.TrimSpace(remainder[closeAt+len(closingDelimiter):])
+	if name == "" || (rest != "" && !strings.HasPrefix(rest, "#")) {
+		return "", false, false
+	}
+	return name, array, true
+}
+
 func normalizeStatusLineFields(fields []string) []string {
 	normalized := make([]string, 0, len(fields))
 	for _, field := range fields {

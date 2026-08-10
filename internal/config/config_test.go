@@ -200,6 +200,128 @@ status_line_use_theme_colors = false
 	}
 }
 
+func TestRemoveMCPServerPreservesUnrelatedConfigurationAndComments(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`# retain this user comment
+[mcp]
+
+# comment attached to the removed server remains user-owned text
+[[mcp.servers]]
+name = "remove-me"
+command = "remove-command"
+args = ["--stdio"]
+
+[mcp.servers.env]
+TOKEN = "secret"
+
+[[mcp.servers]]
+name = "keep-me"
+command = "keep-command"
+enabled = false
+
+[ui]
+status_line = ["mode"]
+`)
+	if err := RemoveMCPServer(path, " remove-me "); err != nil {
+		t.Fatalf("RemoveMCPServer() error = %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after removal error = %v", err)
+	}
+	if len(got.MCP.Servers) != 1 || got.MCP.Servers[0].Name != "keep-me" || got.MCP.Servers[0].IsEnabled() {
+		t.Fatalf("MCP servers after removal = %#v", got.MCP.Servers)
+	}
+	if want := []string{"mode"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+		t.Fatalf("unrelated ui config changed = %#v", got.UI.StatusLineFields())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(data)
+	for _, want := range []string{"# retain this user comment", "# comment attached to the removed server remains user-owned text", "name = \"keep-me\"", "command = \"keep-command\"", "[ui]"} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("updated config missing %q:\n%s", want, contents)
+		}
+	}
+	for _, removed := range []string{"name = \"remove-me\"", "remove-command", "TOKEN = \"secret\""} {
+		if strings.Contains(contents, removed) {
+			t.Fatalf("updated config retained %q:\n%s", removed, contents)
+		}
+	}
+	if err := RemoveMCPServer(path, "keep-me"); err != nil {
+		t.Fatalf("RemoveMCPServer(last server) error = %v", err)
+	}
+	got, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load() after final removal error = %v", err)
+	}
+	if len(got.MCP.Servers) != 0 || !reflect.DeepEqual(got.UI.StatusLineFields(), []string{"mode"}) {
+		t.Fatalf("configuration after final removal = %#v", got)
+	}
+}
+
+func TestRemoveMCPServerRejectsUnknownAndSymbolicLinkWithoutWriting(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "keep-me"
+command = "keep-command"
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveMCPServer(path, "missing"); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("unknown removal error = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("unknown removal modified configuration")
+	}
+
+	link := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveMCPServer(link, "keep-me"); err == nil || !strings.Contains(err.Error(), "symbolic-link") {
+		t.Fatalf("symbolic link removal error = %v", err)
+	}
+}
+
+func TestRemoveMCPServerFailsClosedForMultilineTOMLStrings(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "keep-me"
+command = "keep-command"
+
+[mcp.servers.env]
+CERTIFICATE = """first line
+[ui]
+still part of the value"""
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveMCPServer(path, "keep-me"); err == nil || !strings.Contains(err.Error(), "multiline TOML strings") {
+		t.Fatalf("multiline removal error = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("multiline removal modified configuration")
+	}
+}
+
 func TestLoadRejectsRemovedSystemPromptSetting(t *testing.T) {
 	doc := validConfiguration + "\n[assistant]\nsystem_prompt = \"custom\"\n"
 	_, err := Load(writeConfiguration(t, doc))
