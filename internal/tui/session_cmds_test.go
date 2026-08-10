@@ -752,6 +752,8 @@ func TestIsQueueableInput(t *testing.T) {
 		{"/fork title", false},
 		{"/title x", false},
 		{"/delete id", false},
+		{"/archive id", false},
+		{"/unarchive id", false},
 		{"/exit", false},
 		{"/quit", false},
 	}
@@ -792,6 +794,8 @@ func TestBusyInputDisposition(t *testing.T) {
 		{"/fork title", busyInputReject},
 		{"/title title", busyInputReject},
 		{"/delete sess-1", busyInputReject},
+		{"/archive sess-1", busyInputReject},
+		{"/unarchive sess-1", busyInputReject},
 		{"/exit", busyInputReject},
 	}
 	for _, tc := range cases {

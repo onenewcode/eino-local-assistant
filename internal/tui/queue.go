@@ -102,7 +102,7 @@ func classifyBusyAction(action slashAction, arg string) busyInputDisposition {
 			return busyInputExecuteImmediately
 		}
 		return busyInputReject
-	case slashCompact, slashClear, slashNew, slashResume, slashFork, slashTitle, slashDelete, slashExit:
+	case slashCompact, slashClear, slashNew, slashResume, slashFork, slashTitle, slashDelete, slashArchive, slashUnarchive, slashExit:
 		return busyInputReject
 	default:
 		return busyInputEnqueue

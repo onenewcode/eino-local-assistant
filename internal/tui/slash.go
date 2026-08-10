@@ -26,6 +26,8 @@ const (
 	slashFork
 	slashTitle
 	slashDelete
+	slashArchive
+	slashUnarchive
 	slashQueue
 	slashUsage
 	slashPermissions
@@ -66,12 +68,14 @@ func slashCatalog() []slashCommand {
 		{Name: "/statusline", Description: "configure the persistent bottom status line", NeedsArg: false},
 		{Name: "/context", Description: "context budget, checkpoints, and compaction status"},
 		{Name: "/compact", Description: "summarize stable turns and free context", NeedsArg: true},
-		{Name: "/sessions", Description: "list saved sessions (tokens/cost)"},
+		{Name: "/sessions", Description: "list active sessions (or --archived) with tokens/cost"},
 		{Name: "/new", Description: "start a new session", NeedsArg: true},
 		{Name: "/resume", Description: "choose, resume by ID/name, or use --last ([--recover] after confirming prior process stopped)", NeedsArg: true},
 		{Name: "/model", Description: "switch while idle, or open the configured model picker", NeedsArg: true},
 		{Name: "/fork", Description: "fork the current session at its latest committed turn"},
 		{Name: "/delete", Description: "delete a saved session (not the active one)", NeedsArg: true},
+		{Name: "/archive", Description: "non-destructively archive an inactive saved session", NeedsArg: true},
+		{Name: "/unarchive", Description: "restore an archived saved session", NeedsArg: true},
 		{Name: "/title", Description: "rename the current session", NeedsArg: true},
 		{Name: "/queue", Description: "list queued follow-ups (or: clear/drop/edit/resume)", NeedsArg: true},
 		{Name: "/plan", Description: "enter plan read-only mode, run one prompt, or switch (exit|ask|auto)"},
@@ -205,6 +209,10 @@ func parseSlash(input string) (slashAction, string) {
 		return slashTitle, arg
 	case "/delete":
 		return slashDelete, arg
+	case "/archive":
+		return slashArchive, arg
+	case "/unarchive":
+		return slashUnarchive, arg
 	case "/queue":
 		return slashQueue, arg
 	case "/plan":
@@ -234,12 +242,14 @@ func helpText() string {
 		"  /statusline          configure persistent bottom status fields",
 		"  /context           context budget, checkpoints, and compaction status",
 		"  /compact [focus]   summarize stable turns and free context",
-		"  /sessions          list saved sessions (tokens/cost)",
+		"  /sessions [--archived]  list active or archived sessions (tokens/cost)",
 		"  /new [title]       start a new session",
 		"  /resume [id|name|--last] [--recover]  choose a saved session, resume by exact ID/name, or switch to newest; explicitly recover an interrupted operation",
 		"  /model [name]     switch the active model while idle; no name opens the configured picker",
 		"  /fork              fork the current session at its latest committed turn (auto child ID)",
 		"  /delete <id>       delete a saved session (not the active one)",
+		"  /archive <id|name>  hide an inactive session without deleting it",
+		"  /unarchive <id|name>  restore an archived session to normal selection",
 		"  /title <text>      rename the current session",
 		"  /queue             list queued follow-ups",
 		"  /queue clear       drop all queued follow-ups",
@@ -273,7 +283,7 @@ func helpText() string {
 		"  ctrl+c    interrupt turn/compaction, or quit when idle",
 		"",
 		"While busy, /steer <text> targets only the active regular turn and failed admission is never queued; /help /context /status /statusline /goal /tasks /diff /rules /btw /side /usage /sessions /queue /permissions /memory status|list run immediately; /review is idle-only and never queued; /plan and /permissions ask|auto|plan|yolo changes or prompts are idle-only, never queued, and retain the draft when rejected; the model picker and /model changes also require idle; while busy/compacting, retry after the current operation finishes and the queue remains paused; side questions and reviews never enter the FIFO queue.",
-		"Mutative commands (/compact /clear /new /resume /model /fork /title /delete /exit) cannot be queued.",
+		"Mutative commands (/compact /clear /new /resume /model /fork /title /delete /archive /unarchive /exit) cannot be queued.",
 		"shell/apply_patch may prompt for approval (once / session / deny); plan keeps the existing read-only tool boundary. Status shows cmd=ask|auto|plan or cmd=yolo. Shift+Tab enters yolo with an explicit unsafe warning and never changes mode while busy, compacting, awaiting approval, or serving a side question.",
 		"Sessions auto-save each successful turn. Costs use provider usage when available.",
 		"Persistent memory is project-scoped and separate from /resume.",

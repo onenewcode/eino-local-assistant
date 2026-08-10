@@ -1687,7 +1687,7 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 	case slashNew:
 		return m.cmdNew(arg)
 	case slashSessions:
-		return m.cmdSessions()
+		return m.cmdSessions(arg)
 	case slashResume:
 		return m.cmdResume(arg)
 	case slashModel:
@@ -1698,6 +1698,10 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdTitle(arg)
 	case slashDelete:
 		return m.cmdDelete(arg)
+	case slashArchive:
+		return m.cmdArchive(arg, true)
+	case slashUnarchive:
+		return m.cmdArchive(arg, false)
 	case slashQueue:
 		return m.cmdQueue(arg)
 	case slashPermissions:
@@ -2166,26 +2170,58 @@ func (m *model) currentModelIdentity() string {
 	return strings.TrimSpace(m.deps.Status.Model)
 }
 
-func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
+func (m *model) cmdSessions(arg string) (tea.Model, tea.Cmd) {
+	archived := false
+	switch strings.TrimSpace(arg) {
+	case "":
+	case "--archived":
+		archived = true
+	default:
+		m.appendLine(lineError, "usage: /sessions [--archived]")
+		return m, nil
+	}
 	if m.deps.Store == nil {
 		m.appendLine(lineError, "session store is not configured")
 		return m, nil
 	}
-	list, err := m.deps.Store.ListThreads(m.processCtx())
+	var (
+		list []store.ThreadMeta
+		err  error
+	)
+	if archived {
+		archiveStore, ok := m.deps.Store.(store.ThreadArchiveRepository)
+		if !ok {
+			m.appendLine(lineError, "archived session listing is unavailable in this TUI")
+			return m, nil
+		}
+		list, err = archiveStore.ListArchivedThreads(m.processCtx())
+	} else {
+		list, err = m.deps.Store.ListThreads(m.processCtx())
+	}
 	if err != nil {
 		m.appendLine(lineError, "list sessions: "+err.Error())
 		return m, nil
 	}
 	if len(list) == 0 {
-		m.appendLine(lineSystem, "no saved sessions")
+		message := "no saved sessions"
+		if archived {
+			message = "no archived sessions"
+		}
+		m.appendLine(lineSystem, message)
 		m.appendLine(lineSep, "")
 		return m, nil
 	}
 	var b strings.Builder
-	b.WriteString("Sessions (most recent first):\n")
+	heading := "Sessions"
+	if archived {
+		heading = "Archived sessions"
+	}
+	b.WriteString(heading + " (most recent first):\n")
 	current := ""
-	if session := m.activeSession(); session != nil {
-		current = session.ID()
+	if !archived {
+		if session := m.activeSession(); session != nil {
+			current = session.ID()
+		}
 	}
 	// Cap list length for readability in the viewport.
 	const maxList = 30
@@ -2215,7 +2251,11 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 	if len(list) > maxList {
 		fmt.Fprintf(&b, "… and %d more\n", len(list)-maxList)
 	}
-	b.WriteString("Use /resume to choose, /resume <id-or-name>, /resume --last, or /delete <id>.")
+	if archived {
+		b.WriteString("Use /unarchive <id-or-name> to restore a session.")
+	} else {
+		b.WriteString("Use /resume to choose, /resume <id-or-name>, /resume --last, /archive <id-or-name>, or /delete <id>.")
+	}
 	m.appendLine(lineSystem, strings.TrimRight(b.String(), "\n"))
 	m.appendLine(lineSep, "")
 	return m, nil
@@ -2253,10 +2293,21 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	return m.resumeSession(resolvedID, recoverInterrupted)
 }
 
+type sessionSelectorScope int
+
+const (
+	sessionSelectorActive sessionSelectorScope = iota
+	sessionSelectorArchived
+)
+
 // resolveResumeSelector preserves ID precedence while allowing an exact active
 // session title as a human-facing selector. Ambiguous titles remain an error
 // so a state-changing command never chooses an arbitrary matching session.
 func (m *model) resolveResumeSelector(selector string) (string, error) {
+	return m.resolveSessionSelector(selector, sessionSelectorActive)
+}
+
+func (m *model) resolveSessionSelector(selector string, scope sessionSelectorScope) (string, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
 		return "", errors.New("session ID or name is required")
@@ -2267,7 +2318,24 @@ func (m *model) resolveResumeSelector(selector string) (string, error) {
 	if meta, err := m.deps.Store.LoadThreadMeta(m.processCtx(), selector); err == nil {
 		return meta.ID, nil
 	}
-	list, err := m.deps.Store.ListThreads(m.processCtx())
+	label := "active"
+	var (
+		list []store.ThreadMeta
+		err  error
+	)
+	switch scope {
+	case sessionSelectorActive:
+		list, err = m.deps.Store.ListThreads(m.processCtx())
+	case sessionSelectorArchived:
+		label = "archived"
+		archiveStore, ok := m.deps.Store.(store.ThreadArchiveRepository)
+		if !ok {
+			return "", errors.New("archived session selection is unavailable in this TUI")
+		}
+		list, err = archiveStore.ListArchivedThreads(m.processCtx())
+	default:
+		return "", errors.New("invalid session selector scope")
+	}
 	if err != nil {
 		return "", fmt.Errorf("list sessions: %w", err)
 	}
@@ -2279,7 +2347,7 @@ func (m *model) resolveResumeSelector(selector string) (string, error) {
 	}
 	switch len(matches) {
 	case 0:
-		return "", fmt.Errorf("no active session with ID or name %q", selector)
+		return "", fmt.Errorf("no %s session with ID or name %q", label, selector)
 	case 1:
 		return matches[0], nil
 	default:
@@ -2524,6 +2592,70 @@ func (m *model) cmdDelete(id string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.appendLine(lineSystem, "deleted session "+id)
+	m.appendLine(lineSep, "")
+	return m, nil
+}
+
+// cmdArchive changes a non-destructive archive lifecycle state. The active
+// session is deliberately never archivable from this running TUI because an
+// archived session cannot safely accept its next turn.
+func (m *model) cmdArchive(arg string, archive bool) (tea.Model, tea.Cmd) {
+	if m.mode != modeIdle {
+		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
+		return m, nil
+	}
+	selector := strings.TrimSpace(arg)
+	if selector == "" {
+		command := "/archive"
+		if !archive {
+			command = "/unarchive"
+		}
+		m.appendLine(lineError, "usage: "+command+" <session-id-or-name>")
+		return m, nil
+	}
+	if m.deps.Store == nil {
+		m.appendLine(lineError, "session store is not configured")
+		return m, nil
+	}
+	archiveStore, ok := m.deps.Store.(store.ThreadArchiveRepository)
+	if !ok {
+		m.appendLine(lineError, "session archive lifecycle is unavailable in this TUI")
+		return m, nil
+	}
+	scope := sessionSelectorArchived
+	if archive {
+		scope = sessionSelectorActive
+	}
+	id, err := m.resolveSessionSelector(selector, scope)
+	if err != nil {
+		m.appendLine(lineError, "session archive: "+err.Error())
+		return m, nil
+	}
+	if archive {
+		if session := m.activeSession(); session != nil && session.ID() == id {
+			m.appendLine(lineError, "cannot archive the active session; /new or /resume another first")
+			return m, nil
+		}
+	}
+	state, err := m.deps.Store.LoadThread(m.processCtx(), id)
+	if err != nil {
+		m.appendLine(lineError, "session archive: load session: "+err.Error())
+		return m, nil
+	}
+	if archive {
+		_, err = archiveStore.ArchiveThread(m.processCtx(), id, state.Revision)
+	} else {
+		_, err = archiveStore.UnarchiveThread(m.processCtx(), id, state.Revision)
+	}
+	if err != nil {
+		m.appendLine(lineError, "session archive: "+err.Error())
+		return m, nil
+	}
+	pastTense := "archived"
+	if !archive {
+		pastTense = "unarchived"
+	}
+	m.appendLine(lineSystem, pastTense+" session "+id)
 	m.appendLine(lineSep, "")
 	return m, nil
 }

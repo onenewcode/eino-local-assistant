@@ -50,6 +50,8 @@ func TestParseSlash(t *testing.T) {
 		{"/fork unexpected-argument", slashFork, "unexpected-argument"},
 		{"/title Hello World", slashTitle, "Hello World"},
 		{"/delete 20260715-120000-abc123", slashDelete, "20260715-120000-abc123"},
+		{"/archive completed work", slashArchive, "completed work"},
+		{"/unarchive completed work", slashUnarchive, "completed work"},
 		{"/queue", slashQueue, ""},
 		{"/queue clear", slashQueue, "clear"},
 		{"/queue drop 2", slashQueue, "drop 2"},
@@ -101,7 +103,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 	tokens := []string{
 		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/statusline", "/goal", "/tasks", "/diff", "/rules", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact", "/review",
-		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/queue", "/plan",
+		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/archive", "/unarchive", "/queue", "/plan",
 		"/model",
 		"/permissions", "/policy",
 	}
@@ -132,7 +134,7 @@ func TestSlashCatalogNeedsArg(t *testing.T) {
 		"/clear": false, "/exit": false, "/plan": false, "/permissions": true,
 		"/btw": true, "/steer": true,
 		"/usage": true, "/statusline": false, "/compact": true, "/new": true, "/resume": true, "/fork": false, "/title": true,
-		"/delete": true, "/queue": true, "/model": true, "/memory": true,
+		"/delete": true, "/archive": true, "/unarchive": true, "/queue": true, "/model": true, "/memory": true,
 	}
 	for _, cmd := range slashCatalog() {
 		need, ok := want[cmd.Name]
