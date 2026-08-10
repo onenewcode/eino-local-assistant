@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"eino-local-assistant/internal/agent"
 	"eino-local-assistant/internal/chat"
 	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/memory"
@@ -36,6 +37,7 @@ type sessionStart struct {
 	modelName          string
 	reasoningEffort    string
 	reasoningEffortSet bool
+	toolSelection      tools.ToolSelection
 	yolo               bool
 }
 
@@ -180,7 +182,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 				return tui.ModelSwitchResult{}, switchErr
 			}
 			return tui.ModelSwitchResult{
-				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
+				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.maxModelSteps(), sandboxInfo, runtimeInfo),
 				SessionOpts: bundle.sessionOpts,
 			}, nil
 		},
@@ -190,7 +192,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 				return tui.ModelSwitchResult{}, switchErr
 			}
 			return tui.ModelSwitchResult{
-				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.reactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
+				Status:      statusFromConfig(bundle.cfg, runtime.registry, cmdMode, bundle.maxModelSteps(), sandboxInfo, runtimeInfo),
 				SessionOpts: bundle.sessionOpts,
 			}, nil
 		},
@@ -201,7 +203,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 			}
 			return tui.SessionOpenResult{
 				Session:     opened.session,
-				Status:      statusFromConfig(opened.bundle.cfg, runtime.registry, cmdMode, opened.bundle.reactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
+				Status:      statusFromConfig(opened.bundle.cfg, runtime.registry, cmdMode, opened.bundle.maxModelSteps(), sandboxInfo, runtimeInfo),
 				SessionOpts: opened.bundle.sessionOpts,
 			}, nil
 		},
@@ -209,7 +211,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		WorkspaceDiff:           runtime.workspaceDiff,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
 		SessionOpts:             initialSessionOpts,
-		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, initialReactModel.MaxModelSteps(), sandboxInfo, runtimeInfo),
+		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, maxReActModelSteps(initialReactModel), sandboxInfo, runtimeInfo),
 		ModelCatalog:            modelCatalogFromConfig(modelCfg.Model.CatalogEntries()),
 		TurnOptions: runtimeguard.TurnOptions{
 			MaxModelSteps:                     runtime.runtimeCfg.MaxModelSteps,
@@ -493,6 +495,13 @@ func statusFrom(modelName, reasoningEffort string, registry *tools.Registry, cmd
 		Sandbox:         sandboxInfo,
 		Runtime:         runtimeInfo,
 	}
+}
+
+func maxReActModelSteps(model *agent.ReActModel) int {
+	if model == nil {
+		return 0
+	}
+	return model.MaxModelSteps()
 }
 
 func statusFromConfig(cfg config.Config, registry *tools.Registry, cmdMode string, maxModelSteps int, sandboxInfo tui.SandboxInfo, runtimeInfo tui.RuntimeInfo) tui.StatusInfo {

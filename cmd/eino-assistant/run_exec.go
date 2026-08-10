@@ -44,6 +44,11 @@ type execFinalResponseValidatorSetter interface {
 
 type execSessionFactory func(context.Context, string) (execSession, io.Closer, error)
 
+// execRuntimeFactory preserves the complete per-invocation start request for
+// production wiring. Older narrow factories remain available for isolated cmd
+// tests that only need to observe model and effort forwarding.
+type execRuntimeFactory func(context.Context, string, sessionStart) (execSession, io.Closer, error)
+
 type execOpenSessionFactory func(context.Context, string, string, bool) (execSession, io.Closer, error)
 
 type execSessionModelFactory func(context.Context, string, string) (execSession, io.Closer, error)
@@ -57,6 +62,7 @@ type execOpenSessionModelEffortFactory func(context.Context, string, string, boo
 type execLastSessionSelector func(context.Context, string) (string, error)
 
 type execCommandDeps struct {
+	newRuntime                   execRuntimeFactory
 	newSession                   execSessionFactory
 	newEphemeralSession          execSessionFactory
 	openSession                  execOpenSessionFactory
@@ -219,6 +225,7 @@ func defaultExecCommandDeps() execCommandDeps {
 		}, runtime, nil
 	}
 	return execCommandDeps{
+		newRuntime: openRuntime,
 		newSessionWithModel: func(ctx context.Context, configPath, modelName string) (execSession, io.Closer, error) {
 			return openRuntime(ctx, configPath, sessionStart{modelName: modelName})
 		},
@@ -354,6 +361,8 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 	var outputLastMessage string
 	var outputLastMessageShort string
 	var outputSchema string
+	var allowedTools []string
+	var disallowedTools []string
 	cmd := &cobra.Command{
 		Use:   "exec [PROMPT]",
 		Short: "Run one durable or ephemeral non-interactive turn",
@@ -380,15 +389,29 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 			if err != nil {
 				return finishExecFailure(format, cmd.OutOrStdout(), nil, execErrorInput, err)
 			}
-			factory := deps.newSession
-			modelFactory := deps.newSessionWithModel
-			modelEffortFactory := deps.newSessionWithModelEffort
-			if ephemeral {
-				factory = deps.newEphemeralSession
-				modelFactory = deps.newEphemeralWithModel
-				modelEffortFactory = deps.newEphemeralWithModelEffort
+			var factory execSessionFactory
+			if deps.newRuntime != nil {
+				start := sessionStart{
+					modelName:          modelName,
+					reasoningEffort:    resolvedEffort,
+					reasoningEffortSet: cmd.Flags().Changed("reasoning-effort"),
+					toolSelection:      toolSelectionFromFlags(cmd, allowedTools, disallowedTools),
+					ephemeral:          ephemeral,
+				}
+				factory = func(ctx context.Context, configPath string) (execSession, io.Closer, error) {
+					return deps.newRuntime(ctx, configPath, start)
+				}
+			} else {
+				factory = deps.newSession
+				modelFactory := deps.newSessionWithModel
+				modelEffortFactory := deps.newSessionWithModelEffort
+				if ephemeral {
+					factory = deps.newEphemeralSession
+					modelFactory = deps.newEphemeralWithModel
+					modelEffortFactory = deps.newEphemeralWithModelEffort
+				}
+				factory = execSessionFactoryForModelEffort(factory, modelFactory, modelEffortFactory, modelName, resolvedEffort, cmd.Flags().Changed("reasoning-effort"))
 			}
-			factory = execSessionFactoryForModelEffort(factory, modelFactory, modelEffortFactory, modelName, resolvedEffort, cmd.Flags().Changed("reasoning-effort"))
 			return runExecWithOptionsAndValidator(cmd.Context(), args, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts.configPath, format, ephemeral, resolvedOutputLastMessage, validator, factory)
 		},
 	}
@@ -400,12 +423,13 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&outputLastMessageShort, "output-last-message-short", "o", "", "")
 	_ = cmd.PersistentFlags().MarkHidden("output-last-message-short")
 	cmd.PersistentFlags().StringVar(&outputSchema, "output-schema", "", "locally validate the final assistant JSON response against FILE")
+	addToolSelectionFlags(cmd.PersistentFlags(), &allowedTools, &disallowedTools)
 	cmd.Flags().BoolVar(&ephemeral, "ephemeral", false, "run with a temporary session ledger that is removed when exec exits")
-	cmd.AddCommand(newExecResumeCommand(opts, deps, &outputFormat, &jsonAlias, &modelName, &reasoningEffort, &outputLastMessage, &outputLastMessageShort, &outputSchema, &ephemeral))
+	cmd.AddCommand(newExecResumeCommand(opts, deps, &outputFormat, &jsonAlias, &modelName, &reasoningEffort, &outputLastMessage, &outputLastMessageShort, &outputSchema, &ephemeral, &allowedTools, &disallowedTools))
 	return cmd
 }
 
-func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat *string, jsonAlias *bool, modelName, reasoningEffort *string, outputLastMessage, outputLastMessageShort, outputSchema *string, parentEphemeral *bool) *cobra.Command {
+func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat *string, jsonAlias *bool, modelName, reasoningEffort *string, outputLastMessage, outputLastMessageShort, outputSchema *string, parentEphemeral *bool, allowedTools, disallowedTools *[]string) *cobra.Command {
 	var recoverInterrupted bool
 	var resumeEphemeral bool
 	lastFlag := &lastSessionFlagValue{}
@@ -464,12 +488,6 @@ func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat 
 			}
 			openSession = execOpenSessionFactoryForModelEffort(openSession, openSessionWithModel, openSessionWithModelEffort, dereferenceModelName(modelName), resolvedEffort, cmd.Flags().Changed("reasoning-effort"))
 			return runExecWithOptionsAndValidator(cmd.Context(), promptArgs, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts.configPath, format, ephemeral, resolvedOutputLastMessage, validator, func(ctx context.Context, configPath string) (execSession, io.Closer, error) {
-				if openSession == nil {
-					if ephemeral {
-						return nil, nil, errors.New("exec ephemeral resume session factory is required")
-					}
-					return nil, nil, errors.New("exec resume session factory is required")
-				}
 				if lastFlag.value {
 					if selectLastSession == nil {
 						return nil, nil, errors.New("exec resume --last selector is unavailable")
@@ -482,6 +500,23 @@ func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat 
 					if id == "" {
 						return nil, nil, errors.New("exec resume --last selector returned an empty session id")
 					}
+				}
+				if deps.newRuntime != nil {
+					return deps.newRuntime(ctx, configPath, sessionStart{
+						resumeID:           id,
+						recoverInterrupted: recoverInterrupted,
+						ephemeral:          ephemeral,
+						modelName:          dereferenceModelName(modelName),
+						reasoningEffort:    resolvedEffort,
+						reasoningEffortSet: cmd.Flags().Changed("reasoning-effort"),
+						toolSelection:      toolSelectionFromFlags(cmd, dereferenceStringSlice(allowedTools), dereferenceStringSlice(disallowedTools)),
+					})
+				}
+				if openSession == nil {
+					if ephemeral {
+						return nil, nil, errors.New("exec ephemeral resume session factory is required")
+					}
+					return nil, nil, errors.New("exec resume session factory is required")
 				}
 				return openSession(ctx, configPath, id, recoverInterrupted)
 			})
@@ -512,6 +547,13 @@ func normalizeExecReasoningEffort(value string, changed bool) (string, error) {
 func dereferenceString(value *string) string {
 	if value == nil {
 		return ""
+	}
+	return *value
+}
+
+func dereferenceStringSlice(value *[]string) []string {
+	if value == nil {
+		return nil
 	}
 	return *value
 }

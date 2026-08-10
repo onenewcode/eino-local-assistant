@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -220,6 +221,88 @@ func TestDefaultRegistryInheritsApplyPatchSandboxForShell(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("shell bypassed inherited sandbox: stat marker = %v", err)
 	}
+}
+
+func TestRegistryFilterSelectsInvocationToolSurface(t *testing.T) {
+	workspace := t.TempDir()
+	registry, err := DefaultWithOptions(DefaultOptions{
+		Clock:      time.Now,
+		Shell:      ShellOptions{WorkspaceRoot: workspace},
+		ApplyPatch: ApplyPatchOptions{WorkspaceRoot: workspace, Approval: ApprovalNever},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := registryNames(t, registry)
+
+	tests := []struct {
+		name      string
+		selection ToolSelection
+		want      []string
+	}{
+		{name: "default", want: all},
+		{name: "allow subset", selection: ToolSelection{AllowedSet: true, Allowed: []string{"shell, get_current_time", "shell"}}, want: []string{"get_current_time", "shell"}},
+		{name: "deny subset", selection: ToolSelection{Disallowed: []string{"apply_patch, shell"}}, want: []string{"get_current_time", "read_artifact"}},
+		{name: "deny overrides allow", selection: ToolSelection{AllowedSet: true, Allowed: []string{"shell", "read_artifact"}, Disallowed: []string{"shell"}}, want: []string{"read_artifact"}},
+		{name: "explicit empty", selection: ToolSelection{AllowedSet: true}, want: []string{}},
+		{name: "default keyword", selection: ToolSelection{AllowedSet: true, Allowed: []string{"default"}, Disallowed: []string{"shell"}}, want: []string{"get_current_time", "read_artifact", "apply_patch"}},
+		{name: "wildcard keyword", selection: ToolSelection{AllowedSet: true, Allowed: []string{"*"}}, want: all},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			filtered, filterErr := registry.Filter(context.Background(), tc.selection)
+			if filterErr != nil {
+				t.Fatalf("Filter() error = %v", filterErr)
+			}
+			if got := registryNames(t, filtered); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("names = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegistryFilterRejectsAmbiguousAndUnknownNames(t *testing.T) {
+	workspace := t.TempDir()
+	registry, err := DefaultWithOptions(DefaultOptions{
+		Clock:      time.Now,
+		Shell:      ShellOptions{WorkspaceRoot: workspace},
+		ApplyPatch: ApplyPatchOptions{WorkspaceRoot: workspace, Approval: ApprovalNever},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, selection := range []ToolSelection{
+		{AllowedSet: true, Allowed: []string{"missing_tool"}},
+		{Disallowed: []string{"missing_tool"}},
+	} {
+		_, filterErr := registry.Filter(context.Background(), selection)
+		if filterErr == nil || !strings.Contains(filterErr.Error(), `unknown tool "missing_tool"`) || !strings.Contains(filterErr.Error(), "available: apply_patch") {
+			t.Fatalf("Filter(%+v) error = %v", selection, filterErr)
+		}
+	}
+	_, err = registry.Filter(context.Background(), ToolSelection{AllowedSet: true, Allowed: []string{"default", "shell"}})
+	if err == nil || !strings.Contains(err.Error(), "only as its sole value") {
+		t.Fatalf("mixed default selection error = %v", err)
+	}
+
+	duplicate := New(registry.All()[0], registry.All()[0])
+	if _, err := duplicate.Filter(context.Background(), ToolSelection{}); err == nil || !strings.Contains(err.Error(), "duplicate tool name") {
+		t.Fatalf("duplicate Filter() error = %v", err)
+	}
+}
+
+func registryNames(t *testing.T, registry *Registry) []string {
+	t.Helper()
+	infos, err := registry.Infos(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(infos))
+	for _, info := range infos {
+		names = append(names, info.Name)
+	}
+	return names
 }
 
 func registryToolByName(t *testing.T, registry *Registry, name string) tool.InvokableTool {

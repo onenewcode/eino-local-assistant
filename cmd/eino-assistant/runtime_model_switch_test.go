@@ -22,7 +22,8 @@ import (
 )
 
 type runtimeFactoryChatModel struct {
-	name string
+	name           string
+	withToolsCalls int
 }
 
 func (m *runtimeFactoryChatModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
@@ -34,6 +35,7 @@ func (m *runtimeFactoryChatModel) Stream(context.Context, []*schema.Message, ...
 }
 
 func (m *runtimeFactoryChatModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	m.withToolsCalls++
 	return m, nil
 }
 
@@ -53,6 +55,14 @@ type runtimeSessionStream struct{}
 
 func (runtimeSessionStream) Recv() (*schema.Message, error) { return nil, io.EOF }
 func (runtimeSessionStream) Close()                         {}
+
+// runtimeRegistryTool keeps model-switch tests on the tool-enabled path.
+// The factory is injected in these tests, so execution is intentionally absent.
+type runtimeRegistryTool struct{}
+
+func (runtimeRegistryTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{Name: "test_tool"}, nil
+}
 
 type runtimeMetaLoaderFunc func(context.Context, string) (store.ThreadMeta, error)
 
@@ -98,7 +108,7 @@ func newRuntimeModelSwitchFixture(t *testing.T) (*commandRuntime, *chat.Session,
 		session:        session,
 		sessionStore:   threadStore,
 		chatModel:      oldProvider,
-		registry:       tools.New(),
+		registry:       tools.New(runtimeRegistryTool{}),
 		reactModel:     oldReact,
 		taskController: agent.NewTaskController(),
 		runtimeCfg:     config.RuntimeConfig{MaxModelSteps: 7},
@@ -166,6 +176,32 @@ func TestRuntimeBuildModelBundleOrderAndSharedTaskController(t *testing.T) {
 	}
 	if providerEffort != config.DefaultReasoningEffort || bundle.sessionOpts.ReasoningEffort != config.DefaultReasoningEffort {
 		t.Fatalf("default effort must reach provider and session: provider=%q session=%q", providerEffort, bundle.sessionOpts.ReasoningEffort)
+	}
+}
+
+func TestRuntimeBuildModelBundleUsesDirectModelWithoutTools(t *testing.T) {
+	r, _, _ := newRuntimeModelSwitchFixture(t)
+	r.registry = tools.New()
+	calledReAct := false
+	raw := &runtimeFactoryChatModel{name: "direct"}
+	r.modelFactory = runtimeModelFactory{
+		newChatModel: func(context.Context, config.ModelConfig) (model.ToolCallingChatModel, error) {
+			return raw, nil
+		},
+		newReActModel: func(context.Context, model.ToolCallingChatModel, []tool.BaseTool, agent.ReActOptions) (*agent.ReActModel, error) {
+			calledReAct = true
+			return nil, errors.New("ReAct must not be constructed without tools")
+		},
+		newCompactor: func(model.BaseChatModel, contextbuild.Config) (contextbuild.CheckpointCompactor, error) {
+			return runtimeFactoryCompactor{}, nil
+		},
+	}
+	bundle, err := r.buildModelBundle(context.Background(), validRuntimeConfig("direct"), false)
+	if err != nil {
+		t.Fatalf("buildModelBundle: %v", err)
+	}
+	if calledReAct || raw.withToolsCalls != 0 || bundle.reactModel != nil || bundle.sessionModel == nil || bundle.maxModelSteps() != 0 {
+		t.Fatalf("tool-free bundle = %#v, ReAct called=%t WithTools calls=%d", bundle, calledReAct, raw.withToolsCalls)
 	}
 }
 

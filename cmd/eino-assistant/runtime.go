@@ -88,11 +88,19 @@ type runtimeModelFactory struct {
 }
 
 type runtimeModelBundle struct {
-	cfg         config.Config
-	chatModel   model.ToolCallingChatModel
-	reactModel  *agent.ReActModel
-	compactor   contextbuild.CheckpointCompactor
-	sessionOpts chat.SessionOptions
+	cfg          config.Config
+	chatModel    model.ToolCallingChatModel
+	sessionModel chat.Model
+	reactModel   *agent.ReActModel
+	compactor    contextbuild.CheckpointCompactor
+	sessionOpts  chat.SessionOptions
+}
+
+func (bundle runtimeModelBundle) maxModelSteps() int {
+	if bundle.reactModel == nil {
+		return 0
+	}
+	return bundle.reactModel.MaxModelSteps()
 }
 
 type runtimeSessionOpenResult struct {
@@ -711,6 +719,10 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		registeredTools = append(registeredTools, mcpTool)
 	}
 	registry = tools.New(registeredTools...)
+	registry, err = registry.Filter(ctx, start.toolSelection)
+	if err != nil {
+		return nil, fmt.Errorf("select invocation tools: %w", err)
+	}
 	runtime := &commandRuntime{
 		cfg:                cfg,
 		sessionStore:       sessionStore,
@@ -753,7 +765,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if start.forkID != "" {
 		bundle.sessionOpts.Title = start.title
 		forkResult := store.ForkResult{}
-		session, forkResult, err = forkStartupSession(ctx, sessionStore, start.forkID, bundle.reactModel, bundle.sessionOpts)
+		session, forkResult, err = forkStartupSession(ctx, sessionStore, start.forkID, bundle.sessionModel, bundle.sessionOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -761,7 +773,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	} else if start.resumeID != "" {
 		// Resume uses the durable thread system prompt; project fallback files are
 		// discovered only when composing a new session prompt below.
-		session, err = chat.OpenSession(bundle.reactModel, sessionStore, start.resumeID, bundle.sessionOpts)
+		session, err = chat.OpenSession(bundle.sessionModel, sessionStore, start.resumeID, bundle.sessionOpts)
 		if err != nil {
 			return nil, fmt.Errorf("resume session: %w", err)
 		}
@@ -772,7 +784,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 			return nil, fmt.Errorf("compose system prompt: %w", promptErr)
 		}
 		initialSnapshot = promptSnapshot
-		session, err = chat.NewSession(bundle.reactModel, fullPrompt, bundle.sessionOpts)
+		session, err = chat.NewSession(bundle.sessionModel, fullPrompt, bundle.sessionOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -920,17 +932,28 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 	if rawModel == nil {
 		return runtimeModelBundle{}, errors.New("create chat model: provider returned nil model")
 	}
-	reactModel, err := factory.newReActModel(
-		ctx,
-		rawModel,
-		r.registry.All(),
-		runtimeReActOptions(r.runtimeCfg.MaxModelSteps, r.taskController, contextCfg),
-	)
-	if err != nil {
-		return runtimeModelBundle{}, fmt.Errorf("create ReAct model: %w", err)
-	}
-	if reactModel == nil {
-		return runtimeModelBundle{}, errors.New("create ReAct model: factory returned nil model")
+	var sessionModel chat.Model
+	var reactModel *agent.ReActModel
+	if len(r.registry.All()) == 0 {
+		directModel, directErr := agent.NewDirectModel(rawModel)
+		if directErr != nil {
+			return runtimeModelBundle{}, fmt.Errorf("create direct model: %w", directErr)
+		}
+		sessionModel = directModel
+	} else {
+		reactModel, err = factory.newReActModel(
+			ctx,
+			rawModel,
+			r.registry.All(),
+			runtimeReActOptions(r.runtimeCfg.MaxModelSteps, r.taskController, contextCfg),
+		)
+		if err != nil {
+			return runtimeModelBundle{}, fmt.Errorf("create ReAct model: %w", err)
+		}
+		if reactModel == nil {
+			return runtimeModelBundle{}, errors.New("create ReAct model: factory returned nil model")
+		}
+		sessionModel = reactModel
 	}
 	compactor, err := factory.newCompactor(rawModel, contextCfg)
 	if err != nil {
@@ -940,10 +963,11 @@ func (r *commandRuntime) buildModelBundle(ctx context.Context, cfg config.Config
 		return runtimeModelBundle{}, errors.New("create context compactor: factory returned nil compactor")
 	}
 	return runtimeModelBundle{
-		cfg:        cfg,
-		chatModel:  rawModel,
-		reactModel: reactModel,
-		compactor:  compactor,
+		cfg:          cfg,
+		chatModel:    rawModel,
+		sessionModel: sessionModel,
+		reactModel:   reactModel,
+		compactor:    compactor,
 		sessionOpts: chat.SessionOptions{
 			Store:           r.sessionStore,
 			ModelName:       strings.TrimSpace(cfg.Model.Name),
@@ -1014,7 +1038,7 @@ func (r *commandRuntime) switchModelBinding(ctx context.Context, session *chat.S
 		return runtimeModelBundle{}, err
 	}
 	binding := chat.ModelBinding{
-		Model:     candidate.reactModel,
+		Model:     candidate.sessionModel,
 		ModelName: candidate.sessionOpts.ModelName,
 		Compactor: candidate.compactor,
 		Pricing:   candidate.sessionOpts.Pricing,
@@ -1069,7 +1093,7 @@ func (r *commandRuntime) openSession(ctx context.Context, id string, recoverInte
 	if err != nil {
 		return runtimeSessionOpenResult{}, err
 	}
-	session, err := chat.OpenSession(candidate.reactModel, r.sessionStore, id, candidate.sessionOpts)
+	session, err := chat.OpenSession(candidate.sessionModel, r.sessionStore, id, candidate.sessionOpts)
 	if err != nil {
 		return runtimeSessionOpenResult{}, err
 	}

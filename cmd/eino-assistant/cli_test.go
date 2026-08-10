@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -185,7 +186,7 @@ func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
 			if !called {
 				t.Fatal("interactive runner was not called")
 			}
-			if got != tc.want {
+			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("session start = %#v, want %#v", got, tc.want)
 			}
 			wantConfigPath, err := config.UserConfigPath()

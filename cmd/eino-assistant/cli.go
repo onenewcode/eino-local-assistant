@@ -13,9 +13,11 @@ import (
 
 	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/store"
+	"eino-local-assistant/internal/tools"
 	"eino-local-assistant/internal/usage"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // version is overridden at link time with -ldflags "-X main.version=...".
@@ -49,6 +51,8 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	opts := &rootOptions{configPath: configPath, configPathErr: configPathErr}
 	var title string
 	var name string
+	var allowedTools []string
+	var disallowedTools []string
 	if deps.interactive == nil {
 		deps.interactive = runTUI
 	}
@@ -76,7 +80,12 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return deps.interactive(opts.configPath, sessionStart{title: resolvedTitle, modelName: opts.modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
+			return deps.interactive(opts.configPath, sessionStart{
+				title:         resolvedTitle,
+				modelName:     opts.modelName,
+				toolSelection: toolSelectionFromFlags(cmd, allowedTools, disallowedTools),
+				yolo:          opts.yolo,
+			}, cmd.ErrOrStderr())
 		},
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
@@ -96,6 +105,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	root.Flags().StringVar(&title, "title", "", "optional title for the new session")
 	root.Flags().StringVarP(&name, "name", "n", "", "optional display name for the new session")
 	root.Flags().StringVarP(&opts.modelName, "model", "m", "", "model name for this interactive session (startup override)")
+	addToolSelectionFlags(root.Flags(), &allowedTools, &disallowedTools)
 
 	root.AddCommand(
 		newChatCommand(opts, deps.interactive),
@@ -124,6 +134,8 @@ func newChatCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 	var title string
 	var name string
 	var modelName string
+	var allowedTools []string
+	var disallowedTools []string
 	cmd := &cobra.Command{
 		Use:     "chat",
 		Aliases: []string{"new"},
@@ -141,18 +153,26 @@ func newChatCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 			if err != nil {
 				return err
 			}
-			return interactive(opts.configPath, sessionStart{title: resolvedTitle, modelName: modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
+			return interactive(opts.configPath, sessionStart{
+				title:         resolvedTitle,
+				modelName:     modelName,
+				toolSelection: toolSelectionFromFlags(cmd, allowedTools, disallowedTools),
+				yolo:          opts.yolo,
+			}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&title, "title", "", "optional title for the new session")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "optional display name for the new session")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
+	addToolSelectionFlags(cmd.Flags(), &allowedTools, &disallowedTools)
 	return cmd
 }
 
 func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
 	var recoverInterrupted bool
 	var modelName string
+	var allowedTools []string
+	var disallowedTools []string
 	cmd := &cobra.Command{
 		Use:   "resume <SESSION_ID_OR_NAME>",
 		Short: "Resume a saved session in the TUI",
@@ -167,11 +187,18 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return interactive(opts.configPath, sessionStart{resumeID: strings.TrimSpace(args[0]), recoverInterrupted: recoverInterrupted, modelName: modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
+			return interactive(opts.configPath, sessionStart{
+				resumeID:           strings.TrimSpace(args[0]),
+				recoverInterrupted: recoverInterrupted,
+				modelName:          modelName,
+				toolSelection:      toolSelectionFromFlags(cmd, allowedTools, disallowedTools),
+				yolo:               opts.yolo,
+			}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn or pending compaction before resuming")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
+	addToolSelectionFlags(cmd.Flags(), &allowedTools, &disallowedTools)
 	return cmd
 }
 
@@ -179,6 +206,8 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 	var title string
 	var name string
 	var modelName string
+	var allowedTools []string
+	var disallowedTools []string
 	lastFlag := &lastSessionFlagValue{}
 	cmd := &cobra.Command{
 		Use:   "fork [SESSION_ID_OR_NAME] [PROMPT]",
@@ -212,6 +241,7 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 				forkLast:      lastFlag.value,
 				initialPrompt: prompt,
 				modelName:     modelName,
+				toolSelection: toolSelectionFromFlags(cmd, allowedTools, disallowedTools),
 				yolo:          opts.yolo,
 			}, cmd.ErrOrStderr())
 		},
@@ -222,7 +252,24 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 	cmd.Flags().StringVar(&title, "title", "", "optional display name for the forked session")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "optional display name for the forked session")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
+	addToolSelectionFlags(cmd.Flags(), &allowedTools, &disallowedTools)
 	return cmd
+}
+
+func addToolSelectionFlags(flags *pflag.FlagSet, allowed, disallowed *[]string) {
+	flags.StringSliceVar(allowed, "tools", nil, "tools to expose (comma-separated; empty disables all)")
+	flags.StringSliceVar(disallowed, "disallowed-tools", nil, "tools to hide (comma-separated; deny wins)")
+}
+
+func toolSelectionFromFlags(cmd *cobra.Command, allowed, disallowed []string) tools.ToolSelection {
+	selection := tools.ToolSelection{
+		Allowed:    append([]string(nil), allowed...),
+		Disallowed: append([]string(nil), disallowed...),
+	}
+	if cmd != nil {
+		selection.AllowedSet = cmd.Flags().Changed("tools")
+	}
+	return selection
 }
 
 func parseForkCommandArgs(args []string, last bool) (id, prompt string, err error) {

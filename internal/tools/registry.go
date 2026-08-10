@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +16,15 @@ import (
 // Registry holds the executable tools exposed to the ReAct agent.
 type Registry struct {
 	tools []tool.BaseTool
+}
+
+// ToolSelection restricts the model-visible tools for one process invocation.
+// It intentionally does not represent permission, command-policy, or sandbox
+// rules: those boundaries still govern every selected tool call.
+type ToolSelection struct {
+	Allowed    []string
+	AllowedSet bool
+	Disallowed []string
 }
 
 // DefaultOptions configures built-in tool registration.
@@ -137,6 +147,108 @@ func (r *Registry) All() []tool.BaseTool {
 	out := make([]tool.BaseTool, len(r.tools))
 	copy(out, r.tools)
 	return out
+}
+
+// Filter returns a registry restricted by an invocation-scoped selection.
+// Unset Allowed keeps every registered tool, while an explicitly empty Allowed
+// set exposes none. A sole "default" or "*" Allowed value restores the full
+// registry. Exact Disallowed names always take precedence over Allowed names.
+func (r *Registry) Filter(ctx context.Context, selection ToolSelection) (*Registry, error) {
+	if r == nil {
+		return nil, fmt.Errorf("tool registry is required")
+	}
+	allowed := normalizeToolNames(selection.Allowed)
+	disallowed := normalizeToolNames(selection.Disallowed)
+	if selection.AllowedSet && containsToolDefault(allowed) {
+		if len(allowed) != 1 {
+			return nil, fmt.Errorf("--tools accepts default or * only as its sole value")
+		}
+		selection.AllowedSet = false
+		allowed = nil
+	}
+
+	infos, err := r.Infos(ctx)
+	if err != nil {
+		return nil, err
+	}
+	available := make(map[string]tool.BaseTool, len(infos))
+	for index, info := range infos {
+		if info == nil || strings.TrimSpace(info.Name) == "" {
+			return nil, fmt.Errorf("tool info at index %d has no name", index)
+		}
+		if _, exists := available[info.Name]; exists {
+			return nil, fmt.Errorf("duplicate tool name %q", info.Name)
+		}
+		available[info.Name] = r.tools[index]
+	}
+	if err := validateRequestedToolNames(available, append(append([]string(nil), allowed...), disallowed...)); err != nil {
+		return nil, err
+	}
+
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		allowedSet[name] = struct{}{}
+	}
+	disallowedSet := make(map[string]struct{}, len(disallowed))
+	for _, name := range disallowed {
+		disallowedSet[name] = struct{}{}
+	}
+	filtered := make([]tool.BaseTool, 0, len(r.tools))
+	for index, info := range infos {
+		if _, denied := disallowedSet[info.Name]; denied {
+			continue
+		}
+		if selection.AllowedSet {
+			if _, included := allowedSet[info.Name]; !included {
+				continue
+			}
+		}
+		filtered = append(filtered, r.tools[index])
+	}
+	return New(filtered...), nil
+}
+
+func containsToolDefault(names []string) bool {
+	for _, name := range names {
+		if name == "default" || name == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeToolNames(values []string) []string {
+	names := make([]string, 0, len(values))
+	seen := make(map[string]struct{})
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			name := strings.TrimSpace(part)
+			if name == "" {
+				continue
+			}
+			if _, exists := seen[name]; exists {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func validateRequestedToolNames(available map[string]tool.BaseTool, requested []string) error {
+	for _, name := range requested {
+		if _, exists := available[name]; exists {
+			continue
+		}
+		availableNames := make([]string, 0, len(available))
+		for availableName := range available {
+			availableNames = append(availableNames, availableName)
+		}
+		sort.Strings(availableNames)
+		return fmt.Errorf("unknown tool %q (available: %s)", name, strings.Join(availableNames, ", "))
+	}
+	return nil
 }
 
 // Infos returns tool metadata for model binding and diagnostics.
