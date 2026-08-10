@@ -2215,7 +2215,7 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 	if len(list) > maxList {
 		fmt.Fprintf(&b, "… and %d more\n", len(list)-maxList)
 	}
-	b.WriteString("Use /resume to choose, /resume <id>, /resume --last, or /delete <id>.")
+	b.WriteString("Use /resume to choose, /resume <id-or-name>, /resume --last, or /delete <id>.")
 	m.appendLine(lineSystem, strings.TrimRight(b.String(), "\n"))
 	m.appendLine(lineSep, "")
 	return m, nil
@@ -2229,9 +2229,9 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	if strings.TrimSpace(arg) == "" {
 		return m.openSessionPicker()
 	}
-	id, resumeLast, recoverInterrupted, ok := parseResumeArgs(arg)
+	selector, resumeLast, recoverInterrupted, ok := parseResumeArgs(arg)
 	if !ok {
-		m.appendLine(lineError, "usage: /resume [session-id|--last] [--recover]")
+		m.appendLine(lineError, "usage: /resume [session-id|name|--last] [--recover]")
 		return m, nil
 	}
 	if m.deps.Store == nil {
@@ -2245,7 +2245,46 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	if resumeLast {
 		return m.resumeLatestSession(recoverInterrupted)
 	}
-	return m.resumeSession(id, recoverInterrupted)
+	resolvedID, err := m.resolveResumeSelector(selector)
+	if err != nil {
+		m.appendLine(lineError, "resume: "+err.Error())
+		return m, nil
+	}
+	return m.resumeSession(resolvedID, recoverInterrupted)
+}
+
+// resolveResumeSelector preserves ID precedence while allowing an exact active
+// session title as a human-facing selector. Ambiguous titles remain an error
+// so a state-changing command never chooses an arbitrary matching session.
+func (m *model) resolveResumeSelector(selector string) (string, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return "", errors.New("session ID or name is required")
+	}
+	if m.deps.Store == nil {
+		return "", errors.New("session store is not configured")
+	}
+	if meta, err := m.deps.Store.LoadThreadMeta(m.processCtx(), selector); err == nil {
+		return meta.ID, nil
+	}
+	list, err := m.deps.Store.ListThreads(m.processCtx())
+	if err != nil {
+		return "", fmt.Errorf("list sessions: %w", err)
+	}
+	matches := make([]string, 0, 1)
+	for _, meta := range list {
+		if meta.Title == selector && strings.TrimSpace(meta.ID) != "" {
+			matches = append(matches, meta.ID)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no active session with ID or name %q", selector)
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("session name %q is ambiguous; matching IDs: %s", selector, strings.Join(matches, ", "))
+	}
 }
 
 // resumeLatestSession uses the repository's newest-first active listing for
@@ -2396,30 +2435,38 @@ func (m *model) cmdFork(arg string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// parseResumeArgs accepts one thread ID or --last and an optional exact
-// trailing --recover acknowledgement. Thread IDs cannot contain whitespace.
-func parseResumeArgs(arg string) (id string, resumeLast, recoverInterrupted, ok bool) {
-	fields := strings.Fields(arg)
-	switch len(fields) {
-	case 1:
-		switch fields[0] {
-		case "--recover":
-			return "", false, false, false
-		case "--last":
-			return "", true, false, true
-		default:
-			return fields[0], false, false, true
-		}
-	case 2:
-		if fields[1] != "--recover" || fields[0] == "--recover" {
-			return "", false, false, false
-		}
-		if fields[0] == "--last" {
-			return "", true, true, true
-		}
-		return fields[0], false, true, true
+// parseResumeArgs accepts one thread ID or exact display name, or --last, and
+// an optional exact trailing --recover acknowledgement. --last and --recover
+// stay reserved so selector parsing cannot silently reinterpret control flags.
+func parseResumeArgs(arg string) (selector string, resumeLast, recoverInterrupted, ok bool) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" || arg == "--recover" {
+		return "", false, false, false
 	}
-	return "", false, false, false
+	if arg == "--last" {
+		return "", true, false, true
+	}
+	if arg == "--last --recover" {
+		return "", true, true, true
+	}
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		return "", false, false, false
+	}
+	if fields[len(fields)-1] == "--recover" {
+		recoverInterrupted = true
+		arg = strings.TrimSpace(strings.TrimSuffix(arg, "--recover"))
+		fields = strings.Fields(arg)
+	}
+	if len(fields) == 0 {
+		return "", false, false, false
+	}
+	for _, field := range fields {
+		if field == "--last" || field == "--recover" {
+			return "", false, false, false
+		}
+	}
+	return arg, false, recoverInterrupted, true
 }
 
 func (m *model) appendLegacyCheckpointResetNotice(session *chat.Session) {

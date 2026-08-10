@@ -639,15 +639,15 @@ func TestResumeRecoveryIsExplicitAndStrictlyParsed(t *testing.T) {
 
 	beforeRevision := state.Revision
 	for _, input := range []string{
-		"/resume " + target.ID() + " unexpected",
 		"/resume " + target.ID() + " --recover extra",
 		"/resume --recover",
+		"/resume --last unexpected",
 	} {
 		beforeLines := len(mm.lines)
 		next, _ = mm.submit(input)
 		mm = next.(*model)
 		if len(mm.lines) != beforeLines+1 || mm.lines[len(mm.lines)-1].kind != lineError ||
-			!strings.Contains(mm.lines[len(mm.lines)-1].text, "usage: /resume [session-id|--last] [--recover]") {
+			!strings.Contains(mm.lines[len(mm.lines)-1].text, "usage: /resume [session-id|name|--last] [--recover]") {
 			t.Fatalf("unsupported resume args %q were not rejected cleanly: %#v", input, mm.lines)
 		}
 	}

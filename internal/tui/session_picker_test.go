@@ -286,6 +286,8 @@ func TestResumeLastParsingAndListFailureAreSafe(t *testing.T) {
 		{input: "--last", wantLast: true, wantOK: true},
 		{input: "--last --recover", wantLast: true, wantRecover: true, wantOK: true},
 		{input: "target --recover", wantID: "target", wantRecover: true, wantOK: true},
+		{input: "exact display name", wantID: "exact display name", wantOK: true},
+		{input: "exact display name --recover", wantID: "exact display name", wantRecover: true, wantOK: true},
 		{input: "--recover", wantOK: false},
 		{input: "--recover --last", wantOK: false},
 		{input: "--last unexpected", wantOK: false},
