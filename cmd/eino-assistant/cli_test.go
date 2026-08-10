@@ -40,7 +40,7 @@ func TestRootHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute(%v): %v", args, err)
 			}
-			for _, want := range []string{"Usage:", "chat", "exec", "resume", "sessions", "mcp", "completion", "init", "export", "version"} {
+			for _, want := range []string{"Usage:", "chat", "exec", "resume", "sessions", "mcp", "completion", "init", "export", "doctor", "version"} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("help missing %q:\n%s", want, stdout)
 				}
@@ -71,6 +71,8 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"init", "-h"}, "Create an AGENTS.md project instruction file"},
 		{[]string{"help", "export"}, "Export the complete visible transcript"},
 		{[]string{"export", "-h"}, "Export the complete visible transcript"},
+		{[]string{"help", "doctor"}, "Check local configuration, workspace"},
+		{[]string{"doctor", "-h"}, "Check local configuration, workspace"},
 		{[]string{"help", "mcp"}, "Manage configured MCP servers"},
 		{[]string{"mcp", "list", "-h"}, "output the configured servers as JSON"},
 		{[]string{"mcp", "get", "-h"}, "Show one configured MCP server"},

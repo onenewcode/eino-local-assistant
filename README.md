@@ -14,13 +14,15 @@
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
 - **进程可观测性**：标准库 `log/slog` 结构化日志，默认持久化到 `~/.eino-assistant/logs/eino-YYYY-MM-DD.log`（见 [docs/logging.md](docs/logging.md)）；会话账本仍是 resume 真源
-- **CLI 子命令**：`chat` / `resume` / `sessions` / `mcp` / `completion` / `init` / `export` / `version`（默认无子命令即 chat）
+- **CLI 子命令**：`chat` / `resume` / `sessions` / `mcp` / `completion` / `init` / `export` / `doctor` / `version`（默认无子命令即 chat）
 
-默认无子命令、`chat`/`new` 与 `resume` 需要交互式终端；`exec`、`sessions`、`mcp`、`completion`、`init`、`export`、`version` 与 `help` 可在管道或非 TTY 环境运行。管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
+默认无子命令、`chat`/`new` 与 `resume` 需要交互式终端；`exec`、`sessions`、`mcp`、`completion`、`init`、`export`、`doctor`、`version` 与 `help` 可在管道或非 TTY 环境运行。管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
 
 在新项目中可用 `eino init` 创建最小 `AGENTS.md`，或以 `eino init path/to/AGENTS.md` 指定目标。该命令只会独占创建新文件，绝不会覆盖已有项目规则。
 
 可以用 `eino export <session-id> --output-format markdown|json` 在不启动 TUI 或模型的情况下导出已保存 session 的完整可见 transcript；导出内容与 session 本身均不被修改。
+
+`eino doctor` 可在不联网、不启动模型或 MCP server 的前提下检查本地配置、workspace、storage、已启用 MCP 的本地前置条件及 sandbox/approval 摘要；它不会读取 OAuth keyring 凭据。
 
 ## 安装
 

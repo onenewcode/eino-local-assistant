@@ -92,6 +92,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newCompletionCommand(),
 		newInitCommand(),
 		newExportCommand(opts),
+		newDoctorCommand(opts),
 		newVersionCommand(),
 	)
 
@@ -220,7 +221,7 @@ func listSessions(configPath string, stdout io.Writer) error {
 }
 
 func listSessionsWithFormat(configPath, format string, stdout io.Writer) error {
-	cfg, _, err := loadCommandConfig(configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}

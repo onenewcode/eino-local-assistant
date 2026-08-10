@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"eino-local-assistant/internal/config"
 	"eino-local-assistant/internal/store"
 
 	"github.com/cloudwego/eino/schema"
@@ -53,7 +54,7 @@ func exportSession(configPath, sessionID, format string, stdout io.Writer) error
 	if sessionID == "" {
 		return fmt.Errorf("session id is required")
 	}
-	cfg, _, err := loadCommandConfig(configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
