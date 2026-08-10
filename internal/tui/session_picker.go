@@ -13,7 +13,15 @@ import (
 
 const maxSessionPickerRows = 7
 
+type sessionPickerIntent int
+
+const (
+	sessionPickerResume sessionPickerIntent = iota
+	sessionPickerFork
+)
+
 type sessionPickerState struct {
+	intent   sessionPickerIntent
 	query    string
 	selected int
 	entries  []store.ThreadMeta
@@ -24,6 +32,14 @@ func (m *model) sessionPickerOpen() bool {
 }
 
 func (m *model) openSessionPicker() (tea.Model, tea.Cmd) {
+	return m.openSessionPickerFor(sessionPickerResume)
+}
+
+func (m *model) openForkPicker() (tea.Model, tea.Cmd) {
+	return m.openSessionPickerFor(sessionPickerFork)
+}
+
+func (m *model) openSessionPickerFor(intent sessionPickerIntent) (tea.Model, tea.Cmd) {
 	if m.mode != modeIdle {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
 		return m, nil
@@ -46,13 +62,17 @@ func (m *model) openSessionPicker() (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "list sessions: "+err.Error())
 		return m, nil
 	}
-	entries := sessionPickerCandidates(list, current.ID())
+	entries := sessionPickerCandidatesForIntent(list, current.ID(), intent)
 	if len(entries) == 0 {
-		m.appendLine(lineSystem, "no other active sessions to resume")
+		message := "no other active sessions to resume"
+		if intent == sessionPickerFork {
+			message = "no active sessions available to fork"
+		}
+		m.appendLine(lineSystem, message)
 		m.appendLine(lineSep, "")
 		return m, nil
 	}
-	m.sessionPicker = &sessionPickerState{entries: entries}
+	m.sessionPicker = &sessionPickerState{intent: intent, entries: entries}
 	m.clearSlashMenu()
 	m.clearBacktrack()
 	m.layout()
@@ -61,10 +81,17 @@ func (m *model) openSessionPicker() (tea.Model, tea.Cmd) {
 }
 
 func sessionPickerCandidates(entries []store.ThreadMeta, activeID string) []store.ThreadMeta {
+	return sessionPickerCandidatesForIntent(entries, activeID, sessionPickerResume)
+}
+
+func sessionPickerCandidatesForIntent(entries []store.ThreadMeta, activeID string, intent sessionPickerIntent) []store.ThreadMeta {
 	candidates := make([]store.ThreadMeta, 0, len(entries))
 	for _, entry := range entries {
 		entry.ID = strings.TrimSpace(entry.ID)
-		if entry.ID == "" || entry.ID == activeID || entry.ArchivedAt != nil {
+		if entry.ID == "" || entry.ArchivedAt != nil {
+			continue
+		}
+		if intent == sessionPickerResume && entry.ID == activeID {
 			continue
 		}
 		entry.Title = sessionPickerTitle(entry.Title)
@@ -120,7 +147,15 @@ func (m *model) handleSessionPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.appendLine(lineError, "session picker: no matching session")
 			return m, nil
 		}
-		return m.resumeSession(entry.ID, false)
+		switch m.sessionPicker.intent {
+		case sessionPickerResume:
+			return m.resumeSession(entry.ID, false)
+		case sessionPickerFork:
+			return m.cmdFork(entry.ID)
+		default:
+			m.appendLine(lineError, "session picker: invalid action")
+			return m, nil
+		}
 	case msg.Type == tea.KeyUp || sessionPickerKeyRune(msg, 'k'):
 		m.moveSessionPickerSelection(-1)
 		return m, nil
@@ -177,8 +212,14 @@ func (m *model) sessionPickerView() string {
 	if selected < 0 || selected >= len(rows) {
 		selected = 0
 	}
+	title := "Resume Session"
+	footerAction := "resume"
+	if m.sessionPicker.intent == sessionPickerFork {
+		title = "Fork Session"
+		footerAction = "fork"
+	}
 	lines := []string{
-		statusLinePickerTitleStyle.Render(fmt.Sprintf("Resume Session · active sessions (%d)", len(m.sessionPicker.entries))),
+		statusLinePickerTitleStyle.Render(fmt.Sprintf("%s · active sessions (%d)", title, len(m.sessionPicker.entries))),
 		statusLinePickerSearchStyle.Render("  Type to search: " + m.sessionPicker.query),
 	}
 	start, end := sessionPickerVisibleRange(len(rows), selected)
@@ -199,7 +240,7 @@ func (m *model) sessionPickerView() string {
 	if len(rows) == 0 {
 		lines = append(lines, statusLinePickerSearchStyle.Render("  No matching active sessions"))
 	}
-	lines = append(lines, statusLinePickerFooterStyle.Render("  up/down or j/k select · enter resume · esc cancel"))
+	lines = append(lines, statusLinePickerFooterStyle.Render("  up/down or j/k select · enter "+footerAction+" · esc cancel"))
 	return strings.Join(lines, "\n")
 }
 

@@ -319,8 +319,9 @@ type model struct {
 	// statusLinePicker keeps a private draft until Enter succeeds. Esc leaves
 	// the durable status line and current footer untouched.
 	statusLinePicker *statusLinePickerState
-	// sessionPicker is a non-durable search overlay for choosing another active
-	// session. It changes the active session only after Enter confirms a row.
+	// sessionPicker is a non-durable search overlay for choosing an active
+	// session to resume or fork. It changes durable/TUI session state only after
+	// Enter confirms a row.
 	sessionPicker *sessionPickerState
 	// taskPaneOpen exposes a compact, read-only task projection without making
 	// the controller's internal graph part of the command surface.
@@ -2513,7 +2514,9 @@ func (m *model) cmdFork(arg string) (tea.Model, tea.Cmd) {
 
 	sourceID := current.ID()
 	selector := strings.TrimSpace(arg)
-	if selector == "--last" {
+	if selector == "--pick" {
+		return m.openForkPicker()
+	} else if selector == "--last" {
 		var err error
 		sourceID, err = m.latestForkSourceID()
 		if err != nil {

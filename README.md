@@ -26,7 +26,7 @@
 
 `eino resume` 在未给出 selector 时会列出活跃保存 session 并要求选择；`eino resume --last` 明确恢复最新 session 而不显示列表。`eino fork` 同样会在未给出 source selector 时先要求选择；`eino fork <session-id-or-name> [prompt]` 会从指定 session 的最新 committed turn 创建独立 child，再打开 TUI，`eino fork --last [prompt]` 明确选择当前 storage 中最新 session。选择器只读列出最近的活跃 session，`q`、空输入或 EOF 取消且不会隐式选取最新 session。首个 fork prompt 会直接作为 child 的普通模型输入，即使它以 `/` 开头也不会执行 TUI slash command。
 
-TUI 中 `/fork` 保持分叉当前 session；`/fork <session-id-or-name>` 从另一个 active saved session 创建并直接切换到 child，`/fork --last` 显式选择最近的 active session。两条 selector 都保持 ID 优先、完整名称匹配和同名拒绝的稳定语义；归档名称必须先 `/unarchive`，显式归档 ID 会在 durable fork boundary 被拒绝。
+TUI 中 `/fork` 保持分叉当前 session；`/fork <session-id-or-name>` 从另一个 active saved session 创建并直接切换到 child，`/fork --last` 显式选择最近的 active session，`/fork --pick` 打开可搜索的 active-session parent picker。两条 selector 都保持 ID 优先、完整名称匹配和同名拒绝的稳定语义；归档名称必须先 `/unarchive`，显式归档 ID 会在 durable fork boundary 被拒绝。
 
 `--name`（`-n`）是新建 chat 或 fork child 的 display name 入口，与旧有 `--title` 使用同一 durable 字段，不能同时给出。`resume`、`fork`、`exec resume`、`archive`、`unarchive`、`export` 与 `delete` 都可接受完整 display name；ID 始终优先，大小写不同、前缀或子串都不会猜测。名称重复时会列出候选 ID 并拒绝操作，供脚本稳定地改用 ID。
 
