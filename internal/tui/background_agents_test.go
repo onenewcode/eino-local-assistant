@@ -103,6 +103,99 @@ func TestBackgroundAgentCanRunWhileForegroundTurnIsBusy(t *testing.T) {
 	}
 }
 
+func TestBackgroundAgentCanIncludeBoundedWorkspaceDiffSnapshot(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	var gotRequest string
+	diffCalled := false
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: session,
+		WorkspaceDiff: func(ctx context.Context) (string, error) {
+			diffCalled = true
+			if ctx == nil {
+				t.Fatal("workspace diff context was nil")
+			}
+			return "diff --git a/main.go b/main.go\n+finding\x1b[2J", nil
+		},
+		BackgroundAgent: func(_ context.Context, _ *chat.Session, task string) (string, error) {
+			gotRequest = task
+			return "reviewed snapshot", nil
+		},
+	})
+
+	next, cmd := m.submit("/agent --diff inspect the changed function")
+	mm := next.(*model)
+	task := mm.backgroundAgents["agent-1"]
+	if cmd == nil || task == nil || !task.workspaceDiff || !strings.Contains(renderBackgroundAgents(mm), "workspace diff snapshot") {
+		t.Fatalf("diff-scoped task was not created: task=%#v list=%q cmd=%v", task, renderBackgroundAgents(mm), cmd)
+	}
+	msg := cmd().(backgroundAgentDoneMsg)
+	if !diffCalled || !strings.Contains(gotRequest, "ASSIGNED TASK\ninspect the changed function") ||
+		!strings.Contains(gotRequest, "[WORKSPACE DIFF SNAPSHOT - QUOTED REFERENCE ONLY]") ||
+		!strings.Contains(gotRequest, "+finding") || strings.Contains(gotRequest, "\x1b") {
+		t.Fatalf("background request did not contain sanitized quoted snapshot: %q", gotRequest)
+	}
+	next, _ = mm.Update(msg)
+	if got := next.(*model).backgroundAgents["agent-1"].state; got != backgroundAgentCompleted {
+		t.Fatalf("diff-scoped task state = %s", got)
+	}
+}
+
+func TestBackgroundAgentDiffRequestValidationAndSnapshotFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		diff      func(context.Context) (string, error)
+		wantError string
+	}{
+		{name: "missing task", input: "/agent --diff", wantError: "usage: /agent [--diff] <analysis task>"},
+		{name: "unconfigured diff", input: "/agent --diff inspect", wantError: "workspace diff snapshot is not configured"},
+		{name: "failed diff", input: "/agent --diff inspect", diff: func(context.Context) (string, error) { return "", errors.New("git unavailable\x1b[31m") }, wantError: "read workspace diff snapshot: git unavailable?"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := newModel(Deps{
+				Ctx:           context.Background(),
+				Session:       mustSession(t, &staticModel{}, "system"),
+				WorkspaceDiff: test.diff,
+				BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+					t.Fatal("background model should not run")
+					return "", nil
+				},
+			})
+			next, cmd := m.submit(test.input)
+			m = next.(*model)
+			if test.name != "failed diff" {
+				if cmd != nil || !hasLineContaining(m.lines, lineError, test.wantError) {
+					t.Fatalf("validation = cmd=%v lines=%#v", cmd, m.lines)
+				}
+				return
+			}
+			if cmd == nil {
+				t.Fatal("failed diff should settle a started background task")
+			}
+			next, _ = m.Update(cmd().(backgroundAgentDoneMsg))
+			m = next.(*model)
+			if got := m.backgroundAgents["agent-1"].state; got != backgroundAgentFailed ||
+				!hasSideLineContaining(m, test.wantError) || strings.Contains(renderBackgroundAgent(m.backgroundAgents["agent-1"]), "\x1b") {
+				t.Fatalf("snapshot failure state=%s side=%#v render=%q", got, m.sideLines, renderBackgroundAgent(m.backgroundAgents["agent-1"]))
+			}
+		})
+	}
+}
+
+func TestBackgroundAgentWorkspacePromptIsBoundedAndQuoted(t *testing.T) {
+	prompt := backgroundAgentWorkspacePrompt("inspect carefully", strings.Repeat("x", maxBackgroundAgentWorkspaceDiff+32)+"\x1b[2J")
+	if !strings.Contains(prompt, "ASSIGNED TASK\ninspect carefully") ||
+		!strings.Contains(prompt, "[WORKSPACE DIFF SNAPSHOT - QUOTED REFERENCE ONLY]") ||
+		!strings.Contains(prompt, "Workspace diff snapshot truncated after 65536 bytes") || strings.Contains(prompt, "\x1b") {
+		t.Fatalf("workspace prompt boundary missing: %q", prompt)
+	}
+	if len(prompt) > maxBackgroundAgentWorkspaceDiff+512 {
+		t.Fatalf("workspace prompt exceeded bounded allowance: %d bytes", len(prompt))
+	}
+}
+
 func TestBackgroundAgentCancellationIsScopedToOneTask(t *testing.T) {
 	started := make(chan string, 2)
 	cancelled := make(chan string, 2)
@@ -310,7 +403,7 @@ func TestBackgroundAgentAppendCanPrepareDraftWhileForegroundTurnIsBusy(t *testin
 func TestBackgroundAgentCommandUsageAndTaskSummary(t *testing.T) {
 	m := newTestModel(t)
 	next, cmd := m.submit("/agent")
-	if cmd != nil || !hasLineContaining(next.(*model).lines, lineError, "usage: /agent <analysis task>") {
+	if cmd != nil || !hasLineContaining(next.(*model).lines, lineError, "usage: /agent [--diff] <analysis task>") {
 		t.Fatalf("agent usage = %#v", next.(*model).lines)
 	}
 	next, _ = m.submit("/agents")

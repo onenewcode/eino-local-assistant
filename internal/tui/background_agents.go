@@ -13,6 +13,9 @@ const (
 	maxBackgroundAgents         = 4
 	maxRetainedBackgroundAgents = 16
 	maxBackgroundAgentResult    = 64 * 1024
+	// The runtime snapshot is smaller than the regular /diff display because it
+	// shares one model request with the frozen session reference and task.
+	maxBackgroundAgentWorkspaceDiff = 64 * 1024
 	// A completed report can be larger than a sensible follow-up draft. Keep
 	// explicit user handoff bounded independently from result inspection.
 	maxBackgroundAgentAttachment = 16 * 1024
@@ -31,6 +34,7 @@ const (
 type backgroundAgentTask struct {
 	id                string
 	prompt            string
+	workspaceDiff     bool
 	sessionID         string
 	sessionGeneration uint64
 	startedAt         time.Time
@@ -43,14 +47,19 @@ type backgroundAgentTask struct {
 }
 
 func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		m.appendLine(lineError, "usage: /agent <analysis task>")
+	prompt, includeWorkspaceDiff, usageErr := parseBackgroundAgentPrompt(prompt)
+	if usageErr != "" {
+		m.appendLine(lineError, usageErr)
 		return m, nil
 	}
 	callback := m.deps.BackgroundAgent
 	if callback == nil {
 		m.appendLine(lineError, "background agent unavailable: callback is not configured")
+		return m, nil
+	}
+	workspaceDiff := m.deps.WorkspaceDiff
+	if includeWorkspaceDiff && workspaceDiff == nil {
+		m.appendLine(lineError, "background agent unavailable: workspace diff snapshot is not configured")
 		return m, nil
 	}
 	if m.activeBackgroundAgents() >= maxBackgroundAgents {
@@ -68,6 +77,7 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 	task := &backgroundAgentTask{
 		id:                id,
 		prompt:            prompt,
+		workspaceDiff:     includeWorkspaceDiff,
 		sessionID:         session.ID(),
 		sessionGeneration: generation,
 		startedAt:         time.Now(),
@@ -80,11 +90,24 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 	m.backgroundAgents[id] = task
 	m.backgroundAgentOrder = append(m.backgroundAgentOrder, id)
 	m.trimBackgroundAgents()
-	m.appendLine(lineSystem, fmt.Sprintf("background agent %s started (read-only, no tools): %s", id, backgroundAgentPreview(prompt)))
+	m.appendLine(lineSystem, fmt.Sprintf("background agent %s started (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff), backgroundAgentPreview(prompt)))
 	m.appendLine(lineSep, "")
 
 	return m, func() tea.Msg {
-		answer, err := callback(ctx, session, prompt)
+		request := prompt
+		if includeWorkspaceDiff {
+			diff, diffErr := workspaceDiff(ctx)
+			if diffErr != nil {
+				return backgroundAgentDoneMsg{
+					id:                id,
+					sessionID:         session.ID(),
+					sessionGeneration: generation,
+					err:               fmt.Errorf("read workspace diff snapshot: %w", diffErr),
+				}
+			}
+			request = backgroundAgentWorkspacePrompt(prompt, diff)
+		}
+		answer, err := callback(ctx, session, request)
 		return backgroundAgentDoneMsg{
 			id:                id,
 			sessionID:         session.ID(),
@@ -93,6 +116,53 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 			err:               err,
 		}
 	}
+}
+
+func parseBackgroundAgentPrompt(raw string) (prompt string, includeWorkspaceDiff bool, usageErr string) {
+	prompt = strings.TrimSpace(raw)
+	if prompt == "" {
+		return "", false, "usage: /agent [--diff] <analysis task>"
+	}
+	const diffFlag = "--diff"
+	if prompt == diffFlag {
+		return "", false, "usage: /agent [--diff] <analysis task>"
+	}
+	if strings.HasPrefix(prompt, diffFlag) {
+		suffix := strings.TrimPrefix(prompt, diffFlag)
+		if suffix != "" && strings.TrimSpace(suffix) != suffix {
+			prompt = strings.TrimSpace(suffix)
+			if prompt == "" {
+				return "", false, "usage: /agent [--diff] <analysis task>"
+			}
+			return prompt, true, ""
+		}
+	}
+	return prompt, false, ""
+}
+
+func backgroundAgentWorkspacePrompt(task, diff string) string {
+	payload := sanitizeDiffPayload(diff, maxBackgroundAgentWorkspaceDiff)
+	if payload.text == "" {
+		payload.text = "(no workspace changes in the captured diff)"
+	}
+
+	var b strings.Builder
+	b.WriteString("ASSIGNED TASK\n")
+	b.WriteString(task)
+	b.WriteString("\n\n[WORKSPACE DIFF SNAPSHOT - QUOTED REFERENCE ONLY]\n")
+	b.WriteString(payload.text)
+	if payload.truncated {
+		fmt.Fprintf(&b, "\n[Workspace diff snapshot truncated after %d bytes.]", maxBackgroundAgentWorkspaceDiff)
+	}
+	b.WriteString("\n[END WORKSPACE DIFF SNAPSHOT]")
+	return b.String()
+}
+
+func backgroundAgentScopeLabel(includeWorkspaceDiff bool) string {
+	if includeWorkspaceDiff {
+		return "read-only, no tools; workspace diff snapshot"
+	}
+	return "read-only, no tools"
 }
 
 func (m *model) cmdAgents(arg string) (tea.Model, tea.Cmd) {
@@ -308,7 +378,7 @@ func renderBackgroundAgents(m *model) string {
 		if task == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "  %s [%s] %s\n", task.id, task.state, backgroundAgentPreview(task.prompt))
+		fmt.Fprintf(&b, "  %s [%s; %s] %s\n", task.id, task.state, backgroundAgentScopeLabel(task.workspaceDiff), backgroundAgentPreview(task.prompt))
 	}
 	b.WriteString("Use /agents show <id> to inspect a finished result, /agents append <id> to draft it for explicit review, or /agents cancel <id> to stop an active agent.")
 	return strings.TrimRight(b.String(), "\n")
@@ -319,7 +389,7 @@ func renderBackgroundAgent(task *backgroundAgentTask) string {
 		return "Background agent\n  unavailable"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Background agent: %s\nState: %s\nTask: %s\n", task.id, task.state, backgroundAgentPreview(task.prompt))
+	fmt.Fprintf(&b, "Background agent: %s\nState: %s\nScope: %s\nTask: %s\n", task.id, task.state, backgroundAgentScopeLabel(task.workspaceDiff), backgroundAgentPreview(task.prompt))
 	if task.active() {
 		b.WriteString("Result: not available until the agent reaches a terminal state")
 		return b.String()
