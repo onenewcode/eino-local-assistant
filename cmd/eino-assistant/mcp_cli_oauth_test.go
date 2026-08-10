@@ -37,7 +37,8 @@ url = "https://mcp.example.test/v1"
 			if err := options.AuthorizationURL(ctx, "https://authorize.example.test/?state=temporary"); err != nil {
 				t.Fatalf("AuthorizationURL() error = %v", err)
 			}
-			return &oauth2.Token{AccessToken: "access-token-should-not-print"}, nil
+			options.OnRefreshProfile(&mcpoauth.RefreshProfile{ClientID: "client-id", ClientSecret: "client-secret-should-not-print", TokenURL: "https://issuer.example.test/token", AuthStyle: "in_params"})
+			return &oauth2.Token{AccessToken: "access-token-should-not-print", RefreshToken: "refresh-token-should-not-print"}, nil
 		},
 		newStore: func() mcpOAuthCredentialStore { return store },
 		openBrowser: func(string) error {
@@ -48,7 +49,7 @@ url = "https://mcp.example.test/v1"
 	if err := loginMCPServer(context.Background(), configPath, " remote ", time.Minute, true, &stdout, &stderr, deps); err != nil {
 		t.Fatalf("loginMCPServer() error = %v", err)
 	}
-	if store.savedServer != "remote" || store.savedEndpoint != "https://mcp.example.test/v1" || store.savedToken == nil || store.savedToken.AccessToken != "access-token-should-not-print" {
+	if store.savedServer != "remote" || store.savedEndpoint != "https://mcp.example.test/v1" || store.savedToken == nil || store.savedToken.AccessToken != "access-token-should-not-print" || store.savedCredential.Refresh == nil || store.savedCredential.Refresh.ClientSecret != "client-secret-should-not-print" {
 		t.Fatalf("saved OAuth credential = %#v", store)
 	}
 	updated, err := config.Load(configPath)
@@ -59,7 +60,7 @@ url = "https://mcp.example.test/v1"
 		t.Fatalf("OAuth config after login = %#v", updated.MCP.Servers)
 	}
 	output := stdout.String() + stderr.String()
-	if !strings.Contains(output, "https://authorize.example.test/") || !strings.Contains(output, `Logged in to MCP server "remote".`) || strings.Contains(output, "access-token-should-not-print") {
+	if !strings.Contains(output, "https://authorize.example.test/") || !strings.Contains(output, `Logged in to MCP server "remote".`) || strings.Contains(output, "access-token-should-not-print") || strings.Contains(output, "refresh-token-should-not-print") || strings.Contains(output, "client-secret-should-not-print") {
 		t.Fatalf("login output = %q", output)
 	}
 }
@@ -313,14 +314,15 @@ command = "mcp-server"
 }
 
 type recordingMCPOAuthStore struct {
-	savedServer   string
-	savedEndpoint string
-	savedToken    *oauth2.Token
-	loadToken     *oauth2.Token
-	loadErr       error
-	deleteCalls   int
-	saveErr       error
-	deleteErr     error
+	savedServer     string
+	savedEndpoint   string
+	savedToken      *oauth2.Token
+	savedCredential mcpoauth.Credential
+	loadToken       *oauth2.Token
+	loadErr         error
+	deleteCalls     int
+	saveErr         error
+	deleteErr       error
 }
 
 func (s *recordingMCPOAuthStore) Save(serverName, endpoint string, token *oauth2.Token) error {
@@ -331,6 +333,11 @@ func (s *recordingMCPOAuthStore) Save(serverName, endpoint string, token *oauth2
 	s.savedEndpoint = endpoint
 	s.savedToken = token
 	return nil
+}
+
+func (s *recordingMCPOAuthStore) SaveCredential(serverName, endpoint string, credential mcpoauth.Credential) error {
+	s.savedCredential = credential
+	return s.Save(serverName, endpoint, credential.Token)
 }
 
 func (s *recordingMCPOAuthStore) Load(string, string) (*oauth2.Token, error) {
@@ -356,6 +363,10 @@ type statusMCPOAuthStore struct {
 
 func (s *statusMCPOAuthStore) Save(string, string, *oauth2.Token) error {
 	return errors.New("Save should not be called while inspecting OAuth status")
+}
+
+func (s *statusMCPOAuthStore) SaveCredential(string, string, mcpoauth.Credential) error {
+	return errors.New("SaveCredential should not be called while inspecting OAuth status")
 }
 
 func (s *statusMCPOAuthStore) Load(serverName, endpoint string) (*oauth2.Token, error) {

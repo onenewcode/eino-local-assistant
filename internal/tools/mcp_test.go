@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,6 +176,125 @@ func TestConnectStreamableHTTPMCPServerUsesStoredOAuthCredential(t *testing.T) {
 	defer set.Close()
 	if len(set.Tools) != 1 || missingAuthorization.Load() != 0 {
 		t.Fatalf("OAuth MCP set = tools=%d missing_authorization=%d", len(set.Tools), missingAuthorization.Load())
+	}
+}
+
+func TestConnectStreamableHTTPMCPServerRefreshesStoredOAuthCredential(t *testing.T) {
+	const (
+		oldAccessToken  = "old-access-token"
+		newAccessToken  = "new-access-token"
+		oldRefreshToken = "old-refresh-token"
+		newRefreshToken = "new-refresh-token"
+	)
+	server := newMCPServerForTest()
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, &mcp.StreamableHTTPOptions{JSONResponse: true})
+	var tokenRequests atomic.Int32
+	var staleRequests atomic.Int32
+	var acceptedRequests atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/token":
+			tokenRequests.Add(1)
+			if err := request.ParseForm(); err != nil {
+				t.Errorf("parse refresh request: %v", err)
+				http.Error(writer, "invalid form", http.StatusBadRequest)
+				return
+			}
+			if request.Form.Get("grant_type") != "refresh_token" || request.Form.Get("refresh_token") != oldRefreshToken || request.Form.Get("client_id") != "test-client" || request.Form.Get("client_secret") != "test-secret" || request.Header.Get("Authorization") != "" {
+				t.Errorf("refresh request form=%v authorization=%q", request.Form, request.Header.Get("Authorization"))
+				http.Error(writer, "unexpected refresh request", http.StatusBadRequest)
+				return
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token","token_type":"Bearer","expires_in":3600}`))
+		case "/":
+			fallthrough
+		default:
+			switch request.Header.Get("Authorization") {
+			case "Bearer " + oldAccessToken:
+				staleRequests.Add(1)
+				http.Error(writer, "stale bearer token", http.StatusUnauthorized)
+			case "Bearer " + newAccessToken:
+				acceptedRequests.Add(1)
+				mcpHandler.ServeHTTP(writer, request)
+			default:
+				http.Error(writer, "missing bearer token", http.StatusUnauthorized)
+			}
+		}
+	}))
+	defer httpServer.Close()
+
+	var writesMu sync.Mutex
+	var writes []mcpoauth.Credential
+	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "remote-oauth", Type: mcpTransportStreamableHTTP, URL: httpServer.URL, OAuth: true, ConnectTimeout: time.Second,
+		OAuthCredentialLoader: func(serverName, endpoint string) (*mcpoauth.Credential, error) {
+			if serverName != "remote-oauth" || endpoint != httpServer.URL {
+				t.Errorf("OAuth credential load = server=%q endpoint=%q", serverName, endpoint)
+			}
+			return &mcpoauth.Credential{
+				Token:   &oauth2.Token{AccessToken: oldAccessToken, RefreshToken: oldRefreshToken, Expiry: time.Now().Add(-time.Hour)},
+				Refresh: &mcpoauth.RefreshProfile{ClientID: "test-client", ClientSecret: "test-secret", TokenURL: httpServer.URL + "/token", AuthStyle: "in_params"},
+			}, nil
+		},
+		OAuthCredentialWriter: func(serverName, endpoint string, credential mcpoauth.Credential) error {
+			if serverName != "remote-oauth" || endpoint != httpServer.URL {
+				t.Errorf("OAuth credential write = server=%q endpoint=%q", serverName, endpoint)
+			}
+			writesMu.Lock()
+			defer writesMu.Unlock()
+			writes = append(writes, credential)
+			return nil
+		},
+	}})
+	if err != nil {
+		t.Fatalf("ConnectMCPServers(refresh) error = %v", err)
+	}
+	defer set.Close()
+	if len(set.Tools) != 1 || tokenRequests.Load() != 1 || staleRequests.Load() != 0 || acceptedRequests.Load() == 0 {
+		t.Fatalf("refresh connection = tools=%d token_requests=%d stale_requests=%d accepted_requests=%d", len(set.Tools), tokenRequests.Load(), staleRequests.Load(), acceptedRequests.Load())
+	}
+	writesMu.Lock()
+	defer writesMu.Unlock()
+	if len(writes) != 1 || writes[0].Token.AccessToken != newAccessToken || writes[0].Token.RefreshToken != newRefreshToken || writes[0].Refresh == nil || writes[0].Refresh.ClientSecret != "test-secret" {
+		t.Fatalf("rotated credential writes = %#v", writes)
+	}
+}
+
+func TestConnectMCPServerRefreshFailsClosedWhenRotationCannotPersist(t *testing.T) {
+	var tokenRequests atomic.Int32
+	var mcpRequests atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/token" {
+			tokenRequests.Add(1)
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"access_token":"rotated-access","refresh_token":"rotated-refresh","token_type":"Bearer","expires_in":3600}`))
+			return
+		}
+		mcpRequests.Add(1)
+		http.Error(writer, "MCP endpoint should not receive a bearer token after an unpersisted rotation", http.StatusInternalServerError)
+	}))
+	defer httpServer.Close()
+
+	_, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "remote-oauth", Type: mcpTransportStreamableHTTP, URL: httpServer.URL, OAuth: true, ConnectTimeout: time.Second,
+		OAuthCredentialLoader: func(string, string) (*mcpoauth.Credential, error) {
+			return &mcpoauth.Credential{
+				Token:   &oauth2.Token{AccessToken: "expired-access", RefreshToken: "old-refresh", Expiry: time.Now().Add(-time.Hour)},
+				Refresh: &mcpoauth.RefreshProfile{ClientID: "test-client", TokenURL: httpServer.URL + "/token", AuthStyle: "in_params"},
+			}, nil
+		},
+		OAuthCredentialWriter: func(string, string, mcpoauth.Credential) error {
+			return errors.New("keyring write failed")
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "keyring write failed") {
+		t.Fatalf("ConnectMCPServers(unpersistable refresh) error = %v", err)
+	}
+	if tokenRequests.Load() != 1 || mcpRequests.Load() != 0 {
+		t.Fatalf("unpersistable refresh requests = token=%d mcp=%d", tokenRequests.Load(), mcpRequests.Load())
 	}
 }
 

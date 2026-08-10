@@ -87,7 +87,7 @@ eino mcp auth get remote-oauth --json
 eino mcp logout remote-oauth
 ```
 
-`mcp login` 通过 MCP OAuth metadata discovery、dynamic client registration、PKCE 和仅绑定 `127.0.0.1` 的 loopback callback 获取 token；token 只保存到系统 keyring，并与配置 endpoint 精确绑定。`mcp auth list|get` 不联网，只报告本地 `available`、`expired`、`missing`、`endpoint_mismatch` 或 `keyring_unavailable` 状态和可选 expiry，不能当成远程 server health check。运行时只会为已标记 OAuth 的 server 读取它；token 缺失、endpoint 变更、过期或被 server 拒绝时会明确提示再次运行 `eino mcp login <name>`，不会从 TUI 或 `exec` 暗中拉起浏览器。`mcp logout` 仅删除本地 keyring 凭据和 OAuth 标记，不承诺向 provider 发起 token revoke。当前不支持任意静态 headers、预注册 OAuth client、持久化 client registration、refresh token 或 health/debug。
+`mcp login` 通过 MCP OAuth metadata discovery、dynamic client registration、PKCE 和仅绑定 `127.0.0.1` 的 loopback callback 获取 token，并只将 token、DCR client identity 和 refresh context 保存在系统 keyring；它们与配置 endpoint 精确绑定。运行时会在 access token 过期后用保存的 refresh context 刷新，且仅在新的 token 已成功写回 keyring 后才把它发往 MCP endpoint，支持 refresh-token rotation。旧版 keyring 凭据、未返回 refresh token 的 provider，或 credential 缺失、无效、endpoint 变更和被 server 拒绝时，会明确提示再次运行 `eino mcp login <name>`，不会从 TUI 或 `exec` 暗中拉起浏览器。`mcp auth list|get` 不联网，只报告本地 `available`、`expired`、`missing`、`endpoint_mismatch` 或 `keyring_unavailable` 状态和可选 expiry，不能当成远程 server health check 或 refresh 预检。`mcp logout` 仅删除本地 keyring 凭据和 OAuth 标记，不承诺向 provider 发起 token revoke。当前不支持任意静态 headers、预注册 OAuth client、provider-side revoke 或 health/debug。
 
 ```toml
 [[mcp.servers]]

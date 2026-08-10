@@ -24,6 +24,7 @@ const oauthCallbackPath = "/mcp-oauth/callback"
 type LoginOptions struct {
 	AuthorizationURL func(context.Context, string) error
 	HTTPClient       *http.Client
+	OnRefreshProfile func(*RefreshProfile)
 }
 
 // Login acquires one MCP OAuth access token through metadata discovery,
@@ -53,14 +54,19 @@ func Login(ctx context.Context, endpoint string, options LoginOptions) (*oauth2.
 			Metadata: &oauthex.ClientRegistrationMetadata{
 				ClientName:   "Eino Local Assistant",
 				RedirectURIs: []string{callback.URL()},
+				GrantTypes:   []string{"authorization_code", "refresh_token"},
 			},
 		},
 		RedirectURL:              callback.URL(),
 		AuthorizationCodeFetcher: callback.Fetch,
 		Client:                   httpClient,
-		// Refresh requests need durable client-registration state and a token
-		// rotation policy. Do not request one until that lifecycle is implemented.
-		RequestRefreshToken: false,
+		RequestRefreshToken:      true,
+		NewTokenSource: func(refreshCtx context.Context, oauthConfig *oauth2.Config, token *oauth2.Token) (oauth2.TokenSource, error) {
+			if options.OnRefreshProfile != nil {
+				options.OnRefreshProfile(RefreshProfileFromOAuthConfig(oauthConfig))
+			}
+			return oauthConfig.TokenSource(refreshCtx, token), nil
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("configure MCP OAuth authorization: %w", err)

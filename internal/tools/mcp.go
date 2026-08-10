@@ -24,22 +24,32 @@ import (
 // MCPServerOptions describes one explicitly configured MCP server. An empty
 // Type is kept as a stdio default for embedding callers using the older API.
 type MCPServerOptions struct {
-	Name              string
-	Type              string
-	Command           string
-	Args              []string
-	WorkingDir        string
-	Env               map[string]string
-	URL               string
-	BearerTokenEnvVar string
-	OAuth             bool
-	OAuthTokenLoader  MCPOAuthTokenLoader
-	ConnectTimeout    time.Duration
+	Name                  string
+	Type                  string
+	Command               string
+	Args                  []string
+	WorkingDir            string
+	Env                   map[string]string
+	URL                   string
+	BearerTokenEnvVar     string
+	OAuth                 bool
+	OAuthTokenLoader      MCPOAuthTokenLoader
+	OAuthCredentialLoader MCPOAuthCredentialLoader
+	OAuthCredentialWriter MCPOAuthCredentialWriter
+	ConnectTimeout        time.Duration
 }
 
 // MCPOAuthTokenLoader makes an OAuth-enabled embedding explicit and keeps
 // system-keyring access out of callers that supply their own credential store.
 type MCPOAuthTokenLoader func(serverName, endpoint string) (*oauth2.Token, error)
+
+// MCPOAuthCredentialLoader supplies endpoint-bound OAuth state to embedding
+// callers that do not use the default system keyring store.
+type MCPOAuthCredentialLoader func(serverName, endpoint string) (*mcpoauth.Credential, error)
+
+// MCPOAuthCredentialWriter persists a rotated OAuth credential for an
+// embedding caller. It must use an equally secure credential store.
+type MCPOAuthCredentialWriter func(serverName, endpoint string, credential mcpoauth.Credential) error
 
 const (
 	mcpTransportStdio          = "stdio"
@@ -182,15 +192,22 @@ func mcpClientTransport(opts MCPServerOptions) (mcp.Transport, error) {
 		var client *http.Client
 		var oauthHandler *storedMCPOAuthHandler
 		if opts.OAuth {
-			token, tokenErr := loadMCPStoredOAuthToken(opts, endpoint)
+			credential, writer, tokenErr := loadMCPStoredOAuthCredential(opts, endpoint)
 			if tokenErr != nil {
 				return nil, tokenErr
 			}
-			if !token.Valid() {
-				return nil, fmt.Errorf("MCP OAuth credential for server %q has expired; run %q", opts.Name, "eino mcp login "+opts.Name)
-			}
 			client = newMCPNoRedirectHTTPClient()
-			oauthHandler = newStoredMCPOAuthHandler(opts.Name, token)
+			source, sourceErr := mcpoauth.NewTokenSource(credential, client, writer)
+			if errors.Is(sourceErr, mcpoauth.ErrRefreshUnavailable) {
+				return nil, fmt.Errorf("MCP OAuth credential for server %q cannot be refreshed; run %q", opts.Name, "eino mcp login "+opts.Name)
+			}
+			if errors.Is(sourceErr, mcpoauth.ErrInvalidCredential) {
+				return nil, fmt.Errorf("MCP OAuth credential is invalid for server %q; run %q", opts.Name, "eino mcp login "+opts.Name)
+			}
+			if sourceErr != nil {
+				return nil, fmt.Errorf("prepare MCP OAuth credential for server %q: %w", opts.Name, sourceErr)
+			}
+			oauthHandler = newStoredMCPOAuthHandler(opts.Name, source)
 		}
 		if envVar := strings.TrimSpace(opts.BearerTokenEnvVar); envVar != "" {
 			token, ok := os.LookupEnv(envVar)
@@ -209,24 +226,41 @@ func mcpClientTransport(opts MCPServerOptions) (mcp.Transport, error) {
 	}
 }
 
-func loadMCPStoredOAuthToken(opts MCPServerOptions, endpoint string) (*oauth2.Token, error) {
-	loader := opts.OAuthTokenLoader
-	if loader == nil {
-		loader = func(serverName, serverEndpoint string) (*oauth2.Token, error) {
-			return mcpoauth.NewSystemStore().Load(serverName, serverEndpoint)
-		}
+func loadMCPStoredOAuthCredential(opts MCPServerOptions, endpoint string) (*mcpoauth.Credential, mcpoauth.CredentialWriter, error) {
+	serverName := strings.TrimSpace(opts.Name)
+	if opts.OAuthCredentialLoader != nil {
+		credential, err := opts.OAuthCredentialLoader(serverName, endpoint)
+		return credential, mcpOAuthCredentialWriter(opts, serverName, endpoint), mcpOAuthCredentialLoadError(opts.Name, err)
 	}
-	token, err := loader(strings.TrimSpace(opts.Name), endpoint)
-	if errors.Is(err, mcpoauth.ErrNotFound) || errors.Is(err, mcpoauth.ErrEndpointMismatch) {
-		return nil, fmt.Errorf("MCP OAuth credential is unavailable for server %q; run %q", opts.Name, "eino mcp login "+opts.Name)
+	if opts.OAuthTokenLoader != nil {
+		token, err := opts.OAuthTokenLoader(serverName, endpoint)
+		return &mcpoauth.Credential{Token: token}, nil, mcpOAuthCredentialLoadError(opts.Name, err)
+	}
+	store := mcpoauth.NewSystemStore()
+	credential, err := store.LoadCredential(serverName, endpoint)
+	writer := func(updated mcpoauth.Credential) error {
+		return store.SaveCredential(serverName, endpoint, updated)
+	}
+	return credential, writer, mcpOAuthCredentialLoadError(opts.Name, err)
+}
+
+func mcpOAuthCredentialWriter(opts MCPServerOptions, serverName, endpoint string) mcpoauth.CredentialWriter {
+	if opts.OAuthCredentialWriter == nil {
+		return nil
+	}
+	return func(credential mcpoauth.Credential) error {
+		return opts.OAuthCredentialWriter(serverName, endpoint, credential)
+	}
+}
+
+func mcpOAuthCredentialLoadError(serverName string, err error) error {
+	if errors.Is(err, mcpoauth.ErrNotFound) || errors.Is(err, mcpoauth.ErrEndpointMismatch) || errors.Is(err, mcpoauth.ErrInvalidCredential) {
+		return fmt.Errorf("MCP OAuth credential is unavailable for server %q; run %q", serverName, "eino mcp login "+serverName)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load MCP OAuth credential for server %q: %w", opts.Name, err)
+		return fmt.Errorf("load MCP OAuth credential for server %q: %w", serverName, err)
 	}
-	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
-		return nil, fmt.Errorf("MCP OAuth credential is invalid for server %q; run %q", opts.Name, "eino mcp login "+opts.Name)
-	}
-	return token, nil
+	return nil
 }
 
 func newMCPBearerTokenHTTPClient(token string) *http.Client {
@@ -265,16 +299,15 @@ func (t bearerTokenRoundTripper) RoundTrip(request *http.Request) (*http.Respons
 // flow. Runtime 401 responses must direct the user to explicit mcp login.
 type storedMCPOAuthHandler struct {
 	serverName string
-	token      *oauth2.Token
+	source     oauth2.TokenSource
 }
 
-func newStoredMCPOAuthHandler(serverName string, token *oauth2.Token) *storedMCPOAuthHandler {
-	tokenCopy := *token
-	return &storedMCPOAuthHandler{serverName: strings.TrimSpace(serverName), token: &tokenCopy}
+func newStoredMCPOAuthHandler(serverName string, source oauth2.TokenSource) *storedMCPOAuthHandler {
+	return &storedMCPOAuthHandler{serverName: strings.TrimSpace(serverName), source: source}
 }
 
 func (h *storedMCPOAuthHandler) TokenSource(context.Context) (oauth2.TokenSource, error) {
-	return oauth2.StaticTokenSource(h.token), nil
+	return h.source, nil
 }
 
 func (h *storedMCPOAuthHandler) Authorize(_ context.Context, _ *http.Request, response *http.Response) error {

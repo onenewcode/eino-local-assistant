@@ -53,13 +53,14 @@ func TestLoginDiscoversMetadataUsesPKCEAndReceivesLoopbackCallback(t *testing.T)
 			var payload struct {
 				ClientName   string   `json:"client_name"`
 				RedirectURIs []string `json:"redirect_uris"`
+				GrantTypes   []string `json:"grant_types"`
 			}
 			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 				t.Errorf("decode registration: %v", err)
 				http.Error(writer, "invalid registration", http.StatusBadRequest)
 				return
 			}
-			registration.Store(payload.ClientName, payload.RedirectURIs)
+			registration.Store(payload.ClientName, payload.RedirectURIs, payload.GrantTypes)
 			writeOAuthJSON(t, writer, map[string]any{"client_id": "eino-test-client", "token_endpoint_auth_method": "none"})
 		case "/token":
 			if err := request.ParseForm(); err != nil {
@@ -68,7 +69,7 @@ func TestLoginDiscoversMetadataUsesPKCEAndReceivesLoopbackCallback(t *testing.T)
 				return
 			}
 			tokenRequest.Store(request.Form)
-			writeOAuthJSON(t, writer, map[string]any{"access_token": accessToken, "token_type": "Bearer", "expires_in": 3600})
+			writeOAuthJSON(t, writer, map[string]any{"access_token": accessToken, "refresh_token": "test-refresh-token", "token_type": "Bearer", "expires_in": 3600})
 		default:
 			http.NotFound(writer, request)
 		}
@@ -76,6 +77,7 @@ func TestLoginDiscoversMetadataUsesPKCEAndReceivesLoopbackCallback(t *testing.T)
 	defer httpServer.Close()
 	baseURL = httpServer.URL
 
+	var refreshProfile *RefreshProfile
 	token, err := Login(context.Background(), baseURL+"/mcp", LoginOptions{
 		AuthorizationURL: func(_ context.Context, authorizationURL string) error {
 			metadata.Store(authorizationURL)
@@ -90,12 +92,15 @@ func TestLoginDiscoversMetadataUsesPKCEAndReceivesLoopbackCallback(t *testing.T)
 			}
 			return callback.Body.Close()
 		},
+		OnRefreshProfile: func(profile *RefreshProfile) {
+			refreshProfile = profile
+		},
 	})
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
-	if token.AccessToken != accessToken {
-		t.Fatalf("access token = %q", token.AccessToken)
+	if token.AccessToken != accessToken || token.RefreshToken != "test-refresh-token" {
+		t.Fatalf("token = %#v", token)
 	}
 	parsedAuthorizationURL, err := url.Parse(metadata.Load())
 	if err != nil {
@@ -105,13 +110,16 @@ func TestLoginDiscoversMetadataUsesPKCEAndReceivesLoopbackCallback(t *testing.T)
 	if parsedAuthorizationURL.Path != "/authorize" || query.Get("resource") != baseURL+"/mcp" || query.Get("code_challenge_method") != "S256" || query.Get("code_challenge") == "" || query.Get("state") == "" {
 		t.Fatalf("authorization URL = %s", metadata.Load())
 	}
-	clientName, redirectURIs := registration.Load()
-	if clientName != "Eino Local Assistant" || len(redirectURIs) != 1 || !strings.HasPrefix(redirectURIs[0], "http://127.0.0.1:") || !strings.HasSuffix(redirectURIs[0], oauthCallbackPath) {
-		t.Fatalf("dynamic registration = name=%q redirect_uris=%#v", clientName, redirectURIs)
+	clientName, redirectURIs, grantTypes := registration.Load()
+	if clientName != "Eino Local Assistant" || len(redirectURIs) != 1 || !strings.HasPrefix(redirectURIs[0], "http://127.0.0.1:") || !strings.HasSuffix(redirectURIs[0], oauthCallbackPath) || !containsString(grantTypes, "refresh_token") {
+		t.Fatalf("dynamic registration = name=%q redirect_uris=%#v grant_types=%#v", clientName, redirectURIs, grantTypes)
 	}
 	form := tokenRequest.Load()
 	if form.Get("code") != "authorization-code" || form.Get("resource") != baseURL+"/mcp" || form.Get("code_verifier") == "" || form.Get("client_id") != "eino-test-client" {
 		t.Fatalf("token request = %v", form)
+	}
+	if refreshProfile == nil || refreshProfile.ClientID != "eino-test-client" || refreshProfile.TokenURL != baseURL+"/token" || refreshProfile.AuthStyle != "in_params" {
+		t.Fatalf("refresh profile = %#v", refreshProfile)
 	}
 }
 
@@ -184,19 +192,21 @@ type muRegistration struct {
 	mu           sync.Mutex
 	clientName   string
 	redirectURIs []string
+	grantTypes   []string
 }
 
-func (r *muRegistration) Store(clientName string, redirectURIs []string) {
+func (r *muRegistration) Store(clientName string, redirectURIs, grantTypes []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.clientName = clientName
 	r.redirectURIs = append([]string(nil), redirectURIs...)
+	r.grantTypes = append([]string(nil), grantTypes...)
 }
 
-func (r *muRegistration) Load() (string, []string) {
+func (r *muRegistration) Load() (string, []string, []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.clientName, append([]string(nil), r.redirectURIs...)
+	return r.clientName, append([]string(nil), r.redirectURIs...), append([]string(nil), r.grantTypes...)
 }
 
 type muValues struct {
@@ -222,4 +232,13 @@ func writeOAuthJSON(t *testing.T, writer http.ResponseWriter, value any) {
 	if err := json.NewEncoder(writer).Encode(value); err != nil {
 		t.Errorf("encode OAuth response: %v", err)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

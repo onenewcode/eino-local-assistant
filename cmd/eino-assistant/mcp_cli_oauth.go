@@ -21,6 +21,7 @@ const defaultMCPOAuthLoginTimeout = 5 * time.Minute
 
 type mcpOAuthCredentialStore interface {
 	Save(serverName, endpoint string, token *oauth2.Token) error
+	SaveCredential(serverName, endpoint string, credential mcpoauth.Credential) error
 	Load(serverName, endpoint string) (*oauth2.Token, error)
 	Delete(serverName string) error
 }
@@ -104,6 +105,7 @@ func loginMCPServer(ctx context.Context, configPath, name string, timeout time.D
 	}
 	flowCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	var refreshProfile *mcpoauth.RefreshProfile
 	token, err := deps.login(flowCtx, server.URL, mcpoauth.LoginOptions{
 		AuthorizationURL: func(callbackCtx context.Context, authorizationURL string) error {
 			if _, writeErr := fmt.Fprintln(stdout, "Open the following URL to authorize MCP access:"); writeErr != nil {
@@ -120,6 +122,9 @@ func loginMCPServer(ctx context.Context, configPath, name string, timeout time.D
 			}
 			return callbackCtx.Err()
 		},
+		OnRefreshProfile: func(profile *mcpoauth.RefreshProfile) {
+			refreshProfile = profile
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("log in to MCP server %q: %w", server.Name, err)
@@ -128,7 +133,7 @@ func loginMCPServer(ctx context.Context, configPath, name string, timeout time.D
 	if store == nil {
 		return errors.New("MCP OAuth keyring is unavailable")
 	}
-	if err := store.Save(server.Name, server.URL, token); err != nil {
+	if err := store.SaveCredential(server.Name, server.URL, mcpoauth.Credential{Token: token, Refresh: refreshProfile}); err != nil {
 		return err
 	}
 	if current, currentErr := configuredMCPServerForOAuth(configPath, server.Name); currentErr != nil || current.URL != server.URL {

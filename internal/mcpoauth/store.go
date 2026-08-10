@@ -36,6 +36,22 @@ type Store struct {
 	backend SecretBackend
 }
 
+// Credential is the keyring-only state needed to use one MCP OAuth grant.
+// Refresh is omitted for credentials created before refresh support.
+type Credential struct {
+	Token   *oauth2.Token
+	Refresh *RefreshProfile
+}
+
+// RefreshProfile contains the DCR client identity needed to rotate a token.
+// It is sensitive when ClientSecret is set and must only be stored in keyring.
+type RefreshProfile struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	TokenURL     string `json:"token_url"`
+	AuthStyle    string `json:"auth_style"`
+}
+
 // NewSystemStore uses the current operating system's keyring. It never
 // downgrades to a regular file when the keyring is unavailable.
 func NewSystemStore() *Store {
@@ -47,19 +63,28 @@ func NewStore(backend SecretBackend) *Store {
 	return &Store{backend: backend}
 }
 
-// Save writes one token after validating that it is bound to a configured
-// server endpoint. The keyring receives the serialized secret, never TOML.
+// Save writes a non-refreshable credential for callers that only have an
+// access token. The keyring receives the serialized secret, never TOML.
 func (s *Store) Save(serverName, endpoint string, token *oauth2.Token) error {
+	return s.SaveCredential(serverName, endpoint, Credential{Token: token})
+}
+
+// SaveCredential writes one token and its optional refresh profile after
+// validating that both remain bound to a configured server endpoint.
+func (s *Store) SaveCredential(serverName, endpoint string, credential Credential) error {
 	if err := validateServer(serverName, endpoint); err != nil {
 		return err
 	}
 	if s == nil || s.backend == nil {
 		return errors.New("MCP OAuth keyring is unavailable")
 	}
-	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
+	if credential.Token == nil || strings.TrimSpace(credential.Token.AccessToken) == "" {
 		return errors.New("MCP OAuth access token is empty")
 	}
-	payload, err := json.Marshal(storedCredential{Version: 1, Endpoint: strings.TrimSpace(endpoint), Token: token})
+	if err := validateRefreshProfile(credential.Refresh); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(storedCredential{Version: 2, Endpoint: strings.TrimSpace(endpoint), Token: credential.Token, Refresh: credential.Refresh})
 	if err != nil {
 		return fmt.Errorf("encode MCP OAuth credential: %w", err)
 	}
@@ -70,9 +95,20 @@ func (s *Store) Save(serverName, endpoint string, token *oauth2.Token) error {
 }
 
 // Load returns a copied token only when its stored endpoint matches exactly.
-// This prevents a credential retained under a reused server name from being
-// sent to a newly configured endpoint.
+// This preserves the original access-token API for callers that do not use
+// refresh support.
 func (s *Store) Load(serverName, endpoint string) (*oauth2.Token, error) {
+	credential, err := s.LoadCredential(serverName, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return credential.Token, nil
+}
+
+// LoadCredential returns a copy of the endpoint-bound OAuth credential. It
+// accepts version 1 entries so existing keyring state remains usable until an
+// access token expires and the user performs a new login.
+func (s *Store) LoadCredential(serverName, endpoint string) (*Credential, error) {
 	if err := validateServer(serverName, endpoint); err != nil {
 		return nil, err
 	}
@@ -90,14 +126,19 @@ func (s *Store) Load(serverName, endpoint string) (*oauth2.Token, error) {
 	if err := json.Unmarshal([]byte(payload), &stored); err != nil {
 		return nil, fmt.Errorf("%w: decode stored value: %v", ErrInvalidCredential, err)
 	}
-	if stored.Version != 1 || stored.Token == nil || strings.TrimSpace(stored.Token.AccessToken) == "" {
+	if (stored.Version != 1 && stored.Version != 2) || stored.Token == nil || strings.TrimSpace(stored.Token.AccessToken) == "" {
 		return nil, ErrInvalidCredential
 	}
 	if stored.Endpoint != strings.TrimSpace(endpoint) {
 		return nil, ErrEndpointMismatch
 	}
-	tokenCopy := *stored.Token
-	return &tokenCopy, nil
+	if stored.Version == 2 {
+		if err := validateRefreshProfile(stored.Refresh); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidCredential, err)
+		}
+	}
+	credential := Credential{Token: copyToken(stored.Token), Refresh: copyRefreshProfile(stored.Refresh)}
+	return &credential, nil
 }
 
 // Delete removes one server's stored credential. A missing credential remains
@@ -118,9 +159,26 @@ func (s *Store) Delete(serverName string) error {
 }
 
 type storedCredential struct {
-	Version  int           `json:"version"`
-	Endpoint string        `json:"endpoint"`
-	Token    *oauth2.Token `json:"token"`
+	Version  int             `json:"version"`
+	Endpoint string          `json:"endpoint"`
+	Token    *oauth2.Token   `json:"token"`
+	Refresh  *RefreshProfile `json:"refresh,omitempty"`
+}
+
+func copyToken(token *oauth2.Token) *oauth2.Token {
+	if token == nil {
+		return nil
+	}
+	tokenCopy := *token
+	return &tokenCopy
+}
+
+func copyRefreshProfile(profile *RefreshProfile) *RefreshProfile {
+	if profile == nil {
+		return nil
+	}
+	profileCopy := *profile
+	return &profileCopy
 }
 
 type systemKeyring struct{}
