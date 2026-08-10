@@ -217,13 +217,13 @@ func TestDeleteRefusesActiveAndDeletesOther(t *testing.T) {
 		Status:  StatusInfo{Model: "m"},
 	})
 
-	next, _ := m.submit("/delete " + active.ID())
+	next, _ := m.submit("/delete " + active.ID() + " --yes")
 	mm := next.(*model)
 	if !hasLineContaining(mm.lines, lineError, "cannot delete the active session") {
 		t.Fatalf("expected active refuse: %#v", mm.lines)
 	}
 
-	next, _ = mm.submit("/delete " + other.ID())
+	next, _ = mm.submit("/delete " + other.ID() + " --yes")
 	mm = next.(*model)
 	if !hasLineContaining(mm.lines, lineSystem, "deleted session "+other.ID()) {
 		t.Fatalf("expected delete ok: %#v", mm.lines)
@@ -235,6 +235,95 @@ func TestDeleteRefusesActiveAndDeletesOther(t *testing.T) {
 	for _, meta := range list {
 		if meta.ID == other.ID() {
 			t.Fatalf("other session still present")
+		}
+	}
+}
+
+func TestDeleteRequiresConfirmationAndResolvesNamesAcrossLifecycle(t *testing.T) {
+	ctx := context.Background()
+	m, threadStore, active := newSessionPickerTestModel(t)
+	other := newSessionPickerTestSession(t, threadStore, "Finished work")
+	archived := newSessionPickerTestSession(t, threadStore, "Archived cleanup")
+	state, err := threadStore.LoadThread(ctx, archived.ID())
+	if err != nil {
+		t.Fatalf("LoadThread archived: %v", err)
+	}
+	if _, err := threadStore.ArchiveThread(ctx, archived.ID(), state.Revision); err != nil {
+		t.Fatalf("ArchiveThread: %v", err)
+	}
+	m.textarea.SetValue("draft must survive delete confirmation error")
+
+	next, _ := m.submit("/delete Finished work")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineError, "delete requires --yes or --force") || mm.activeSession() != active || mm.textarea.Value() != "draft must survive delete confirmation error" {
+		t.Fatalf("unconfirmed delete changed TUI state: lines=%#v active=%p draft=%q", mm.lines, mm.activeSession(), mm.textarea.Value())
+	}
+	if _, err := threadStore.LoadThreadMeta(ctx, other.ID()); err != nil {
+		t.Fatalf("unconfirmed delete removed session: %v", err)
+	}
+
+	next, _ = mm.submit("/delete Finished work --yes")
+	mm = next.(*model)
+	if !hasLineContaining(mm.lines, lineSystem, "deleted session "+other.ID()) {
+		t.Fatalf("name delete confirmation missing: %#v", mm.lines)
+	}
+	if _, err := threadStore.LoadThreadMeta(ctx, other.ID()); err == nil {
+		t.Fatal("name-selected session still exists after delete")
+	}
+
+	next, _ = mm.submit("/delete Archived cleanup --force")
+	mm = next.(*model)
+	if !hasLineContaining(mm.lines, lineSystem, "deleted session "+archived.ID()) {
+		t.Fatalf("archived name force confirmation missing: %#v", mm.lines)
+	}
+	if _, err := threadStore.LoadThreadMeta(ctx, archived.ID()); err == nil {
+		t.Fatal("archived name-selected session still exists after delete")
+	}
+
+	next, _ = mm.submit("/delete Active session --yes")
+	mm = next.(*model)
+	if mm.activeSession() != active || !hasLineContaining(mm.lines, lineError, "cannot delete the active session") {
+		t.Fatalf("active name delete changed TUI state: active=%p lines=%#v", mm.activeSession(), mm.lines)
+	}
+
+	duplicateActive := newSessionPickerTestSession(t, threadStore, "Duplicate lifecycle name")
+	duplicateArchived := newSessionPickerTestSession(t, threadStore, "Duplicate lifecycle name")
+	state, err = threadStore.LoadThread(ctx, duplicateArchived.ID())
+	if err != nil {
+		t.Fatalf("LoadThread duplicate archived: %v", err)
+	}
+	if _, err := threadStore.ArchiveThread(ctx, duplicateArchived.ID(), state.Revision); err != nil {
+		t.Fatalf("ArchiveThread duplicate: %v", err)
+	}
+	next, _ = mm.submit("/delete Duplicate lifecycle name --yes")
+	mm = next.(*model)
+	if !hasLineContaining(mm.lines, lineError, "session name \"Duplicate lifecycle name\" is ambiguous") {
+		t.Fatalf("cross-lifecycle duplicate was not rejected: %#v", mm.lines)
+	}
+	if _, err := threadStore.LoadThreadMeta(ctx, duplicateActive.ID()); err != nil {
+		t.Fatalf("ambiguous active duplicate was deleted: %v", err)
+	}
+	if _, err := threadStore.LoadThreadMeta(ctx, duplicateArchived.ID()); err != nil {
+		t.Fatalf("ambiguous archived duplicate was deleted: %v", err)
+	}
+}
+
+func TestParseDeleteArgs(t *testing.T) {
+	for _, tc := range []struct {
+		input         string
+		wantSelector  string
+		wantConfirmed bool
+	}{
+		{input: "", wantSelector: "", wantConfirmed: false},
+		{input: "session-id", wantSelector: "session-id", wantConfirmed: false},
+		{input: "Release cleanup --yes", wantSelector: "Release cleanup", wantConfirmed: true},
+		{input: "Release cleanup --force", wantSelector: "Release cleanup", wantConfirmed: true},
+		{input: "--yes", wantSelector: "--yes", wantConfirmed: false},
+		{input: "Release cleanup --yes later", wantSelector: "Release cleanup --yes later", wantConfirmed: false},
+	} {
+		selector, confirmed := parseDeleteArgs(tc.input)
+		if selector != tc.wantSelector || confirmed != tc.wantConfirmed {
+			t.Fatalf("parseDeleteArgs(%q) = (%q, %t), want (%q, %t)", tc.input, selector, confirmed, tc.wantSelector, tc.wantConfirmed)
 		}
 	}
 }

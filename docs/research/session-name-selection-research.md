@@ -2,7 +2,7 @@
 
 > Status: research note, not an implementation plan.
 >
-> Research date: 2026-08-10; re-verify before adoption.
+> Research date: 2026-08-10; revalidated on 2026-08-11 before deletion-selector adoption.
 >
 > Scope: display names as an ergonomic session selector in deployed coding-agent CLIs, including identity precedence, ambiguity, and lifecycle boundaries.
 >
@@ -21,6 +21,8 @@
 **Fact (locally installed product observation):** Codex CLI `0.146.0` reports `codex resume [SESSION_ID] [PROMPT]`. Its help says `SESSION_ID` accepts a session UUID or session name, that UUIDs take precedence when a selector parses as one, and that `--last` selects the most recent recorded session when no ID is supplied. Observed 2026-08-10. The public source project is [openai/codex](https://github.com/openai/codex), with the product reference at [Codex CLI reference](https://developers.openai.com/codex/cli/reference/).
 
 **Fact (locally installed product observation):** The same Codex installation describes `archive` and `unarchive` selectors as "Session id (UUID) or session name. UUIDs take precedence if it parses." This shows name selection is used for both navigation and non-destructive lifecycle actions, not only initial chat creation. Observed 2026-08-10.
+
+**Fact (locally installed product observation):** Codex CLI `0.146.0` now describes `codex delete <SESSION>` as deleting by ID or name, with the same UUID-precedence wording. The separate `--force` shortcut requires a UUID. Revalidated 2026-08-11.
 
 ### Claude Code
 
@@ -48,5 +50,5 @@
 
 ## References
 
-- Codex CLI `0.146.0`: local `codex resume --help`, `codex archive --help`, and `codex unarchive --help`, observed 2026-08-10; [Codex CLI reference](https://developers.openai.com/codex/cli/reference/) and [openai/codex](https://github.com/openai/codex).
+- Codex CLI `0.146.0`: local `codex resume --help`, `codex archive --help`, `codex unarchive --help`, and `codex delete --help`, observed 2026-08-10 and revalidated 2026-08-11; [Codex CLI reference](https://developers.openai.com/codex/cli/reference/) and [openai/codex](https://github.com/openai/codex).
 - Claude Code `2.1.220`: local `claude --help`, observed 2026-08-10; [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference/).

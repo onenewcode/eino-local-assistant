@@ -30,7 +30,7 @@ TUI 中 `/fork` 保持分叉当前 session；`/fork <session-id-or-name>` 从另
 
 `--name`（`-n`）是新建 chat 或 fork child 的 display name 入口，与旧有 `--title` 使用同一 durable 字段，不能同时给出。`resume`、`fork`、`exec resume`、`archive`、`unarchive`、`export` 与 `delete` 都可接受完整 display name；ID 始终优先，大小写不同、前缀或子串都不会猜测。名称重复时会列出候选 ID 并拒绝操作，供脚本稳定地改用 ID。
 
-`eino delete <session-id-or-name> --yes` 会永久删除一个已保存 session；`--force` 是等价的显式确认写法。删除不启动 TUI 或模型，且会拒绝仍有 active turn 或 pending compaction 的 session，避免删除可能继续写入或需要恢复的 durable journal。删除不可恢复，可先用 `eino sessions` 核对 ID 或用 `eino export` 保留 transcript。
+`eino delete <session-id-or-name> --yes` 会永久删除一个已保存 session；`--force` 是等价的显式确认写法。TUI 使用相同的 `/delete <session-id-or-name> --yes|--force` 确认边界，不能删除当前 session。删除不启动 TUI 或模型，且会拒绝仍有 active turn 或 pending compaction 的 session，避免删除可能继续写入或需要恢复的 durable journal。删除不可恢复，可先用 `eino sessions` 核对 ID 或用 `eino export` 保留 transcript。
 
 `eino archive <session-id-or-name>` 会非破坏性地整理一个已结束的 session：journal、transcript、checkpoint、artifact 与 usage 都保留，但正常 `eino sessions`、`resume --last` 与 `fork --last` 不再选择它。可用 `eino sessions --archived` 查看，再以 `eino unarchive <session-id-or-name>` 恢复；仍有 active turn 或 pending compaction 的 session 必须先按正常恢复流程结束，不能直接改变归档状态。
 

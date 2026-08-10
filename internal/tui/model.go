@@ -2276,7 +2276,7 @@ func (m *model) cmdSessions(arg string) (tea.Model, tea.Cmd) {
 	if archived {
 		b.WriteString("Use /unarchive <id-or-name> to restore a session.")
 	} else {
-		b.WriteString("Use /resume to choose, /resume <id-or-name>, /resume --last, /archive <id-or-name>, or /delete <id>.")
+		b.WriteString("Use /resume to choose, /resume <id-or-name>, /resume --last, /archive <id-or-name>, or /delete <id-or-name> --yes.")
 	}
 	m.appendLine(lineSystem, strings.TrimRight(b.String(), "\n"))
 	m.appendLine(lineSep, "")
@@ -2320,6 +2320,7 @@ type sessionSelectorScope int
 const (
 	sessionSelectorActive sessionSelectorScope = iota
 	sessionSelectorArchived
+	sessionSelectorAll
 )
 
 // resolveResumeSelector preserves ID precedence while allowing an exact active
@@ -2355,6 +2356,18 @@ func (m *model) resolveSessionSelector(selector string, scope sessionSelectorSco
 			return "", errors.New("archived session selection is unavailable in this TUI")
 		}
 		list, err = archiveStore.ListArchivedThreads(m.processCtx())
+	case sessionSelectorAll:
+		label = "saved"
+		list, err = m.deps.Store.ListThreads(m.processCtx())
+		if err == nil {
+			archiveStore, ok := m.deps.Store.(store.ThreadArchiveRepository)
+			if !ok {
+				return "", errors.New("archived session selection is unavailable in this TUI")
+			}
+			var archived []store.ThreadMeta
+			archived, err = archiveStore.ListArchivedThreads(m.processCtx())
+			list = append(list, archived...)
+		}
 	default:
 		return "", errors.New("invalid session selector scope")
 	}
@@ -2669,18 +2682,27 @@ func (m *model) cmdTitle(title string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) cmdDelete(id string) (tea.Model, tea.Cmd) {
+func (m *model) cmdDelete(arg string) (tea.Model, tea.Cmd) {
 	if m.mode != modeIdle {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
 		return m, nil
 	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		m.appendLine(lineError, "usage: /delete <session-id>")
+	selector, confirmed := parseDeleteArgs(arg)
+	if selector == "" {
+		m.appendLine(lineError, "usage: /delete <session-id-or-name> --yes")
+		return m, nil
+	}
+	if !confirmed {
+		m.appendLine(lineError, "delete requires --yes or --force to confirm permanent session removal")
 		return m, nil
 	}
 	if m.deps.Store == nil {
 		m.appendLine(lineError, "session store is not configured")
+		return m, nil
+	}
+	id, err := m.resolveSessionSelector(selector, sessionSelectorAll)
+	if err != nil {
+		m.appendLine(lineError, "delete: "+err.Error())
 		return m, nil
 	}
 	if session := m.activeSession(); session != nil && session.ID() == id {
@@ -2694,6 +2716,25 @@ func (m *model) cmdDelete(id string) (tea.Model, tea.Cmd) {
 	m.appendLine(lineSystem, "deleted session "+id)
 	m.appendLine(lineSep, "")
 	return m, nil
+}
+
+// parseDeleteArgs reserves the trailing confirmation token, keeping display
+// names as complete strings rather than splitting multi-word names into flags.
+func parseDeleteArgs(arg string) (selector string, confirmed bool) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return "", false
+	}
+	fields := strings.Fields(arg)
+	if len(fields) < 2 {
+		return arg, false
+	}
+	confirmation := fields[len(fields)-1]
+	if confirmation != "--yes" && confirmation != "--force" {
+		return arg, false
+	}
+	selector = strings.TrimSpace(strings.TrimSuffix(arg, confirmation))
+	return selector, selector != ""
 }
 
 // cmdArchive changes a non-destructive archive lifecycle state. The active
