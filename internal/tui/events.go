@@ -90,6 +90,17 @@ type sideQuestionDoneMsg struct {
 	unavailable       bool
 }
 
+// backgroundAgentDoneMsg settles one process-local analysis child. It is
+// intentionally separate from normal turn events and never enters the session
+// ledger or model context.
+type backgroundAgentDoneMsg struct {
+	id                string
+	sessionID         string
+	sessionGeneration uint64
+	answer            string
+	err               error
+}
+
 type reviewDoneMsg struct {
 	requestID         uint64
 	sessionID         string

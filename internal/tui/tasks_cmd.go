@@ -51,8 +51,16 @@ func renderTasksCommand(m *model) string {
 	fmt.Fprintf(&b, "  Current tool: %s\n", tool)
 	fmt.Fprintf(&b, "  Queued follow-ups: %d\n", len(m.queue))
 	fmt.Fprintf(&b, "  Goal/checklist: %s\n", goalChecklist)
-	b.WriteString("  Background resources: unavailable (no background shell/subagent runtime)")
+	b.WriteString("  ")
+	b.WriteString(backgroundAgentTaskSummary(m))
 	return b.String()
+}
+
+func backgroundAgentTaskSummary(m *model) string {
+	if m == nil || m.deps.BackgroundAgent == nil {
+		return "Background resources: unavailable (no background shell/subagent runtime)"
+	}
+	return fmt.Sprintf("Background analysis agents: %d active, %d retained (limit %d; manage with /agents)", m.activeBackgroundAgents(), len(m.backgroundAgents), maxBackgroundAgents)
 }
 
 func tasksForegroundState(m *model) string {

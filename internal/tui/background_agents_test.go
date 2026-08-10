@@ -1,0 +1,262 @@
+package tui
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"eino-local-assistant/internal/chat"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func TestBackgroundAgentStartsCompletesAndShowsDisplayOnlyResult(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	called := false
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: session,
+		BackgroundAgent: func(ctx context.Context, got *chat.Session, task string) (string, error) {
+			called = true
+			if ctx == nil || got != session || task != "inspect the test failure" {
+				t.Fatalf("callback args: ctx=%v session=%p task=%q", ctx, got, task)
+			}
+			return "check the assertions first", nil
+		},
+	})
+	m.queue = []string{"retained"}
+	beforeTranscript := session.Transcript()
+
+	next, cmd := m.submit("/agent inspect the test failure")
+	mm := next.(*model)
+	if cmd == nil || !reflect.DeepEqual(mm.queue, []string{"retained"}) {
+		t.Fatalf("background agent start = cmd %v queue %#v", cmd, mm.queue)
+	}
+	task := mm.backgroundAgents["agent-1"]
+	if task == nil || task.state != backgroundAgentWorking {
+		t.Fatalf("started task = %#v", task)
+	}
+
+	msg, ok := cmd().(backgroundAgentDoneMsg)
+	if !ok {
+		t.Fatalf("command returned %T, want backgroundAgentDoneMsg", cmd())
+	}
+	next, _ = mm.Update(msg)
+	mm = next.(*model)
+	task = mm.backgroundAgents["agent-1"]
+	if !called || task == nil || task.state != backgroundAgentCompleted || task.answer != "check the assertions first" {
+		t.Fatalf("completed task = %#v called=%v", task, called)
+	}
+	if !hasSideLineContaining(mm, "[agent-1] completed") {
+		t.Fatalf("completion notice missing: %#v", mm.sideLines)
+	}
+	if !reflect.DeepEqual(session.Transcript(), beforeTranscript) {
+		t.Fatal("background result changed durable session transcript")
+	}
+
+	next, showCmd := mm.submit("/agents show agent-1")
+	if showCmd != nil || !hasLineContaining(next.(*model).lines, lineSystem, "check the assertions first") ||
+		!hasLineContaining(next.(*model).lines, lineSystem, "not sent to the parent model") {
+		t.Fatalf("show output missing display-only result: %#v", next.(*model).lines)
+	}
+}
+
+func TestBackgroundAgentCanRunWhileForegroundTurnIsBusy(t *testing.T) {
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+			return "finding", nil
+		},
+	})
+	m.mode = modeBusy
+	m.turnID = 9
+	m.queue = []string{"queued"}
+	cancelled := false
+	m.turnCancel = func() { cancelled = true }
+
+	next, cmd := m.queueWhileBusy("/agent inspect independently")
+	mm := next.(*model)
+	if cmd == nil || mm.mode != modeBusy || mm.turnID != 9 || cancelled || !reflect.DeepEqual(mm.queue, []string{"queued"}) {
+		t.Fatalf("busy start changed foreground state: mode=%s turn=%d cancelled=%v queue=%#v cmd=%v", modeName(mm.mode), mm.turnID, cancelled, mm.queue, cmd)
+	}
+	msg := cmd().(backgroundAgentDoneMsg)
+	next, _ = mm.Update(msg)
+	if got := next.(*model).backgroundAgents["agent-1"].state; got != backgroundAgentCompleted {
+		t.Fatalf("busy background task state = %s", got)
+	}
+}
+
+func TestBackgroundAgentCancellationIsScopedToOneTask(t *testing.T) {
+	started := make(chan string, 2)
+	cancelled := make(chan string, 2)
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		BackgroundAgent: func(ctx context.Context, _ *chat.Session, task string) (string, error) {
+			started <- task
+			<-ctx.Done()
+			cancelled <- task
+			return "", ctx.Err()
+		},
+	})
+	_, firstCmd := m.submit("/agent first")
+	_, secondCmd := m.submit("/agent second")
+	firstResult := make(chan backgroundAgentDoneMsg, 1)
+	secondResult := make(chan backgroundAgentDoneMsg, 1)
+	go func() { firstResult <- firstCmd().(backgroundAgentDoneMsg) }()
+	go func() { secondResult <- secondCmd().(backgroundAgentDoneMsg) }()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("background callback did not start")
+		}
+	}
+
+	next, cmd := m.submit("/agents cancel agent-1")
+	m = next.(*model)
+	if cmd != nil || m.backgroundAgents["agent-1"].state != backgroundAgentCancelling || m.backgroundAgents["agent-2"].state != backgroundAgentWorking {
+		t.Fatalf("cancel state = first %#v second %#v", m.backgroundAgents["agent-1"], m.backgroundAgents["agent-2"])
+	}
+	select {
+	case got := <-cancelled:
+		if got != "first" {
+			t.Fatalf("cancelled wrong task %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first task was not cancelled")
+	}
+	select {
+	case got := <-cancelled:
+		t.Fatalf("second task cancelled with first: %q", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+	next, _ = m.Update(<-firstResult)
+	m = next.(*model)
+	if m.backgroundAgents["agent-1"].state != backgroundAgentCancelled {
+		t.Fatalf("first terminal state = %#v", m.backgroundAgents["agent-1"])
+	}
+
+	next, _ = m.submit("/agents cancel agent-2")
+	m = next.(*model)
+	select {
+	case got := <-cancelled:
+		if got != "second" {
+			t.Fatalf("second cancellation = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second task was not cancelled during cleanup")
+	}
+	next, _ = m.Update(<-secondResult)
+	if got := next.(*model).backgroundAgents["agent-2"].state; got != backgroundAgentCancelled {
+		t.Fatalf("second terminal state = %s", got)
+	}
+}
+
+func TestBackgroundAgentsAreCancelledWhenTUIExits(t *testing.T) {
+	started := make(chan struct{}, 2)
+	cancelled := make(chan struct{}, 2)
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		BackgroundAgent: func(ctx context.Context, _ *chat.Session, _ string) (string, error) {
+			started <- struct{}{}
+			<-ctx.Done()
+			cancelled <- struct{}{}
+			return "", ctx.Err()
+		},
+	})
+	_, firstCmd := m.submit("/agent first")
+	_, secondCmd := m.submit("/agent second")
+	go func() { _ = firstCmd() }()
+	go func() { _ = secondCmd() }()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("background callback did not start")
+		}
+	}
+
+	next, quitCmd := m.submit("/exit")
+	m = next.(*model)
+	if quitCmd == nil || !m.quitting {
+		t.Fatalf("exit did not enter quitting state: quitting=%v cmd=%v", m.quitting, quitCmd)
+	}
+	for range 2 {
+		select {
+		case <-cancelled:
+		case <-time.After(time.Second):
+			t.Fatal("exit did not cancel every background agent")
+		}
+	}
+}
+
+func TestBackgroundAgentLimitStaleResultAndBoundedPresentation(t *testing.T) {
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+			return strings.Repeat("x", maxBackgroundAgentResult+10) + "\x1b[2J", nil
+		},
+	})
+	commands := make([]tea.Cmd, 0, maxBackgroundAgents)
+	for index := range maxBackgroundAgents {
+		next, cmd := m.submit("/agent task " + itoa(index+1))
+		m = next.(*model)
+		commands = append(commands, cmd)
+	}
+	next, cmd := m.submit("/agent one too many")
+	m = next.(*model)
+	if cmd != nil || !hasLineContaining(m.lines, lineError, "background agent limit reached") {
+		t.Fatalf("limit rejection missing: %#v", m.lines)
+	}
+
+	firstMsg := commands[0]().(backgroundAgentDoneMsg)
+	second := mustSession(t, &staticModel{}, "second")
+	m.replaceSession(second)
+	beforeSideLines := len(m.sideLines)
+	next, _ = m.Update(firstMsg)
+	m = next.(*model)
+	if len(m.sideLines) != beforeSideLines {
+		t.Fatalf("stale completion should not enter current TUI output: %#v", m.sideLines)
+	}
+	next, _ = m.submit("/agents show agent-1")
+	m = next.(*model)
+	if !hasLineContaining(m.lines, lineSystem, "result truncated after 65536 bytes") {
+		t.Fatalf("bounded result notice missing: %#v", m.lines)
+	}
+	for _, line := range m.lines {
+		if strings.Contains(line.text, "\x1b") {
+			t.Fatalf("background result leaked terminal escape: %q", line.text)
+		}
+	}
+	for _, id := range []string{"agent-2", "agent-3", "agent-4"} {
+		next, _ = m.submit("/agents cancel " + id)
+		m = next.(*model)
+	}
+}
+
+func TestBackgroundAgentCommandUsageAndTaskSummary(t *testing.T) {
+	m := newTestModel(t)
+	next, cmd := m.submit("/agent")
+	if cmd != nil || !hasLineContaining(next.(*model).lines, lineError, "usage: /agent <analysis task>") {
+		t.Fatalf("agent usage = %#v", next.(*model).lines)
+	}
+	next, _ = m.submit("/agents")
+	if !hasLineContaining(next.(*model).lines, lineSystem, "no background analysis runtime is configured") {
+		t.Fatalf("unavailable agents list = %#v", next.(*model).lines)
+	}
+
+	m = newModel(Deps{Ctx: context.Background(), Session: mustSession(t, &staticModel{}, "system"), BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+		return "", errors.New("not started")
+	}})
+	summary := renderTasksCommand(m)
+	if !strings.Contains(summary, "Background analysis agents: 0 active, 0 retained") {
+		t.Fatalf("task summary omitted configured background runtime: %q", summary)
+	}
+}

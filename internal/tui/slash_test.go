@@ -30,6 +30,9 @@ func TestParseSlash(t *testing.T) {
 		{"/rules", slashRules, ""},
 		{"/skills", slashSkills, ""},
 		{"/skills release checklist", slashSkills, "release checklist"},
+		{"/agent inspect the failing test", slashAgent, "inspect the failing test"},
+		{"/agents", slashAgents, ""},
+		{"/agents show agent-1", slashAgents, "show agent-1"},
 		{"/btw what changed?", slashSide, "what changed?"},
 		{"/side what changed?", slashSide, "what changed?"},
 		{"/BTW", slashSide, ""},
@@ -103,7 +106,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/statusline", "/goal", "/tasks", "/diff", "/rules", "/skills", "/btw", "/side", "/steer", "/usage",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/statusline", "/goal", "/tasks", "/diff", "/rules", "/skills", "/agent", "/agents", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact", "/review",
 		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/archive", "/unarchive", "/queue", "/plan",
 		"/model",
@@ -132,7 +135,7 @@ func catalogCoversToken(catalog []slashCommand, tok string) bool {
 
 func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
-		"/help": false, "/status": false, "/goal": false, "/tasks": false, "/diff": false, "/review": false, "/rules": false, "/skills": true, "/context": false, "/sessions": false,
+		"/help": false, "/status": false, "/goal": false, "/tasks": false, "/diff": false, "/review": false, "/rules": false, "/skills": true, "/agent": true, "/agents": true, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/plan": false, "/permissions": true,
 		"/btw": true, "/steer": true,
 		"/usage": true, "/statusline": false, "/compact": true, "/new": true, "/resume": true, "/fork": true, "/title": true,
@@ -246,6 +249,9 @@ func TestFilterSlashCommandsMatrix(t *testing.T) {
 		{"/sess", []string{"/sessions"}},
 		{"/n", []string{"/new"}},
 		{"/new", []string{"/new"}},
+		{"/a", []string{"/agent", "/agents", "/archive"}},
+		{"/ag", []string{"/agent", "/agents"}},
+		{"/agents", []string{"/agents"}},
 		{"/r", []string{"/review", "/rules", "/resume"}},
 		{"/re", []string{"/review", "/resume"}},
 		{"/res", []string{"/resume"}},

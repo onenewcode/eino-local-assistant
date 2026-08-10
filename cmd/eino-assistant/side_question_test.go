@@ -160,6 +160,81 @@ func TestCommandRuntimeSideQuestionValidation(t *testing.T) {
 	}
 }
 
+func TestCommandRuntimeBackgroundAgentUsesFrozenReferenceWithoutTools(t *testing.T) {
+	model := &recordingSideQuestionModel{response: schema.AssistantMessage("  analysis finding  ", nil)}
+	session, threadStore := newSideQuestionTestSession(t, "frozen prompt", "recorded history")
+	runtime := &commandRuntime{chatModel: model}
+	beforeTranscript := session.Transcript()
+	beforeUsage := session.UsageSummary()
+	beforeState, err := threadStore.LoadThread(context.Background(), session.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	answer, err := runtime.backgroundAgent(context.Background(), session, "inspect the failure boundary")
+	if err != nil {
+		t.Fatalf("backgroundAgent: %v", err)
+	}
+	if answer != "analysis finding" || len(model.requests) != 1 || model.withToolsCalls != 0 {
+		t.Fatalf("answer=%q requests=%d withTools=%d", answer, len(model.requests), model.withToolsCalls)
+	}
+	requestText := sideQuestionRequestText(model.requests[0])
+	for _, fragment := range []string{
+		"background read-only analysis subagent",
+		"frozen prompt",
+		"recorded history",
+		"inspect the failure boundary",
+		"reference-only",
+		"Do not modify files",
+		"Do not call tools or further subagents",
+	} {
+		if !strings.Contains(requestText, fragment) {
+			t.Fatalf("background request missing %q:\n%s", fragment, requestText)
+		}
+	}
+	for _, message := range model.requests[0] {
+		if message != nil && (message.Role == schema.Tool || len(message.ToolCalls) != 0) {
+			t.Fatalf("background request contains tool data: %#v", message)
+		}
+	}
+	if !reflect.DeepEqual(session.Transcript(), beforeTranscript) || !reflect.DeepEqual(session.UsageSummary(), beforeUsage) {
+		t.Fatal("background agent changed session transcript or usage")
+	}
+	afterState, err := threadStore.LoadThread(context.Background(), session.ID())
+	if err != nil || afterState.Revision != beforeState.Revision || afterState.Meta.MessageCount != beforeState.Meta.MessageCount {
+		t.Fatalf("background agent changed thread: before=%#v after=%#v err=%v", beforeState, afterState, err)
+	}
+}
+
+func TestCommandRuntimeBackgroundAgentValidation(t *testing.T) {
+	model := &recordingSideQuestionModel{response: schema.AssistantMessage("answer", nil)}
+	session, _ := newSideQuestionTestSession(t, "frozen prompt", "")
+	for _, test := range []struct {
+		name    string
+		runtime *commandRuntime
+		session *chat.Session
+		task    string
+		wantErr error
+	}{
+		{name: "nil session", runtime: &commandRuntime{chatModel: model}, task: "task", wantErr: errBackgroundAgentSessionUnavailable},
+		{name: "nil runtime", session: session, task: "task", wantErr: errBackgroundAgentModelUnavailable},
+		{name: "nil model", runtime: &commandRuntime{}, session: session, task: "task", wantErr: errBackgroundAgentModelUnavailable},
+		{name: "empty task", runtime: &commandRuntime{chatModel: model}, session: session, task: " \t\n", wantErr: errBackgroundAgentEmpty},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := test.runtime.backgroundAgent(context.Background(), test.session, test.task)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+
+	emptyModel := &recordingSideQuestionModel{response: schema.AssistantMessage("", nil)}
+	if _, err := (&commandRuntime{chatModel: emptyModel}).backgroundAgent(context.Background(), session, "task"); !errors.Is(err, errBackgroundAgentResponseEmpty) {
+		t.Fatalf("empty response error = %v", err)
+	}
+}
+
 func sideQuestionRequestText(messages []*schema.Message) string {
 	var parts []string
 	for _, message := range messages {

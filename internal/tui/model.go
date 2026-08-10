@@ -148,6 +148,10 @@ type ListProjectSkillsCallback func(context.Context) (ProjectSkillsCatalog, erro
 // discovered relative path, subject to the runtime's bounded reader.
 type ReadProjectSkillCallback func(context.Context, string) (ProjectSkillDetails, error)
 
+// BackgroundAgentCallback runs one isolated, read-only analysis task from a
+// frozen session reference. It must not modify the session or workspace.
+type BackgroundAgentCallback func(context.Context, *chat.Session, string) (string, error)
+
 // SessionOpenResult carries the complete runtime snapshot for a resumed
 // session. Unlike ModelSwitchResult, opening a session intentionally changes
 // the active Session pointer.
@@ -218,6 +222,9 @@ type Deps struct {
 	// SideQuestion answers a temporary side question without writing the main
 	// session ledger or changing the active turn.
 	SideQuestion func(context.Context, *chat.Session, string) (string, error)
+	// BackgroundAgent starts a read-only analysis subagent. The TUI owns each
+	// child context, cancellation handle, identity, and display-only result.
+	BackgroundAgent BackgroundAgentCallback
 	// SwitchModel replaces the active session's provider binding in place. It
 	// never creates a new session or clears TUI transient state.
 	SwitchModel ModelSwitchCallback
@@ -378,8 +385,14 @@ type model struct {
 	sideQuestions       int
 	sideQuestionPending map[uint64]struct{}
 	sideQuestionNextID  uint64
-	reviewInFlight      bool
-	reviewNextID        uint64
+	// backgroundAgents is process-local so finished results can be inspected
+	// after the user switches sessions. They never enter a session ledger or
+	// the parent model prompt.
+	backgroundAgents      map[string]*backgroundAgentTask
+	backgroundAgentOrder  []string
+	backgroundAgentNextID uint64
+	reviewInFlight        bool
+	reviewNextID          uint64
 
 	mode              mode
 	sessionMu         sync.RWMutex
@@ -1125,6 +1138,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.interruptCompaction()
 				return m, nil
 			}
+			m.cancelBackgroundAgents()
 			m.quitting = true
 			return m, tea.Quit
 		case tea.KeyEsc:
@@ -1147,6 +1161,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyCtrlD:
 			if m.mode == modeIdle && strings.TrimSpace(m.textarea.Value()) == "" {
+				m.cancelBackgroundAgents()
 				m.quitting = true
 				return m, tea.Quit
 			}
@@ -1358,6 +1373,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.finishSideQuestion(msg)
+		return m, nil
+
+	case backgroundAgentDoneMsg:
+		m.finishBackgroundAgent(msg)
 		return m, nil
 
 	case reviewDoneMsg:
@@ -1716,6 +1735,7 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSep, "")
 		return m, nil
 	case slashExit:
+		m.cancelBackgroundAgents()
 		m.quitting = true
 		return m, tea.Quit
 	case slashClear:
@@ -1736,6 +1756,10 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdRules(arg)
 	case slashSkills:
 		return m.cmdSkills(arg)
+	case slashAgent:
+		return m.cmdAgent(arg)
+	case slashAgents:
+		return m.cmdAgents(arg)
 	case slashSide:
 		return m.cmdSideQuestion(sideQuestionLabel(input), arg)
 	case slashSteer:
