@@ -65,6 +65,8 @@ eino
 | --- | --- | --- |
 | `shell` | 终端/进程（git、构建、测试、cat/ls/rg 等） | Codex `.rules` + 保守已知只读回退 + approval；默认在 OS sandbox worker 中 |
 | `apply_patch` | create_file / update_file / delete_file | 默认 ask；与 shell 共用工作区沙盒边界 |
+| `list_skills` | 发现项目中的可用 `SKILL.md` 工作流 | 只读、数量有上限；不自动注入全文 |
+| `read_skill` | 按名称读取一个已发现的 `SKILL.md` | 只读、默认 16 KiB / 最大 64 KiB |
 | `get_current_time` | 真实本机时间 | 无 |
 | `read_artifact` | 当前 thread 的 artifact:// 证据 | thread 作用域 |
 | `update_plan` | 多步骤 checklist（pending / in_progress / completed，至多一个 in_progress） | 进度 UI only；不挡交付；写入仍由 permissions/sandbox 管 |

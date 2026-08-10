@@ -28,7 +28,8 @@ type ToolSelection struct {
 }
 
 // DefaultOptions configures built-in tool registration.
-// Codex-oriented subset: shell + apply_patch, plus product helpers.
+// Codex-oriented tool surface: shell + apply_patch, bounded project skills,
+// and product helpers.
 type DefaultOptions struct {
 	Clock      func() time.Time
 	Shell      ShellOptions
@@ -40,6 +41,7 @@ type DefaultOptions struct {
 // DefaultWithOptions registers the Codex-subset tool surface:
 //   - shell — terminal / process (Codex shell)
 //   - apply_patch — structured file create/update/delete (Codex apply_patch subset)
+//   - list_skills / read_skill — on-demand project workflows (read-only)
 //   - get_current_time — host wall clock (product)
 //   - read_artifact — thread-scoped evidence (product)
 //   - memory_* — project-scoped persistent memory reads (product)
@@ -98,6 +100,16 @@ func DefaultWithOptions(opts DefaultOptions) (*Registry, error) {
 	if shellOpts.Sandbox == nil {
 		shellOpts.Sandbox = patchOpts.Sandbox
 	}
+	skillOpts := SkillOptions{WorkingDir: shellOpts.WorkspaceRoot}
+	listSkillsTool, err := NewListSkills(skillOpts)
+	if err != nil {
+		return nil, fmt.Errorf("create list_skills tool: %w", err)
+	}
+	readSkillTool, err := NewReadSkill(skillOpts)
+	if err != nil {
+		return nil, fmt.Errorf("create read_skill tool: %w", err)
+	}
+	registered = append(registered, listSkillsTool, readSkillTool)
 
 	if !patchOpts.Disabled {
 		patchTool, err := NewApplyPatch(patchOpts)

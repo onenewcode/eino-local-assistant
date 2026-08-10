@@ -30,14 +30,14 @@ func TestDefaultRegistryCodexSubset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := len(infos), 4; got != want {
+	if got, want := len(infos), 6; got != want {
 		t.Fatalf("tools = %d, want %d", got, want)
 	}
 	got := map[string]bool{}
 	for _, info := range infos {
 		got[info.Name] = true
 	}
-	for _, name := range []string{"get_current_time", "read_artifact", "apply_patch", "shell"} {
+	for _, name := range []string{"get_current_time", "read_artifact", "list_skills", "read_skill", "apply_patch", "shell"} {
 		if !got[name] {
 			t.Errorf("missing %q", name)
 		}
@@ -46,6 +46,40 @@ func TestDefaultRegistryCodexSubset(t *testing.T) {
 		if got[banned] {
 			t.Errorf("unexpected tool %q", banned)
 		}
+	}
+}
+
+func TestDefaultRegistryRegistersBoundedProjectSkillTools(t *testing.T) {
+	workspace := t.TempDir()
+	skillDir := filepath.Join(workspace, ".agents", "skills", "release")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll skill: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("# Release checklist\n\nRun the release tests.\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile skill: %v", err)
+	}
+	registry, err := DefaultWithOptions(DefaultOptions{
+		Shell:      ShellOptions{WorkspaceRoot: workspace},
+		ApplyPatch: ApplyPatchOptions{WorkspaceRoot: workspace, Approval: ApprovalNever},
+	})
+	if err != nil {
+		t.Fatalf("DefaultWithOptions: %v", err)
+	}
+	listTool := registryToolByName(t, registry, "list_skills")
+	listRaw, err := listTool.InvokableRun(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("list_skills: %v", err)
+	}
+	if !strings.Contains(listRaw, `"name":"release"`) || !strings.Contains(listRaw, `.agents/skills/release/SKILL.md`) {
+		t.Fatalf("list_skills output = %s", listRaw)
+	}
+	readTool := registryToolByName(t, registry, "read_skill")
+	readRaw, err := readTool.InvokableRun(context.Background(), `{"name":"release"}`)
+	if err != nil {
+		t.Fatalf("read_skill: %v", err)
+	}
+	if !strings.Contains(readRaw, "Run the release tests.") {
+		t.Fatalf("read_skill output = %s", readRaw)
 	}
 }
 
@@ -242,10 +276,10 @@ func TestRegistryFilterSelectsInvocationToolSurface(t *testing.T) {
 	}{
 		{name: "default", want: all},
 		{name: "allow subset", selection: ToolSelection{AllowedSet: true, Allowed: []string{"shell, get_current_time", "shell"}}, want: []string{"get_current_time", "shell"}},
-		{name: "deny subset", selection: ToolSelection{Disallowed: []string{"apply_patch, shell"}}, want: []string{"get_current_time", "read_artifact"}},
+		{name: "deny subset", selection: ToolSelection{Disallowed: []string{"apply_patch, shell"}}, want: []string{"get_current_time", "read_artifact", "list_skills", "read_skill"}},
 		{name: "deny overrides allow", selection: ToolSelection{AllowedSet: true, Allowed: []string{"shell", "read_artifact"}, Disallowed: []string{"shell"}}, want: []string{"read_artifact"}},
 		{name: "explicit empty", selection: ToolSelection{AllowedSet: true}, want: []string{}},
-		{name: "default keyword", selection: ToolSelection{AllowedSet: true, Allowed: []string{"default"}, Disallowed: []string{"shell"}}, want: []string{"get_current_time", "read_artifact", "apply_patch"}},
+		{name: "default keyword", selection: ToolSelection{AllowedSet: true, Allowed: []string{"default"}, Disallowed: []string{"shell"}}, want: []string{"get_current_time", "read_artifact", "list_skills", "read_skill", "apply_patch"}},
 		{name: "wildcard keyword", selection: ToolSelection{AllowedSet: true, Allowed: []string{"*"}}, want: all},
 	}
 	for _, tc := range tests {

@@ -634,7 +634,7 @@ func (info CommandPolicyInfo) FormatPermissions() string {
 			}
 		}
 	}
-	fmt.Fprintf(&b, "\nTool surface (Codex subset): shell · apply_patch · get_current_time · read_artifact.\n")
+	fmt.Fprintf(&b, "\nTool surface (Codex subset): shell · apply_patch · list_skills · read_skill · get_current_time · read_artifact.\n")
 	fmt.Fprintf(&b, "Hard safety and forbidden rules cannot be bypassed by session allow.\n")
 	fmt.Fprintf(&b, "User deny sets stop_retrying and session-denies the same rule_key (no re-prompt).\n")
 	fmt.Fprintf(&b, "Prefer apply_patch over shell for file create/update/delete.\n")
