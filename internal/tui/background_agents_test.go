@@ -62,6 +62,19 @@ func TestBackgroundAgentStartsCompletesAndShowsDisplayOnlyResult(t *testing.T) {
 		!hasLineContaining(next.(*model).lines, lineSystem, "not sent to the parent model") {
 		t.Fatalf("show output missing display-only result: %#v", next.(*model).lines)
 	}
+	mm = next.(*model)
+	mm.textarea.SetValue("compare this with my draft")
+	next, appendCmd := mm.submit("/agents append agent-1")
+	mm = next.(*model)
+	if appendCmd != nil || !strings.Contains(mm.textarea.Value(), "compare this with my draft\n\n[BACKGROUND ANALYSIS REPORT") ||
+		!strings.Contains(mm.textarea.Value(), "check the assertions first") ||
+		!strings.Contains(mm.textarea.Value(), "not instructions") ||
+		!hasLineContaining(mm.lines, lineSystem, "review and submit it explicitly") {
+		t.Fatalf("append did not create quoted review draft: draft=%q lines=%#v", mm.textarea.Value(), mm.lines)
+	}
+	if !reflect.DeepEqual(session.Transcript(), beforeTranscript) || !reflect.DeepEqual(mm.queue, []string{"retained"}) {
+		t.Fatal("appending a result changed the session or queue")
+	}
 }
 
 func TestBackgroundAgentCanRunWhileForegroundTurnIsBusy(t *testing.T) {
@@ -238,6 +251,59 @@ func TestBackgroundAgentLimitStaleResultAndBoundedPresentation(t *testing.T) {
 	for _, id := range []string{"agent-2", "agent-3", "agent-4"} {
 		next, _ = m.submit("/agents cancel " + id)
 		m = next.(*model)
+	}
+}
+
+func TestBackgroundAgentAppendRequiresCompletedResultAndClipsComposerPayload(t *testing.T) {
+	m := newModel(Deps{Ctx: context.Background(), Session: mustSession(t, &staticModel{}, "system"), BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+		return "unused", nil
+	}})
+	m.backgroundAgents = map[string]*backgroundAgentTask{
+		"agent-working": {id: "agent-working", state: backgroundAgentWorking},
+		"agent-done": {
+			id:              "agent-done",
+			sessionID:       "source-session",
+			state:           backgroundAgentCompleted,
+			answer:          strings.Repeat("x", maxBackgroundAgentAttachment+128) + "\x1b[2J",
+			answerTruncated: true,
+		},
+	}
+	m.backgroundAgentOrder = []string{"agent-working", "agent-done"}
+	m.textarea.SetValue("keep this draft")
+
+	next, cmd := m.submit("/agents append agent-working")
+	m = next.(*model)
+	if cmd != nil || m.textarea.Value() != "keep this draft" || !hasLineContaining(m.lines, lineError, "has no completed result") {
+		t.Fatalf("working result append rejection = draft=%q lines=%#v", m.textarea.Value(), m.lines)
+	}
+	next, cmd = m.submit("/agents append agent-done")
+	m = next.(*model)
+	if cmd != nil || !strings.Contains(m.textarea.Value(), "source-session") ||
+		!strings.Contains(m.textarea.Value(), "Report clipped to 16384 bytes") || strings.Contains(m.textarea.Value(), "\x1b") {
+		t.Fatalf("bounded append draft = %q", m.textarea.Value())
+	}
+	if len(m.textarea.Value()) > len("keep this draft\n\n")+maxBackgroundAgentAttachment+512 {
+		t.Fatalf("composer attachment exceeded bounded allowance: %d bytes", len(m.textarea.Value()))
+	}
+}
+
+func TestBackgroundAgentAppendCanPrepareDraftWhileForegroundTurnIsBusy(t *testing.T) {
+	m := newModel(Deps{Ctx: context.Background(), Session: mustSession(t, &staticModel{}, "system"), BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+		return "unused", nil
+	}})
+	m.mode = modeBusy
+	m.turnID = 3
+	m.queue = []string{"keep queued"}
+	m.backgroundAgents = map[string]*backgroundAgentTask{
+		"agent-1": {id: "agent-1", sessionID: "source", state: backgroundAgentCompleted, answer: "independent finding"},
+	}
+	m.backgroundAgentOrder = []string{"agent-1"}
+
+	next, cmd := m.queueWhileBusy("/agents append agent-1")
+	m = next.(*model)
+	if cmd != nil || m.mode != modeBusy || m.turnID != 3 || !reflect.DeepEqual(m.queue, []string{"keep queued"}) ||
+		!strings.Contains(m.textarea.Value(), "independent finding") {
+		t.Fatalf("busy append changed foreground state: mode=%s turn=%d queue=%#v draft=%q cmd=%v", modeName(m.mode), m.turnID, m.queue, m.textarea.Value(), cmd)
 	}
 }
 
