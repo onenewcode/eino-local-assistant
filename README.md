@@ -55,6 +55,21 @@ eino
 
 工具的权限语言仍不是安全边界；实际文件和网络隔离由 sandbox worker 提供。
 
+## MCP
+
+在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio MCP server。`eino mcp list` 只读取并显示静态配置，不启动 server 或打印环境变量值；`--json` 输出稳定的 name/enabled/transport 结构。
+
+```toml
+[[mcp.servers]]
+name = "local-tools"
+command = "npx"
+args = ["-y", "@example/mcp-server"]
+working_dir = "/absolute/workspace"
+
+[mcp.servers.env]
+API_TOKEN = "set-a-secret-here"
+```
+
 
 ## 配置
 

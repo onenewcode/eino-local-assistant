@@ -92,6 +92,17 @@ max_consecutive_equivalent_tool_calls = 3
 [storage]
 data_dir = ""
 
+# MCP configuration is static: `eino mcp list` displays these entries without
+# starting a process or printing environment values.
+# [[mcp.servers]]
+# name = "local-tools"
+# command = "npx"
+# args = ["-y", "@example/mcp-server"]
+# working_dir = "/absolute/workspace"
+#
+# [mcp.servers.env]
+# API_TOKEN = "replace-with-your-token"
+
 # Process diagnostics (log/slog). Session journals remain the product ledger;
 # these files are operational only and never replace resume/replay.
 [logging]

@@ -55,7 +55,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		Short: "Eino local coding assistant",
 		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat and resume. Use --yolo only when you explicitly accept host-side tool execution without approval prompts.",
 		Example: fmt.Sprintf(
-			"  %[1]s\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s version",
+			"  %[1]s\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s mcp list\n  %[1]s version",
 			appName,
 		),
 		Args:          cobra.NoArgs,
@@ -87,6 +87,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newExecCommand(opts, deps.exec),
 		newResumeCommand(opts, deps.interactive),
 		newSessionsCommand(opts),
+		newMCPCommand(opts),
 		newVersionCommand(),
 	)
 

@@ -38,7 +38,7 @@ func TestSandboxRunnerLinuxKeepsDirectNetworkOpen(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	direct := executeLinuxSandboxProbe(t, ctx, runner, shellQuote(probe)+" "+shellQuote(directTarget))
+	direct := executeLinuxSandboxProbe(ctx, t, runner, shellQuote(probe)+" "+shellQuote(directTarget))
 	if direct.ExitCode != 0 {
 		t.Fatalf("direct host network was blocked: %#v", direct)
 	}
@@ -80,7 +80,7 @@ func TestSandboxRunnerLinuxFailsClosedWithoutBwrap(t *testing.T) {
 	}
 }
 
-func executeLinuxSandboxProbe(t *testing.T, ctx context.Context, runner *SandboxRunner, command string) ShellOutput {
+func executeLinuxSandboxProbe(ctx context.Context, t *testing.T, runner *SandboxRunner, command string) ShellOutput {
 	t.Helper()
 	response, outcome, err := runner.Execute(ctx, SandboxWorkerRequest{
 		Kind:           sandboxWorkerShell,

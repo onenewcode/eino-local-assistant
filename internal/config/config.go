@@ -42,6 +42,24 @@ type Config struct {
 	Rules RulesConfig `toml:"rules"`
 	// Memory is project-scoped semantic memory (not session resume).
 	Memory MemoryConfig `toml:"memory"`
+	// MCP declares external stdio MCP servers. The list is inert until a
+	// caller explicitly connects to the configured servers.
+	MCP MCPConfig `toml:"mcp"`
+}
+
+// MCPConfig declares external MCP servers available to the CLI.
+type MCPConfig struct {
+	Servers []MCPServerConfig `toml:"servers"`
+}
+
+// MCPServerConfig describes a local stdio MCP server without exposing its
+// environment values in status output.
+type MCPServerConfig struct {
+	Name       string            `toml:"name"`
+	Command    string            `toml:"command"`
+	Args       []string          `toml:"args"`
+	WorkingDir string            `toml:"working_dir"`
+	Env        map[string]string `toml:"env"`
 }
 
 // ProjectTrustConfig records whether a user trusts a workspace's own rules.
@@ -935,6 +953,9 @@ func (c *Config) Validate() error {
 	if err := c.Memory.Validate(); err != nil {
 		return err
 	}
+	if err := c.MCP.Validate(); err != nil {
+		return err
+	}
 	if err := c.UI.Validate(); err != nil {
 		return err
 	}
@@ -942,6 +963,34 @@ func (c *Config) Validate() error {
 		return err
 	}
 	return c.Runtime.Validate()
+}
+
+// Validate checks MCP server identities and optional working directories.
+func (c MCPConfig) Validate() error {
+	seen := make(map[string]struct{}, len(c.Servers))
+	for i, server := range c.Servers {
+		name := strings.TrimSpace(server.Name)
+		if name == "" {
+			return fmt.Errorf("mcp.servers[%d].name is required", i)
+		}
+		if strings.TrimSpace(server.Command) == "" {
+			return fmt.Errorf("mcp.servers[%d].command is required", i)
+		}
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("mcp server name %q is duplicated", name)
+		}
+		seen[name] = struct{}{}
+		if dir := strings.TrimSpace(server.WorkingDir); dir != "" {
+			info, err := os.Stat(dir)
+			if err != nil {
+				return fmt.Errorf("mcp.servers[%d].working_dir: %w", i, err)
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("mcp.servers[%d].working_dir is not a directory", i)
+			}
+		}
+	}
+	return nil
 }
 
 // Validate checks rules configuration.
