@@ -88,6 +88,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newExecCommand(opts, deps.exec),
 		newResumeCommand(opts, deps.interactive),
 		newForkCommand(opts, deps.interactive),
+		newDeleteCommand(opts),
 		newSessionsCommand(opts),
 		newMCPCommand(opts),
 		newCompletionCommand(),

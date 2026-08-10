@@ -340,14 +340,29 @@ func publishNewJournal(tempPath, destination string) error {
 	return nil
 }
 
-// DeleteThread removes one session journal. The advisory lock prevents a
-// concurrent writer from deleting a live journal underneath itself.
+// DeleteThread permanently removes one inactive session journal. It takes the
+// writer lock and then checks durable lifecycle state so a quiet active turn or
+// pending compaction cannot be deleted between another process's writes.
 func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 	dir, unlock, err := s.lockThread(ctx, id)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	state, events, err := s.loadThreadLocked(dir, id)
+	if err != nil {
+		return err
+	}
+	tracker, err := lifecycleFromEvents(events)
+	if err != nil {
+		return err
+	}
+	if tracker.activeTurnID != "" {
+		return fmt.Errorf("%w: %q", ErrThreadDeleteActiveTurn, tracker.activeTurnID)
+	}
+	if state.PendingCompaction != nil {
+		return fmt.Errorf("%w: %q", ErrThreadDeletePendingCompaction, state.PendingCompaction.OperationID)
+	}
 	if err := os.Remove(journalPath(dir, id)); err != nil {
 		return fmt.Errorf("delete session journal: %w", err)
 	}

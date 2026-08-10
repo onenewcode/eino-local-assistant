@@ -17,6 +17,12 @@ var (
 	ErrRevisionConflict = errors.New("thread revision conflict")
 	// ErrThreadLocked means another process currently owns the thread lock.
 	ErrThreadLocked = errors.New("thread is locked by another writer")
+	// ErrThreadDeleteActiveTurn prevents permanent removal while an unfinished
+	// turn may still be resumed or terminalized by another process.
+	ErrThreadDeleteActiveTurn = errors.New("cannot delete thread while a turn is active")
+	// ErrThreadDeletePendingCompaction prevents permanent removal while a
+	// compaction provider operation may still reconcile durable state.
+	ErrThreadDeletePendingCompaction = errors.New("cannot delete thread while compaction is pending")
 	// ErrJournalCorrupt means a non-tail journal record failed integrity checks.
 	ErrJournalCorrupt = errors.New("thread journal is corrupt")
 	// ErrInvalidThreadLifecycle means an event violates the turn/tool state

@@ -769,6 +769,43 @@ func TestThreadStoreMetadataListAndDelete(t *testing.T) {
 	}
 }
 
+func TestThreadStoreDeleteRejectsActiveLifecycle(t *testing.T) {
+	threadStore, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	state, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "thread-delete-active"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: "active-turn", Input: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := threadStore.DeleteThread(ctx, state.ID); !errors.Is(err, ErrThreadDeleteActiveTurn) {
+		t.Fatalf("active delete error = %v, want ErrThreadDeleteActiveTurn", err)
+	}
+	if _, err := threadStore.LoadThread(ctx, state.ID); err != nil {
+		t.Fatalf("active delete removed thread: %v", err)
+	}
+
+	state, err = threadStore.FailTurn(ctx, state.ID, state.Revision, TurnFailure{TurnID: "active-turn", Error: "stop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartCompaction(ctx, state.ID, state.Revision, CompactionStart{OperationID: "pending-delete"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := threadStore.DeleteThread(ctx, state.ID); !errors.Is(err, ErrThreadDeletePendingCompaction) {
+		t.Fatalf("pending compaction delete error = %v, want ErrThreadDeletePendingCompaction", err)
+	}
+	if _, err := threadStore.LoadThread(ctx, state.ID); err != nil {
+		t.Fatalf("pending compaction delete removed thread: %v", err)
+	}
+}
+
 func TestThreadStoreRejectsDuplicateIDAcrossDatePaths(t *testing.T) {
 	store, err := NewThreadStore(t.TempDir())
 	if err != nil {
