@@ -90,6 +90,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newSessionsCommand(opts),
 		newMCPCommand(opts),
 		newCompletionCommand(),
+		newInitCommand(),
 		newVersionCommand(),
 	)
 
