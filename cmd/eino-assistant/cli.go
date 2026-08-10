@@ -89,6 +89,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newResumeCommand(opts, deps.interactive),
 		newSessionsCommand(opts),
 		newMCPCommand(opts),
+		newCompletionCommand(),
 		newVersionCommand(),
 	)
 
@@ -159,6 +160,29 @@ func newSessionsCommand(opts *rootOptions) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&outputFormat, "output-format", sessionsOutputFormatText, "session list format: text or json")
 	return cmd
+}
+
+func newCompletionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "completion <bash|zsh|fish|powershell>",
+		Short: "Generate a shell completion script",
+		Long:  "Generate a completion script for the requested shell. Redirect the output to the shell's completion directory or source it in the current shell.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch strings.ToLower(strings.TrimSpace(args[0])) {
+			case "bash":
+				return cmd.Root().GenBashCompletion(cmd.OutOrStdout())
+			case "zsh":
+				return cmd.Root().GenZshCompletion(cmd.OutOrStdout())
+			case "fish":
+				return cmd.Root().GenFishCompletion(cmd.OutOrStdout(), true)
+			case "powershell", "pwsh":
+				return cmd.Root().GenPowerShellCompletion(cmd.OutOrStdout())
+			default:
+				return fmt.Errorf("unsupported shell %q (choose bash, zsh, fish, or powershell)", args[0])
+			}
+		},
+	}
 }
 
 func newVersionCommand() *cobra.Command {

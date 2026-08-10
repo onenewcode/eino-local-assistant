@@ -40,7 +40,7 @@ func TestRootHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute(%v): %v", args, err)
 			}
-			for _, want := range []string{"Usage:", "chat", "exec", "resume", "sessions", "mcp", "version"} {
+			for _, want := range []string{"Usage:", "chat", "exec", "resume", "sessions", "mcp", "completion", "version"} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("help missing %q:\n%s", want, stdout)
 				}
@@ -65,6 +65,8 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"resume", "-h"}, "Resume a previously saved session"},
 		{[]string{"help", "sessions"}, "List saved sessions"},
 		{[]string{"sessions", "-h"}, "List saved sessions"},
+		{[]string{"help", "completion"}, "Generate a completion script"},
+		{[]string{"completion", "-h"}, "Generate a completion script"},
 		{[]string{"help", "mcp"}, "Manage configured MCP servers"},
 		{[]string{"mcp", "list", "-h"}, "output the configured servers as JSON"},
 		{[]string{"mcp", "get", "-h"}, "Show one configured MCP server"},
@@ -85,6 +87,24 @@ func TestCommandHelp(t *testing.T) {
 				t.Fatalf("expected %q in:\n%s", tc.want, stdout)
 			}
 		})
+	}
+}
+
+func TestCompletionGeneratesSupportedShells(t *testing.T) {
+	for _, shell := range []string{"bash", "zsh", "fish", "powershell", "pwsh"} {
+		t.Run(shell, func(t *testing.T) {
+			stdout, _, err := executeForTest("completion", shell)
+			if err != nil {
+				t.Fatalf("completion %s: %v", shell, err)
+			}
+			if strings.TrimSpace(stdout) == "" {
+				t.Fatalf("completion %s returned empty output", shell)
+			}
+		})
+	}
+	_, _, err := executeForTest("completion", "tcsh")
+	if err == nil || !strings.Contains(err.Error(), "unsupported shell") {
+		t.Fatalf("completion tcsh error = %v", err)
 	}
 }
 
