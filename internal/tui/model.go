@@ -1376,8 +1376,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case backgroundAgentDoneMsg:
-		m.finishBackgroundAgent(msg)
-		return m, nil
+		return m, m.finishBackgroundAgent(msg)
 
 	case reviewDoneMsg:
 		if !m.reviewInFlight || msg.requestID != m.reviewNextID {

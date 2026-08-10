@@ -302,7 +302,7 @@ func TestBackgroundAgentsAreCancelledWhenTUIExits(t *testing.T) {
 	}
 }
 
-func TestBackgroundAgentLimitStaleResultAndBoundedPresentation(t *testing.T) {
+func TestBackgroundAgentQueueDispatchStaleResultAndBoundedPresentation(t *testing.T) {
 	m := newModel(Deps{
 		Ctx:     context.Background(),
 		Session: mustSession(t, &staticModel{}, "system"),
@@ -318,18 +318,23 @@ func TestBackgroundAgentLimitStaleResultAndBoundedPresentation(t *testing.T) {
 	}
 	next, cmd := m.submit("/agent one too many")
 	m = next.(*model)
-	if cmd != nil || !hasLineContaining(m.lines, lineError, "background agent limit reached") {
-		t.Fatalf("limit rejection missing: %#v", m.lines)
+	if cmd != nil || m.backgroundAgents["agent-5"].state != backgroundAgentQueued || !hasLineContaining(m.lines, lineSystem, "agent-5 queued") {
+		t.Fatalf("fifth task should queue at concurrency limit: task=%#v lines=%#v", m.backgroundAgents["agent-5"], m.lines)
 	}
 
 	firstMsg := commands[0]().(backgroundAgentDoneMsg)
 	second := mustSession(t, &staticModel{}, "second")
 	m.replaceSession(second)
 	beforeSideLines := len(m.sideLines)
-	next, _ = m.Update(firstMsg)
+	next, queuedCmd := m.Update(firstMsg)
 	m = next.(*model)
-	if len(m.sideLines) != beforeSideLines {
-		t.Fatalf("stale completion should not enter current TUI output: %#v", m.sideLines)
+	if len(m.sideLines) != beforeSideLines || queuedCmd == nil || m.backgroundAgents["agent-5"].state != backgroundAgentWorking {
+		t.Fatalf("stale completion should dispatch without entering current TUI output: task=%#v cmd=%v side=%#v", m.backgroundAgents["agent-5"], queuedCmd, m.sideLines)
+	}
+	next, _ = m.Update(queuedCmd().(backgroundAgentDoneMsg))
+	m = next.(*model)
+	if m.backgroundAgents["agent-5"].state != backgroundAgentCompleted {
+		t.Fatalf("queued task did not complete after dispatch: %#v", m.backgroundAgents["agent-5"])
 	}
 	next, _ = m.submit("/agents show agent-1")
 	m = next.(*model)
@@ -344,6 +349,39 @@ func TestBackgroundAgentLimitStaleResultAndBoundedPresentation(t *testing.T) {
 	for _, id := range []string{"agent-2", "agent-3", "agent-4"} {
 		next, _ = m.submit("/agents cancel " + id)
 		m = next.(*model)
+	}
+}
+
+func TestBackgroundAgentQueueRetentionLimitAndQueuedCancellation(t *testing.T) {
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+			return "unused", nil
+		},
+	})
+	for index := range maxRetainedBackgroundAgents {
+		next, _ := m.submit("/agent task " + itoa(index+1))
+		m = next.(*model)
+	}
+	if got := m.activeBackgroundAgents(); got != maxBackgroundAgents || m.queuedBackgroundAgents() != maxRetainedBackgroundAgents-maxBackgroundAgents {
+		t.Fatalf("queue accounting active=%d queued=%d", got, m.queuedBackgroundAgents())
+	}
+	next, cmd := m.submit("/agent overflow")
+	m = next.(*model)
+	if cmd != nil || !hasLineContaining(m.lines, lineError, "background agent queue is full (16 retained)") {
+		t.Fatalf("retention limit rejection missing: %#v", m.lines)
+	}
+
+	next, cmd = m.submit("/agents cancel agent-5")
+	m = next.(*model)
+	if cmd != nil || m.backgroundAgents["agent-5"].state != backgroundAgentCancelled || !hasLineContaining(m.lines, lineSystem, "cancelled before start") {
+		t.Fatalf("queued cancellation = task=%#v lines=%#v", m.backgroundAgents["agent-5"], m.lines)
+	}
+	next, cmd = m.submit("/agent admitted after terminal retention")
+	m = next.(*model)
+	if cmd != nil || len(m.backgroundAgents) != maxRetainedBackgroundAgents || m.backgroundAgents["agent-5"] != nil || m.backgroundAgents["agent-17"] == nil || m.backgroundAgents["agent-17"].state != backgroundAgentQueued {
+		t.Fatalf("terminal retention should make room for a queued task: count=%d old=%#v new=%#v cmd=%v", len(m.backgroundAgents), m.backgroundAgents["agent-5"], m.backgroundAgents["agent-17"], cmd)
 	}
 }
 

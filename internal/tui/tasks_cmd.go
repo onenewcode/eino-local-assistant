@@ -60,7 +60,7 @@ func backgroundAgentTaskSummary(m *model) string {
 	if m == nil || m.deps.BackgroundAgent == nil {
 		return "Background resources: unavailable (no background shell/subagent runtime)"
 	}
-	return fmt.Sprintf("Background analysis agents: %d active, %d retained (limit %d; manage with /agents)", m.activeBackgroundAgents(), len(m.backgroundAgents), maxBackgroundAgents)
+	return fmt.Sprintf("Background analysis agents: %d active, %d retained, %d queued (concurrency limit %d; retained limit %d; manage with /agents)", m.activeBackgroundAgents(), len(m.backgroundAgents), m.queuedBackgroundAgents(), maxBackgroundAgents, maxRetainedBackgroundAgents)
 }
 
 func tasksForegroundState(m *model) string {

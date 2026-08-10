@@ -10,7 +10,7 @@
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，shell 可用 `eino sessions --output-format json` 读取机器可读元数据而不加载 transcript，并可通过 `eino fork <session-id> [prompt]`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
 - **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话；TUI `/rules` 只查看当前 session 创建时捕获的 source metadata，不 reload 文件
 - **旁路问题（安全子集）**：TUI `/btw <question>`（`/side` 别名）使用当前 frozen session context 做 reference；不打断、不排队主 turn，不写主 ledger、usage 或 journal，不调用工具/子 agent
-- **后台分析子 agent（安全子集）**：TUI `/agent [--diff] <task>` 启动最多 4 个 process-local、只读且无工具的分析 child；`--diff` 可附带有界 Git diff snapshot，`/agents` 可列出、查看有界 display-only 结果、显式附加到草稿或按 ID 取消，结果不会自动写回父 session、usage 或模型上下文
+- **后台分析子 agent（安全子集）**：TUI `/agent [--diff] <task>` 最多并行 4 个 process-local、只读且无工具的分析 child，超出项按 FIFO 排队且最多保留 16 条；`--diff` 可附带有界 Git diff snapshot，`/agents` 可列出、查看有界 display-only 结果、显式附加到草稿或按 ID 取消，结果不会自动写回父 session、usage 或模型上下文
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
@@ -76,7 +76,7 @@ eino
 
 交互 TUI 的 `/skills` 列出当前 workspace 发现的项目 skills；`/skills <name>` 只预览一个已发现的、有界 `SKILL.md`。两者不会创建模型 turn、不会把全文自动注入 session，也能在正常 turn 忙碌时立即查看。若本次运行通过 `--tools` 排除了 `list_skills` 或 `read_skill`，对应的检查操作会明确不可用。
 
-`/agent <analysis task>` 可在普通 turn 忙碌时立即启动一个独立的后台分析 child，返回稳定的 `agent-N` ID；`/agent --diff <analysis task>` 还会先通过既有固定参数、受限的 Git reader 获取一次 64 KiB workspace diff snapshot，将其作为 quoted reference 提供给同一个无工具 child。child 本身不能运行 shell；快照读取失败会使该 child 明确失败。`/agents` 显示状态，`/agents show <id>` 查看完成结果，`/agents append <id>` 将已完成结果作为带来源的 quoted reference 追加到编辑器草稿，`/agents cancel <id>` 只取消指定 child。append 最多放入 16 KiB，用户必须先审阅再自行发送；它不是自动 result merge。child 只接收创建时的 frozen session reference，并使用无工具模型调用：不能编辑文件、运行 shell、升级权限或再派生 agent。结果最多保留 16 条、每条显示最多 64 KiB，且只用于 TUI 检查；不会写入 parent ledger 或 usage，也不会在未经用户明确操作时进入后续模型上下文。退出 TUI 会请求取消所有 active child；切换 `/new` 或 `/resume` 后仍可用 `/agents show` 检查已保留结果，但旧 session 的完成通知不会插入新 session 页面。
+`/agent <analysis task>` 可在普通 turn 忙碌时立即启动一个独立的后台分析 child，返回稳定的 `agent-N` ID；最多 4 个 child 同时运行，超出项为 `queued` 并按创建顺序在一个 running child 进入 terminal state 后启动。process-local 总记录上限为 16；最早的 terminal record 会在新任务到来时淘汰，若 16 条都处于 queued/running/cancelling 则新任务明确被拒绝。`/agent --diff <analysis task>` 还会先通过既有固定参数、受限的 Git reader 获取一次 64 KiB workspace diff snapshot，将其作为 quoted reference 提供给同一个无工具 child。child 本身不能运行 shell；快照读取失败会使该 child 明确失败。`/agents` 显示状态，`/agents show <id>` 查看完成结果，`/agents append <id>` 将已完成结果作为带来源的 quoted reference 追加到编辑器草稿，`/agents cancel <id>` 只取消指定 child（queued 项不会触发模型调用）。append 最多放入 16 KiB，用户必须先审阅再自行发送；它不是自动 result merge。child 只接收创建时的 frozen session reference，并使用无工具模型调用：不能编辑文件、运行 shell、升级权限或再派生 agent。结果最多保留 16 条、每条显示最多 64 KiB，且只用于 TUI 检查；不会写入 parent ledger 或 usage，也不会在未经用户明确操作时进入后续模型上下文。退出 TUI 会请求取消所有 active 或 queued child；切换 `/new` 或 `/resume` 后仍可用 `/agents show` 检查已保留结果，但旧 session 的完成通知不会插入新 session 页面。
 
 ## MCP
 

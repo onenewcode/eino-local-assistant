@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"eino-local-assistant/internal/chat"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -24,6 +26,7 @@ const (
 type backgroundAgentState string
 
 const (
+	backgroundAgentQueued     backgroundAgentState = "queued"
 	backgroundAgentWorking    backgroundAgentState = "working"
 	backgroundAgentCancelling backgroundAgentState = "cancelling"
 	backgroundAgentCompleted  backgroundAgentState = "completed"
@@ -35,12 +38,15 @@ type backgroundAgentTask struct {
 	id                string
 	prompt            string
 	workspaceDiff     bool
+	session           *chat.Session
 	sessionID         string
 	sessionGeneration uint64
 	startedAt         time.Time
 	finishedAt        time.Time
 	state             backgroundAgentState
 	cancel            context.CancelFunc
+	callback          BackgroundAgentCallback
+	workspaceDiffRead func(context.Context) (string, error)
 	answer            string
 	answerTruncated   bool
 	failure           string
@@ -62,46 +68,96 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "background agent unavailable: workspace diff snapshot is not configured")
 		return m, nil
 	}
-	if m.activeBackgroundAgents() >= maxBackgroundAgents {
-		m.appendLine(lineError, fmt.Sprintf("background agent limit reached (%d active); wait or /agents cancel <id>", maxBackgroundAgents))
-		return m, nil
-	}
 	session, generation := m.activeSessionSnapshot()
 	if session == nil {
 		m.appendLine(lineError, "background agent unavailable: session is unavailable")
 		return m, nil
 	}
 
-	ctx, cancel := m.backgroundAgentContext()
+	if m.backgroundAgents == nil {
+		m.backgroundAgents = make(map[string]*backgroundAgentTask)
+	}
+	// Free one retained terminal record before admitting new work. Active and
+	// queued tasks are never evicted, so a full live queue remains explicit.
+	m.trimBackgroundAgents(maxRetainedBackgroundAgents - 1)
+	if len(m.backgroundAgents) >= maxRetainedBackgroundAgents {
+		m.appendLine(lineError, fmt.Sprintf("background agent queue is full (%d retained); inspect or cancel existing agents", maxRetainedBackgroundAgents))
+		return m, nil
+	}
 	id := m.nextBackgroundAgentID()
 	task := &backgroundAgentTask{
 		id:                id,
 		prompt:            prompt,
 		workspaceDiff:     includeWorkspaceDiff,
+		session:           session,
 		sessionID:         session.ID(),
 		sessionGeneration: generation,
-		startedAt:         time.Now(),
-		state:             backgroundAgentWorking,
-		cancel:            cancel,
-	}
-	if m.backgroundAgents == nil {
-		m.backgroundAgents = make(map[string]*backgroundAgentTask)
+		state:             backgroundAgentQueued,
+		callback:          callback,
+		workspaceDiffRead: workspaceDiff,
 	}
 	m.backgroundAgents[id] = task
 	m.backgroundAgentOrder = append(m.backgroundAgentOrder, id)
-	m.trimBackgroundAgents()
+	cmd := m.dispatchQueuedBackgroundAgents()
+	if task.state == backgroundAgentQueued {
+		m.appendLine(lineSystem, fmt.Sprintf("background agent %s queued (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff), backgroundAgentPreview(prompt)))
+		m.appendLine(lineSep, "")
+	}
+	return m, cmd
+}
+
+// dispatchQueuedBackgroundAgents starts queued tasks in insertion order while
+// respecting the process-local concurrency cap. A cancellation continues to
+// occupy its slot until its callback reports a terminal message.
+func (m *model) dispatchQueuedBackgroundAgents() tea.Cmd {
+	if m.activeBackgroundAgents() >= maxBackgroundAgents {
+		return nil
+	}
+	// Dispatch runs after one admission or terminal event. Starting one task
+	// fills the newly available slot, and later terminal events fill later
+	// slots in FIFO order without pre-marking unstarted work as running.
+	return m.startBackgroundAgent(m.nextQueuedBackgroundAgent())
+}
+
+func (m *model) nextQueuedBackgroundAgent() *backgroundAgentTask {
+	for _, id := range m.backgroundAgentOrder {
+		task := m.backgroundAgents[id]
+		if task != nil && task.state == backgroundAgentQueued {
+			return task
+		}
+	}
+	return nil
+}
+
+func (m *model) startBackgroundAgent(task *backgroundAgentTask) tea.Cmd {
+	if task == nil || task.state != backgroundAgentQueued || task.callback == nil || task.session == nil {
+		return nil
+	}
+	ctx, cancel := m.backgroundAgentContext()
+	task.state = backgroundAgentWorking
+	task.startedAt = time.Now()
+	task.cancel = cancel
+
+	id := task.id
+	prompt := task.prompt
+	includeWorkspaceDiff := task.workspaceDiff
+	session := task.session
+	sessionID := task.sessionID
+	sessionGeneration := task.sessionGeneration
+	callback := task.callback
+	workspaceDiff := task.workspaceDiffRead
 	m.appendLine(lineSystem, fmt.Sprintf("background agent %s started (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff), backgroundAgentPreview(prompt)))
 	m.appendLine(lineSep, "")
 
-	return m, func() tea.Msg {
+	return func() tea.Msg {
 		request := prompt
 		if includeWorkspaceDiff {
 			diff, diffErr := workspaceDiff(ctx)
 			if diffErr != nil {
 				return backgroundAgentDoneMsg{
 					id:                id,
-					sessionID:         session.ID(),
-					sessionGeneration: generation,
+					sessionID:         sessionID,
+					sessionGeneration: sessionGeneration,
 					err:               fmt.Errorf("read workspace diff snapshot: %w", diffErr),
 				}
 			}
@@ -110,8 +166,8 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 		answer, err := callback(ctx, session, request)
 		return backgroundAgentDoneMsg{
 			id:                id,
-			sessionID:         session.ID(),
-			sessionGeneration: generation,
+			sessionID:         sessionID,
+			sessionGeneration: sessionGeneration,
 			answer:            answer,
 			err:               err,
 		}
@@ -189,6 +245,13 @@ func (m *model) cmdAgents(arg string) (tea.Model, tea.Cmd) {
 	case "append":
 		return m.appendBackgroundAgentResult(task)
 	case "cancel":
+		if task.state == backgroundAgentQueued {
+			task.state = backgroundAgentCancelled
+			task.finishedAt = time.Now()
+			m.appendLine(lineSystem, fmt.Sprintf("background agent %s cancelled before start", task.id))
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
 		if !task.active() {
 			m.appendLine(lineError, fmt.Sprintf("background agent %s is already %s", task.id, task.state))
 			return m, nil
@@ -259,12 +322,12 @@ func backgroundAgentAttachment(task *backgroundAgentTask) string {
 	return b.String()
 }
 
-func (m *model) finishBackgroundAgent(msg backgroundAgentDoneMsg) {
+func (m *model) finishBackgroundAgent(msg backgroundAgentDoneMsg) tea.Cmd {
 	task := m.backgroundAgents[msg.id]
 	// Commands are process-local, but bind completion to the task snapshot so a
 	// stale or malformed message can never settle a differently sourced task.
 	if task == nil || !task.active() || msg.sessionID != task.sessionID || msg.sessionGeneration != task.sessionGeneration {
-		return
+		return nil
 	}
 	if task.cancel != nil {
 		task.cancel()
@@ -287,11 +350,11 @@ func (m *model) finishBackgroundAgent(msg backgroundAgentDoneMsg) {
 		task.answer = payload.text
 		task.answerTruncated = payload.truncated
 	}
-	m.trimBackgroundAgents()
+	m.trimBackgroundAgents(maxRetainedBackgroundAgents)
 
 	current, generation := m.activeSessionSnapshot()
 	if current == nil || current.ID() != task.sessionID || generation != task.sessionGeneration {
-		return
+		return m.dispatchQueuedBackgroundAgents()
 	}
 	switch task.state {
 	case backgroundAgentCompleted:
@@ -301,6 +364,7 @@ func (m *model) finishBackgroundAgent(msg backgroundAgentDoneMsg) {
 	case backgroundAgentCancelled:
 		m.appendSideLine(fmt.Sprintf("[%s] cancelled", task.id))
 	}
+	return m.dispatchQueuedBackgroundAgents()
 }
 
 func (m *model) backgroundAgentContext() (context.Context, context.CancelFunc) {
@@ -331,7 +395,15 @@ func (m *model) activeBackgroundAgents() int {
 
 func (m *model) cancelBackgroundAgents() {
 	for _, task := range m.backgroundAgents {
-		if task == nil || !task.active() {
+		if task == nil {
+			continue
+		}
+		if task.state == backgroundAgentQueued {
+			task.state = backgroundAgentCancelled
+			task.finishedAt = time.Now()
+			continue
+		}
+		if !task.active() {
 			continue
 		}
 		task.state = backgroundAgentCancelling
@@ -341,12 +413,12 @@ func (m *model) cancelBackgroundAgents() {
 	}
 }
 
-func (m *model) trimBackgroundAgents() {
-	for len(m.backgroundAgents) > maxRetainedBackgroundAgents {
+func (m *model) trimBackgroundAgents(limit int) {
+	for len(m.backgroundAgents) > limit {
 		removed := false
 		for index, id := range m.backgroundAgentOrder {
 			task := m.backgroundAgents[id]
-			if task == nil || task.active() {
+			if task == nil || !task.terminal() {
 				continue
 			}
 			delete(m.backgroundAgents, id)
@@ -364,6 +436,10 @@ func (task *backgroundAgentTask) active() bool {
 	return task != nil && (task.state == backgroundAgentWorking || task.state == backgroundAgentCancelling)
 }
 
+func (task *backgroundAgentTask) terminal() bool {
+	return task != nil && (task.state == backgroundAgentCompleted || task.state == backgroundAgentFailed || task.state == backgroundAgentCancelled)
+}
+
 func renderBackgroundAgents(m *model) string {
 	if m == nil || m.deps.BackgroundAgent == nil {
 		return "Background agents\n  unavailable: no background analysis runtime is configured"
@@ -372,7 +448,7 @@ func renderBackgroundAgents(m *model) string {
 		return "Background agents (0)\n  (none; use /agent <analysis task> to start one)"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Background agents (%d; %d active, limit %d)\n", len(m.backgroundAgents), m.activeBackgroundAgents(), maxBackgroundAgents)
+	fmt.Fprintf(&b, "Background agents (%d; %d active, %d queued, concurrency limit %d)\n", len(m.backgroundAgents), m.activeBackgroundAgents(), m.queuedBackgroundAgents(), maxBackgroundAgents)
 	for _, id := range m.backgroundAgentOrder {
 		task := m.backgroundAgents[id]
 		if task == nil {
@@ -395,6 +471,8 @@ func renderBackgroundAgent(task *backgroundAgentTask) string {
 		return b.String()
 	}
 	switch task.state {
+	case backgroundAgentQueued:
+		b.WriteString("Result: queued; the model call has not started yet")
 	case backgroundAgentCompleted:
 		b.WriteString("Result (display-only; not sent to the parent model):\n\n")
 		b.WriteString(task.answer)
@@ -408,6 +486,16 @@ func renderBackgroundAgent(task *backgroundAgentTask) string {
 		b.WriteString("Result: cancelled before a result was accepted")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *model) queuedBackgroundAgents() int {
+	queued := 0
+	for _, task := range m.backgroundAgents {
+		if task != nil && task.state == backgroundAgentQueued {
+			queued++
+		}
+	}
+	return queued
 }
 
 func backgroundAgentPreview(prompt string) string {
