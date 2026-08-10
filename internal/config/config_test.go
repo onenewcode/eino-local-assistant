@@ -116,16 +116,34 @@ connect_timeout_seconds = 7
 		t.Fatalf("remote MCP server = %#v", server)
 	}
 
+	oauthConfig, err := Load(writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "oauth-tools"
+type = "streamable_http"
+url = "https://mcp.example.test/oauth"
+oauth = true
+`))
+	if err != nil {
+		t.Fatalf("Load(OAuth server) error = %v", err)
+	}
+	if len(oauthConfig.MCP.Servers) != 1 || !oauthConfig.MCP.Servers[0].OAuth {
+		t.Fatalf("OAuth MCP server = %#v", oauthConfig.MCP.Servers)
+	}
+
 	for name, source := range map[string]string{
-		"missing URL":      `type = "streamable_http"`,
-		"unsupported type": `type = "sse"` + "\n" + `url = "https://mcp.example.test"`,
-		"stdio URL":        `command = "mcp-server"` + "\n" + `url = "https://mcp.example.test"`,
-		"stdio bearer":     `command = "mcp-server"` + "\n" + `bearer_token_env_var = "EINO_MCP_TOKEN"`,
-		"remote command":   `type = "streamable_http"` + "\n" + `url = "https://mcp.example.test"` + "\n" + `command = "mcp-server"`,
-		"bad scheme":       `type = "streamable_http"` + "\n" + `url = "file:///tmp/mcp"`,
-		"credential URL":   `type = "streamable_http"` + "\n" + `url = "https://token@example.test/mcp"`,
-		"query URL":        `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp?token=secret"`,
-		"bad bearer name":  `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp"` + "\n" + `bearer_token_env_var = "NOT-VALID"`,
+		"missing URL":       `type = "streamable_http"`,
+		"unsupported type":  `type = "sse"` + "\n" + `url = "https://mcp.example.test"`,
+		"stdio URL":         `command = "mcp-server"` + "\n" + `url = "https://mcp.example.test"`,
+		"stdio bearer":      `command = "mcp-server"` + "\n" + `bearer_token_env_var = "EINO_MCP_TOKEN"`,
+		"stdio OAuth":       `command = "mcp-server"` + "\n" + `oauth = true`,
+		"remote command":    `type = "streamable_http"` + "\n" + `url = "https://mcp.example.test"` + "\n" + `command = "mcp-server"`,
+		"bad scheme":        `type = "streamable_http"` + "\n" + `url = "file:///tmp/mcp"`,
+		"credential URL":    `type = "streamable_http"` + "\n" + `url = "https://token@example.test/mcp"`,
+		"query URL":         `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp?token=secret"`,
+		"bad bearer name":   `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp"` + "\n" + `bearer_token_env_var = "NOT-VALID"`,
+		"bearer with OAuth": `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp"` + "\n" + `bearer_token_env_var = "EINO_MCP_TOKEN"` + "\n" + `oauth = true`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, loadErr := Load(writeConfiguration(t, validConfiguration+"\n[mcp]\n\n[[mcp.servers]]\nname = \"invalid\"\n"+source+"\n"))
@@ -459,6 +477,95 @@ line two"""
 `)
 	if err := SetMCPServerEnabled(multiline, "server", false); err == nil || !strings.Contains(err.Error(), "multiline TOML strings") {
 		t.Fatalf("multiline toggle error = %v", err)
+	}
+}
+
+func TestSetMCPOAuthEnabledPreservesRemoteServerAndRejectsUnsafeConfigurations(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`# preserve this comment
+[mcp]
+
+[[mcp.servers]]
+name = "remote"
+type = "streamable_http"
+url = "https://mcp.example.test/v1"
+enabled = false
+
+[[mcp.servers]]
+name = "local"
+command = "mcp-server"
+`)
+	if err := SetMCPOAuthEnabled(path, "remote", true); err != nil {
+		t.Fatalf("SetMCPOAuthEnabled(enable) error = %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after enabling OAuth error = %v", err)
+	}
+	if len(got.MCP.Servers) != 2 || !got.MCP.Servers[0].OAuth || got.MCP.Servers[0].IsEnabled() || got.MCP.Servers[0].URL != "https://mcp.example.test/v1" {
+		t.Fatalf("MCP servers after OAuth update = %#v", got.MCP.Servers)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(data)
+	for _, want := range []string{"# preserve this comment", "oauth = true", "enabled = false", `url = "https://mcp.example.test/v1"`} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("updated config missing %q:\n%s", want, contents)
+		}
+	}
+	if err := SetMCPOAuthEnabled(path, "remote", true); err != nil {
+		t.Fatalf("SetMCPOAuthEnabled(idempotent) error = %v", err)
+	}
+	again, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != contents {
+		t.Fatal("idempotent OAuth update rewrote configuration")
+	}
+	if err := SetMCPOAuthEnabled(path, "remote", false); err != nil {
+		t.Fatalf("SetMCPOAuthEnabled(disable) error = %v", err)
+	}
+	if err := SetMCPOAuthEnabled(path, "local", true); err == nil || !strings.Contains(err.Error(), "does not support OAuth") {
+		t.Fatalf("local OAuth update error = %v", err)
+	}
+	if err := SetMCPOAuthEnabled(path, "missing", true); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("missing OAuth update error = %v", err)
+	}
+
+	link := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetMCPOAuthEnabled(link, "remote", true); err == nil || !strings.Contains(err.Error(), "symbolic-link") {
+		t.Fatalf("symbolic link OAuth update error = %v", err)
+	}
+
+	bearer := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "bearer"
+type = "streamable_http"
+url = "https://mcp.example.test/v1"
+bearer_token_env_var = "EINO_MCP_TOKEN"
+`)
+	if err := SetMCPOAuthEnabled(bearer, "bearer", true); err == nil || !strings.Contains(err.Error(), "bearer_token_env_var") {
+		t.Fatalf("bearer OAuth update error = %v", err)
+	}
+
+	multiline := writeConfiguration(t, strings.Replace(validConfiguration, `api_key = "test-api-key"`, `api_key = """line one
+line two"""`, 1)+`
+[mcp]
+
+[[mcp.servers]]
+name = "remote"
+type = "streamable_http"
+url = "https://mcp.example.test/v1"
+`)
+	if err := SetMCPOAuthEnabled(multiline, "remote", true); err == nil || !strings.Contains(err.Error(), "multiline TOML strings") {
+		t.Fatalf("multiline OAuth update error = %v", err)
 	}
 }
 

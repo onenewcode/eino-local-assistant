@@ -66,6 +66,7 @@ type MCPServerConfig struct {
 	Env                   map[string]string `toml:"env"`
 	URL                   string            `toml:"url"`
 	BearerTokenEnvVar     string            `toml:"bearer_token_env_var"`
+	OAuth                 bool              `toml:"oauth"`
 	Enabled               *bool             `toml:"enabled"`
 	ConnectTimeoutSeconds int               `toml:"connect_timeout_seconds"`
 }
@@ -889,7 +890,7 @@ func SetMCPServerEnabled(path, name string, enabled bool) error {
 	if !found {
 		return fmt.Errorf("mcp server %q is not configured", name)
 	}
-	updated, err := setMCPServerEnabledSource(string(data), cfg.MCP.Servers, name, enabled)
+	updated, err := setMCPServerBooleanSource(string(data), cfg.MCP.Servers, name, "enabled", enabled)
 	if err != nil {
 		return err
 	}
@@ -899,7 +900,65 @@ func SetMCPServerEnabled(path, name string, enabled bool) error {
 	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
 }
 
-func setMCPServerEnabledSource(source string, servers []MCPServerConfig, name string, enabled bool) (string, error) {
+// SetMCPOAuthEnabled records whether a remote MCP server may load an OAuth
+// token from the system keyring in future runtimes. It never reads a token.
+func SetMCPOAuthEnabled(path, name string, enabled bool) error {
+	if strings.ToLower(filepath.Ext(path)) != ".toml" {
+		return errors.New("configuration file must use the .toml extension")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("mcp server name is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect configuration: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to update a symbolic-link configuration file")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("configuration file must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration: %w", err)
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, server := range cfg.MCP.Servers {
+		if strings.TrimSpace(server.Name) != name {
+			continue
+		}
+		found = true
+		if server.TransportType() != MCPTransportStreamableHTTP {
+			return fmt.Errorf("mcp server %q does not support OAuth", name)
+		}
+		if strings.TrimSpace(server.BearerTokenEnvVar) != "" {
+			return fmt.Errorf("mcp server %q uses bearer_token_env_var instead of OAuth", name)
+		}
+		if server.OAuth == enabled {
+			return nil
+		}
+		break
+	}
+	if !found {
+		return fmt.Errorf("mcp server %q is not configured", name)
+	}
+	updated, err := setMCPServerBooleanSource(string(data), cfg.MCP.Servers, name, "oauth", enabled)
+	if err != nil {
+		return err
+	}
+	if _, err := parseConfig([]byte(updated)); err != nil {
+		return fmt.Errorf("validate updated configuration: %w", err)
+	}
+	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+func setMCPServerBooleanSource(source string, servers []MCPServerConfig, name, settingName string, enabled bool) (string, error) {
 	if strings.Contains(source, `"""`) || strings.Contains(source, `'''`) {
 		return "", errors.New("cannot update MCP configuration containing multiline TOML strings")
 	}
@@ -923,10 +982,10 @@ func setMCPServerEnabledSource(source string, servers []MCPServerConfig, name st
 		if isAnyTOMLTableHeader(lines[i]) {
 			break
 		}
-		if !isTOMLAssignment(lines[i], "enabled") {
+		if !isTOMLAssignment(lines[i], settingName) {
 			continue
 		}
-		lines[i] = replaceTOMLBooleanSetting(lines[i], "enabled", enabled)
+		lines[i] = replaceTOMLBooleanSetting(lines[i], settingName, enabled)
 		return strings.Join(lines, ""), nil
 	}
 	insertAt := block.end
@@ -936,7 +995,7 @@ func setMCPServerEnabledSource(source string, servers []MCPServerConfig, name st
 			break
 		}
 	}
-	setting := fmt.Sprintf("enabled = %t\n", enabled)
+	setting := fmt.Sprintf("%s = %t\n", settingName, enabled)
 	lines = append(lines[:insertAt], append([]string{setting}, lines[insertAt:]...)...)
 	return strings.Join(lines, ""), nil
 }
@@ -1043,6 +1102,9 @@ func formatMCPServerTOML(server MCPServerConfig) (string, error) {
 				return "", fmt.Errorf("format MCP bearer token environment variable: %w", tokenEnvVarErr)
 			}
 			fmt.Fprintf(&out, "bearer_token_env_var = %s\n", tokenEnvVar)
+		}
+		if server.OAuth {
+			out.WriteString("oauth = true\n")
 		}
 		if server.Enabled != nil {
 			fmt.Fprintf(&out, "enabled = %t\n", *server.Enabled)
@@ -1465,6 +1527,9 @@ func (c MCPConfig) Validate() error {
 			if strings.TrimSpace(server.BearerTokenEnvVar) != "" {
 				return fmt.Errorf("mcp.servers[%d].bearer_token_env_var is only valid for type %q", i, MCPTransportStreamableHTTP)
 			}
+			if server.OAuth {
+				return fmt.Errorf("mcp.servers[%d].oauth is only valid for type %q", i, MCPTransportStreamableHTTP)
+			}
 			if dir := strings.TrimSpace(server.WorkingDir); dir != "" {
 				info, err := os.Stat(dir)
 				if err != nil {
@@ -1483,6 +1548,9 @@ func (c MCPConfig) Validate() error {
 			}
 			if name := strings.TrimSpace(server.BearerTokenEnvVar); name != "" && !isMCPEnvironmentName(name) {
 				return fmt.Errorf("mcp.servers[%d].bearer_token_env_var must be a conventional environment variable name", i)
+			}
+			if server.OAuth && strings.TrimSpace(server.BearerTokenEnvVar) != "" {
+				return fmt.Errorf("mcp.servers[%d] cannot set both oauth and bearer_token_env_var", i)
 			}
 		default:
 			return fmt.Errorf("mcp.servers[%d].type must be %q or %q", i, MCPTransportStdio, MCPTransportStreamableHTTP)
