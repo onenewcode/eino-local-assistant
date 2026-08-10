@@ -40,7 +40,7 @@ func TestRootHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute(%v): %v", args, err)
 			}
-			for _, want := range []string{"Usage:", "chat", "exec", "resume", "sessions", "mcp", "completion", "init", "export", "doctor", "version"} {
+			for _, want := range []string{"Usage:", "chat", "exec", "resume", "fork", "sessions", "mcp", "completion", "init", "export", "doctor", "version"} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("help missing %q:\n%s", want, stdout)
 				}
@@ -63,6 +63,8 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"exec", "resume", "-h"}, "Open the explicitly named durable session"},
 		{[]string{"help", "resume"}, "Resume a previously saved session"},
 		{[]string{"resume", "-h"}, "Resume a previously saved session"},
+		{[]string{"help", "fork"}, "Create an independent child of a saved session"},
+		{[]string{"fork", "-h"}, "fork the newest saved session"},
 		{[]string{"help", "sessions"}, "List saved sessions"},
 		{[]string{"sessions", "-h"}, "List saved sessions"},
 		{[]string{"help", "completion"}, "Generate a completion script"},
@@ -153,6 +155,8 @@ func TestInteractiveModelFlagWiresSessionStart(t *testing.T) {
 		{name: "new alias yolo", args: []string{"new", "--yolo"}, want: sessionStart{yolo: true}},
 		{name: "resume", args: []string{"resume", "saved-session", "-m", "resume-model"}, want: sessionStart{resumeID: "saved-session", modelName: "resume-model"}},
 		{name: "resume yolo", args: []string{"resume", "saved-session", "--yolo"}, want: sessionStart{resumeID: "saved-session", yolo: true}},
+		{name: "fork", args: []string{"fork", "saved-session", "try", "another", "approach", "-m", "fork-model"}, want: sessionStart{forkID: "saved-session", initialPrompt: "try another approach", modelName: "fork-model"}},
+		{name: "fork last", args: []string{"fork", "--last", "try", "another", "approach", "--yolo"}, want: sessionStart{forkLast: true, initialPrompt: "try another approach", yolo: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,6 +243,26 @@ func TestResumeRequiresID(t *testing.T) {
 	_, _, err := executeForTest("resume")
 	if err == nil {
 		t.Fatal("expected error when resume id is missing")
+	}
+}
+
+func TestForkRequiresSelectorAndParsesPrompt(t *testing.T) {
+	_, _, err := executeForTest("fork")
+	if err == nil || !strings.Contains(err.Error(), "requires a session id or --last") {
+		t.Fatalf("fork without selector error = %v", err)
+	}
+
+	id, prompt, err := parseForkCommandArgs([]string{"saved-session", "try", "another", "approach"}, false)
+	if err != nil || id != "saved-session" || prompt != "try another approach" {
+		t.Fatalf("explicit fork args = id:%q prompt:%q err:%v", id, prompt, err)
+	}
+	id, prompt, err = parseForkCommandArgs([]string{"try", "another", "approach"}, true)
+	if err != nil || id != "" || prompt != "try another approach" {
+		t.Fatalf("last fork args = id:%q prompt:%q err:%v", id, prompt, err)
+	}
+	_, _, err = executeForTest("fork", "saved-session", "--last")
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --last") {
+		t.Fatalf("fork conflicting selectors error = %v", err)
 	}
 }
 

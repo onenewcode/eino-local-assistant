@@ -54,9 +54,9 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	root := &cobra.Command{
 		Use:   appName + " [command]",
 		Short: "Eino local coding assistant",
-		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat and resume. Use --yolo only when you explicitly accept host-side tool execution without approval prompts.",
+		Long:  "Eino local coding assistant — interactive TUI chat and durable non-interactive execution with ReAct tools. Use -m/--model for a startup-only model override on interactive chat, resume, and fork. Use --yolo only when you explicitly accept host-side tool execution without approval prompts.",
 		Example: fmt.Sprintf(
-			"  %[1]s\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s sessions\n  %[1]s mcp list\n  %[1]s version",
+			"  %[1]s\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s fork --last \"try another approach\"\n  %[1]s sessions\n  %[1]s mcp list\n  %[1]s version",
 			appName,
 		),
 		Args:          cobra.NoArgs,
@@ -68,8 +68,8 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		},
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		if opts.yolo && cmd != cmd.Root() && (cmd.Parent() != cmd.Root() || (cmd.Name() != "chat" && cmd.Name() != "resume")) {
-			return errors.New("--yolo is only supported for interactive chat/new/resume; headless and informational commands cannot use it")
+		if opts.yolo && cmd != cmd.Root() && (cmd.Parent() != cmd.Root() || (cmd.Name() != "chat" && cmd.Name() != "resume" && cmd.Name() != "fork")) {
+			return errors.New("--yolo is only supported for interactive chat/new/resume/fork; headless and informational commands cannot use it")
 		}
 		if cmd.Name() == "version" {
 			return nil
@@ -87,6 +87,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newChatCommand(opts, deps.interactive),
 		newExecCommand(opts, deps.exec),
 		newResumeCommand(opts, deps.interactive),
+		newForkCommand(opts, deps.interactive),
 		newSessionsCommand(opts),
 		newMCPCommand(opts),
 		newCompletionCommand(),
@@ -143,6 +144,54 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn or pending compaction before resuming")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
 	return cmd
+}
+
+func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
+	var modelName string
+	lastFlag := &lastSessionFlagValue{}
+	cmd := &cobra.Command{
+		Use:   "fork [SESSION_ID] [PROMPT]",
+		Short: "Fork a saved session in the TUI",
+		Long: "Create an independent child of a saved session and open it in the TUI. " +
+			"The optional PROMPT starts the child immediately. Use --last to fork the newest saved session; with --last, all positional arguments are PROMPT. " +
+			"Requires an interactive terminal (stdin and stdout must be a TTY).\n\n" +
+			"A session picker is not available yet, so provide SESSION_ID or explicitly opt in to --last.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if lastFlag.positionalBefore {
+				return errors.New("session id cannot be combined with --last")
+			}
+			_, _, err := parseForkCommandArgs(args, lastFlag.value)
+			return err
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, prompt, err := parseForkCommandArgs(args, lastFlag.value)
+			if err != nil {
+				return err
+			}
+			return interactive(opts.configPath, sessionStart{
+				forkID:        id,
+				forkLast:      lastFlag.value,
+				initialPrompt: prompt,
+				modelName:     modelName,
+				yolo:          opts.yolo,
+			}, cmd.ErrOrStderr())
+		},
+	}
+	lastFlag.hasPositionalBefore = func() bool { return len(cmd.Flags().Args()) > 0 }
+	cmd.Flags().Var(lastFlag, "last", "fork the newest saved session")
+	cmd.Flags().Lookup("last").NoOptDefVal = "true"
+	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
+	return cmd
+}
+
+func parseForkCommandArgs(args []string, last bool) (id, prompt string, err error) {
+	if last {
+		return "", strings.TrimSpace(strings.Join(args, " ")), nil
+	}
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return "", "", errors.New("fork requires a session id or --last")
+	}
+	return strings.TrimSpace(args[0]), strings.TrimSpace(strings.Join(args[1:], " ")), nil
 }
 
 func newSessionsCommand(opts *rootOptions) *cobra.Command {

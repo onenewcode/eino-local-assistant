@@ -410,6 +410,77 @@ func TestResolveStartupModelConfigUsesDurableTargetBeforeBundle(t *testing.T) {
 	}
 }
 
+func TestResolveStartupModelConfigUsesForkSourceBinding(t *testing.T) {
+	_, _, threadStore := newRuntimeModelSwitchFixture(t)
+	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{
+		Store:           threadStore,
+		ModelName:       "fork-source-model",
+		ReasoningEffort: "high",
+	})
+	if err != nil {
+		t.Fatalf("target NewSession: %v", err)
+	}
+
+	resolved, err := resolveStartupModelConfig(context.Background(), validRuntimeConfig("configured-model"), sessionStart{
+		forkID: target.ID(),
+	}, threadStore)
+	if err != nil {
+		t.Fatalf("resolveStartupModelConfig: %v", err)
+	}
+	if resolved.Model.Name != "fork-source-model" || resolved.Model.ReasoningEffort != "high" {
+		t.Fatalf("fork source binding: model=%q effort=%q", resolved.Model.Name, resolved.Model.ReasoningEffort)
+	}
+}
+
+func TestForkStartupSessionCreatesChildWithoutChangingSource(t *testing.T) {
+	ctx := context.Background()
+	threadStore, err := store.NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := threadStore.CreateThread(ctx, store.ThreadMeta{
+		ID:              "fork-startup-source",
+		Model:           "source-model",
+		ReasoningEffort: "high",
+	}, "frozen source prompt")
+	if err != nil {
+		t.Fatalf("CreateThread: %v", err)
+	}
+	source, err = threadStore.StartTurn(ctx, source.ID, source.Revision, store.TurnStart{TurnID: "turn-1", Input: "source question"})
+	if err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	source, err = threadStore.CommitTurn(ctx, source.ID, source.Revision, store.TurnCommit{
+		TurnID: "turn-1",
+		Messages: []*schema.Message{
+			schema.UserMessage("source question"),
+			schema.AssistantMessage("source answer", nil),
+		},
+	})
+	if err != nil {
+		t.Fatalf("CommitTurn: %v", err)
+	}
+	before, err := threadStore.LoadThread(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("LoadThread source before fork: %v", err)
+	}
+
+	child, result, err := forkStartupSession(ctx, threadStore, source.ID, runtimeSessionModel{}, chat.SessionOptions{Store: threadStore})
+	if err != nil {
+		t.Fatalf("forkStartupSession: %v", err)
+	}
+	if child == nil || result.SourceID != source.ID || child.ID() != result.ChildID || child.ModelName() != "source-model" || child.ReasoningEffort() != "high" {
+		t.Fatalf("forked child/result = child:%#v result:%#v", child, result)
+	}
+	after, err := threadStore.LoadThread(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("LoadThread source after fork: %v", err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("fork changed source state:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
 func TestResolveStartupModelConfigExplicitEffortKeepsDurableModel(t *testing.T) {
 	_, _, threadStore := newRuntimeModelSwitchFixture(t)
 	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{

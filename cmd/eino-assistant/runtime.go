@@ -78,6 +78,7 @@ type commandRuntime struct {
 	rulesSnapshot         agent.PromptLayerSnapshot
 	rulesSnapshotReady    bool
 	rulesSnapshotStatus   string
+	forkParentID          string
 }
 
 type runtimeModelFactory struct {
@@ -203,11 +204,29 @@ func selectNewestExecSession(ctx context.Context, lister execThreadLister) (stri
 	return id, nil
 }
 
+// forkStartupSession creates the durable child before constructing the TUI.
+// The source journal stays read-only; a child-open failure intentionally does
+// not roll back the already-published, independently recoverable child.
+func forkStartupSession(ctx context.Context, threadStore *store.ThreadStore, sourceID string, sessionModel chat.Model, opts chat.SessionOptions) (*chat.Session, store.ForkResult, error) {
+	if threadStore == nil {
+		return nil, store.ForkResult{}, errors.New("session store is unavailable")
+	}
+	result, err := threadStore.ForkThread(ctx, sourceID, "", "")
+	if err != nil {
+		return nil, store.ForkResult{}, fmt.Errorf("fork session: %w", err)
+	}
+	child, err := chat.OpenSession(sessionModel, threadStore, result.ChildID, opts)
+	if err != nil {
+		return nil, result, fmt.Errorf("open forked session: %w", err)
+	}
+	return child, result, nil
+}
+
 // resolveStartupModelConfig keeps startup model selection in one place. A
 // fresh session uses config, an explicit override wins for every start mode,
-// and an unqualified resume inherits the target thread's durable identity
-// only when that identity is non-empty. Legacy threads without one keep the
-// current config model and effort.
+// and an unqualified resume or fork inherits the source thread's durable
+// identity only when that identity is non-empty. Legacy threads without one
+// keep the current config model and effort.
 func resolveStartupModelConfig(
 	ctx context.Context,
 	cfg config.Config,
@@ -223,17 +242,18 @@ func resolveStartupModelConfig(
 			return config.Config{}, err
 		}
 	}
-	if strings.TrimSpace(start.resumeID) == "" {
+	sourceID := start.sourceSessionID()
+	if sourceID == "" {
 		if start.reasoningEffortSet {
 			cfg.Model.ReasoningEffort = strings.TrimSpace(start.reasoningEffort)
 		}
 		return cfg, nil
 	}
 	if explicitModel == "" && source == nil {
-		return config.Config{}, errors.New("resume model source is unavailable")
+		return config.Config{}, errors.New("session model source is unavailable")
 	}
 	if explicitModel == "" {
-		meta, err := source.LoadThreadMeta(ctx, strings.TrimSpace(start.resumeID))
+		meta, err := source.LoadThreadMeta(ctx, sourceID)
 		if err != nil {
 			return config.Config{}, fmt.Errorf("load resume session metadata: %w", err)
 		}
@@ -409,6 +429,9 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := start.validate(); err != nil {
+		return nil, err
+	}
 	startupCWD, err := captureStartupCWD(os.Getwd)
 	if err != nil {
 		return nil, err
@@ -421,7 +444,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(start.resumeID) == "" || strings.TrimSpace(start.modelName) != "" {
+	if start.sourceSessionID() == "" || strings.TrimSpace(start.modelName) != "" {
 		if cfg, err = resolveStartupModelConfig(ctx, cfg, start, nil); err != nil {
 			return nil, err
 		}
@@ -446,12 +469,13 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	sourceDataDir := dataDir
 	sourceThreadPath := ""
 	var sourceStore *store.ThreadStore
-	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+	sourceID := start.sourceSessionID()
+	if start.ephemeral && sourceID != "" {
 		sourceStore, err = store.OpenThreadStore(sourceDataDir, store.ThreadStoreOptions{ReadOnly: true})
 		if err != nil {
 			return nil, fmt.Errorf("open durable source session store: %w", err)
 		}
-		sourceThreadPath, err = sourceStore.ThreadPath(strings.TrimSpace(start.resumeID))
+		sourceThreadPath, err = sourceStore.ThreadPath(sourceID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve durable source session path: %w", err)
 		}
@@ -481,16 +505,23 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 			}
 		}
 	}()
-	if start.resumeID != "" && !start.ephemeral {
+	if start.forkLast {
+		start.forkID, err = selectNewestExecSession(ctx, sessionStore)
+		if err != nil {
+			return nil, fmt.Errorf("select last fork session: %w", err)
+		}
+		sourceID = start.sourceSessionID()
+	}
+	if sourceID != "" && !start.ephemeral {
 		sourceStore = sessionStore
 	}
-	if strings.TrimSpace(start.resumeID) != "" && strings.TrimSpace(start.modelName) == "" {
+	if sourceID != "" && strings.TrimSpace(start.modelName) == "" {
 		if cfg, err = resolveStartupModelConfig(ctx, cfg, start, sourceStore); err != nil {
 			return nil, err
 		}
 	}
-	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
-		if err = sourceStore.SnapshotThread(ctx, start.resumeID, sessionStore); err != nil {
+	if start.ephemeral && sourceID != "" {
+		if err = sourceStore.SnapshotThread(ctx, sourceID, sessionStore); err != nil {
 			return nil, fmt.Errorf("snapshot durable resume session: %w", err)
 		}
 		_ = sourceStore.Close()
@@ -507,7 +538,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	}
 	protectedSourceDataDir := ""
 	protectedSourceThreadPaths := []string(nil)
-	if start.ephemeral && strings.TrimSpace(start.resumeID) != "" {
+	if start.ephemeral && sourceID != "" {
 		protectedSourceDataDir = sourceDataDir
 		protectedSourceThreadPaths = []string{sourceThreadPath}
 	}
@@ -678,7 +709,14 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 
 	var session *chat.Session
 	var initialSnapshot agent.PromptLayerSnapshot
-	if start.resumeID != "" {
+	if start.forkID != "" {
+		forkResult := store.ForkResult{}
+		session, forkResult, err = forkStartupSession(ctx, sessionStore, start.forkID, bundle.reactModel, bundle.sessionOpts)
+		if err != nil {
+			return nil, err
+		}
+		runtime.forkParentID = forkResult.SourceID
+	} else if start.resumeID != "" {
 		// Resume uses the durable thread system prompt; project fallback files are
 		// discovered only when composing a new session prompt below.
 		session, err = chat.OpenSession(bundle.reactModel, sessionStore, start.resumeID, bundle.sessionOpts)
@@ -704,13 +742,15 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	runtime.sessionOpts = bundle.sessionOpts
 	runtime.composePromptSnapshot = composePromptSnapshot
 	runtime.rulesSnapshot = initialSnapshot
-	runtime.rulesSnapshotReady = start.resumeID == ""
-	runtime.rulesSnapshotStatus = initialRulesSnapshotStatus(start.resumeID == "")
+	runtime.rulesSnapshotReady = start.sourceSessionID() == ""
+	runtime.rulesSnapshotStatus = initialRulesSnapshotStatus(start.sourceSessionID() == "")
 	runtime.composePrompt = runtime.composeSystemPrompt
 
 	mode := "chat"
 	if start.ephemeral {
 		mode = "exec-ephemeral"
+	} else if runtime.forkParentID != "" {
+		mode = "fork"
 	} else if strings.TrimSpace(start.resumeID) != "" {
 		mode = "resume"
 	}

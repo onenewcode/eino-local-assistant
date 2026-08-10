@@ -408,7 +408,7 @@ func newExecCommand(opts *rootOptions, deps execCommandDeps) *cobra.Command {
 func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat *string, jsonAlias *bool, modelName, reasoningEffort *string, outputLastMessage, outputLastMessageShort, outputSchema *string, parentEphemeral *bool) *cobra.Command {
 	var recoverInterrupted bool
 	var resumeEphemeral bool
-	lastFlag := &execLastFlagValue{}
+	lastFlag := &lastSessionFlagValue{}
 	cmd := &cobra.Command{
 		Use:   "resume [SESSION_ID] [PROMPT]",
 		Short: "Resume one durable or ephemeral non-interactive session turn",
@@ -523,20 +523,22 @@ func dereferenceModelName(modelName *string) string {
 	return *modelName
 }
 
-type execLastFlagValue struct {
+// lastSessionFlagValue records whether --last was placed after a positional
+// selector so commands can reject an ambiguous selector pair.
+type lastSessionFlagValue struct {
 	value               bool
 	positionalBefore    bool
 	hasPositionalBefore func() bool
 }
 
-func (flag *execLastFlagValue) String() string {
+func (flag *lastSessionFlagValue) String() string {
 	if flag == nil || !flag.value {
 		return "false"
 	}
 	return "true"
 }
 
-func (flag *execLastFlagValue) Set(raw string) error {
+func (flag *lastSessionFlagValue) Set(raw string) error {
 	value, err := strconv.ParseBool(raw)
 	if err != nil {
 		return err
@@ -548,7 +550,7 @@ func (flag *execLastFlagValue) Set(raw string) error {
 	return nil
 }
 
-func (*execLastFlagValue) Type() string { return "bool" }
+func (*lastSessionFlagValue) Type() string { return "bool" }
 
 func validateExecResumeArgs(args []string, useLast, positionalBeforeLast bool) error {
 	if useLast {

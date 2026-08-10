@@ -200,7 +200,12 @@ type Deps struct {
 	// NotifyActiveSession reports the current thread id to background workers
 	// (e.g. memory consolidator). Optional.
 	NotifyActiveSession func(sessionID string)
+	// InitialPrompt starts one normal model turn after the TUI opens. It never
+	// passes through slash-command parsing.
+	InitialPrompt string
 }
+
+type initialPromptMsg string
 
 type mode int
 
@@ -939,6 +944,10 @@ func newModel(deps Deps) *model {
 }
 
 func (m *model) Init() tea.Cmd {
+	prompt := strings.TrimSpace(m.deps.InitialPrompt)
+	if prompt != "" {
+		return tea.Batch(textarea.Blink, func() tea.Msg { return initialPromptMsg(prompt) })
+	}
 	return textarea.Blink
 }
 
@@ -946,6 +955,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case initialPromptMsg:
+		prompt := strings.TrimSpace(string(msg))
+		if prompt == "" || m.mode != modeIdle {
+			return m, nil
+		}
+		// Shell startup text must never invoke a TUI slash command implicitly.
+		m.stickBottom = true
+		m.inputHist.push(prompt)
+		m.appendLine(lineUser, prompt)
+		m.streamingAssistant = false
+		return m.startTurn(prompt)
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height

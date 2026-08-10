@@ -59,6 +59,32 @@ func TestSubmitHelpAndClear(t *testing.T) {
 	}
 }
 
+func TestInitialPromptStartsTurnWithoutParsingSlashCommands(t *testing.T) {
+	session := mustSession(t, &staticModel{}, "system")
+	m := newModel(Deps{Ctx: context.Background(), Session: session, InitialPrompt: "/help investigate startup"})
+	initCmd := m.Init()
+	initMsg := initCmd()
+	batch, ok := initMsg.(tea.BatchMsg)
+	if !ok || len(batch) != 2 {
+		t.Fatalf("Init message=%T %#v", initMsg, initMsg)
+	}
+	msg := batch[1]()
+	if _, ok := msg.(initialPromptMsg); !ok {
+		t.Fatalf("startup message=%T", msg)
+	}
+	next, turnCmd := m.Update(msg)
+	mm := next.(*model)
+	if turnCmd == nil || mm.mode != modeBusy {
+		t.Fatalf("initial prompt did not start turn: mode=%v cmd=%v", mm.mode, turnCmd)
+	}
+	if !hasLineContaining(mm.lines, lineUser, "/help investigate startup") {
+		t.Fatalf("initial prompt missing from transcript: %#v", mm.lines)
+	}
+	if hasLineContaining(mm.lines, lineSystem, "Commands:") {
+		t.Fatalf("initial prompt executed as slash command: %#v", mm.lines)
+	}
+}
+
 func TestSubmitStatus(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
 	for _, test := range []struct {

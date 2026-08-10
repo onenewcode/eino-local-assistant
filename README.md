@@ -7,22 +7,24 @@
 - **ReAct 工具循环**（Codex 子集）：`shell`、`apply_patch`，以及产品用 `get_current_time` / `read_artifact`；调用过程在 UI 中可见
 - **任务清单（Codex 风格）**：多步骤工作可用 `update_plan` 维护 checklist；仅用于进度展示，不挡交付，不授予写权限
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 可按需在短生命周期 worker 中执行；默认关闭 OS sandbox，网络在所有模式下开放，并有总 turn / 模型决策 / tool-call 预算；显式 `--yolo`/`/permissions yolo` 会旁路 approval 与 OS sandbox，只保留尽力而为的命令和路径检查，不能作为安全边界
-- **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，shell 可用 `eino sessions --output-format json` 读取机器可读元数据而不加载 transcript，并可通过 `internal/chat.Session.Fork`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
+- **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，shell 可用 `eino sessions --output-format json` 读取机器可读元数据而不加载 transcript，并可通过 `eino fork <session-id> [prompt]`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
 - **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话；TUI `/rules` 只查看当前 session 创建时捕获的 source metadata，不 reload 文件
 - **旁路问题（安全子集）**：TUI `/btw <question>`（`/side` 别名）使用当前 frozen session context 做 reference；不打断、不排队主 turn，不写主 ledger、usage 或 journal，不调用工具/子 agent
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
 - **进程可观测性**：标准库 `log/slog` 结构化日志，默认持久化到 `~/.eino-assistant/logs/eino-YYYY-MM-DD.log`（见 [docs/logging.md](docs/logging.md)）；会话账本仍是 resume 真源
-- **CLI 子命令**：`chat` / `resume` / `sessions` / `mcp` / `completion` / `init` / `export` / `doctor` / `version`（默认无子命令即 chat）
+- **CLI 子命令**：`chat` / `resume` / `fork` / `sessions` / `mcp` / `completion` / `init` / `export` / `doctor` / `version`（默认无子命令即 chat）
 
-默认无子命令、`chat`/`new` 与 `resume` 需要交互式终端；`exec`、`sessions`、`mcp`、`completion`、`init`、`export`、`doctor`、`version` 与 `help` 可在管道或非 TTY 环境运行。管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
+默认无子命令、`chat`/`new`、`resume` 与 `fork` 需要交互式终端；`exec`、`sessions`、`mcp`、`completion`、`init`、`export`、`doctor`、`version` 与 `help` 可在管道或非 TTY 环境运行。管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
 
 在新项目中可用 `eino init` 创建最小 `AGENTS.md`，或以 `eino init path/to/AGENTS.md` 指定目标。该命令只会独占创建新文件，绝不会覆盖已有项目规则。
 
 可以用 `eino export <session-id> --output-format markdown|json` 在不启动 TUI 或模型的情况下导出已保存 session 的完整可见 transcript；导出内容与 session 本身均不被修改。
 
 `eino doctor` 可在不联网、不启动模型或 MCP server 的前提下检查本地配置、workspace、storage、已启用 MCP 的本地前置条件及 sandbox/approval 摘要；它不会读取 OAuth keyring 凭据。
+
+`eino fork <session-id> [prompt]` 会从指定 session 的最新 committed turn 创建独立 child，再打开 TUI；可用 `eino fork --last [prompt]` 明确选择当前 storage 中最新 session。首个 prompt 会直接作为 child 的普通模型输入，即使它以 `/` 开头也不会执行 TUI slash command。该命令暂不提供 session picker，因此必须给出 session ID 或 `--last`。
 
 ## 安装
 
@@ -149,7 +151,7 @@ sandbox 是独立层，详见 `docs/tool-policy.md`。
 
 ### 显式 YOLO 权限模式
 
-`--yolo` 是只允许交互 TUI 的危险启动参数，可用于裸命令、`chat`/`new` 和 `resume`；运行中的 idle TUI 也可显式执行 `/permissions yolo`。`Shift+Tab` 按 `ask -> auto -> plan -> yolo -> ask` 循环；每次进入 yolo 都会显示危险警告。headless `exec` 和 informational 子命令拒绝 `--yolo`，不会静默忽略。
+`--yolo` 是只允许交互 TUI 的危险启动参数，可用于裸命令、`chat`/`new`、`resume` 和 `fork`；运行中的 idle TUI 也可显式执行 `/permissions yolo`。`Shift+Tab` 按 `ask -> auto -> plan -> yolo -> ask` 循环；每次进入 yolo 都会显示危险警告。headless `exec` 和 informational 子命令拒绝 `--yolo`，不会静默忽略。
 
 yolo 同时绕过普通 approval/approver/session allow-deny 和 `shell`/`apply_patch` 的 OS sandbox worker，直接使用当前 host 的读写、进程执行和网络能力；这不表示 root、管理员或虚拟机外特权。approval bypass 与 sandbox bypass 是两个独立概念，本文实现明确同时开启二者。yolo 中仍会运行规则匹配、shell 工作目录与 `apply_patch` workspace/path/symlink 检查；但 `hardShellSafetyDeny` 只是字符串级的尽力而为防护，不是 shell 解析或宿主隔离，不能据此把 yolo 当作安全模式。普通模式 sandbox 不可用时仍返回 `sandbox_unavailable` 并 fail-closed，不会静默变成 yolo。
 

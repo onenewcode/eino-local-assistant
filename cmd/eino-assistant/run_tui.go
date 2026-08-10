@@ -28,12 +28,38 @@ import (
 type sessionStart struct {
 	title              string
 	resumeID           string
+	forkID             string
+	forkLast           bool
+	initialPrompt      string
 	recoverInterrupted bool
 	ephemeral          bool
 	modelName          string
 	reasoningEffort    string
 	reasoningEffortSet bool
 	yolo               bool
+}
+
+func (start sessionStart) sourceSessionID() string {
+	if id := strings.TrimSpace(start.resumeID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(start.forkID)
+}
+
+func (start sessionStart) validate() error {
+	if strings.TrimSpace(start.resumeID) != "" && strings.TrimSpace(start.forkID) != "" {
+		return errors.New("resume and fork session selectors cannot be combined")
+	}
+	if start.forkLast && strings.TrimSpace(start.forkID) != "" {
+		return errors.New("fork accepts either a session id or --last, not both")
+	}
+	if start.forkLast && strings.TrimSpace(start.resumeID) != "" {
+		return errors.New("resume and fork session selectors cannot be combined")
+	}
+	if start.ephemeral && (strings.TrimSpace(start.forkID) != "" || start.forkLast) {
+		return errors.New("fork cannot use an ephemeral session ledger")
+	}
+	return nil
 }
 
 func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr error) {
@@ -58,7 +84,9 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 			runErr = errors.Join(runErr, fmt.Errorf("close command runtime: %w", closeErr))
 		}
 	}()
-	if start.resumeID != "" {
+	if runtime.forkParentID != "" {
+		fmt.Fprintf(stderr, "forked session %s from %s\n", runtime.session.ID(), runtime.forkParentID)
+	} else if start.resumeID != "" {
 		// Keep the durable create-time system prompt. Mid-session rewrites would
 		// bust provider prefix cache and diverge from freeze-until-/new-or-/clear.
 		fmt.Fprintf(stderr, "resumed session %s\n", runtime.session.ID())
@@ -202,6 +230,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		NotifyActiveSession: func(id string) {
 			activeSessionID.Store(id)
 		},
+		InitialPrompt: start.initialPrompt,
 	})
 	// After alt-screen teardown, print a Codex-style resume command into
 	// the main terminal scrollback so the session is one paste away.
