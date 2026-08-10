@@ -65,6 +65,7 @@ type MCPServerConfig struct {
 	WorkingDir            string            `toml:"working_dir"`
 	Env                   map[string]string `toml:"env"`
 	URL                   string            `toml:"url"`
+	BearerTokenEnvVar     string            `toml:"bearer_token_env_var"`
 	Enabled               *bool             `toml:"enabled"`
 	ConnectTimeoutSeconds int               `toml:"connect_timeout_seconds"`
 }
@@ -976,6 +977,7 @@ func AddMCPServer(path string, server MCPServerConfig) error {
 	server.Command = strings.TrimSpace(server.Command)
 	server.WorkingDir = strings.TrimSpace(server.WorkingDir)
 	server.URL = strings.TrimSpace(server.URL)
+	server.BearerTokenEnvVar = strings.TrimSpace(server.BearerTokenEnvVar)
 	if err := (MCPConfig{Servers: []MCPServerConfig{server}}).Validate(); err != nil {
 		return err
 	}
@@ -1035,6 +1037,13 @@ func formatMCPServerTOML(server MCPServerConfig) (string, error) {
 		var out strings.Builder
 		out.WriteString("[[mcp.servers]]\n")
 		fmt.Fprintf(&out, "name = %s\ntype = %q\nurl = %s\n", name, MCPTransportStreamableHTTP, endpoint)
+		if server.BearerTokenEnvVar != "" {
+			tokenEnvVar, tokenEnvVarErr := formatMCPServerTOMLString(server.BearerTokenEnvVar)
+			if tokenEnvVarErr != nil {
+				return "", fmt.Errorf("format MCP bearer token environment variable: %w", tokenEnvVarErr)
+			}
+			fmt.Fprintf(&out, "bearer_token_env_var = %s\n", tokenEnvVar)
+		}
 		if server.Enabled != nil {
 			fmt.Fprintf(&out, "enabled = %t\n", *server.Enabled)
 		}
@@ -1453,6 +1462,9 @@ func (c MCPConfig) Validate() error {
 			if strings.TrimSpace(server.URL) != "" {
 				return fmt.Errorf("mcp.servers[%d].url is only valid for type %q", i, MCPTransportStreamableHTTP)
 			}
+			if strings.TrimSpace(server.BearerTokenEnvVar) != "" {
+				return fmt.Errorf("mcp.servers[%d].bearer_token_env_var is only valid for type %q", i, MCPTransportStreamableHTTP)
+			}
 			if dir := strings.TrimSpace(server.WorkingDir); dir != "" {
 				info, err := os.Stat(dir)
 				if err != nil {
@@ -1468,6 +1480,9 @@ func (c MCPConfig) Validate() error {
 			}
 			if err := validateMCPStreamableHTTPURL(server.URL); err != nil {
 				return fmt.Errorf("mcp.servers[%d].url: %w", i, err)
+			}
+			if name := strings.TrimSpace(server.BearerTokenEnvVar); name != "" && !isMCPEnvironmentName(name) {
+				return fmt.Errorf("mcp.servers[%d].bearer_token_env_var must be a conventional environment variable name", i)
 			}
 		default:
 			return fmt.Errorf("mcp.servers[%d].type must be %q or %q", i, MCPTransportStdio, MCPTransportStreamableHTTP)
@@ -1498,6 +1513,23 @@ func validateMCPStreamableHTTPURL(raw string) error {
 		return errors.New("must not include a query or fragment")
 	}
 	return nil
+}
+
+func isMCPEnvironmentName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range name {
+		char := name[i]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || char == '_' {
+			continue
+		}
+		if i > 0 && char >= '0' && char <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Validate checks rules configuration.

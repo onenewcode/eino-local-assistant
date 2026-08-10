@@ -256,7 +256,7 @@ func TestMCPAddWritesStdioServerWithoutStartingItOrPrintingSecrets(t *testing.T)
 
 func TestMCPAddRejectsInvalidCommandShapeAndEnvironment(t *testing.T) {
 	stdout, _, err := executeMCPCommandForTest("mcp", "add", "--help")
-	if err != nil || !strings.Contains(stdout, "Add one stdio MCP server") || !strings.Contains(stdout, "--env") || !strings.Contains(stdout, "--url") || !strings.Contains(stdout, "Use -- before a stdio command") {
+	if err != nil || !strings.Contains(stdout, "Add one stdio MCP server") || !strings.Contains(stdout, "--env") || !strings.Contains(stdout, "--url") || !strings.Contains(stdout, "--bearer-token-env-var") || !strings.Contains(stdout, "Use -- before a stdio command") {
 		t.Fatalf("mcp add help = %q, err=%v", stdout, err)
 	}
 	for _, args := range [][]string{
@@ -275,7 +275,7 @@ func TestMCPAddRejectsInvalidCommandShapeAndEnvironment(t *testing.T) {
 
 func TestMCPAddWritesStreamableHTTPEndpointWithoutConnecting(t *testing.T) {
 	configPath := writeMCPListConfig(t, "# retain this configuration comment\n")
-	stdout, _, err := executeMCPCommandWithConfigForTest(configPath, "mcp", "add", " remote-tools ", "--url", "https://does-not-resolve.invalid/mcp")
+	stdout, _, err := executeMCPCommandWithConfigForTest(configPath, "mcp", "add", " remote-tools ", "--url", "https://does-not-resolve.invalid/mcp", "--bearer-token-env-var", "EINO_REMOTE_TOKEN")
 	if err != nil {
 		t.Fatalf("mcp add --url error = %v", err)
 	}
@@ -290,20 +290,27 @@ func TestMCPAddWritesStreamableHTTPEndpointWithoutConnecting(t *testing.T) {
 	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Transport.Type != "streamable_http" || entries[0].Transport.URL != "https://does-not-resolve.invalid/mcp" {
+	if len(entries) != 1 || entries[0].Transport.Type != "streamable_http" || entries[0].Transport.URL != "https://does-not-resolve.invalid/mcp" || entries[0].Transport.BearerTokenEnvVar != "EINO_REMOTE_TOKEN" {
 		t.Fatalf("added remote MCP entry = %+v", entries)
+	}
+	textOutput, err := getMCPServerForTest(configPath, "remote-tools", false)
+	if err != nil || !strings.Contains(textOutput, "bearer_token_env_var: EINO_REMOTE_TOKEN") {
+		t.Fatalf("mcp get remote bearer output = %q, err=%v", textOutput, err)
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "# retain this configuration comment") || !strings.Contains(string(data), `type = "streamable_http"`) || !strings.Contains(string(data), `url = "https://does-not-resolve.invalid/mcp"`) || strings.Contains(string(data), "command =") {
+	if !strings.Contains(string(data), "# retain this configuration comment") || !strings.Contains(string(data), `type = "streamable_http"`) || !strings.Contains(string(data), `url = "https://does-not-resolve.invalid/mcp"`) || !strings.Contains(string(data), `bearer_token_env_var = "EINO_REMOTE_TOKEN"`) || strings.Contains(string(data), "command =") {
 		t.Fatalf("added remote MCP config =\n%s", data)
 	}
 	for _, args := range [][]string{
 		{"mcp", "add", "remote", "--url", "https://example.test/mcp", "--env", "TOKEN=secret"},
 		{"mcp", "add", "remote", "--url", "https://example.test/mcp", "--", "command"},
 		{"mcp", "add", "remote", "--url", "file:///tmp/mcp"},
+		{"mcp", "add", "remote", "--url", "https://example.test/mcp", "--bearer-token-env-var", "NOT-VALID"},
+		{"mcp", "add", "remote", "--url", "https://example.test/mcp", "--bearer-token-env-var", ""},
+		{"mcp", "add", "local", "--bearer-token-env-var", "EINO_REMOTE_TOKEN", "--", "command"},
 	} {
 		if _, _, commandErr := executeMCPCommandForTest(args...); commandErr == nil {
 			t.Fatalf("mcp add %q should reject invalid remote input", args)

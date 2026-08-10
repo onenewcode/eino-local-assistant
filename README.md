@@ -70,10 +70,12 @@ eino mcp add local-tools --env LOG_LEVEL=debug -- npx -y @example/mcp-server
 远程 Streamable HTTP endpoint 使用 `--url`，同样只写配置而不在添加时联网：
 
 ```sh
-eino mcp add remote-tools --url https://mcp.example.com/mcp
+eino mcp add remote-tools --url https://mcp.example.com/mcp --bearer-token-env-var EINO_REMOTE_MCP_TOKEN
 ```
 
-远程 URL 只接受绝对 `http` 或 `https` 地址，且不接受 URL 用户信息、query 或 fragment，避免把凭据变成可展示的端点字段。本轮尚未实现远程静态 headers、bearer token、OAuth 登录/登出或凭据存储；需要认证的服务会在运行时连接失败，而不会暗中发送配置中的 secret。
+远程 URL 只接受绝对 `http` 或 `https` 地址，且不接受 URL 用户信息、query 或 fragment，避免把凭据变成可展示的端点字段。`--bearer-token-env-var` 只保存环境变量名，不写入或回显 token；运行时建连时读取 token，随后该 session 的每个远程 MCP 请求都会发送 bearer header。变量不存在或为空会明确失败，HTTP redirect 不会被跟随，避免将认证头转发给另一台主机。
+
+本轮尚未实现远程静态 headers、OAuth 登录/登出、凭据存储或 health/debug；需要其他认证方式的服务会在运行时连接失败，而不会暗中发送配置中的 secret。
 
 ```toml
 [[mcp.servers]]
@@ -93,6 +95,7 @@ API_TOKEN = "set-a-secret-here"
 name = "remote-tools"
 type = "streamable_http"
 url = "https://mcp.example.com/mcp"
+# bearer_token_env_var = "EINO_REMOTE_MCP_TOKEN"
 # enabled = true                 # 省略时也会启用
 # connect_timeout_seconds = 15   # 可设为 1-60
 ```

@@ -110,12 +110,14 @@ data_dir = ""
 # name = "remote-tools"
 # type = "streamable_http"
 # url = "https://mcp.example.com/mcp"
+# bearer_token_env_var = "EINO_REMOTE_MCP_TOKEN"
 # enabled = true
 # connect_timeout_seconds = 15
 #
 # Streamable HTTP URLs must be absolute http(s) endpoints without user info,
-# query strings, or fragments. Remote headers, bearer tokens, and OAuth are
-# intentionally not configured here.
+# query strings, or fragments. bearer_token_env_var stores only an environment
+# variable name; remote static headers and OAuth are intentionally not
+# configured here.
 
 # Process diagnostics (log/slog). Session journals remain the product ledger;
 # these files are operational only and never replace resume/replay.

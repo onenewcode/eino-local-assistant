@@ -21,20 +21,22 @@ type mcpServerEntry struct {
 }
 
 type mcpTransportView struct {
-	Type       string   `json:"type"`
-	Command    string   `json:"command,omitempty"`
-	Args       []string `json:"args"`
-	WorkingDir string   `json:"working_dir,omitempty"`
-	EnvVars    []string `json:"env_vars,omitempty"`
-	URL        string   `json:"url,omitempty"`
+	Type              string   `json:"type"`
+	Command           string   `json:"command,omitempty"`
+	Args              []string `json:"args"`
+	WorkingDir        string   `json:"working_dir,omitempty"`
+	EnvVars           []string `json:"env_vars,omitempty"`
+	URL               string   `json:"url,omitempty"`
+	BearerTokenEnvVar string   `json:"bearer_token_env_var,omitempty"`
 }
 
 func (v mcpTransportView) MarshalJSON() ([]byte, error) {
 	if v.Type == config.MCPTransportStreamableHTTP {
 		return json.Marshal(struct {
-			Type string `json:"type"`
-			URL  string `json:"url"`
-		}{Type: v.Type, URL: v.URL})
+			Type              string `json:"type"`
+			URL               string `json:"url"`
+			BearerTokenEnvVar string `json:"bearer_token_env_var,omitempty"`
+		}{Type: v.Type, URL: v.URL, BearerTokenEnvVar: v.BearerTokenEnvVar})
 	}
 	return json.Marshal(struct {
 		Type       string   `json:"type"`
@@ -110,6 +112,7 @@ func newMCPGetCommand(opts *rootOptions) *cobra.Command {
 func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 	var environment []string
 	var endpoint string
+	var bearerTokenEnvVar string
 	cmd := &cobra.Command{
 		Use:   "add <name> (--url <url> | -- <command> [args...])",
 		Short: "Add one configured MCP server",
@@ -122,7 +125,13 @@ func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 				if len(environment) > 0 {
 					return fmt.Errorf("mcp add --env is only valid with a stdio command")
 				}
+				if cmd.Flags().Changed("bearer-token-env-var") && strings.TrimSpace(bearerTokenEnvVar) == "" {
+					return fmt.Errorf("mcp add --bearer-token-env-var requires an environment variable name")
+				}
 				return nil
+			}
+			if cmd.Flags().Changed("bearer-token-env-var") {
+				return fmt.Errorf("mcp add --bearer-token-env-var is only valid with --url")
 			}
 			if cmd.Flags().ArgsLenAtDash() != 1 || len(args) < 2 {
 				return fmt.Errorf("mcp add requires <name> --url <url> or <name> -- <command> [args...]")
@@ -137,6 +146,7 @@ func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 			if cmd.Flags().Changed("url") {
 				server.Type = config.MCPTransportStreamableHTTP
 				server.URL = strings.TrimSpace(endpoint)
+				server.BearerTokenEnvVar = strings.TrimSpace(bearerTokenEnvVar)
 			} else {
 				env, err := parseMCPEnvironment(environment)
 				if err != nil {
@@ -155,6 +165,7 @@ func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 	}
 	cmd.Flags().StringArrayVarP(&environment, "env", "e", nil, "environment variable to set (KEY=VALUE; repeatable)")
 	cmd.Flags().StringVar(&endpoint, "url", "", "Streamable HTTP MCP endpoint URL")
+	cmd.Flags().StringVar(&bearerTokenEnvVar, "bearer-token-env-var", "", "environment variable containing a Streamable HTTP bearer token")
 	return cmd
 }
 
@@ -235,11 +246,12 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		return err
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tTRANSPORT\tCOMMAND/URL\tARGS\tENV\tWORKING DIR")
+	fmt.Fprintln(tw, "NAME\tTRANSPORT\tCOMMAND/URL\tARGS\tENV\tAUTH\tWORKING DIR")
 	for _, entry := range entries {
 		endpoint := mcpTransportEndpoint(entry.Transport)
 		args := quotedArguments(entry.Transport.Args)
 		env := strings.Join(entry.Transport.EnvVars, ",")
+		auth := entry.Transport.BearerTokenEnvVar
 		workingDir := entry.Transport.WorkingDir
 		if args == "" {
 			args = "-"
@@ -247,10 +259,13 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		if env == "" {
 			env = "-"
 		}
+		if auth == "" {
+			auth = "-"
+		}
 		if workingDir == "" {
 			workingDir = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.Name, entry.Transport.Type, endpoint, args, env, workingDir)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", entry.Name, entry.Transport.Type, endpoint, args, env, auth, workingDir)
 	}
 	return tw.Flush()
 }
@@ -282,6 +297,7 @@ func mcpServerEntries(servers []config.MCPServerConfig) []mcpServerEntry {
 		transport := mcpTransportView{Type: server.TransportType()}
 		if transport.Type == config.MCPTransportStreamableHTTP {
 			transport.URL = strings.TrimSpace(server.URL)
+			transport.BearerTokenEnvVar = strings.TrimSpace(server.BearerTokenEnvVar)
 			entries = append(entries, mcpServerEntry{
 				Name:      strings.TrimSpace(server.Name),
 				Enabled:   server.IsEnabled(),
@@ -318,7 +334,11 @@ func mcpTransportEndpoint(transport mcpTransportView) string {
 
 func writeMCPServerDetails(stdout io.Writer, entry mcpServerEntry) error {
 	if entry.Transport.Type == config.MCPTransportStreamableHTTP {
-		_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL)
+		if entry.Transport.BearerTokenEnvVar == "" {
+			_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL)
+			return err
+		}
+		_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n  bearer_token_env_var: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL, entry.Transport.BearerTokenEnvVar)
 		return err
 	}
 	args := quotedArguments(entry.Transport.Args)

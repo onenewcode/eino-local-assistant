@@ -102,6 +102,7 @@ func TestMCPStreamableHTTPConfigurationAndValidation(t *testing.T) {
 name = "remote-tools"
 type = "streamable_http"
 url = "https://mcp.example.test/v1/tools"
+bearer_token_env_var = "EINO_MCP_TOKEN"
 connect_timeout_seconds = 7
 `))
 	if err != nil {
@@ -111,7 +112,7 @@ connect_timeout_seconds = 7
 		t.Fatalf("MCP server count = %d, want 1", len(got.MCP.Servers))
 	}
 	server := got.MCP.Servers[0]
-	if server.TransportType() != MCPTransportStreamableHTTP || server.URL != "https://mcp.example.test/v1/tools" || server.Command != "" || server.ConnectTimeout() != 7*time.Second {
+	if server.TransportType() != MCPTransportStreamableHTTP || server.URL != "https://mcp.example.test/v1/tools" || server.BearerTokenEnvVar != "EINO_MCP_TOKEN" || server.Command != "" || server.ConnectTimeout() != 7*time.Second {
 		t.Fatalf("remote MCP server = %#v", server)
 	}
 
@@ -119,10 +120,12 @@ connect_timeout_seconds = 7
 		"missing URL":      `type = "streamable_http"`,
 		"unsupported type": `type = "sse"` + "\n" + `url = "https://mcp.example.test"`,
 		"stdio URL":        `command = "mcp-server"` + "\n" + `url = "https://mcp.example.test"`,
+		"stdio bearer":     `command = "mcp-server"` + "\n" + `bearer_token_env_var = "EINO_MCP_TOKEN"`,
 		"remote command":   `type = "streamable_http"` + "\n" + `url = "https://mcp.example.test"` + "\n" + `command = "mcp-server"`,
 		"bad scheme":       `type = "streamable_http"` + "\n" + `url = "file:///tmp/mcp"`,
 		"credential URL":   `type = "streamable_http"` + "\n" + `url = "https://token@example.test/mcp"`,
 		"query URL":        `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp?token=secret"`,
+		"bad bearer name":  `type = "streamable_http"` + "\n" + `url = "https://example.test/mcp"` + "\n" + `bearer_token_env_var = "NOT-VALID"`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, loadErr := Load(writeConfiguration(t, validConfiguration+"\n[mcp]\n\n[[mcp.servers]]\nname = \"invalid\"\n"+source+"\n"))

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -20,14 +21,15 @@ import (
 // MCPServerOptions describes one explicitly configured MCP server. An empty
 // Type is kept as a stdio default for embedding callers using the older API.
 type MCPServerOptions struct {
-	Name           string
-	Type           string
-	Command        string
-	Args           []string
-	WorkingDir     string
-	Env            map[string]string
-	URL            string
-	ConnectTimeout time.Duration
+	Name              string
+	Type              string
+	Command           string
+	Args              []string
+	WorkingDir        string
+	Env               map[string]string
+	URL               string
+	BearerTokenEnvVar string
+	ConnectTimeout    time.Duration
 }
 
 const (
@@ -165,10 +167,41 @@ func mcpClientTransport(opts MCPServerOptions) (mcp.Transport, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &mcp.StreamableClientTransport{Endpoint: endpoint}, nil
+		var client *http.Client
+		if envVar := strings.TrimSpace(opts.BearerTokenEnvVar); envVar != "" {
+			token, ok := os.LookupEnv(envVar)
+			if !ok || token == "" {
+				return nil, fmt.Errorf("MCP bearer token environment variable %q is not set or is empty", envVar)
+			}
+			client = newMCPBearerTokenHTTPClient(token)
+		}
+		return &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: client}, nil
 	default:
 		return nil, fmt.Errorf("unsupported MCP transport %q", transport)
 	}
+}
+
+func newMCPBearerTokenHTTPClient(token string) *http.Client {
+	return &http.Client{
+		Transport: bearerTokenRoundTripper{base: http.DefaultTransport, token: token},
+		// A transport-level header injector would otherwise attach the token to a
+		// redirect target. Remote MCP endpoints must be addressed directly.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+type bearerTokenRoundTripper struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (t bearerTokenRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	clone.Header.Set("Authorization", "Bearer "+t.token)
+	return t.base.RoundTrip(clone)
 }
 
 func validStreamableMCPEndpoint(raw string) (string, error) {

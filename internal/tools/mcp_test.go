@@ -65,12 +65,20 @@ func TestConnectMCPServersDiscoversAndCallsTool(t *testing.T) {
 }
 
 func TestConnectStreamableHTTPMCPServerDiscoversCallsAndClosesSession(t *testing.T) {
+	const token = "test-bearer-token"
+	t.Setenv("EINO_TEST_MCP_BEARER_TOKEN", token)
 	server := newMCPServerForTest()
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return server
 	}, &mcp.StreamableHTTPOptions{JSONResponse: true})
 	var deleteRequests atomic.Int32
+	var missingAuthorization atomic.Int32
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+token {
+			missingAuthorization.Add(1)
+			http.Error(w, "missing bearer token", http.StatusUnauthorized)
+			return
+		}
 		if request.Method == http.MethodDelete {
 			deleteRequests.Add(1)
 		}
@@ -79,10 +87,11 @@ func TestConnectStreamableHTTPMCPServerDiscoversCallsAndClosesSession(t *testing
 	defer httpServer.Close()
 
 	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
-		Name:           "remote",
-		Type:           mcpTransportStreamableHTTP,
-		URL:            httpServer.URL,
-		ConnectTimeout: time.Second,
+		Name:              "remote",
+		Type:              mcpTransportStreamableHTTP,
+		URL:               httpServer.URL,
+		BearerTokenEnvVar: "EINO_TEST_MCP_BEARER_TOKEN",
+		ConnectTimeout:    time.Second,
 	}})
 	if err != nil {
 		t.Fatalf("ConnectMCPServers() error = %v", err)
@@ -105,6 +114,9 @@ func TestConnectStreamableHTTPMCPServerDiscoversCallsAndClosesSession(t *testing
 	if deleteRequests.Load() != 1 {
 		t.Fatalf("remote session DELETE requests = %d, want 1", deleteRequests.Load())
 	}
+	if missingAuthorization.Load() != 0 {
+		t.Fatalf("remote requests without bearer token = %d", missingAuthorization.Load())
+	}
 }
 
 func TestMCPClientTransportRejectsInvalidStreamableHTTPEndpoints(t *testing.T) {
@@ -113,6 +125,44 @@ func TestMCPClientTransportRejectsInvalidStreamableHTTPEndpoints(t *testing.T) {
 		if err == nil {
 			t.Fatalf("mcpClientTransport(%q) succeeded", endpoint)
 		}
+	}
+}
+
+func TestMCPClientTransportRejectsMissingBearerToken(t *testing.T) {
+	t.Setenv("EINO_MCP_MISSING_TOKEN", "")
+	_, err := mcpClientTransport(MCPServerOptions{
+		Type:              mcpTransportStreamableHTTP,
+		URL:               "https://mcp.example.test",
+		BearerTokenEnvVar: "EINO_MCP_MISSING_TOKEN",
+	})
+	if err == nil || !strings.Contains(err.Error(), "EINO_MCP_MISSING_TOKEN") {
+		t.Fatalf("missing bearer token error = %v", err)
+	}
+}
+
+func TestMCPBearerTokenClientDoesNotFollowRedirects(t *testing.T) {
+	const token = "test-bearer-token"
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests.Add(1)
+	}))
+	defer target.Close()
+	var sourceAuthorization atomic.Int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") == "Bearer "+token {
+			sourceAuthorization.Add(1)
+		}
+		http.Redirect(w, request, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	response, err := newMCPBearerTokenHTTPClient(token).Get(source.URL)
+	if err != nil {
+		t.Fatalf("GET redirect source: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTemporaryRedirect || sourceAuthorization.Load() != 1 || targetRequests.Load() != 0 {
+		t.Fatalf("redirect response=%d source_auth=%d target_requests=%d", response.StatusCode, sourceAuthorization.Load(), targetRequests.Load())
 	}
 }
 
