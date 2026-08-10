@@ -280,6 +280,7 @@ var defaultStatusLineFields = []string{
 	"used-tokens",
 	"task-progress",
 	"activity",
+	"mode",
 }
 
 // StatusLineFields returns an owned, normalized footer field list.
@@ -312,7 +313,7 @@ func (c UIConfig) Validate() error {
 }
 
 var statusLineFieldSet = map[string]struct{}{
-	"model-with-reasoning": {}, "context-used": {}, "used-tokens": {}, "task-progress": {}, "activity": {},
+	"model-with-reasoning": {}, "context-used": {}, "used-tokens": {}, "task-progress": {}, "activity": {}, "mode": {},
 }
 
 // ToolsConfig holds runtime limits for Codex-subset tools (not permission language).

@@ -1731,7 +1731,7 @@ func (m *model) cmdPermissions(arg string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.appendLine(lineError, tools.YoloModeWarning)
-		m.appendLine(lineSystem, "permission mode: yolo (explicit; not in Shift+Tab cycle)")
+		m.appendLine(lineSystem, "permission mode: yolo")
 		return m, nil
 	}
 	if err := state.SetInteractiveMode(arg); err != nil {
@@ -1763,14 +1763,19 @@ func (m *model) cyclePermissionMode() (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
 		return m, nil
 	}
-	if state.InteractiveMode() == "yolo" {
-		m.appendLine(lineError, "YOLO mode is explicit; use /permissions ask|auto|plan to leave it")
-		return m, nil
-	}
 	target := nextPermissionMode(state.InteractiveMode())
-	if err := state.SetInteractiveMode(target); err != nil {
+	var err error
+	if target == "yolo" {
+		err = state.SetYolo()
+	} else {
+		err = state.SetInteractiveMode(target)
+	}
+	if err != nil {
 		m.appendLine(lineError, "permission mode switching is unavailable in this TUI")
 		return m, nil
+	}
+	if target == "yolo" {
+		m.appendLine(lineError, tools.YoloModeWarning)
 	}
 	m.appendLine(lineSystem, "permission mode: "+state.InteractiveMode())
 	return m, nil
@@ -1782,6 +1787,10 @@ func nextPermissionMode(current string) string {
 		return "auto"
 	case "auto":
 		return "plan"
+	case "plan":
+		return "yolo"
+	case "yolo":
+		return "ask"
 	default:
 		return "ask"
 	}

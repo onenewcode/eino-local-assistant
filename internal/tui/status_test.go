@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/tools"
 )
 
 func TestShortSessionID(t *testing.T) {
@@ -104,6 +105,7 @@ func TestJoinStatusSuffix(t *testing.T) {
 func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 	m := newTestModel(t)
 	m.deps.Status.Model = "openai/test-model"
+	m.deps.PolicyInfo.Mode = "ask"
 	line := m.statusLine()
 	if strings.Contains(line, "openai/") {
 		t.Fatalf("status must omit provider prefix: %q", line)
@@ -114,6 +116,9 @@ func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 	// The Codex-like footer never exposes the internal ctx= rendering.
 	if strings.Contains(line, "ctx=") {
 		t.Fatalf("status must use human-facing context text: %q", line)
+	}
+	if !strings.Contains(line, "ask") || strings.Contains(line, "mode=") {
+		t.Fatalf("default status must include the compact mode: %q", line)
 	}
 }
 
@@ -155,6 +160,25 @@ func TestStatusActivityCanBeHiddenIndependently(t *testing.T) {
 	m.mode = modeBusy
 	if line := m.statusLabel(); strings.Contains(line, "thinking") {
 		t.Fatalf("activity ignored status-line selection: %q", line)
+	}
+}
+
+func TestStatusLineModeIsOptionalAndTracksState(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(t)
+	m.deps.PolicyInfo.ApprovalState = state
+	m.deps.StatusLine.Fields = []string{statusFieldMode}
+	if got := m.statusLabel(); got != "ask" {
+		t.Fatalf("mode field = %q, want ask", got)
+	}
+	if err := state.SetYolo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.statusLabel(); got != "yolo" {
+		t.Fatalf("mode field = %q, want yolo", got)
 	}
 }
 

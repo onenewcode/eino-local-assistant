@@ -26,6 +26,7 @@ var statusLinePickerFieldRows = []statusLinePickerRow{
 	{field: statusFieldUsedTokens, label: "used-tokens"},
 	{field: statusFieldTaskProgress, label: "task-progress"},
 	{field: statusFieldActivity, label: "activity"},
+	{field: statusFieldMode, label: "mode"},
 }
 
 func (m *model) statusLinePickerOpen() bool {

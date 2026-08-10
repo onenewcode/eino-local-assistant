@@ -192,7 +192,7 @@ func statusStyleForField(field string) lipgloss.Style {
 		return statusModelStyle
 	case statusFieldContextUsed:
 		return statusContextStyle
-	case statusFieldUsedTokens:
+	case statusFieldUsedTokens, statusFieldMode:
 		return statusPolicyStyle
 	case statusFieldTaskProgress, statusFieldActivity:
 		return statusTaskStyle

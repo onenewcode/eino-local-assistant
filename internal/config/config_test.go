@@ -96,7 +96,7 @@ func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if want := []string{"model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+	if want := []string{"model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity", "mode"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
 		t.Fatalf("default status line = %#v, want %#v", got.UI.StatusLineFields(), want)
 	}
 
@@ -115,6 +115,13 @@ func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
 		if _, err := Load(writeConfiguration(t, validConfiguration+"\n"+doc)); err == nil {
 			t.Fatalf("Load(%q) succeeded for an invalid status line", doc)
 		}
+	}
+	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\"mode\"]\n"))
+	if err != nil {
+		t.Fatalf("Load(mode status line) error = %v", err)
+	}
+	if want := []string{"mode"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+		t.Fatalf("mode status line = %#v, want %#v", got.UI.StatusLineFields(), want)
 	}
 }
 

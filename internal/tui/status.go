@@ -15,6 +15,7 @@ const (
 	statusFieldUsedTokens         = "used-tokens"
 	statusFieldTaskProgress       = "task-progress"
 	statusFieldActivity           = "activity"
+	statusFieldMode               = "mode"
 )
 
 const defaultModelReasoningEffort = config.DefaultReasoningEffort
@@ -25,10 +26,11 @@ var defaultStatusLineFields = []string{
 	statusFieldUsedTokens,
 	statusFieldTaskProgress,
 	statusFieldActivity,
+	statusFieldMode,
 }
 
 var statusLineFieldSet = map[string]struct{}{
-	statusFieldModelWithReasoning: {}, statusFieldContextUsed: {}, statusFieldUsedTokens: {}, statusFieldTaskProgress: {}, statusFieldActivity: {},
+	statusFieldModelWithReasoning: {}, statusFieldContextUsed: {}, statusFieldUsedTokens: {}, statusFieldTaskProgress: {}, statusFieldActivity: {}, statusFieldMode: {},
 }
 
 // StatusLineConfig is the persisted selection controlled by /statusline.
@@ -140,6 +142,14 @@ func (m *model) statusActivity() string {
 	}
 }
 
+func (m *model) statusLineMode() string {
+	fragment := m.deps.PolicyInfo.CmdPolicyFragment()
+	if mode, ok := strings.CutPrefix(fragment, "cmd="); ok {
+		return mode
+	}
+	return ""
+}
+
 func (m *model) statusLineSegments() []statusLineSegment {
 	return m.statusLineSegmentsForConfig(m.deps.StatusLine)
 }
@@ -153,6 +163,7 @@ func (m *model) statusLineSegmentsForConfig(config StatusLineConfig) []statusLin
 		statusFieldUsedTokens:         statusLineUsedTokens(session),
 		statusFieldTaskProgress:       statusLineTaskProgress(session),
 		statusFieldActivity:           m.statusActivity(),
+		statusFieldMode:               m.statusLineMode(),
 	}
 
 	segments := make([]statusLineSegment, 0, len(config.Fields))
@@ -204,7 +215,7 @@ func fitStatusLineSegments(width int, segments []statusLineSegment) []statusLine
 }
 
 func statusLineDropIndex(segments []statusLineSegment) int {
-	for _, field := range []string{statusFieldUsedTokens, statusFieldContextUsed, statusFieldTaskProgress} {
+	for _, field := range []string{statusFieldUsedTokens, statusFieldContextUsed, statusFieldTaskProgress, statusFieldMode} {
 		for i := len(segments) - 1; i > 0; i-- {
 			if segments[i].field == field {
 				return i

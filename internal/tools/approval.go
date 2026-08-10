@@ -107,8 +107,8 @@ func (s *ApprovalState) SetInteractiveMode(mode string) error {
 }
 
 // SetYolo enables the dangerous mode through an explicit caller-owned path.
-// It is deliberately not accepted by SetInteractiveMode, so Shift+Tab cannot
-// enter yolo as part of the ordinary safe mode cycle.
+// It remains separate from SetInteractiveMode so callers must deliberately
+// choose it and display the corresponding unsafe-mode warning.
 func (s *ApprovalState) SetYolo() error {
 	return s.Set(ApprovalYolo)
 }
