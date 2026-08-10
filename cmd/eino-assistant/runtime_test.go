@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"eino-local-assistant/internal/agent"
 	"eino-local-assistant/internal/config"
@@ -39,6 +40,30 @@ func TestRuntimeReActOptionsEnableExplicitSteer(t *testing.T) {
 	}
 	if got, want := options.Admission.CeilingTokens(), 5_700; got != want {
 		t.Fatalf("request admission ceiling = %d, want %d", got, want)
+	}
+}
+
+func TestMCPServerOptionsFilterDisabledAndPreserveConfiguration(t *testing.T) {
+	disabled := false
+	enabled := true
+	servers := []config.MCPServerConfig{
+		{Name: "default", Command: "default-server", Args: []string{"--stdio"}, Env: map[string]string{"TOKEN": "secret"}},
+		{Name: "disabled", Command: "disabled-server", Enabled: &disabled},
+		{Name: "configured", Command: "configured-server", Args: []string{"--port", "3000"}, Enabled: &enabled, WorkingDir: "/workspace", ConnectTimeoutSeconds: 7},
+	}
+	options := mcpServerOptions(servers)
+	if len(options) != 2 {
+		t.Fatalf("MCP options = %#v, want disabled server filtered", options)
+	}
+	if options[0].Name != "default" || options[0].ConnectTimeout != 15*time.Second || options[0].Env["TOKEN"] != "secret" {
+		t.Fatalf("default MCP option = %#v", options[0])
+	}
+	if options[1].Name != "configured" || options[1].WorkingDir != "/workspace" || options[1].ConnectTimeout != 7*time.Second {
+		t.Fatalf("configured MCP option = %#v", options[1])
+	}
+	servers[0].Args[0] = "changed"
+	if options[0].Args[0] != "--stdio" {
+		t.Fatalf("MCP option args alias source configuration: %#v", options[0].Args)
 	}
 }
 

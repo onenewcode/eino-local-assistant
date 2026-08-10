@@ -42,8 +42,8 @@ type Config struct {
 	Rules RulesConfig `toml:"rules"`
 	// Memory is project-scoped semantic memory (not session resume).
 	Memory MemoryConfig `toml:"memory"`
-	// MCP declares external stdio MCP servers. The list is inert until a
-	// caller explicitly connects to the configured servers.
+	// MCP declares external stdio MCP servers. Runtime entry points connect
+	// enabled servers before constructing their tool registries.
 	MCP MCPConfig `toml:"mcp"`
 }
 
@@ -55,11 +55,30 @@ type MCPConfig struct {
 // MCPServerConfig describes a local stdio MCP server without exposing its
 // environment values in status output.
 type MCPServerConfig struct {
-	Name       string            `toml:"name"`
-	Command    string            `toml:"command"`
-	Args       []string          `toml:"args"`
-	WorkingDir string            `toml:"working_dir"`
-	Env        map[string]string `toml:"env"`
+	Name                  string            `toml:"name"`
+	Command               string            `toml:"command"`
+	Args                  []string          `toml:"args"`
+	WorkingDir            string            `toml:"working_dir"`
+	Env                   map[string]string `toml:"env"`
+	Enabled               *bool             `toml:"enabled"`
+	ConnectTimeoutSeconds int               `toml:"connect_timeout_seconds"`
+}
+
+const defaultMCPConnectTimeoutSeconds = 15
+
+// IsEnabled reports whether the server starts with a new runtime. Omitted
+// values preserve the expected enabled-by-default behavior.
+func (c MCPServerConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+// ConnectTimeout returns the bounded discovery deadline for this server.
+func (c MCPServerConfig) ConnectTimeout() time.Duration {
+	seconds := c.ConnectTimeoutSeconds
+	if seconds == 0 {
+		seconds = defaultMCPConnectTimeoutSeconds
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // ProjectTrustConfig records whether a user trusts a workspace's own rules.
@@ -975,6 +994,9 @@ func (c MCPConfig) Validate() error {
 		}
 		if strings.TrimSpace(server.Command) == "" {
 			return fmt.Errorf("mcp.servers[%d].command is required", i)
+		}
+		if server.ConnectTimeoutSeconds < 0 || server.ConnectTimeoutSeconds > 60 {
+			return fmt.Errorf("mcp.servers[%d].connect_timeout_seconds must be between 1 and 60 when set", i)
 		}
 		if _, exists := seen[name]; exists {
 			return fmt.Errorf("mcp server name %q is duplicated", name)

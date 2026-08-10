@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -69,6 +70,73 @@ func TestMCPToolPermissionDenied(t *testing.T) {
 	}), `{"value":"blocked"}`)
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("denied call error = %v", err)
+	}
+}
+
+func TestMCPToolRuntimeApprovalFailsClosedWithoutApprover(t *testing.T) {
+	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "test", Command: os.Args[0], Args: []string{"-test.run=TestMCPServerProcess"},
+		Env: map[string]string{"EINO_MCP_HELPER": "1"},
+	}}, MCPConnectionOptions{Approval: ApprovalOnRequest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	_, err = set.Tools[0].InvokableRun(context.Background(), `{"value":"blocked"}`)
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("runtime approval error = %v, want permission denied", err)
+	}
+}
+
+func TestMCPToolRuntimeApprovalSessionAllow(t *testing.T) {
+	allows := NewSessionAllowlist()
+	approver := &recordingApprover{responses: []ApprovalAction{ApprovalSession}}
+	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "test", Command: os.Args[0], Args: []string{"-test.run=TestMCPServerProcess"},
+		Env: map[string]string{"EINO_MCP_HELPER": "1"},
+	}}, MCPConnectionOptions{
+		Approval:      ApprovalOnRequest,
+		Approver:      approver,
+		SessionAllows: allows,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	for _, value := range []string{"first", "second"} {
+		output, callErr := set.Tools[0].InvokableRun(context.Background(), `{"value":"`+value+`"}`)
+		if callErr != nil || output != value {
+			t.Fatalf("MCP call output=%q err=%v", output, callErr)
+		}
+	}
+	requests := approver.Requests()
+	if len(requests) != 1 {
+		t.Fatalf("approval requests = %d, want 1", len(requests))
+	}
+	if request := requests[0]; request.Command != "MCP test.echo" || request.RuleKey != "mcp:test:echo" || !request.AllowSession {
+		t.Fatalf("approval request = %+v", request)
+	}
+	if !allows.Contains("mcp:test:echo") {
+		t.Fatal("session allow was not retained")
+	}
+}
+
+func TestMCPToolRuntimeApprovalStateOverridesStaticMode(t *testing.T) {
+	state, err := NewApprovalState(ApprovalNever)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "test", Command: os.Args[0], Args: []string{"-test.run=TestMCPServerProcess"},
+		Env: map[string]string{"EINO_MCP_HELPER": "1"},
+	}}, MCPConnectionOptions{Approval: ApprovalOnRequest, ApprovalState: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	output, err := set.Tools[0].InvokableRun(context.Background(), `{"value":"allowed"}`)
+	if err != nil || output != "allowed" {
+		t.Fatalf("MCP call output=%q err=%v", output, err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const validConfiguration = `
@@ -48,6 +49,48 @@ func TestLoadAcceptsOneCompleteConfiguration(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load() = %#v, want %#v", got, want)
+	}
+}
+
+func TestMCPServerDefaultsAndTimeoutValidation(t *testing.T) {
+	got, err := Load(writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "default"
+command = "mcp-default"
+
+[[mcp.servers]]
+name = "disabled"
+command = "mcp-disabled"
+enabled = false
+connect_timeout_seconds = 7
+`))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(got.MCP.Servers) != 2 {
+		t.Fatalf("MCP server count = %d, want 2", len(got.MCP.Servers))
+	}
+	if !got.MCP.Servers[0].IsEnabled() || got.MCP.Servers[0].ConnectTimeout() != 15*time.Second {
+		t.Fatalf("default MCP server = %#v, enabled=%t timeout=%s", got.MCP.Servers[0], got.MCP.Servers[0].IsEnabled(), got.MCP.Servers[0].ConnectTimeout())
+	}
+	if got.MCP.Servers[1].IsEnabled() || got.MCP.Servers[1].ConnectTimeout() != 7*time.Second {
+		t.Fatalf("configured MCP server = %#v, enabled=%t timeout=%s", got.MCP.Servers[1], got.MCP.Servers[1].IsEnabled(), got.MCP.Servers[1].ConnectTimeout())
+	}
+
+	for _, timeout := range []string{"-1", "61"} {
+		_, err := Load(writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "invalid"
+command = "mcp-invalid"
+connect_timeout_seconds = `+timeout+`
+`))
+		if err == nil || !strings.Contains(err.Error(), "connect_timeout_seconds") {
+			t.Fatalf("timeout %s error = %v, want validation failure", timeout, err)
+		}
 	}
 }
 

@@ -72,6 +72,7 @@ type commandRuntime struct {
 	protectedPaths        []string
 	sandboxEnvironment    sandbox.EnvironmentSnapshot
 	sandboxRunner         *tools.SandboxRunner
+	mcpTools              *tools.MCPToolSet
 	runtimeCfg            config.RuntimeConfig
 	composePromptSnapshot func() (string, agent.PromptLayerSnapshot, error)
 	rulesSnapshot         agent.PromptLayerSnapshot
@@ -269,6 +270,11 @@ func (r *commandRuntime) Close() error {
 	if r.sandboxRunner != nil {
 		if err := r.sandboxRunner.Close(); err != nil {
 			closeErrs = append(closeErrs, fmt.Errorf("close sandbox runner: %w", err))
+		}
+	}
+	if r.mcpTools != nil {
+		if err := r.mcpTools.Close(); err != nil {
+			closeErrs = append(closeErrs, fmt.Errorf("close MCP tools: %w", err))
 		}
 	}
 	if r.memStore != nil {
@@ -608,12 +614,31 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	if err != nil {
 		return nil, err
 	}
+	mcpTools, err := tools.ConnectMCPServers(ctx, mcpServerOptions(cfg.MCP.Servers), tools.MCPConnectionOptions{
+		Approval:      approvalMode,
+		ApprovalState: approvalState,
+		Approver:      approver,
+		SessionAllows: sessionAllows,
+		SessionDenies: sessionDenies,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			_ = mcpTools.Close()
+		}
+	}()
 	taskController := agent.NewTaskController()
 	taskTools, err := agent.NewTaskTools(taskController)
 	if err != nil {
 		return nil, fmt.Errorf("create task tools: %w", err)
 	}
-	registry = tools.New(append(registry.All(), taskTools...)...)
+	registeredTools := append(registry.All(), taskTools...)
+	for _, mcpTool := range mcpTools.Tools {
+		registeredTools = append(registeredTools, mcpTool)
+	}
+	registry = tools.New(registeredTools...)
 	runtime := &commandRuntime{
 		cfg:                cfg,
 		sessionStore:       sessionStore,
@@ -633,6 +658,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		protectedPaths:     protectedPaths,
 		sandboxEnvironment: sandboxEnvironment,
 		sandboxRunner:      sandboxRunner,
+		mcpTools:           mcpTools,
 		runtimeCfg:         runtimeCfg,
 	}
 	bundle, err := runtime.buildModelBundle(ctx, cfg, start.recoverInterrupted)
@@ -697,11 +723,30 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		"workspace", workspaceRoot,
 		"approval_policy", string(approvalMode),
 		"sandbox_mode", cfg.Sandbox.ModeNormalized(),
+		"mcp_servers", len(mcpTools.Servers),
 		"ephemeral", start.ephemeral,
 		"log_path", logger.Path(),
 		"yolo", start.yolo,
 	)
 	return runtime, nil
+}
+
+func mcpServerOptions(servers []config.MCPServerConfig) []tools.MCPServerOptions {
+	options := make([]tools.MCPServerOptions, 0, len(servers))
+	for _, server := range servers {
+		if !server.IsEnabled() {
+			continue
+		}
+		options = append(options, tools.MCPServerOptions{
+			Name:           server.Name,
+			Command:        server.Command,
+			Args:           append([]string(nil), server.Args...),
+			WorkingDir:     server.WorkingDir,
+			Env:            server.Env,
+			ConnectTimeout: server.ConnectTimeout(),
+		})
+	}
+	return options
 }
 
 // openRuntimeLogger installs the process default slog logger. File logs use the

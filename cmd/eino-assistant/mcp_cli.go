@@ -68,7 +68,7 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		sort.Strings(envVars)
 		entries = append(entries, mcpListEntry{
 			Name:    strings.TrimSpace(server.Name),
-			Enabled: true,
+			Enabled: server.IsEnabled(),
 			Transport: mcpTransportView{
 				Type:       "stdio",
 				Command:    strings.TrimSpace(server.Command),

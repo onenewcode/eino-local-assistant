@@ -99,6 +99,8 @@ data_dir = ""
 # command = "npx"
 # args = ["-y", "@example/mcp-server"]
 # working_dir = "/absolute/workspace"
+# enabled = true
+# connect_timeout_seconds = 15
 #
 # [mcp.servers.env]
 # API_TOKEN = "replace-with-your-token"

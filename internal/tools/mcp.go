@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -17,11 +18,27 @@ import (
 
 // MCPServerOptions describes one explicitly configured stdio MCP server.
 type MCPServerOptions struct {
-	Name       string
-	Command    string
-	Args       []string
-	WorkingDir string
-	Env        map[string]string
+	Name           string
+	Command        string
+	Args           []string
+	WorkingDir     string
+	Env            map[string]string
+	ConnectTimeout time.Duration
+}
+
+// MCPConnectionOptions gives external tools the same runtime approval state
+// as shell and apply_patch. Leaving it unset preserves the library-level
+// context permission hook used by embedding callers.
+type MCPConnectionOptions struct {
+	Approval      ApprovalMode
+	ApprovalState *ApprovalState
+	Approver      Approver
+	SessionAllows *SessionAllowlist
+	SessionDenies *SessionDenylist
+}
+
+func (o MCPConnectionOptions) usesRuntimeApproval() bool {
+	return o.Approval != "" || o.ApprovalState != nil || o.Approver != nil || o.SessionAllows != nil || o.SessionDenies != nil
 }
 
 // MCPToolSet owns the external sessions and the Eino tools backed by them.
@@ -41,7 +58,11 @@ type MCPServerInfo struct {
 // ConnectMCPServers starts configured servers and discovers their tools.
 // Names are namespaced as mcp__<server>__<tool> to avoid collisions with
 // built-ins and to keep the remote name private to the adapter.
-func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions) (*MCPToolSet, error) {
+func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions, connectionOptions ...MCPConnectionOptions) (*MCPToolSet, error) {
+	options := MCPConnectionOptions{}
+	if len(connectionOptions) > 0 {
+		options = connectionOptions[0]
+	}
 	set := &MCPToolSet{}
 	seen := make(map[string]struct{})
 	for _, opts := range servers {
@@ -62,8 +83,14 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions) (*MCPToo
 				cmd.Env = append(cmd.Env, key+"="+value)
 			}
 		}
-		session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+		serverCtx := ctx
+		cancel := func() {}
+		if opts.ConnectTimeout > 0 {
+			serverCtx, cancel = context.WithTimeout(ctx, opts.ConnectTimeout)
+		}
+		session, err := client.Connect(serverCtx, &mcp.CommandTransport{Command: cmd}, nil)
 		if err != nil {
+			cancel()
 			set.Close()
 			return nil, fmt.Errorf("connect MCP server %q: %w", name, err)
 		}
@@ -71,8 +98,9 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions) (*MCPToo
 		serverInfo := MCPServerInfo{Name: name}
 		cursor := ""
 		for {
-			result, listErr := session.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
+			result, listErr := session.ListTools(serverCtx, &mcp.ListToolsParams{Cursor: cursor})
 			if listErr != nil {
+				cancel()
 				set.Close()
 				return nil, fmt.Errorf("list MCP tools from %q: %w", name, listErr)
 			}
@@ -82,16 +110,18 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions) (*MCPToo
 				}
 				toolName := mcpToolName(name, remote.Name)
 				if _, exists := seen[toolName]; exists {
+					cancel()
 					set.Close()
 					return nil, fmt.Errorf("duplicate MCP tool name %q", toolName)
 				}
 				info, infoErr := mcpToolInfo(toolName, remote)
 				if infoErr != nil {
+					cancel()
 					set.Close()
 					return nil, fmt.Errorf("decode MCP tool %q: %w", remote.Name, infoErr)
 				}
 				seen[toolName] = struct{}{}
-				set.Tools = append(set.Tools, &mcpTool{session: session, remoteName: remote.Name, info: info})
+				set.Tools = append(set.Tools, &mcpTool{session: session, serverName: name, remoteName: remote.Name, info: info, options: options})
 				serverInfo.ToolCount++
 			}
 			cursor = strings.TrimSpace(result.NextCursor)
@@ -99,6 +129,7 @@ func ConnectMCPServers(ctx context.Context, servers []MCPServerOptions) (*MCPToo
 				break
 			}
 		}
+		cancel()
 		set.Servers = append(set.Servers, serverInfo)
 	}
 	return set, nil
@@ -121,8 +152,10 @@ func (s *MCPToolSet) Close() error {
 
 type mcpTool struct {
 	session    *mcp.ClientSession
+	serverName string
 	remoteName string
 	info       *schema.ToolInfo
+	options    MCPConnectionOptions
 }
 
 func (t *mcpTool) Info(context.Context) (*schema.ToolInfo, error) {
@@ -136,9 +169,7 @@ func (t *mcpTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ..
 			return "", fmt.Errorf("decode MCP tool arguments: %w", err)
 		}
 	}
-	if err := RequirePermission(ctx, PermissionRequest{
-		Tool: t.info.Name, Action: "call", Detail: t.remoteName, Risk: RiskMedium,
-	}); err != nil {
+	if err := t.authorize(ctx); err != nil {
 		return "", err
 	}
 	result, err := t.session.CallTool(ctx, &mcp.CallToolParams{Name: t.remoteName, Arguments: args})
@@ -154,6 +185,55 @@ func (t *mcpTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ..
 		return string(raw), nil
 	}
 	return output, nil
+}
+
+func (t *mcpTool) authorize(ctx context.Context) error {
+	if !t.options.usesRuntimeApproval() {
+		return RequirePermission(ctx, PermissionRequest{
+			Tool: t.info.Name, Action: "call", Detail: t.remoteName, Risk: RiskMedium,
+		})
+	}
+	key := "mcp:" + t.serverName + ":" + t.remoteName
+	mode := effectiveApprovalMode(t.options.Approval, t.options.ApprovalState)
+	if mode == ApprovalNever || isYoloApprovalMode(mode) {
+		return nil
+	}
+	if mode == ApprovalPlan || (t.options.SessionDenies != nil && t.options.SessionDenies.Contains(key)) {
+		return fmt.Errorf("%w: %s", ErrPermissionDenied, t.info.Name)
+	}
+	if t.options.SessionAllows != nil && t.options.SessionAllows.Contains(key) {
+		return nil
+	}
+	if t.options.Approver == nil {
+		return fmt.Errorf("%w: %s", ErrPermissionDenied, t.info.Name)
+	}
+	resp, err := t.options.Approver.Request(ctx, ApprovalRequest{
+		Tool:         t.info.Name,
+		Command:      "MCP " + t.serverName + "." + t.remoteName,
+		Reason:       "MCP tool calls can invoke external services",
+		RuleID:       "mcp",
+		RuleKey:      key,
+		AllowSession: true,
+	})
+	if err != nil {
+		return err
+	}
+	switch resp.Action {
+	case ApprovalOnce:
+		return nil
+	case ApprovalSession:
+		if t.options.SessionAllows != nil {
+			t.options.SessionAllows.Allow(key)
+		}
+		return nil
+	case ApprovalDeny:
+		if t.options.SessionDenies != nil {
+			t.options.SessionDenies.Deny(key)
+		}
+		return fmt.Errorf("%w: %s", ErrPermissionDenied, t.info.Name)
+	default:
+		return fmt.Errorf("%w: %s", ErrPermissionDenied, t.info.Name)
+	}
 }
 
 func mcpToolName(server, remote string) string {

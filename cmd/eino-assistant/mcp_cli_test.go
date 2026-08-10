@@ -59,6 +59,7 @@ TOKEN = "do-not-print"
 [[mcp.servers]]
 name = "helper"
 command = "./helper"
+enabled = false
 `)
 	stdout, err := listMCPServersForTest(configPath, true)
 	if err != nil {
@@ -73,6 +74,9 @@ command = "./helper"
 	}
 	if len(entries) != 2 || entries[0].Name != "local-tools" || !entries[0].Enabled {
 		t.Fatalf("MCP entries = %+v", entries)
+	}
+	if entries[1].Name != "helper" || entries[1].Enabled {
+		t.Fatalf("disabled MCP entry = %+v", entries[1])
 	}
 	if entries[0].Transport.Type != "stdio" || entries[0].Transport.Command != "npx" || strings.Join(entries[0].Transport.Args, " ") != "-y @example/server" {
 		t.Fatalf("first transport = %+v", entries[0].Transport)
