@@ -140,7 +140,7 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 		t.Fatalf("empty JSON list = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "--help")
-	if err != nil || !strings.Contains(stdout, "Manage configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "login") || !strings.Contains(stdout, "logout") || !strings.Contains(stdout, "enable") || !strings.Contains(stdout, "disable") || !strings.Contains(stdout, "remove") {
+	if err != nil || !strings.Contains(stdout, "Manage configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "auth") || !strings.Contains(stdout, "login") || !strings.Contains(stdout, "logout") || !strings.Contains(stdout, "enable") || !strings.Contains(stdout, "disable") || !strings.Contains(stdout, "remove") {
 		t.Fatalf("mcp help = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "list", "--help")

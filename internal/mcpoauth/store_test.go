@@ -65,6 +65,11 @@ func TestStoreRejectsInvalidInputAndBackendErrors(t *testing.T) {
 	if _, err := broken.Load("remote", "https://mcp.example.test"); err == nil || errors.Is(err, ErrNotFound) {
 		t.Fatalf("Load(broken keyring) error = %v", err)
 	}
+	backend := newMemoryBackend()
+	backend.values[keyringService+"/"+credentialKey("remote")] = "not JSON"
+	if _, err := NewStore(backend).Load("remote", "https://mcp.example.test"); !errors.Is(err, ErrInvalidCredential) {
+		t.Fatalf("Load(invalid credential) error = %v", err)
+	}
 }
 
 type memoryBackend struct {

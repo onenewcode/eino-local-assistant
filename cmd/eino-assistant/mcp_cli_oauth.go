@@ -21,6 +21,7 @@ const defaultMCPOAuthLoginTimeout = 5 * time.Minute
 
 type mcpOAuthCredentialStore interface {
 	Save(serverName, endpoint string, token *oauth2.Token) error
+	Load(serverName, endpoint string) (*oauth2.Token, error)
 	Delete(serverName string) error
 }
 

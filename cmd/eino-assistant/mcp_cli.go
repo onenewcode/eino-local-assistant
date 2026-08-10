@@ -66,6 +66,7 @@ func newMCPCommand(opts *rootOptions) *cobra.Command {
 		newMCPListCommand(opts),
 		newMCPGetCommand(opts),
 		newMCPAddCommand(opts),
+		newMCPAuthCommand(opts),
 		newMCPLoginCommand(opts),
 		newMCPLogoutCommand(opts),
 		newMCPEnableCommand(opts),

@@ -20,6 +20,8 @@ var (
 	ErrNotFound = errors.New("MCP OAuth credential is not stored")
 	// ErrEndpointMismatch reports that a saved token belongs to an older server URL.
 	ErrEndpointMismatch = errors.New("MCP OAuth credential belongs to a different endpoint")
+	// ErrInvalidCredential reports an unreadable or structurally invalid keyring value.
+	ErrInvalidCredential = errors.New("MCP OAuth credential is invalid")
 )
 
 // SecretBackend is the narrow OS-keyring contract needed by Store.
@@ -86,10 +88,10 @@ func (s *Store) Load(serverName, endpoint string) (*oauth2.Token, error) {
 	}
 	var stored storedCredential
 	if err := json.Unmarshal([]byte(payload), &stored); err != nil {
-		return nil, fmt.Errorf("decode MCP OAuth credential: %w", err)
+		return nil, fmt.Errorf("%w: decode stored value: %v", ErrInvalidCredential, err)
 	}
 	if stored.Version != 1 || stored.Token == nil || strings.TrimSpace(stored.Token.AccessToken) == "" {
-		return nil, errors.New("stored MCP OAuth credential is invalid")
+		return nil, ErrInvalidCredential
 	}
 	if stored.Endpoint != strings.TrimSpace(endpoint) {
 		return nil, ErrEndpointMismatch
