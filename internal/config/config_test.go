@@ -322,6 +322,104 @@ still part of the value"""
 	}
 }
 
+func TestSetMCPServerEnabledPreservesServerDetailsAndComments(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "default-enabled"
+command = "default-command"
+args = ["--stdio"]
+
+[mcp.servers.env]
+TOKEN = "secret"
+
+[[mcp.servers]]
+name = "explicit-enabled"
+command = "explicit-command"
+enabled = false # preserve this comment
+`)
+	if err := SetMCPServerEnabled(path, "default-enabled", false); err != nil {
+		t.Fatalf("SetMCPServerEnabled(disable) error = %v", err)
+	}
+	if err := SetMCPServerEnabled(path, "explicit-enabled", true); err != nil {
+		t.Fatalf("SetMCPServerEnabled(enable) error = %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after setting enabled error = %v", err)
+	}
+	if len(got.MCP.Servers) != 2 || got.MCP.Servers[0].IsEnabled() || !got.MCP.Servers[1].IsEnabled() || !reflect.DeepEqual(got.MCP.Servers[0].Args, []string{"--stdio"}) || got.MCP.Servers[0].Env["TOKEN"] != "secret" {
+		t.Fatalf("MCP servers after enabled updates = %#v", got.MCP.Servers)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(data)
+	for _, want := range []string{"enabled = false", "enabled = true # preserve this comment", "TOKEN = \"secret\"", "args = [\"--stdio\"]"} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("updated config missing %q:\n%s", want, contents)
+		}
+	}
+	if err := SetMCPServerEnabled(path, "default-enabled", false); err != nil {
+		t.Fatalf("SetMCPServerEnabled(idempotent) error = %v", err)
+	}
+	again, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != contents {
+		t.Fatal("idempotent enabled update rewrote configuration")
+	}
+}
+
+func TestSetMCPServerEnabledRejectsUnknownSymbolicLinkAndMultilineConfig(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "server"
+command = "command"
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetMCPServerEnabled(path, "missing", false); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("unknown toggle error = %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("unknown toggle modified configuration")
+	}
+	link := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetMCPServerEnabled(link, "server", false); err == nil || !strings.Contains(err.Error(), "symbolic-link") {
+		t.Fatalf("symbolic link toggle error = %v", err)
+	}
+
+	multiline := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "server"
+command = "command"
+
+[mcp.servers.env]
+VALUE = """line one
+line two"""
+`)
+	if err := SetMCPServerEnabled(multiline, "server", false); err == nil || !strings.Contains(err.Error(), "multiline TOML strings") {
+		t.Fatalf("multiline toggle error = %v", err)
+	}
+}
+
 func TestAddMCPServerPreservesExistingConfigurationAndSortsEnvironment(t *testing.T) {
 	path := writeConfiguration(t, validConfiguration+`# preserve user comments
 [ui]

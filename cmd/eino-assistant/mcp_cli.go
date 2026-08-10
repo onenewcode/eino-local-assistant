@@ -32,10 +32,17 @@ func newMCPCommand(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Manage configured MCP servers",
-		Long:  "Inspect configured MCP servers from the user-level TOML configuration.",
+		Long:  "Manage configured MCP servers in the user-level TOML configuration.",
 		Args:  cobra.NoArgs,
 	}
-	cmd.AddCommand(newMCPListCommand(opts), newMCPGetCommand(opts), newMCPAddCommand(opts), newMCPRemoveCommand(opts))
+	cmd.AddCommand(
+		newMCPListCommand(opts),
+		newMCPGetCommand(opts),
+		newMCPAddCommand(opts),
+		newMCPEnableCommand(opts),
+		newMCPDisableCommand(opts),
+		newMCPRemoveCommand(opts),
+	)
 	return cmd
 }
 
@@ -111,6 +118,40 @@ func newMCPAddCommand(opts *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringArrayVarP(&environment, "env", "e", nil, "environment variable to set (KEY=VALUE; repeatable)")
+	return cmd
+}
+
+func newMCPEnableCommand(opts *rootOptions) *cobra.Command {
+	return newMCPSetEnabledCommand(opts, "enable", "Enable", true)
+}
+
+func newMCPDisableCommand(opts *rootOptions) *cobra.Command {
+	return newMCPSetEnabledCommand(opts, "disable", "Disable", false)
+}
+
+func newMCPSetEnabledCommand(opts *rootOptions, verb, action string, enabled bool) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   verb + " <name>",
+		Short: action + " one configured MCP server",
+		Long:  action + " one configured MCP server for future runtimes without starting or stopping an MCP process.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+				return err
+			}
+			if strings.TrimSpace(args[0]) == "" {
+				return fmt.Errorf("MCP server name is required")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := strings.TrimSpace(args[0])
+			if err := config.SetMCPServerEnabled(opts.configPath, name, enabled); err != nil {
+				return err
+			}
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s MCP server %q.\n", action+"d", name)
+			return err
+		},
+	}
 	return cmd
 }
 

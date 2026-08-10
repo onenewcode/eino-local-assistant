@@ -101,7 +101,7 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 		t.Fatalf("empty JSON list = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "--help")
-	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "remove") {
+	if err != nil || !strings.Contains(stdout, "Manage configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "enable") || !strings.Contains(stdout, "disable") || !strings.Contains(stdout, "remove") {
 		t.Fatalf("mcp help = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "list", "--help")
@@ -231,6 +231,64 @@ func TestMCPAddRejectsInvalidCommandShapeAndEnvironment(t *testing.T) {
 	} {
 		if _, _, err := executeMCPCommandForTest(args...); err == nil {
 			t.Fatalf("mcp add %q should reject invalid input", args)
+		}
+	}
+}
+
+func TestMCPEnableAndDisableUpdateFutureRuntimeConfiguration(t *testing.T) {
+	configPath := writeMCPListConfig(t, `[mcp]
+
+[[mcp.servers]]
+name = "local-tools"
+command = "does-not-exist"
+`)
+	stdout, _, err := executeMCPCommandWithConfigForTest(configPath, "mcp", "disable", " local-tools ")
+	if err != nil {
+		t.Fatalf("mcp disable error = %v", err)
+	}
+	if strings.TrimSpace(stdout) != `Disabled MCP server "local-tools".` {
+		t.Fatalf("mcp disable output = %q", stdout)
+	}
+	jsonOutput, err := listMCPServersForTest(configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []mcpServerEntry
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Enabled {
+		t.Fatalf("disabled MCP list entry = %+v", entries)
+	}
+	stdout, _, err = executeMCPCommandWithConfigForTest(configPath, "mcp", "enable", "local-tools")
+	if err != nil {
+		t.Fatalf("mcp enable error = %v", err)
+	}
+	if strings.TrimSpace(stdout) != `Enabled MCP server "local-tools".` {
+		t.Fatalf("mcp enable output = %q", stdout)
+	}
+	jsonOutput, err = listMCPServersForTest(configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !entries[0].Enabled || entries[0].Transport.Command != "does-not-exist" {
+		t.Fatalf("enabled MCP list entry = %+v", entries)
+	}
+}
+
+func TestMCPEnableAndDisableRejectInvalidNamesAndDocumentNoProcessEffects(t *testing.T) {
+	for _, verb := range []string{"enable", "disable"} {
+		stdout, _, err := executeMCPCommandForTest("mcp", verb, "--help")
+		if err != nil || !strings.Contains(stdout, "configured MCP server") || !strings.Contains(stdout, "without starting or stopping") {
+			t.Fatalf("mcp %s help = %q, err=%v", verb, stdout, err)
+		}
+		for _, args := range [][]string{{"mcp", verb}, {"mcp", verb, "first", "second"}, {"mcp", verb, " "}} {
+			if _, _, err := executeMCPCommandForTest(args...); err == nil {
+				t.Fatalf("mcp %s %q should reject invalid arguments", verb, args)
+			}
 		}
 	}
 }

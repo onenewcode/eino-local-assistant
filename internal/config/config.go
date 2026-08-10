@@ -826,6 +826,126 @@ func RemoveMCPServer(path, name string) error {
 	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
 }
 
+// SetMCPServerEnabled updates the persisted activation state for one MCP
+// server. It only affects future runtime construction; it cannot alter an MCP
+// session already owned by another process.
+func SetMCPServerEnabled(path, name string, enabled bool) error {
+	if strings.ToLower(filepath.Ext(path)) != ".toml" {
+		return errors.New("configuration file must use the .toml extension")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("mcp server name is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect configuration: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to update a symbolic-link configuration file")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("configuration file must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration: %w", err)
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, server := range cfg.MCP.Servers {
+		if strings.TrimSpace(server.Name) != name {
+			continue
+		}
+		found = true
+		if server.IsEnabled() == enabled {
+			return nil
+		}
+		break
+	}
+	if !found {
+		return fmt.Errorf("mcp server %q is not configured", name)
+	}
+	updated, err := setMCPServerEnabledSource(string(data), cfg.MCP.Servers, name, enabled)
+	if err != nil {
+		return err
+	}
+	if _, err := parseConfig([]byte(updated)); err != nil {
+		return fmt.Errorf("validate updated configuration: %w", err)
+	}
+	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+func setMCPServerEnabledSource(source string, servers []MCPServerConfig, name string, enabled bool) (string, error) {
+	if strings.Contains(source, `"""`) || strings.Contains(source, `'''`) {
+		return "", errors.New("cannot update MCP configuration containing multiline TOML strings")
+	}
+	target := -1
+	for i, server := range servers {
+		if strings.TrimSpace(server.Name) == name {
+			target = i
+			break
+		}
+	}
+	if target < 0 {
+		return "", fmt.Errorf("mcp server %q is not configured", name)
+	}
+	lines := strings.SplitAfter(source, "\n")
+	blocks := mcpServerSourceBlocks(lines)
+	if len(blocks) != len(servers) {
+		return "", errors.New("could not locate MCP server configuration block")
+	}
+	block := blocks[target]
+	for i := block.start + 1; i < block.end; i++ {
+		if isAnyTOMLTableHeader(lines[i]) {
+			break
+		}
+		if !isTOMLAssignment(lines[i], "enabled") {
+			continue
+		}
+		lines[i] = replaceTOMLBooleanSetting(lines[i], "enabled", enabled)
+		return strings.Join(lines, ""), nil
+	}
+	insertAt := block.end
+	for i := block.start + 1; i < block.end; i++ {
+		if isAnyTOMLTableHeader(lines[i]) {
+			insertAt = i
+			break
+		}
+	}
+	setting := fmt.Sprintf("enabled = %t\n", enabled)
+	lines = append(lines[:insertAt], append([]string{setting}, lines[insertAt:]...)...)
+	return strings.Join(lines, ""), nil
+}
+
+func isTOMLAssignment(line, name string) bool {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") {
+		return false
+	}
+	key, _, ok := strings.Cut(trimmed, "=")
+	return ok && strings.TrimSpace(key) == name
+}
+
+func replaceTOMLBooleanSetting(line, name string, value bool) string {
+	ending := ""
+	if strings.HasSuffix(line, "\n") {
+		ending = "\n"
+	}
+	comment := ""
+	if commentAt := strings.Index(line, "#"); commentAt >= 0 {
+		comment = strings.TrimSpace(strings.TrimSuffix(line[commentAt:], "\n"))
+	}
+	replacement := fmt.Sprintf("%s = %t", name, value)
+	if comment != "" {
+		replacement += " " + comment
+	}
+	return replacement + ending
+}
+
 // AddMCPServer appends one validated stdio MCP server to a user-owned TOML
 // config without reformatting unrelated settings or comments.
 func AddMCPServer(path string, server MCPServerConfig) error {

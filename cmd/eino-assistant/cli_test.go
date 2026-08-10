@@ -64,10 +64,12 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"resume", "-h"}, "Resume a previously saved session"},
 		{[]string{"help", "sessions"}, "List saved sessions"},
 		{[]string{"sessions", "-h"}, "List saved sessions"},
-		{[]string{"help", "mcp"}, "Inspect configured MCP servers"},
+		{[]string{"help", "mcp"}, "Manage configured MCP servers"},
 		{[]string{"mcp", "list", "-h"}, "output the configured servers as JSON"},
 		{[]string{"mcp", "get", "-h"}, "Show one configured MCP server"},
 		{[]string{"mcp", "add", "-h"}, "Add one stdio MCP server"},
+		{[]string{"mcp", "enable", "-h"}, "Enable one configured MCP server"},
+		{[]string{"mcp", "disable", "-h"}, "Disable one configured MCP server"},
 		{[]string{"mcp", "remove", "-h"}, "Remove one configured MCP server"},
 		{[]string{"version", "-h"}, "Print version information"},
 	}

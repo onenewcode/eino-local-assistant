@@ -57,7 +57,7 @@ eino
 
 ## MCP
 
-在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio MCP server。TUI 和 `exec` 运行时会启动启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动 server 或打印环境变量值；`eino mcp remove <name>` 会原子删除该配置但同样不会启动 server。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
+在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio MCP server。TUI 和 `exec` 运行时会启动启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动 server 或打印环境变量值；`eino mcp enable <name>` / `eino mcp disable <name>` 为未来 runtime 更新启用状态，`eino mcp remove <name>` 会原子删除该配置。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
 
 可用显式命令行快速添加本地 stdio server（`--` 后才是要保存、但不会立即执行的 command）：
 
