@@ -24,7 +24,7 @@ func TestSlashMenuOpenRefilterClose(t *testing.T) {
 	}
 
 	setComposer(m, "/s")
-	if got := namesOf(m.slashItems); !equalStrings(got, []string{"/status", "/btw", "/steer", "/statusline", "/sessions"}) {
+	if got := namesOf(m.slashItems); !equalStrings(got, []string{"/status", "/skills", "/btw", "/steer", "/statusline", "/sessions"}) {
 		t.Fatalf("/s => %v", got)
 	}
 
@@ -163,6 +163,13 @@ func TestSlashMenuTabCompleteNeedsArgClasses(t *testing.T) {
 	mm = next.(*model)
 	if mm.textarea.Value() != "/resume " {
 		t.Fatalf("tab /resume = %q", mm.textarea.Value())
+	}
+
+	setComposer(mm, "/sk")
+	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyTab})
+	mm = next.(*model)
+	if mm.textarea.Value() != "/skills " {
+		t.Fatalf("tab /skills = %q", mm.textarea.Value())
 	}
 
 	setComposer(mm, "/fo")

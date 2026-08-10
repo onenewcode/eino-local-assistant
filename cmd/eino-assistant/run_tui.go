@@ -221,6 +221,8 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		},
 		RulesReport:             runtime.rulesReport,
 		WorkspaceDiff:           runtime.workspaceDiff,
+		ListProjectSkills:       runtime.listProjectSkills,
+		ReadProjectSkill:        runtime.readProjectSkill,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
 		SessionOpts:             initialSessionOpts,
 		Status:                  statusFromConfig(modelCfg, runtime.registry, cmdMode, maxReActModelSteps(initialReactModel), sandboxInfo, runtimeInfo),

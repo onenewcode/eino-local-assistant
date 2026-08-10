@@ -15,6 +15,7 @@ const (
 	slashDiff
 	slashReview
 	slashRules
+	slashSkills
 	slashSide
 	slashSteer
 	slashContext
@@ -62,6 +63,7 @@ func slashCatalog() []slashCommand {
 		{Name: "/diff", Description: "show the read-only Git diff snapshot, including untracked files"},
 		{Name: "/review", Description: "review workspace changes without modifying files or running verification"},
 		{Name: "/rules", Description: "show captured instruction source metadata (no reload)"},
+		{Name: "/skills", Description: "list project skills or preview one bounded SKILL.md", NeedsArg: true},
 		{Name: "/btw", Aliases: []string{"/side"}, Description: "ask a temporary side question without interrupting the current turn", NeedsArg: true},
 		{Name: "/steer", Description: "redirect the current regular turn without starting another turn", NeedsArg: true},
 		{Name: "/usage", Description: "toggle turn usage footer (on|off|toggle)", NeedsArg: true},
@@ -183,6 +185,8 @@ func parseSlash(input string) (slashAction, string) {
 		return slashReview, arg
 	case "/rules":
 		return slashRules, arg
+	case "/skills":
+		return slashSkills, arg
 	case "/btw", "/side":
 		return slashSide, arg
 	case "/steer":
@@ -236,6 +240,7 @@ func helpText() string {
 		"  /diff              show tracked staged+unstaged and non-ignored untracked changes (read-only; ignored omitted)",
 		"  /review            review workspace changes once (read-only display; no edits, tools, or verification)",
 		"  /rules             captured instruction sources and budgets (no reload)",
+		"  /skills [name]     list project skills or preview one bounded SKILL.md (read-only)",
 		"  /btw <question>    ask a temporary side question without interrupting the current turn (alias: /side)",
 		"  /steer <text>      steer only the active regular busy turn; failures are not queued",
 		"  /usage [on|off]    show/toggle per-turn API usage footer (default on)",

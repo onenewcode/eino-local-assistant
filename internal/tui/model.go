@@ -113,6 +113,41 @@ type ModelSelection struct {
 // ModelSwitchResult.Status; no provider-effective effort is implied here.
 type ModelSwitchWithOptionsCallback func(context.Context, *chat.Session, ModelSelection) (ModelSwitchResult, error)
 
+// ProjectSkillSummary is the display-safe discovery metadata for one project
+// skill. It deliberately excludes the full SKILL.md content.
+type ProjectSkillSummary struct {
+	Name        string
+	Path        string
+	Description string
+}
+
+// ProjectSkillsCatalog is a bounded list returned by the runtime-owned skill
+// discovery callback. Truncated means more conventional-root candidates may
+// exist than the listed entries.
+type ProjectSkillsCatalog struct {
+	Skills    []ProjectSkillSummary
+	Truncated bool
+}
+
+// ProjectSkillDetails is one bounded SKILL.md preview. Content remains
+// project data and cannot change the session's system or permission rules.
+type ProjectSkillDetails struct {
+	Name      string
+	Path      string
+	Content   string
+	Bytes     int
+	Truncated bool
+}
+
+// ListProjectSkillsCallback discovers project skills without reading their
+// full instructions. It is runtime-owned so the TUI cannot expand the
+// workspace file access surface itself.
+type ListProjectSkillsCallback func(context.Context) (ProjectSkillsCatalog, error)
+
+// ReadProjectSkillCallback reads one previously discoverable skill by name or
+// discovered relative path, subject to the runtime's bounded reader.
+type ReadProjectSkillCallback func(context.Context, string) (ProjectSkillDetails, error)
+
 // SessionOpenResult carries the complete runtime snapshot for a resumed
 // session. Unlike ModelSwitchResult, opening a session intentionally changes
 // the active Session pointer.
@@ -174,6 +209,10 @@ type Deps struct {
 	WorkspaceDiff func(context.Context) (string, error)
 	// WorkspaceReview performs one display-only review of a bounded diff.
 	WorkspaceReview func(context.Context, string) (string, error)
+	// ListProjectSkills and ReadProjectSkill expose the registry's bounded,
+	// read-only skill surface to the user-facing /skills inspector.
+	ListProjectSkills ListProjectSkillsCallback
+	ReadProjectSkill  ReadProjectSkillCallback
 	// InvalidateRulesSnapshot marks provenance unavailable after /resume.
 	InvalidateRulesSnapshot func()
 	// SideQuestion answers a temporary side question without writing the main
@@ -1695,6 +1734,8 @@ func (m *model) submit(input string) (tea.Model, tea.Cmd) {
 		return m.cmdReview(arg)
 	case slashRules:
 		return m.cmdRules(arg)
+	case slashSkills:
+		return m.cmdSkills(arg)
 	case slashSide:
 		return m.cmdSideQuestion(sideQuestionLabel(input), arg)
 	case slashSteer:

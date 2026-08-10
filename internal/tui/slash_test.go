@@ -28,6 +28,8 @@ func TestParseSlash(t *testing.T) {
 		{"/review", slashReview, ""},
 		{"/review extra", slashReview, "extra"},
 		{"/rules", slashRules, ""},
+		{"/skills", slashSkills, ""},
+		{"/skills release checklist", slashSkills, "release checklist"},
 		{"/btw what changed?", slashSide, "what changed?"},
 		{"/side what changed?", slashSide, "what changed?"},
 		{"/BTW", slashSide, ""},
@@ -101,7 +103,7 @@ func TestSlashCatalogParseableAndComplete(t *testing.T) {
 		}
 	}
 	tokens := []string{
-		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/statusline", "/goal", "/tasks", "/diff", "/rules", "/btw", "/side", "/steer", "/usage",
+		"/help", "/?", "/exit", "/quit", "/clear", "/status", "/statusline", "/goal", "/tasks", "/diff", "/rules", "/skills", "/btw", "/side", "/steer", "/usage",
 		"/context", "/compact", "/review",
 		"/new", "/sessions", "/resume", "/fork", "/title", "/delete", "/archive", "/unarchive", "/queue", "/plan",
 		"/model",
@@ -130,7 +132,7 @@ func catalogCoversToken(catalog []slashCommand, tok string) bool {
 
 func TestSlashCatalogNeedsArg(t *testing.T) {
 	want := map[string]bool{
-		"/help": false, "/status": false, "/goal": false, "/tasks": false, "/diff": false, "/review": false, "/rules": false, "/context": false, "/sessions": false,
+		"/help": false, "/status": false, "/goal": false, "/tasks": false, "/diff": false, "/review": false, "/rules": false, "/skills": true, "/context": false, "/sessions": false,
 		"/clear": false, "/exit": false, "/plan": false, "/permissions": true,
 		"/btw": true, "/steer": true,
 		"/usage": true, "/statusline": false, "/compact": true, "/new": true, "/resume": true, "/fork": true, "/title": true,
@@ -236,7 +238,7 @@ func TestFilterSlashCommandsMatrix(t *testing.T) {
 		{"/cl", []string{"/clear"}},
 		{"/cle", []string{"/clear"}},
 		{"/clear", []string{"/clear"}},
-		{"/s", []string{"/status", "/btw", "/steer", "/statusline", "/sessions"}},
+		{"/s", []string{"/status", "/skills", "/btw", "/steer", "/statusline", "/sessions"}},
 		{"/si", []string{"/btw"}},
 		{"/st", []string{"/status", "/steer", "/statusline"}},
 		{"/se", []string{"/sessions"}},

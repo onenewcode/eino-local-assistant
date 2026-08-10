@@ -4,7 +4,7 @@
 
 
 - **交互终端（TTY）**：Bubble Tea 全屏 TUI（圆角输入框、状态条、滚动对话、markdown/工具卡片、spinner、斜杠命令）
-- **ReAct 工具循环**（Codex 子集）：`shell`、`apply_patch`，以及产品用 `get_current_time` / `read_artifact`；调用过程在 UI 中可见
+- **ReAct 工具循环**（Codex 子集）：`shell`、`apply_patch`、按需 `list_skills` / `read_skill`，以及产品用 `get_current_time` / `read_artifact`；调用过程在 UI 中可见
 - **任务清单（Codex 风格）**：多步骤工作可用 `update_plan` 维护 checklist；仅用于进度展示，不挡交付，不授予写权限
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 可按需在短生命周期 worker 中执行；默认关闭 OS sandbox，网络在所有模式下开放，并有总 turn / 模型决策 / tool-call 预算；显式 `--yolo`/`/permissions yolo` 会旁路 approval 与 OS sandbox，只保留尽力而为的命令和路径检查，不能作为安全边界
 - **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，shell 可用 `eino sessions --output-format json` 读取机器可读元数据而不加载 transcript，并可通过 `eino fork <session-id> [prompt]`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
@@ -72,6 +72,8 @@ eino
 | `update_plan` | 多步骤 checklist（pending / in_progress / completed，至多一个 in_progress） | 进度 UI only；不挡交付；写入仍由 permissions/sandbox 管 |
 
 工具的权限语言仍不是安全边界；实际文件和网络隔离由 sandbox worker 提供。
+
+交互 TUI 的 `/skills` 列出当前 workspace 发现的项目 skills；`/skills <name>` 只预览一个已发现的、有界 `SKILL.md`。两者不会创建模型 turn、不会把全文自动注入 session，也能在正常 turn 忙碌时立即查看。若本次运行通过 `--tools` 排除了 `list_skills` 或 `read_skill`，对应的检查操作会明确不可用。
 
 ## MCP
 
