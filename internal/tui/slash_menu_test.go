@@ -218,7 +218,7 @@ func TestSlashMenuEnterAutoSubmitNoArg(t *testing.T) {
 	setComposer(mm, "/st")
 	next, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mm = next.(*model)
-	if !hasLineContaining(mm.lines, lineSystem, "model=") {
+	if !hasLineContaining(mm.lines, lineSystem, "Model:") {
 		t.Fatalf("status not submitted: %#v", mm.lines)
 	}
 

@@ -54,7 +54,7 @@ const maxSlashMenuRows = 8
 func slashCatalog() []slashCommand {
 	return []slashCommand{
 		{Name: "/help", Aliases: []string{"/?"}, Description: "show commands and Esc key behavior"},
-		{Name: "/status", Description: "model, session, tokens, cost, max_model_steps, context, declared catalog lifecycle, reasoning effort (requested/default); declared catalog effort options/default, Ctrl+O details"},
+		{Name: "/status", Description: "model, reasoning effort, and current session"},
 		{Name: "/goal", Description: "show the compact autonomous task goal and progress (read-only)"},
 		{Name: "/tasks", Description: "show the bounded foreground turn and background resource summary (read-only)"},
 		{Name: "/diff", Description: "show the read-only Git diff snapshot, including untracked files"},
@@ -222,7 +222,7 @@ func helpText() string {
 	return strings.Join([]string{
 		"Commands:",
 		"  /help              show this help and key bindings (including Esc backtrack)",
-		"  /status            model, session, tokens, cost, max_model_steps, context, declared catalog lifecycle, reasoning effort (requested/default); declared catalog effort options/default; ctrl+o toggles details",
+		"  /status            model, reasoning effort, and current session",
 		"  /goal              show the compact autonomous task goal and progress (read-only)",
 		"  /tasks             show foreground turn, current tool, queue count, goal/checklist projection, and background availability (read-only)",
 		"  /diff              show tracked staged+unstaged and non-ignored untracked changes (read-only; ignored omitted)",
@@ -264,6 +264,7 @@ func helpText() string {
 		"  ctrl+t    show/hide complex task progress when available",
 		"  ctrl+o    show/hide reasoning details (display only)",
 		"  alt+p     open/close the configured model picker (keeps the draft)",
+		"  alt+q     focus queued messages above the composer; enter sends selected now, x cancels it",
 		"  pgup/pgdn scroll transcript (or review a long host-escalation command)",
 		"  home/end  jump to top / bottom of transcript",
 		"  esc       idle with an empty composer: first arms backtrack; second opens history prompt selector",

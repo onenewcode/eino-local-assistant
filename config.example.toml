@@ -47,6 +47,12 @@ window_tokens = 32000
 input_per_million = 0.0
 output_per_million = 0.0
 
+# Persistent status-line fields, also configurable interactively with
+# /statusline. `activity` shows live states such as thinking, streaming,
+# tool execution, compaction, and pending approval.
+[ui]
+# status_line = ["model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity"]
+
 [workspace]
 root = ""
 

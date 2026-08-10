@@ -185,8 +185,8 @@ type Deps struct {
 	// HideTurnUsage skips the post-turn API usage footer when true.
 	// Default (false) shows the footer. Wired from ui.show_turn_usage.
 	HideTurnUsage bool
-	// StatusLine controls the persisted footer fields and semantic colors. An
-	// empty field list uses the Codex-like default.
+	// StatusLine controls the persisted footer fields. An empty field list uses
+	// the Codex-like default.
 	StatusLine StatusLineConfig
 	// SaveStatusLineConfig persists a complete status-line selection in the user
 	// configuration. It is optional for embedders that do not own config.
@@ -279,7 +279,9 @@ type model struct {
 	queue []string
 	// queuePaused blocks automatic FIFO promotion after a non-cancel turn error.
 	// It is process-local; /queue resume explicitly clears it.
-	queuePaused bool
+	queuePaused       bool
+	queuePaneFocused  bool
+	queuePaneSelected int
 	// inputHist is shell-style Up/Down composer history for this TUI process.
 	inputHist inputHistory
 	// slashItems is the live prefix-filtered command menu (empty => closed).
@@ -806,6 +808,8 @@ func (m *model) resetSessionTransientState() {
 	m.reviewInFlight = false
 	m.queue = nil
 	m.queuePaused = false
+	m.queuePaneFocused = false
+	m.queuePaneSelected = 0
 	m.modelPickerItems = nil
 	m.modelPickerSel = 0
 	m.modelPickerEfforts = nil
@@ -1003,6 +1007,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.modelPickerOpen() {
 			return m.handleModelPickerKey(msg)
+		}
+		if isQueuePaneToggleKey(msg) {
+			if m.queuePaneFocused {
+				m.closeQueuePane()
+				return m, nil
+			}
+			m.openQueuePane()
+			return m, nil
+		}
+		if m.queuePaneFocused {
+			return m.handleQueuePaneKey(msg)
 		}
 		if m.backtrackState.mode == backtrackArmed && msg.Type != tea.KeyEsc {
 			m.clearBacktrack()
@@ -1319,7 +1334,7 @@ func (m *model) View() string {
 	} else {
 		statusLine = m.statusLinePicker.draft
 	}
-	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegmentsForConfig(statusLine), statusLine.UseThemeColors))
+	status := renderStatusBar(m.width, renderStatusLine(m.statusLineSegmentsForConfig(statusLine)))
 	helpTextLine := "enter send · ↑↓ history · ctrl+t tasks · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	if m.hasPendingApproval() {
 		if approvalAllowsSession(m.pendingApproval.Request) {
@@ -1335,12 +1350,16 @@ func (m *model) View() string {
 		helpTextLine = "↑↓/jk select model · enter choose/apply · esc cancel · alt+p close"
 	} else if m.statusLinePickerOpen() {
 		helpTextLine = "type to search · space toggle · ↑↓/jk move · enter save · esc cancel"
+	} else if m.queuePaneFocused {
+		helpTextLine = "↑↓/jk select queued message · enter send now · x cancel · alt+q composer"
 	} else if m.backtrackState.mode == backtrackSelecting {
 		helpTextLine = "↑↓/jk select prompt · enter fork before prompt · esc cancel"
 	} else if m.backtrackState.mode == backtrackArmed {
 		helpTextLine = "esc backtrack history · edit or submit to cancel · /help"
 	} else if m.taskPaneOpen {
 		helpTextLine = "ctrl+t hide task progress · " + m.reasoningToggleHint() + " · esc interrupt · /help"
+	} else if len(m.queue) > 0 {
+		helpTextLine = "alt+q manage queued messages · " + m.reasoningToggleHint() + " · esc interrupt · /help"
 	}
 	help := helpStyle.Render(helpTextLine)
 	composer := renderComposer(m.width, m.textarea.View())
@@ -1370,6 +1389,9 @@ func (m *model) View() string {
 		parts = append(parts, m.statusLinePickerView())
 	} else if m.backtrackState.mode == backtrackSelecting {
 		parts = append(parts, m.backtrackOverlayView())
+	}
+	if m.queuePaneVisible() {
+		parts = append(parts, m.queuePaneView())
 	}
 	parts = append(parts, composer, help, status)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
@@ -1418,7 +1440,7 @@ func (m *model) statusPolicyFragment() string {
 
 // statusLine keeps a styled single-line form for tests and lightweight callers.
 func (m *model) statusLine() string {
-	return renderStatusLine(m.statusLineSegments(), m.deps.StatusLine.UseThemeColors)
+	return renderStatusLine(m.statusLineSegments())
 }
 
 func (m *model) layout() {
@@ -1436,12 +1458,12 @@ func (m *model) layout() {
 	}
 	m.textarea.SetWidth(innerW)
 	// viewport = total - composer border - status - help - optional task pane -
-	// slash/approval/backtrack/status-line picker. Keep one spare row so modal
+	// queue pane - slash/approval/backtrack/status-line picker. Keep one spare row so modal
 	// pages retain their historical safety margin at small terminal heights.
 	composerHeight := m.textarea.Height() + 2
-	extra := m.taskPaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.statusLinePickerHeight() + m.backtrackOverlayHeight()
+	extra := m.taskPaneHeight() + m.queuePaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.statusLinePickerHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
-		extra = m.taskPaneHeight() + m.approvalModalHeight()
+		extra = m.taskPaneHeight() + m.queuePaneHeight() + m.approvalModalHeight()
 	}
 	reserved := composerHeight + 3 + extra
 	h := max(5, m.height-reserved)
@@ -1521,7 +1543,7 @@ func (m *model) approvalDetailRows() int {
 	header, _ := approvalModalSections(width, m.pendingApproval.Request)
 	// Keep a usable transcript viewport while reserving border, blank line,
 	// choices, footer, and (when needed) the detail-page indicator.
-	availableModalRows := max(8, height-composerHeight-3-5)
+	availableModalRows := max(8, height-composerHeight-m.queuePaneHeight()-3-5)
 	fixedRows := len(header) + 6
 	return max(1, availableModalRows-fixedRows)
 }
@@ -1582,7 +1604,9 @@ func (m *model) queueWhileBusy(input string) (tea.Model, tea.Cmd) {
 	m.inputHist.push(input)
 	m.textarea.Reset()
 	m.syncComposerHeight()
-	m.appendLine(lineSystem, queuedSystemLine(len(m.queue), input))
+	m.normalizeQueuePaneSelection()
+	m.layout()
+	m.refreshViewport()
 	return m, nil
 }
 
@@ -2478,6 +2502,7 @@ func (m *model) cmdQueue(arg string) (tea.Model, tea.Cmd) {
 		n := len(m.queue)
 		m.queue = nil
 		m.queuePaused = false
+		m.normalizeQueuePaneSelection()
 		if n == 0 {
 			m.appendLine(lineSystem, queueEmptyMessage)
 		} else {
@@ -2507,6 +2532,7 @@ func (m *model) cmdQueue(arg string) (tea.Model, tea.Cmd) {
 		if len(m.queue) == 0 {
 			m.queuePaused = false
 		}
+		m.normalizeQueuePaneSelection()
 		m.appendLine(lineSystem, fmt.Sprintf("queue dropped (%d): %s", index, queuePreview(dropped)))
 		m.appendLine(lineSep, "")
 		return m, nil
@@ -2553,6 +2579,7 @@ func (m *model) cmdQueue(arg string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.queue, _ = editQueuedFollowUp(m.queue, index, newText)
+		m.normalizeQueuePaneSelection()
 		m.appendLine(lineSystem, fmt.Sprintf("queue edited (%d): %s", index, queuePreview(newText)))
 		m.appendLine(lineSep, "")
 		return m, nil
@@ -2912,6 +2939,7 @@ func (m *model) drainQueue() tea.Cmd {
 	for len(m.queue) > 0 {
 		next := m.queue[0]
 		m.queue = m.queue[1:]
+		m.normalizeQueuePaneSelection()
 		m.err = nil
 		_, cmd := m.submit(next)
 		if m.mode != modeIdle {
@@ -3118,117 +3146,28 @@ func (m *model) loadOlderTranscript() {
 }
 
 func (m *model) statusReport() string {
-	tools := "none"
-	if len(m.deps.Status.Tools) > 0 {
-		tools = strings.Join(m.deps.Status.Tools, ", ")
-	}
-	transcriptCount := 0
 	sessionID := "(none)"
-	title := ""
-	usageLine := ""
-	ctxLine := ""
 	if session := m.activeSession(); session != nil {
-		transcriptCount = len(session.Transcript())
 		if id := session.ID(); id != "" {
 			sessionID = id
-		}
-		title = session.Title()
-		apiUsage := sessionAPIUsage(session)
-		usageLine = "\n" + usage.FormatAPIUsage(apiUsage) + "  " +
-			usage.FormatCostEstimate(apiUsage.CostUSD, apiUsage.Status)
-		ctxLine = "\nlast provider request: " + usage.FormatContextSnapshot(sessionContextSnapshot(session))
-		cfg := session.ContextConfig()
-		contextStatus := session.ContextStatus()
-		if contextStatus.CeilingTokens > 0 {
-			if contextStatus.OriginalTokens > 0 || contextStatus.CurrentTokens > 0 {
-				pct := 0
-				if contextStatus.CurrentTokens > 0 {
-					pct = contextStatus.CurrentTokens * 100 / cfg.WindowTokens
-				}
-				ctxLine += fmt.Sprintf("\ncontext planner estimate: window=%s view=%s (%d%%) auto_compact=85%% safety_ceiling=95%% source_estimate=%s omitted_groups=%d fallbacks=%d",
-					usage.FormatTokens(cfg.WindowTokens),
-					usage.FormatTokens(contextStatus.CurrentTokens),
-					pct,
-					usage.FormatTokens(contextStatus.OriginalTokens),
-					contextStatus.OmittedTurnGroups,
-					len(contextStatus.LastFallbacks),
-				)
-			} else {
-				ctxLine += fmt.Sprintf("\ncontext planner estimate: window=%s auto_compact=85%% safety_ceiling=95%% target=50%%",
-					usage.FormatTokens(cfg.WindowTokens),
-				)
-			}
-		} else if cfg.WindowTokens > 0 {
-			ctxLine += fmt.Sprintf("\ncontext planner estimate: window=%s auto_compact=85%% safety_ceiling=95%% target=50%%",
-				usage.FormatTokens(cfg.WindowTokens),
-			)
 		}
 	}
 	modelName := m.deps.Status.Model
 	if modelName == "" {
 		modelName = "(unknown)"
 	}
-	turnUsage := "on"
-	if m.deps.HideTurnUsage {
-		turnUsage = "off"
-	}
-	report := fmt.Sprintf("model=%s  session=%s  transcript=%d  tools=%s  mode=%s  turn_usage=%s",
-		modelName, sessionID, transcriptCount, tools, modeName(m.mode), turnUsage)
-	if label := strings.TrimSpace(m.deps.Status.ModelDisplayName); label != "" {
-		report += "  model_label=" + label
-	}
-	if lifecycle := strings.TrimSpace(m.deps.Status.DeclaredCatalogLifecycle); lifecycle != "" {
-		report += "  model_catalog_lifecycle=" + lifecycle
-	}
-	if title != "" {
-		report += "  title=" + title
-	}
-	report += "  reasoning_effort=" + reasoningEffortStatus(m.deps.Status.ReasoningEffort)
-	if efforts := m.deps.Status.DeclaredReasoningEfforts; len(efforts) > 0 {
-		report += "  reasoning_effort_declared_available=" + strings.Join(efforts, ",")
-	}
-	if declaredDefault := strings.TrimSpace(m.deps.Status.DeclaredReasoningEffortDefault); declaredDefault != "" {
-		report += "  reasoning_effort_declared_catalog_default=" + declaredDefault
-	}
-	if frag := m.statusPolicyFragment(); frag != "" {
-		report += "  " + frag
-	}
-	runtime := m.deps.Status.Runtime
-	if !runtime.Configured() {
-		runtime = m.deps.PolicyInfo.Runtime
-	}
-	maxModelSteps := m.deps.Status.MaxModelSteps
-	if maxModelSteps == 0 {
-		maxModelSteps = runtime.MaxModelSteps
-	}
-	if maxModelSteps > 0 {
-		report += fmt.Sprintf("  max_model_steps=%d", maxModelSteps)
-	}
-	if runtime.MaxTurnSeconds > 0 {
-		report += fmt.Sprintf("  max_turn_seconds=%d", runtime.MaxTurnSeconds)
-	}
-	if runtime.MaxToolCalls > 0 {
-		report += fmt.Sprintf("  max_tool_calls=%d", runtime.MaxToolCalls)
-	}
-	if runtime.MaxConsecutiveEquivalentToolCalls > 0 {
-		report += fmt.Sprintf(
-			"  max_consecutive_equivalent_tool_calls=%d",
-			runtime.MaxConsecutiveEquivalentToolCalls,
-		)
-	}
-	if m.queuePaused {
-		report += fmt.Sprintf("  queue_paused=true  queued=%d  queue_resume=/queue resume", len(m.queue))
-	} else if n := len(m.queue); n > 0 {
-		report += fmt.Sprintf("  queued=%d", n)
-	}
-	return report + usageLine + ctxLine
+	return fmt.Sprintf("Model: %s\nReasoning effort: %s\nSession: %s",
+		modelName,
+		reasoningEffortStatus(m.deps.Status.ReasoningEffort),
+		sessionID,
+	)
 }
 
 func reasoningEffortStatus(value string) string {
 	if value = strings.TrimSpace(value); value != "" {
-		return "requested:" + value
+		return value
 	}
-	return "requested:" + defaultModelReasoningEffort
+	return defaultModelReasoningEffort
 }
 
 func modeName(m mode) string {

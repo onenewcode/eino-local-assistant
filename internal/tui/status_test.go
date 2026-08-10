@@ -117,9 +117,25 @@ func TestStatusLineDefaultShowsModelWithoutProvider(t *testing.T) {
 	}
 }
 
-func TestStatusLabelBusyUsesTaskProgress(t *testing.T) {
+func TestStatusLineUsedTokensUsesCompactKUnits(t *testing.T) {
+	tests := []struct {
+		tokens int
+		want   string
+	}{
+		{tokens: 999, want: "999 used"},
+		{tokens: 1_500, want: "1.5k used"},
+		{tokens: 535_272, want: "535k used"},
+	}
+	for _, test := range tests {
+		if got := statusLineUsedTokenCount(test.tokens); got != test.want {
+			t.Fatalf("statusLineUsedTokenCount(%d) = %q, want %q", test.tokens, got, test.want)
+		}
+	}
+}
+
+func TestStatusLabelBusyUsesConfigurableActivity(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLine.Fields = []string{statusFieldModelWithReasoning, statusFieldTaskProgress}
+	m.deps.StatusLine.Fields = []string{statusFieldModelWithReasoning, statusFieldTaskProgress, statusFieldActivity}
 	m.mode = modeBusy
 	line := m.statusLabel()
 	if !strings.Contains(line, "thinking") {
@@ -130,6 +146,15 @@ func TestStatusLabelBusyUsesTaskProgress(t *testing.T) {
 	}
 	if strings.Contains(line, "ctx=") {
 		t.Fatalf("busy status without measurement must omit ctx: %q", line)
+	}
+}
+
+func TestStatusActivityCanBeHiddenIndependently(t *testing.T) {
+	m := newTestModel(t)
+	m.deps.StatusLine.Fields = []string{statusFieldModelWithReasoning, statusFieldTaskProgress}
+	m.mode = modeBusy
+	if line := m.statusLabel(); strings.Contains(line, "thinking") {
+		t.Fatalf("activity ignored status-line selection: %q", line)
 	}
 }
 

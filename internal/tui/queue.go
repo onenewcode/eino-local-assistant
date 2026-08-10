@@ -10,7 +10,7 @@ import (
 // maxQueue caps follow-up messages queued while a turn is running.
 const maxQueue = 32
 
-// queuePreviewRunes is the max preview length for the "queued (n): …" system line.
+// queuePreviewRunes is the max preview length used by queue displays.
 const queuePreviewRunes = 48
 
 const (
@@ -69,10 +69,6 @@ func queuePreview(input string) string {
 	}
 	runes := []rune(compact)
 	return string(runes[:queuePreviewRunes-1]) + "…"
-}
-
-func queuedSystemLine(n int, input string) string {
-	return fmt.Sprintf("queued (%d): %s", n, queuePreview(input))
 }
 
 // classifyBusyAction keeps context/session mutations behind an idle boundary,
@@ -177,6 +173,20 @@ func dropQueuedFollowUp(queue []string, index int) ([]string, string, bool) {
 	copy(queue[index-1:], queue[index:])
 	queue[len(queue)-1] = ""
 	return queue[:len(queue)-1], dropped, true
+}
+
+// promoteQueuedFollowUp moves a 1-based queue entry to the FIFO head.
+func promoteQueuedFollowUp(queue []string, index int) ([]string, bool) {
+	if index < 1 || index > len(queue) {
+		return queue, false
+	}
+	if index == 1 {
+		return queue, true
+	}
+	selected := queue[index-1]
+	copy(queue[1:index], queue[:index-1])
+	queue[0] = selected
+	return queue, true
 }
 
 func editQueuedFollowUp(queue []string, index int, newText string) ([]string, bool) {

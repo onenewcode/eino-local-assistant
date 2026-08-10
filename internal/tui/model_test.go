@@ -65,8 +65,8 @@ func TestSubmitStatus(t *testing.T) {
 		name string
 		want string
 	}{
-		{name: "explicit", want: "reasoning_effort=requested:high"},
-		{name: "omitted defaults to medium", want: "reasoning_effort=requested:medium"},
+		{name: "explicit", want: "Reasoning effort: high"},
+		{name: "omitted defaults to medium", want: "Reasoning effort: medium"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			status := StatusInfo{Model: "deepseek", Tools: []string{"get_current_time"}}
@@ -76,11 +76,11 @@ func TestSubmitStatus(t *testing.T) {
 			m := newModel(Deps{Ctx: context.Background(), Session: session, Status: status})
 			next, _ := m.submit("/status")
 			mm := next.(*model)
-			if !hasLineContaining(mm.lines, lineSystem, "model=deepseek") {
+			if !hasLineContaining(mm.lines, lineSystem, "Model: deepseek") {
 				t.Fatalf("status missing model: %#v", mm.lines)
 			}
-			if !hasLineContaining(mm.lines, lineSystem, "get_current_time") {
-				t.Fatalf("status missing tools: %#v", mm.lines)
+			if hasLineContaining(mm.lines, lineSystem, "get_current_time") {
+				t.Fatalf("status leaked internal tools: %#v", mm.lines)
 			}
 			if !hasLineContaining(mm.lines, lineSystem, test.want) {
 				t.Fatalf("status missing reasoning effort %q: %#v", test.want, mm.lines)
@@ -89,7 +89,7 @@ func TestSubmitStatus(t *testing.T) {
 	}
 }
 
-func TestStatusReportSeparatesDeclaredCapabilitiesFromRequestedEffort(t *testing.T) {
+func TestStatusReportOnlyShowsUserFacingModelDetails(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
 	m := newModel(Deps{
 		Ctx:     context.Background(),
@@ -104,29 +104,30 @@ func TestStatusReportSeparatesDeclaredCapabilitiesFromRequestedEffort(t *testing
 	})
 	report := m.statusReport()
 	for _, want := range []string{
-		"model_catalog_lifecycle=deprecated",
-		"reasoning_effort=requested:high",
-		"reasoning_effort_declared_available=low,high",
-		"reasoning_effort_declared_catalog_default=high",
+		"Model: openai/reasoning-model",
+		"Reasoning effort: high",
+		"Session:",
 	} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("status report missing %q:\n%s", want, report)
 		}
 	}
-	if strings.Contains(report, "reasoning_effort_effective") {
-		t.Fatalf("status report made an effective-value claim:\n%s", report)
+	for _, unwanted := range []string{"model_catalog_lifecycle", "reasoning_effort_declared", "reasoning_effort_effective", "deprecated"} {
+		if strings.Contains(report, unwanted) {
+			t.Fatalf("status report leaked internal field %q:\n%s", unwanted, report)
+		}
 	}
 }
 
-func TestStatusReportOmitsUndeclaredCatalogLifecycle(t *testing.T) {
+func TestStatusReportHasThreeStableLines(t *testing.T) {
 	session := mustSession(t, &staticModel{}, "system")
 	m := newModel(Deps{
 		Ctx:     context.Background(),
 		Session: session,
 		Status:  StatusInfo{Model: "openai/custom-deployment"},
 	})
-	if report := m.statusReport(); strings.Contains(report, "model_catalog_lifecycle=") {
-		t.Fatalf("status report exposed lifecycle for an undeclared model:\n%s", report)
+	if report := m.statusReport(); len(strings.Split(report, "\n")) != 3 {
+		t.Fatalf("status report line count = %d, want 3:\n%s", len(strings.Split(report, "\n")), report)
 	}
 }
 

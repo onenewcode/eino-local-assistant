@@ -157,7 +157,7 @@ func TestSlashCatalogQueueDescriptionIncludesControls(t *testing.T) {
 	t.Fatal("slash catalog is missing /queue")
 }
 
-func TestStatusHelpDocumentsReasoningVisibility(t *testing.T) {
+func TestStatusHelpDocumentsCompactReport(t *testing.T) {
 	var description string
 	for _, cmd := range slashCatalog() {
 		if cmd.Name == "/status" {
@@ -165,13 +165,13 @@ func TestStatusHelpDocumentsReasoningVisibility(t *testing.T) {
 			break
 		}
 	}
-	if !strings.Contains(description, "declared catalog lifecycle") || !strings.Contains(description, "reasoning effort (requested/default)") || !strings.Contains(description, "declared catalog effort options/default") || !strings.Contains(description, "Ctrl+O details") {
+	if description != "model, reasoning effort, and current session" {
 		t.Fatalf("status catalog description = %q", description)
 	}
 
 	help := helpText()
-	if !strings.Contains(help, "/status            model, session, tokens, cost, max_model_steps, context, declared catalog lifecycle, reasoning effort (requested/default); declared catalog effort options/default; ctrl+o toggles details") {
-		t.Fatalf("status help line missing reasoning visibility details: %s", help)
+	if !strings.Contains(help, "/status            model, reasoning effort, and current session") {
+		t.Fatalf("status help line missing compact report details: %s", help)
 	}
 }
 

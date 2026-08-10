@@ -29,8 +29,8 @@ func TestStatusLineCommandOpensCodexStylePickerAndSavesDraft(t *testing.T) {
 	}
 	view := m.View()
 	for _, want := range []string{
-		"Configure Status Line", "Type to search", "Use theme colors",
-		"model-with-reasoning", "context-used", "used-tokens", "task-progress",
+		"Configure Status Line", "Type to search",
+		"model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity",
 		"gpt-5.6-terra xhigh", "Context 0% used", "0 used", "Tasks 0/0",
 	} {
 		if !strings.Contains(view, want) {
@@ -50,17 +50,15 @@ func TestStatusLineCommandOpensCodexStylePickerAndSavesDraft(t *testing.T) {
 		t.Fatalf("live status line must render below the composer:\n%s", view)
 	}
 
-	// Theme colors is selected initially. Turn it off, then remove task-progress
-	// from the private draft before committing it with Enter.
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
-	m = next.(*model)
 	for range 4 {
 		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
 		m = next.(*model)
 	}
+	// Activity is selected last. Remove it from the private draft before
+	// committing it with Enter.
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
 	m = next.(*model)
-	if !m.statusLinePickerOpen() || !m.deps.StatusLine.UseThemeColors {
+	if !m.statusLinePickerOpen() {
 		t.Fatal("draft changes must not apply before Enter")
 	}
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -69,8 +67,7 @@ func TestStatusLineCommandOpensCodexStylePickerAndSavesDraft(t *testing.T) {
 		t.Fatal("successful save left picker open")
 	}
 	want := StatusLineConfig{
-		Fields:         []string{statusFieldModelWithReasoning, statusFieldContextUsed, statusFieldUsedTokens},
-		UseThemeColors: false,
+		Fields: []string{statusFieldModelWithReasoning, statusFieldContextUsed, statusFieldUsedTokens, statusFieldTaskProgress},
 	}
 	if !reflect.DeepEqual(m.deps.StatusLine, want) || !reflect.DeepEqual(saved, want) {
 		t.Fatalf("saved status line = %#v, callback=%#v, want=%#v", m.deps.StatusLine, saved, want)
@@ -89,7 +86,7 @@ func TestStatusLinePickerSearchAndCancelDiscardDraft(t *testing.T) {
 		m = next.(*model)
 	}
 	view := m.View()
-	if !strings.Contains(view, "used-tokens") || strings.Contains(view, "Use theme colors") {
+	if !strings.Contains(view, "used-tokens") || strings.Contains(view, "activity") {
 		t.Fatalf("search did not filter picker rows:\n%s", view)
 	}
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
@@ -106,7 +103,7 @@ func TestStatusLinePickerSearchAndCancelDiscardDraft(t *testing.T) {
 
 func TestStatusLinePickerFailedSaveKeepsDraftAndCommittedSettings(t *testing.T) {
 	m := newTestModel(t)
-	m.deps.StatusLine = StatusLineConfig{Fields: []string{statusFieldModelWithReasoning}, UseThemeColors: true}
+	m.deps.StatusLine = StatusLineConfig{Fields: []string{statusFieldModelWithReasoning}}
 	m.deps.SaveStatusLineConfig = func(StatusLineConfig) error { return errors.New("read-only config") }
 
 	next, _ := m.submit("/statusline")
@@ -135,7 +132,6 @@ func TestStatusLinePickerCombinesModelAndReasoning(t *testing.T) {
 			statusFieldUsedTokens,
 			statusFieldTaskProgress,
 		},
-		UseThemeColors: true,
 	}
 	m.deps.StatusLine = normalizeStatusLineConfig(m.deps.StatusLine)
 	if want := []string{statusFieldModelWithReasoning, statusFieldContextUsed, statusFieldUsedTokens, statusFieldTaskProgress}; !reflect.DeepEqual(m.deps.StatusLine.Fields, want) {

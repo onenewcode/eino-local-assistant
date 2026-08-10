@@ -26,8 +26,9 @@ func TestEnqueueFollowUpHelpers(t *testing.T) {
 	if got := queuePreview(long); !strings.HasSuffix(got, "…") {
 		t.Fatalf("long preview should truncate: %q", got)
 	}
-	if !strings.Contains(queuedSystemLine(2, "hi"), "queued (2): hi") {
-		t.Fatalf("queued system line formatting")
+	q, ok = promoteQueuedFollowUp([]string{"one", "two", "three"}, 3)
+	if !ok || !reflect.DeepEqual(q, []string{"three", "one", "two"}) {
+		t.Fatalf("promote = %#v ok=%v", q, ok)
 	}
 }
 
@@ -308,8 +309,8 @@ func TestEnterWhileBusyEnqueues(t *testing.T) {
 	if strings.TrimSpace(mm.textarea.Value()) != "" {
 		t.Fatalf("composer should reset after enqueue")
 	}
-	if !hasLineContaining(mm.lines, lineSystem, "queued (1):") {
-		t.Fatalf("missing queued system line: %#v", mm.lines)
+	if hasLineContaining(mm.lines, lineSystem, "queued (") {
+		t.Fatalf("queued follow-up must not enter transcript: %#v", mm.lines)
 	}
 }
 
@@ -513,13 +514,6 @@ func TestQueueListAndStatusExposePause(t *testing.T) {
 	if !hasLineContaining(mm.lines, lineSystem, "Queue (1) [paused]") ||
 		!hasLineContaining(mm.lines, lineSystem, "/queue resume") {
 		t.Fatalf("queue list omitted paused state or resume hint: %#v", mm.lines)
-	}
-
-	next, _ = mm.submit("/status")
-	mm = next.(*model)
-	if !hasLineContaining(mm.lines, lineSystem, "queue_paused=true") ||
-		!hasLineContaining(mm.lines, lineSystem, "queue_resume=/queue resume") {
-		t.Fatalf("status omitted paused state or resume hint: %#v", mm.lines)
 	}
 }
 

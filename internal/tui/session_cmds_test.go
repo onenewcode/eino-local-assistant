@@ -182,12 +182,14 @@ func TestStatusReportUsesAPISnapshotRatherThanPlannerTokens(t *testing.T) {
 	}
 	m := newModel(Deps{Ctx: ctx, Session: resumed, Status: StatusInfo{Model: "m"}})
 	report := m.statusReport()
-	for _, want := range []string{
-		"API usage (exact): input=1.2k completion=34 cached=0 total=1.2k calls=1",
-		"cost~=$0", "context=1.2k/4.0k (30%)", "context planner estimate:",
-	} {
+	for _, want := range []string{"Model: m", "Reasoning effort: medium", "Session: " + resumed.ID()} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("status report missing %q:\n%s", want, report)
+		}
+	}
+	for _, unwanted := range []string{"API usage", "cost~=", "context planner estimate", "last provider request"} {
+		if strings.Contains(report, unwanted) {
+			t.Fatalf("status report leaked diagnostic %q:\n%s", unwanted, report)
 		}
 	}
 }

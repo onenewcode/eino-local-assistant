@@ -18,7 +18,6 @@ type statusLinePickerState struct {
 type statusLinePickerRow struct {
 	field string
 	label string
-	theme bool
 }
 
 var statusLinePickerFieldRows = []statusLinePickerRow{
@@ -26,6 +25,7 @@ var statusLinePickerFieldRows = []statusLinePickerRow{
 	{field: statusFieldContextUsed, label: "context-used"},
 	{field: statusFieldUsedTokens, label: "used-tokens"},
 	{field: statusFieldTaskProgress, label: "task-progress"},
+	{field: statusFieldActivity, label: "activity"},
 }
 
 func (m *model) statusLinePickerOpen() bool {
@@ -65,8 +65,7 @@ func (m *model) closeStatusLinePicker() {
 
 func copyStatusLineConfig(config StatusLineConfig) StatusLineConfig {
 	return StatusLineConfig{
-		Fields:         append([]string(nil), config.Fields...),
-		UseThemeColors: config.UseThemeColors,
+		Fields: append([]string(nil), config.Fields...),
 	}
 }
 
@@ -75,9 +74,8 @@ func (m *model) statusLinePickerRows() []statusLinePickerRow {
 		return nil
 	}
 	query := strings.ToLower(strings.TrimSpace(m.statusLinePicker.query))
-	rows := make([]statusLinePickerRow, 0, len(statusLinePickerFieldRows)+1)
-	allRows := append([]statusLinePickerRow{{label: "Use theme colors", theme: true}}, statusLinePickerFieldRows...)
-	for _, row := range allRows {
+	rows := make([]statusLinePickerRow, 0, len(statusLinePickerFieldRows))
+	for _, row := range statusLinePickerFieldRows {
 		if query == "" || strings.Contains(strings.ToLower(row.label), query) {
 			rows = append(rows, row)
 		}
@@ -167,11 +165,6 @@ func (m *model) toggleSelectedStatusLinePickerRow() {
 	if !ok {
 		return
 	}
-	if row.theme {
-		m.statusLinePicker.draft.UseThemeColors = !m.statusLinePicker.draft.UseThemeColors
-		m.refreshViewport()
-		return
-	}
 	if containsStatusLineField(m.statusLinePicker.draft.Fields, row.field) {
 		if len(m.statusLinePicker.draft.Fields) == 1 {
 			m.appendLine(lineError, "status line must retain at least one field")
@@ -243,12 +236,7 @@ func (m *model) statusLinePickerView() string {
 	start, end := statusLinePickerVisibleRange(len(rows), selected)
 	for i := start; i < end; i++ {
 		row := rows[i]
-		checked := false
-		if row.theme {
-			checked = m.statusLinePicker.draft.UseThemeColors
-		} else {
-			checked = containsStatusLineField(m.statusLinePicker.draft.Fields, row.field)
-		}
+		checked := containsStatusLineField(m.statusLinePicker.draft.Fields, row.field)
 		marker := "[ ]"
 		if checked {
 			marker = "[x]"

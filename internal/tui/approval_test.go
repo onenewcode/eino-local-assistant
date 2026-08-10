@@ -302,7 +302,7 @@ func TestSandboxStatusFragments(t *testing.T) {
 	}
 }
 
-func TestStatusUsesPolicySandboxFallbackAndRuntime(t *testing.T) {
+func TestStatusKeepsPolicyAndRuntimeDetailsOutOfCompactReport(t *testing.T) {
 	m := &model{deps: Deps{
 		Status: StatusInfo{CmdPolicy: "cmd=ask", MaxModelSteps: 8},
 		PolicyInfo: CommandPolicyInfo{
@@ -318,18 +318,10 @@ func TestStatusUsesPolicySandboxFallbackAndRuntime(t *testing.T) {
 	if got := m.statusPolicyFragment(); got != "cmd=ask · sb=rw" {
 		t.Fatalf("status policy = %q", got)
 	}
-	report := m.statusReport()
-	if !containsAll(
-		report,
-		"max_turn_seconds=600",
-		"max_model_steps=8",
-		"max_tool_calls=16",
-		"max_consecutive_equivalent_tool_calls=3",
-	) {
-		t.Fatalf("status report missing runtime info:\n%s", report)
-	}
-	if strings.Count(report, "max_model_steps=") != 1 {
-		t.Fatalf("status report duplicated max_model_steps: %s", report)
+	for _, unwanted := range []string{"cmd=ask", "sb=rw", "max_turn_seconds", "max_model_steps", "max_tool_calls"} {
+		if strings.Contains(m.statusReport(), unwanted) {
+			t.Fatalf("status report leaked internal state %q:\n%s", unwanted, m.statusReport())
+		}
 	}
 }
 

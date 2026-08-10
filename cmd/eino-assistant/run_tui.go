@@ -191,11 +191,10 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		},
 		HideTurnUsage: !modelCfg.UI.TurnUsageEnabled(),
 		StatusLine: tui.StatusLineConfig{
-			Fields:         modelCfg.UI.StatusLineFields(),
-			UseThemeColors: modelCfg.UI.StatusLineThemeColorsEnabled(),
+			Fields: modelCfg.UI.StatusLineFields(),
 		},
 		SaveStatusLineConfig: func(statusLine tui.StatusLineConfig) error {
-			return config.SaveStatusLineConfig(configPath, statusLine.Fields, statusLine.UseThemeColors)
+			return config.SaveStatusLineConfig(configPath, statusLine.Fields)
 		},
 		Approval:   approvalBridge,
 		PolicyInfo: policyInfo,

@@ -53,12 +53,6 @@ func TestPermissionsCommandSwitchesIdleModeAndKeepsStaticPolicy(t *testing.T) {
 	if got := m.statusPolicyFragment(); got != "cmd=plan" {
 		t.Fatalf("plan status policy = %q, want cmd=plan", got)
 	}
-	next, _ = m.submit("/status")
-	m = next.(*model)
-	if !hasLineContaining(m.lines, lineSystem, "cmd=plan") {
-		t.Fatalf("status report did not reflect plan mode: %#v", m.lines)
-	}
-
 	next, _ = m.submit("/permissions")
 	m = next.(*model)
 	var report string

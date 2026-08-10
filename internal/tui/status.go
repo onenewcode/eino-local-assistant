@@ -14,6 +14,7 @@ const (
 	statusFieldContextUsed        = "context-used"
 	statusFieldUsedTokens         = "used-tokens"
 	statusFieldTaskProgress       = "task-progress"
+	statusFieldActivity           = "activity"
 )
 
 const defaultModelReasoningEffort = config.DefaultReasoningEffort
@@ -23,17 +24,16 @@ var defaultStatusLineFields = []string{
 	statusFieldContextUsed,
 	statusFieldUsedTokens,
 	statusFieldTaskProgress,
+	statusFieldActivity,
 }
 
 var statusLineFieldSet = map[string]struct{}{
-	statusFieldModelWithReasoning: {}, statusFieldContextUsed: {}, statusFieldUsedTokens: {}, statusFieldTaskProgress: {},
+	statusFieldModelWithReasoning: {}, statusFieldContextUsed: {}, statusFieldUsedTokens: {}, statusFieldTaskProgress: {}, statusFieldActivity: {},
 }
 
-// StatusLineConfig is the full persisted selection controlled by /statusline.
-// Fields and theme colors are intentionally committed together.
+// StatusLineConfig is the persisted selection controlled by /statusline.
 type StatusLineConfig struct {
-	Fields         []string
-	UseThemeColors bool
+	Fields []string
 }
 
 type statusLineSegment struct {
@@ -67,15 +67,8 @@ func normalizeStatusLineFields(fields []string) []string {
 }
 
 func normalizeStatusLineConfig(config StatusLineConfig) StatusLineConfig {
-	useThemeColors := config.UseThemeColors
-	// The zero Deps value is used by lightweight embedders and tests. It should
-	// get the same default as omitted TOML configuration.
-	if len(config.Fields) == 0 {
-		useThemeColors = true
-	}
 	return StatusLineConfig{
-		Fields:         normalizeStatusLineFields(config.Fields),
-		UseThemeColors: useThemeColors,
+		Fields: normalizeStatusLineFields(config.Fields),
 	}
 }
 
@@ -111,7 +104,11 @@ func (m *model) statusLineModelWithReasoning() string {
 }
 
 func statusLineUsedTokens(session *chat.Session) string {
-	return fmt.Sprintf("%d used", sessionAPIUsage(session).TotalTokens)
+	return statusLineUsedTokenCount(sessionAPIUsage(session).TotalTokens)
+}
+
+func statusLineUsedTokenCount(total int) string {
+	return usage.FormatTokens(total) + " used"
 }
 
 func statusLineTaskProgress(session *chat.Session) string {
@@ -154,7 +151,8 @@ func (m *model) statusLineSegmentsForConfig(config StatusLineConfig) []statusLin
 		statusFieldModelWithReasoning: m.statusLineModelWithReasoning(),
 		statusFieldContextUsed:        statusLineContext(session),
 		statusFieldUsedTokens:         statusLineUsedTokens(session),
-		statusFieldTaskProgress:       joinStatusFields(statusLineTaskProgress(session), m.statusActivity()),
+		statusFieldTaskProgress:       statusLineTaskProgress(session),
+		statusFieldActivity:           m.statusActivity(),
 	}
 
 	segments := make([]statusLineSegment, 0, len(config.Fields))
@@ -191,8 +189,8 @@ func fitStatusLineSegments(width int, segments []statusLineSegment) []statusLine
 	}
 	kept := append([]statusLineSegment(nil), segments...)
 	for len(kept) > 1 && statusLineSegmentsWidth(kept) > width {
-		// Preserve model and task state whenever possible. Token usage is useful
-		// metadata but is the first field to give way to an active task/status.
+		// Preserve model and live activity whenever possible. Token usage and
+		// context metadata yield first on a narrow terminal.
 		drop := statusLineDropIndex(kept)
 		kept = append(kept[:drop], kept[drop+1:]...)
 	}
@@ -206,9 +204,11 @@ func fitStatusLineSegments(width int, segments []statusLineSegment) []statusLine
 }
 
 func statusLineDropIndex(segments []statusLineSegment) int {
-	for i := len(segments) - 1; i > 0; i-- {
-		if segments[i].field == statusFieldUsedTokens {
-			return i
+	for _, field := range []string{statusFieldUsedTokens, statusFieldContextUsed, statusFieldTaskProgress} {
+		for i := len(segments) - 1; i > 0; i-- {
+			if segments[i].field == field {
+				return i
+			}
 		}
 	}
 	return len(segments) - 1

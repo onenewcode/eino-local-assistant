@@ -94,6 +94,8 @@ yolo 同时绕过普通 approval/approver/session allow-deny 和 `shell`/`apply_
 
 `model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。`model.reasoning_effort` 省略时固定为 `medium`：启动、恢复会话和模型选择都会把该值作为实际请求传给 provider，并写入会话账本，而不是只在状态栏显示。`model.context` 只有一个设置：`window_tokens`，即模型的完整物理上下文窗口。它必须与实际部署相符；状态栏和 `/context` 都以这个完整窗口为分母，绝不会显示“窗口减输出预留”这一误导性的容量。
 
+底部状态栏通过 `/statusline` 持久化选择字段和顺序：`model-with-reasoning`、`context-used`、`used-tokens`、`task-progress` 与 `activity`。其中 `activity` 独立显示 `thinking`、工具执行、流式输出、压缩和等待授权等即时状态，可按需关闭；状态栏颜色不提供单独配置。`/status` 只显示模型、推理强度和当前会话，API usage 在每轮 footer 或 `/sessions`，上下文与压缩诊断在 `/context`。
+
 使用 Anthropic 时，配置其公开的 Messages API（不是 Claude Code 的本地会话、OAuth 或订阅协议）：
 
 为什么没有 `max_output_tokens`、Anthropic 的必填 `max_tokens` 如何处理，以及固定的上下文/压缩与恢复合同，见 [上下文管理](docs/context-management.md)。`model.pricing` 只是本地费用估算，不是服务商账单。
