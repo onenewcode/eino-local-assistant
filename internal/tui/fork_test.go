@@ -129,7 +129,7 @@ func TestForkSwitchesToChildAndPreservesSource(t *testing.T) {
 	}
 }
 
-func TestForkRejectsArgumentsWithoutCreatingAChild(t *testing.T) {
+func TestForkRejectsUnknownSelectorWithoutCreatingAChild(t *testing.T) {
 	ctx := context.Background()
 	threadStore, err := store.NewThreadStore(t.TempDir())
 	if err != nil {
@@ -153,10 +153,10 @@ func TestForkRejectsArgumentsWithoutCreatingAChild(t *testing.T) {
 	next, _ := m.submit("/fork ordinary title")
 	mm := next.(*model)
 	if mm.activeSession() != source {
-		t.Fatal("fork argument unexpectedly changed the active session")
+		t.Fatal("unknown fork selector unexpectedly changed the active session")
 	}
-	if !hasLineContaining(mm.lines, lineError, "usage: /fork") {
-		t.Fatalf("fork usage error missing: %#v", mm.lines)
+	if !hasLineContaining(mm.lines, lineError, "no active session with ID or name") {
+		t.Fatalf("unknown fork selector error missing: %#v", mm.lines)
 	}
 	after, err := threadStore.ListThreads(ctx)
 	if err != nil {
@@ -164,6 +164,121 @@ func TestForkRejectsArgumentsWithoutCreatingAChild(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("fork argument created a child: before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestForkSelectedActiveSessionByName(t *testing.T) {
+	ctx := context.Background()
+	m, threadStore, current := newSessionPickerTestModel(t)
+	source := newSessionPickerTestSession(t, threadStore, "Completed investigation")
+	if err := source.Ask(ctx, "capture the working answer", nil); err != nil {
+		t.Fatalf("seed source Ask: %v", err)
+	}
+	currentBefore, err := threadStore.LoadThread(ctx, current.ID())
+	if err != nil {
+		t.Fatalf("LoadThread current before fork: %v", err)
+	}
+	m.textarea.SetValue("draft remains available after a selected fork")
+
+	next, _ := m.submit("/fork Completed investigation")
+	mm := next.(*model)
+	child := mm.activeSession()
+	if child == nil || child.ID() == current.ID() || child.ID() == source.ID() {
+		t.Fatalf("selected fork child = %#v, want a new session", child)
+	}
+	childMeta, err := threadStore.LoadThreadMeta(ctx, child.ID())
+	if err != nil {
+		t.Fatalf("LoadThreadMeta child: %v", err)
+	}
+	if childMeta.ParentID != source.ID() {
+		t.Fatalf("child parent = %q, want selected source %q", childMeta.ParentID, source.ID())
+	}
+	currentAfter, err := threadStore.LoadThread(ctx, current.ID())
+	if err != nil {
+		t.Fatalf("LoadThread current after fork: %v", err)
+	}
+	if !reflect.DeepEqual(currentAfter, currentBefore) {
+		t.Fatalf("selected fork changed the previously active session: before=%#v after=%#v", currentBefore, currentAfter)
+	}
+	if !hasLineContaining(mm.lines, lineSystem, "forked "+child.ID()+" from "+source.ID()) {
+		t.Fatalf("selected fork banner missing: %#v", mm.lines)
+	}
+	if mm.textarea.Value() != "draft remains available after a selected fork" {
+		t.Fatalf("selected fork changed composer draft: %q", mm.textarea.Value())
+	}
+}
+
+func TestForkSelectedSourceUsesRuntimeBindingCallback(t *testing.T) {
+	ctx := context.Background()
+	m, threadStore, current := newSessionPickerTestModel(t)
+	source := newSessionPickerTestSession(t, threadStore, "Different durable model")
+	if err := source.Ask(ctx, "persist a parent turn", nil); err != nil {
+		t.Fatalf("seed source Ask: %v", err)
+	}
+	wantStatus := StatusInfo{Model: "openai/source-model", ReasoningEffort: "high"}
+	wantOpts := chat.SessionOptions{Store: threadStore, ModelName: "source-model", ReasoningEffort: "high"}
+	var gotID string
+	m.deps.ForkSession = func(ctx context.Context, id string) (SessionForkResult, error) {
+		gotID = id
+		child, result, err := source.Fork(ctx, "", "")
+		if err != nil {
+			return SessionForkResult{}, err
+		}
+		return SessionForkResult{Session: child, Fork: result, Status: wantStatus, SessionOpts: wantOpts}, nil
+	}
+
+	next, _ := m.submit("/fork " + source.ID())
+	mm := next.(*model)
+	if gotID != source.ID() || mm.activeSession() == current || mm.activeSession().ID() == source.ID() {
+		t.Fatalf("runtime fork callback/source switch = id=%q active=%#v", gotID, mm.activeSession())
+	}
+	if mm.deps.Status.Model != wantStatus.Model || mm.deps.Status.ReasoningEffort != wantStatus.ReasoningEffort ||
+		mm.deps.SessionOpts.ModelName != wantOpts.ModelName || mm.deps.SessionOpts.ReasoningEffort != wantOpts.ReasoningEffort {
+		t.Fatalf("runtime fork snapshot was not installed: status=%#v opts=%#v", mm.deps.Status, mm.deps.SessionOpts)
+	}
+}
+
+func TestForkLastAndArchivedSelectors(t *testing.T) {
+	ctx := context.Background()
+	m, threadStore, current := newSessionPickerTestModel(t)
+	latest := newSessionPickerTestSession(t, threadStore, "Newest finished work")
+	if err := latest.Ask(ctx, "persist a latest parent turn", nil); err != nil {
+		t.Fatalf("seed latest Ask: %v", err)
+	}
+	next, _ := m.submit("/fork --last")
+	mm := next.(*model)
+	child := mm.activeSession()
+	if child == nil || child.ID() == current.ID() {
+		t.Fatalf("--last did not create a child: %#v", child)
+	}
+	childMeta, err := threadStore.LoadThreadMeta(ctx, child.ID())
+	if err != nil {
+		t.Fatalf("LoadThreadMeta --last child: %v", err)
+	}
+	if childMeta.ParentID != latest.ID() {
+		t.Fatalf("--last parent = %q, want newest %q", childMeta.ParentID, latest.ID())
+	}
+
+	archived := newSessionPickerTestSession(t, threadStore, "Archived branch")
+	if err := archived.Ask(ctx, "persist archived parent turn", nil); err != nil {
+		t.Fatalf("seed archived Ask: %v", err)
+	}
+	state, err := threadStore.LoadThread(ctx, archived.ID())
+	if err != nil {
+		t.Fatalf("LoadThread archived: %v", err)
+	}
+	if _, err := threadStore.ArchiveThread(ctx, archived.ID(), state.Revision); err != nil {
+		t.Fatalf("ArchiveThread: %v", err)
+	}
+	next, _ = mm.submit("/fork Archived branch")
+	mm = next.(*model)
+	if mm.activeSession() != child || !hasLineContaining(mm.lines, lineError, "no active session with ID or name") {
+		t.Fatalf("archived selector changed state or was accepted: active=%#v lines=%#v", mm.activeSession(), mm.lines)
+	}
+	next, _ = mm.submit("/fork " + archived.ID())
+	mm = next.(*model)
+	if mm.activeSession() != child || !hasLineContaining(mm.lines, lineError, "thread is archived") {
+		t.Fatalf("archived ID changed state or was accepted: active=%#v lines=%#v", mm.activeSession(), mm.lines)
 	}
 }
 
@@ -222,7 +337,8 @@ func TestForkChildOpenFailureLeavesSourceActive(t *testing.T) {
 	if len(notifications) != 0 {
 		t.Fatalf("child open failure notified a child: %#v", notifications)
 	}
-	if !hasLineContaining(mm.lines, lineError, "fork: load thread transcript: child open failed") {
+	if repository.childID == "" || !hasLineContaining(mm.lines, lineError, "forked child \""+repository.childID+"\" was published but could not open") ||
+		!hasLineContaining(mm.lines, lineError, "child open failed") {
 		t.Fatalf("child open failure missing: %#v", mm.lines)
 	}
 }

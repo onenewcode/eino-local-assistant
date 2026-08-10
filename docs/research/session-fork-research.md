@@ -2,7 +2,7 @@
 
 > 状态：调研笔记，不是实现设计或迁移方案。
 >
-> 调研日期：2026-08-10；产品和实现会演进，采用前应重新核验。
+> 调研日期：2026-08-10；已于 2026-08-11 本机重新核验。产品和实现会演进，采用前应再次核验。
 >
 > 范围：已部署 coding-agent CLI 从已有交互会话创建独立分支时的 selector、首条输入、持久化与失败边界。
 >
@@ -19,13 +19,13 @@
 
 ### Codex CLI：可选 ID 与 prompt，省略 ID 时使用 picker 或 `--last`
 
-**事实（本机已部署产品观察）：** Codex CLI `0.146.0` 的 `codex fork --help` 报告用法为 `codex fork [OPTIONS] [SESSION_ID] [PROMPT]`。它说明省略 ID 时默认打开 picker，`--last` 绕过 picker 选择最近会话，`--all` 禁用 cwd filtering。`codex resume --help` 使用同一组 session selector 和可选 prompt。观察日期：2026-08-10；官方入口为 [Codex CLI reference](https://developers.openai.com/codex/cli/reference/)，该环境对该网页返回 HTTP 403，因此此处不从网页内容推断额外行为。
+**事实（本机已部署产品观察）：** Codex CLI `0.146.0` 的 `codex fork --help` 报告用法为 `codex fork [OPTIONS] [SESSION_ID] [PROMPT]`。它说明省略 ID 时默认打开 picker，`--last` 绕过 picker 选择最近会话，`--all` 禁用 cwd filtering。`codex resume --help` 使用同一组 session selector 和可选 prompt。观察日期：2026-08-10，并于 2026-08-11 重新核验；官方入口为 [Codex CLI reference](https://developers.openai.com/codex/cli/reference/)，该环境对该网页返回 HTTP 403，因此此处不从网页内容推断额外行为。
 
 **事实（本机已部署产品观察）：** `codex --help` 将 `fork`、`resume`、`archive`、`delete` 与 `unarchive` 并列为 session lifecycle commands，表明 fork 是 shell 层可发现的会话操作，而非仅 TUI 内动作。观察日期：2026-08-10；公开项目为 [openai/codex](https://github.com/openai/codex)。
 
 ### Claude Code：恢复时显式切换到新的 session ID
 
-**事实（本机已部署产品观察）：** Claude Code `2.1.220` 的 `claude --help` 将 `--fork-session` 描述为“when resuming, create a new session ID instead of reusing the original”，并要求配合 `--resume` 或 `--continue`。同一帮助还说明 `--continue` 选择当前目录最近会话，`--resume` 接受 session ID 或打开交互 picker。观察日期：2026-08-10；官方入口为 [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference/)，该环境连接被重置，因此此处不从网页内容推断未在 CLI help 中出现的行为。
+**事实（本机已部署产品观察）：** Claude Code `2.1.220` 的 `claude --help` 将 `--fork-session` 描述为“when resuming, create a new session ID instead of reusing the original”，并要求配合 `--resume` 或 `--continue`。同一帮助还说明 `--continue` 选择当前目录最近会话，`--resume` 接受 session ID 或打开交互 picker。观察日期：2026-08-10，并于 2026-08-11 重新核验；官方入口为 [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference/)，该环境连接被重置，因此此处不从网页内容推断未在 CLI help 中出现的行为。
 
 ## 3. 机制与取舍
 
@@ -59,6 +59,6 @@
 
 ## References
 
-- Codex CLI `0.146.0`: `codex --help`, `codex resume --help`, `codex fork --help`，本机观察于 2026-08-10；[Codex CLI reference](https://developers.openai.com/codex/cli/reference/)。
-- Claude Code `2.1.220`: `claude --help`，本机观察于 2026-08-10；[Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference/)。
+- Codex CLI `0.146.0`: `codex --help`, `codex resume --help`, `codex fork --help`，本机观察于 2026-08-10，并于 2026-08-11 重核；[Codex CLI reference](https://developers.openai.com/codex/cli/reference/)。
+- Claude Code `2.1.220`: `claude --help`，本机观察于 2026-08-10，并于 2026-08-11 重核；[Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference/)。
 - OpenCode: [sessions documentation](https://opencode.ai/docs/sessions/)，本次访问未能核验，记录为证据缺口而非行为来源。

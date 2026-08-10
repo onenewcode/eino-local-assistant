@@ -108,6 +108,12 @@ type runtimeSessionOpenResult struct {
 	bundle  runtimeModelBundle
 }
 
+type runtimeSessionForkResult struct {
+	session *chat.Session
+	fork    store.ForkResult
+	bundle  runtimeModelBundle
+}
+
 func defaultRuntimeModelFactory() runtimeModelFactory {
 	return runtimeModelFactory{
 		newChatModel:  provider.NewChatModel,
@@ -1105,6 +1111,61 @@ func (r *commandRuntime) openSession(ctx context.Context, id string, recoverInte
 	r.session = session
 	r.modelMu.Unlock()
 	return runtimeSessionOpenResult{session: session, bundle: candidate}, nil
+}
+
+// forkSession restores the selected source's durable model binding, forks it
+// without changing the parent, and commits the new child as the runtime
+// session only after all three stages succeed. This differs from openSession:
+// using a resume callback as a fork preflight would mutate runtime state even
+// when the durable fork is rejected.
+func (r *commandRuntime) forkSession(ctx context.Context, id string) (runtimeSessionForkResult, error) {
+	if r == nil {
+		return runtimeSessionForkResult{}, errors.New("runtime is required")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return runtimeSessionForkResult{}, errors.New("session id is required")
+	}
+	if r.sessionStore == nil {
+		return runtimeSessionForkResult{}, errors.New("session store is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	meta, err := r.sessionStore.LoadThreadMeta(ctx, id)
+	if err != nil {
+		return runtimeSessionForkResult{}, fmt.Errorf("load session metadata: %w", err)
+	}
+	cfg, _, _, _ := r.modelSnapshot()
+	if durableName := strings.TrimSpace(meta.Model); durableName != "" {
+		if err := applyModelOverride(&cfg, durableName); err != nil {
+			return runtimeSessionForkResult{}, err
+		}
+		cfg.Model.ReasoningEffort = strings.TrimSpace(meta.ReasoningEffort)
+	}
+	candidate, err := r.buildModelBundle(ctx, cfg, false)
+	if err != nil {
+		return runtimeSessionForkResult{}, err
+	}
+	source, err := chat.OpenSession(candidate.sessionModel, r.sessionStore, id, candidate.sessionOpts)
+	if err != nil {
+		return runtimeSessionForkResult{}, fmt.Errorf("open source session: %w", err)
+	}
+	child, fork, err := source.Fork(ctx, "", "")
+	if err != nil {
+		return runtimeSessionForkResult{}, err
+	}
+	if child == nil {
+		return runtimeSessionForkResult{}, errors.New("forked child session is unavailable")
+	}
+	r.modelMu.Lock()
+	r.cfg = candidate.cfg
+	r.chatModel = candidate.chatModel
+	r.reactModel = candidate.reactModel
+	r.sessionOpts = candidate.sessionOpts
+	r.session = child
+	r.modelMu.Unlock()
+	return runtimeSessionForkResult{session: child, fork: fork, bundle: candidate}, nil
 }
 
 // composeSystemPrompt is the only runtime path that both recomposes a prompt

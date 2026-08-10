@@ -246,7 +246,8 @@ func TestBacktrackForkFailureKeepsSourceAndPrompt(t *testing.T) {
 	if !reflect.DeepEqual(sourceTranscript, source.Transcript()) {
 		t.Fatal("failed fork changed source transcript")
 	}
-	if !hasLineContaining(m.lines, lineError, "backtrack: load thread transcript: child open failed") {
+	if repository.childID == "" || !hasLineContaining(m.lines, lineError, "backtrack: forked child \""+repository.childID+"\" was published but could not open") ||
+		!hasLineContaining(m.lines, lineError, "child open failed") {
 		t.Fatalf("fork failure missing: %#v", m.lines)
 	}
 }
@@ -290,7 +291,8 @@ func TestBacktrackBeforeFirstForkFailureKeepsSourceAndPrompt(t *testing.T) {
 	if !reflect.DeepEqual(sourceTranscript, source.Transcript()) {
 		t.Fatal("before-first fork failure changed source transcript")
 	}
-	if !hasLineContaining(m.lines, lineError, "backtrack: load thread transcript: child open failed") {
+	if repository.childID == "" || !hasLineContaining(m.lines, lineError, "backtrack: forked child \""+repository.childID+"\" was published but could not open") ||
+		!hasLineContaining(m.lines, lineError, "child open failed") {
 		t.Fatalf("before-first fork failure missing: %#v", m.lines)
 	}
 }

@@ -653,8 +653,10 @@ func (s *Session) fork(ctx context.Context, childID string, fork sessionForkFunc
 	})
 	if err != nil {
 		// Fork publication is an external store side effect and is intentionally
-		// not rolled back when opening the in-memory child fails.
-		return nil, result, err
+		// not rolled back when opening the in-memory child fails. Include its ID
+		// in the error so callers can resume or delete the durable child instead
+		// of treating a valid branch as a phantom failure.
+		return nil, result, fmt.Errorf("forked child %q was published but could not open: %w", result.ChildID, err)
 	}
 	if child.SystemPrompt() != forkConfig.systemPrompt {
 		return nil, result, fmt.Errorf("forked child system prompt differs from source session")

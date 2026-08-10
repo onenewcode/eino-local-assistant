@@ -127,6 +127,21 @@ type SessionOpenResult struct {
 // existing local fallback path.
 type SessionOpenCallback func(context.Context, string, bool) (SessionOpenResult, error)
 
+// SessionForkResult is the complete runtime snapshot after forking a saved
+// session. The callback owns source-model selection so a child retains its
+// parent's durable binding instead of inheriting whichever session is open.
+type SessionForkResult struct {
+	Session     *chat.Session
+	Fork        store.ForkResult
+	Status      StatusInfo
+	SessionOpts chat.SessionOptions
+}
+
+// SessionForkCallback creates and opens a child from an active saved-session
+// ID. It must leave the runtime's active binding unchanged when no child is
+// published, just as an unsuccessful session switch does.
+type SessionForkCallback func(context.Context, string) (SessionForkResult, error)
+
 // StatusFragment returns compact command-policy and sandbox state.
 func (info StatusInfo) StatusFragment() string {
 	fragments := make([]string, 0, 4)
@@ -176,6 +191,9 @@ type Deps struct {
 	// OpenSession is the optional runtime-owned resume path. When absent, TUI
 	// falls back to opening the target with the current model binding.
 	OpenSession SessionOpenCallback
+	// ForkSession is the optional runtime-owned cross-session fork path. It
+	// restores the source's durable model binding before publishing the child.
+	ForkSession SessionForkCallback
 	// SessionOpts is reused for /new and /resume so pricing/context stay consistent.
 	SessionOpts chat.SessionOptions
 	Status      StatusInfo
@@ -834,13 +852,17 @@ func (m *model) resetSessionTransientState() {
 }
 
 func (m *model) activateForkChild(source, child *chat.Session, result store.ForkResult) {
-	childID := child.ID()
-	if childID == "" {
-		childID = result.ChildID
-	}
 	sourceID := ""
 	if source != nil {
 		sourceID = source.ID()
+	}
+	m.activateForkChildFromID(sourceID, child, result)
+}
+
+func (m *model) activateForkChildFromID(sourceID string, child *chat.Session, result store.ForkResult) {
+	childID := child.ID()
+	if childID == "" {
+		childID = result.ChildID
 	}
 	transcript := child.Transcript()
 	m.replaceSession(child)
@@ -2466,20 +2488,77 @@ func (m *model) cmdFork(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
 		return m, nil
 	}
-	if strings.TrimSpace(arg) != "" {
-		m.appendLine(lineError, "usage: /fork")
-		return m, nil
-	}
-
-	source := m.activeSession()
-	if source == nil {
+	current := m.activeSession()
+	if current == nil {
 		m.appendLine(lineError, "fork: session is unavailable")
 		return m, nil
 	}
+	if m.deps.Store == nil {
+		m.appendLine(lineError, "fork: session store is not configured")
+		return m, nil
+	}
 
-	// Empty arguments ask the durable fork primitive to select the latest
-	// complete turn and generate the child ID. The source title is carried by
-	// the child ledger; no TUI-only title mutation is needed here.
+	sourceID := current.ID()
+	selector := strings.TrimSpace(arg)
+	if selector == "--last" {
+		var err error
+		sourceID, err = m.latestForkSourceID()
+		if err != nil {
+			m.appendLine(lineError, "fork: "+err.Error())
+			return m, nil
+		}
+	} else if selector != "" {
+		resolvedID, err := m.resolveSessionSelector(selector, sessionSelectorActive)
+		if err != nil {
+			m.appendLine(lineError, "fork: "+err.Error())
+			return m, nil
+		}
+		sourceID = resolvedID
+	}
+
+	// The production callback restores the source model before publishing the
+	// child. It is deliberately separate from OpenSession: opening a source
+	// merely to fork it must not replace the runtime's active session on error.
+	if m.deps.ForkSession != nil {
+		forked, err := m.deps.ForkSession(m.processCtx(), sourceID)
+		if err != nil {
+			m.appendLine(lineError, "fork: "+err.Error())
+			return m, nil
+		}
+		if forked.Session == nil {
+			m.appendLine(lineError, "fork: runtime callback returned no child session")
+			return m, nil
+		}
+		m.deps.Status = cloneStatusInfo(forked.Status)
+		m.deps.SessionOpts = forked.SessionOpts
+		if sourceID != current.ID() && m.deps.InvalidateRulesSnapshot != nil {
+			m.deps.InvalidateRulesSnapshot()
+		}
+		m.activateForkChildFromID(sourceID, forked.Session, forked.Fork)
+		return m, nil
+	}
+
+	source := current
+	if sourceID != current.ID() {
+		model := current.Model()
+		if model == nil {
+			m.appendLine(lineError, "fork: chat model is unavailable")
+			return m, nil
+		}
+		opts := m.deps.SessionOpts
+		opts.Store = m.deps.Store
+		opts.ModelName = m.currentModelIdentity()
+		var err error
+		source, err = chat.OpenSession(model, m.deps.Store, sourceID, opts)
+		if err != nil {
+			m.appendLine(lineError, "fork: open source session: "+err.Error())
+			return m, nil
+		}
+	}
+
+	// Empty child ID and boundary ask the durable fork primitive to select the
+	// latest complete turn and generate the child ID. The source title is
+	// carried by the child ledger; no TUI-only title mutation is needed here.
 	child, result, err := source.Fork(m.processCtx(), "", "")
 	if err != nil {
 		m.appendLine(lineError, "fork: "+err.Error())
@@ -2499,8 +2578,29 @@ func (m *model) cmdFork(arg string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.activateForkChild(source, child, result)
+	if sourceID != current.ID() && m.deps.InvalidateRulesSnapshot != nil {
+		m.deps.InvalidateRulesSnapshot()
+	}
+	m.activateForkChildFromID(sourceID, child, result)
 	return m, nil
+}
+
+// latestForkSourceID mirrors the explicit --last branch used by shell Code
+// Agent clients. Empty /fork remains a fork of the current active session.
+func (m *model) latestForkSourceID() (string, error) {
+	if m.deps.Store == nil {
+		return "", errors.New("session store is not configured")
+	}
+	list, err := m.deps.Store.ListThreads(m.processCtx())
+	if err != nil {
+		return "", fmt.Errorf("list sessions: %w", err)
+	}
+	for _, meta := range list {
+		if id := strings.TrimSpace(meta.ID); id != "" && meta.ArchivedAt == nil {
+			return id, nil
+		}
+	}
+	return "", errors.New("no saved sessions available")
 }
 
 // parseResumeArgs accepts one thread ID or exact display name, or --last, and

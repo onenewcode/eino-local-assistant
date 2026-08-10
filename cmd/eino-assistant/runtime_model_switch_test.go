@@ -368,6 +368,96 @@ func TestRuntimeOpenSessionUsesTargetDurableModelBeforeBuilding(t *testing.T) {
 	}
 }
 
+func TestRuntimeForkSessionUsesSourceDurableModelAndCommitsChild(t *testing.T) {
+	r, active, threadStore := newRuntimeModelSwitchFixture(t)
+	source, err := chat.NewSession(runtimeSessionModel{}, "source prompt", chat.SessionOptions{
+		Store:           threadStore,
+		ModelName:       "durable-source",
+		ReasoningEffort: "high",
+	})
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+	if err := source.Ask(context.Background(), "persist source turn", nil); err != nil {
+		t.Fatalf("source Ask: %v", err)
+	}
+	sourceBefore, err := threadStore.LoadThread(context.Background(), source.ID())
+	if err != nil {
+		t.Fatalf("LoadThread source before fork: %v", err)
+	}
+	var providerName string
+	r.modelFactory = runtimeModelFactory{
+		newChatModel: func(_ context.Context, cfg config.ModelConfig) (model.ToolCallingChatModel, error) {
+			providerName = cfg.Name
+			return &runtimeFactoryChatModel{name: cfg.Name}, nil
+		},
+		newReActModel: func(context.Context, model.ToolCallingChatModel, []tool.BaseTool, agent.ReActOptions) (*agent.ReActModel, error) {
+			return &agent.ReActModel{}, nil
+		},
+		newCompactor: func(model.BaseChatModel, contextbuild.Config) (contextbuild.CheckpointCompactor, error) {
+			return runtimeFactoryCompactor{}, nil
+		},
+	}
+
+	forked, err := r.forkSession(context.Background(), source.ID())
+	if err != nil {
+		t.Fatalf("forkSession: %v", err)
+	}
+	if providerName != "durable-source" || forked.session == nil || forked.session != r.session || r.session == active {
+		t.Fatalf("fork runtime selection: provider=%q child=%p runtime=%p active=%p", providerName, forked.session, r.session, active)
+	}
+	if forked.fork.SourceID != source.ID() || forked.session.ID() == source.ID() || forked.session.ModelName() != "durable-source" || forked.session.ReasoningEffort() != "high" {
+		t.Fatalf("fork child provenance/binding = result=%#v child=%#v", forked.fork, forked.session)
+	}
+	if r.cfg.Model.Name != "durable-source" || r.cfg.Model.ReasoningEffort != "high" || r.sessionOpts.ModelName != "durable-source" || r.sessionOpts.ReasoningEffort != "high" {
+		t.Fatalf("runtime binding after fork: cfg=%q/%q opts=%q/%q", r.cfg.Model.Name, r.cfg.Model.ReasoningEffort, r.sessionOpts.ModelName, r.sessionOpts.ReasoningEffort)
+	}
+	sourceAfter, err := threadStore.LoadThread(context.Background(), source.ID())
+	if err != nil {
+		t.Fatalf("LoadThread source after fork: %v", err)
+	}
+	if !reflect.DeepEqual(sourceAfter, sourceBefore) {
+		t.Fatalf("fork changed source state: before=%#v after=%#v", sourceBefore, sourceAfter)
+	}
+}
+
+func TestRuntimeForkSessionFailureLeavesOldBundleUnchanged(t *testing.T) {
+	r, active, threadStore := newRuntimeModelSwitchFixture(t)
+	source, err := chat.NewSession(runtimeSessionModel{}, "source prompt", chat.SessionOptions{Store: threadStore, ModelName: "durable-source"})
+	if err != nil {
+		t.Fatalf("source NewSession: %v", err)
+	}
+	state, err := threadStore.LoadThread(context.Background(), source.ID())
+	if err != nil {
+		t.Fatalf("LoadThread source: %v", err)
+	}
+	if _, err := threadStore.StartTurn(context.Background(), source.ID(), state.Revision, store.TurnStart{TurnID: "active-source", Input: "unfinished"}); err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	oldCfg, oldProvider, oldReact, oldOpts := r.modelSnapshot()
+	r.modelFactory = runtimeModelFactory{
+		newChatModel: func(_ context.Context, cfg config.ModelConfig) (model.ToolCallingChatModel, error) {
+			if cfg.Name != "durable-source" {
+				t.Fatalf("fork failure built wrong target model %q", cfg.Name)
+			}
+			return &runtimeFactoryChatModel{name: cfg.Name}, nil
+		},
+		newReActModel: func(context.Context, model.ToolCallingChatModel, []tool.BaseTool, agent.ReActOptions) (*agent.ReActModel, error) {
+			return &agent.ReActModel{}, nil
+		},
+		newCompactor: func(model.BaseChatModel, contextbuild.Config) (contextbuild.CheckpointCompactor, error) {
+			return runtimeFactoryCompactor{}, nil
+		},
+	}
+	if _, err := r.forkSession(context.Background(), source.ID()); err == nil {
+		t.Fatal("forkSession unexpectedly accepted an active source")
+	}
+	gotCfg, gotProvider, gotReact, gotOpts := r.modelSnapshot()
+	if !reflect.DeepEqual(gotCfg, oldCfg) || gotProvider != oldProvider || gotReact != oldReact || !reflect.DeepEqual(gotOpts, oldOpts) || r.session != active {
+		t.Fatalf("failed fork polluted runtime: cfg=%#v provider=%p react=%p opts=%#v session=%p", gotCfg, gotProvider, gotReact, gotOpts, r.session)
+	}
+}
+
 func TestRuntimeOpenSessionFailureLeavesOldBundleUnchanged(t *testing.T) {
 	r, active, threadStore := newRuntimeModelSwitchFixture(t)
 	target, err := chat.NewSession(runtimeSessionModel{}, "target prompt", chat.SessionOptions{Store: threadStore, ModelName: "durable-target"})

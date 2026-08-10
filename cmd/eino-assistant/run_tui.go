@@ -207,6 +207,18 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 				SessionOpts: opened.bundle.sessionOpts,
 			}, nil
 		},
+		ForkSession: func(ctx context.Context, id string) (tui.SessionForkResult, error) {
+			forked, forkErr := runtime.forkSession(ctx, id)
+			if forkErr != nil {
+				return tui.SessionForkResult{}, forkErr
+			}
+			return tui.SessionForkResult{
+				Session:     forked.session,
+				Fork:        forked.fork,
+				Status:      statusFromConfig(forked.bundle.cfg, runtime.registry, cmdMode, forked.bundle.maxModelSteps(), sandboxInfo, runtimeInfo),
+				SessionOpts: forked.bundle.sessionOpts,
+			}, nil
+		},
 		RulesReport:             runtime.rulesReport,
 		WorkspaceDiff:           runtime.workspaceDiff,
 		InvalidateRulesSnapshot: runtime.invalidateRulesSnapshot,
