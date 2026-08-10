@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"eino-local-assistant/internal/chat"
+	"eino-local-assistant/internal/tools"
 )
 
 func TestShortSessionID(t *testing.T) {
@@ -155,6 +156,25 @@ func TestStatusActivityCanBeHiddenIndependently(t *testing.T) {
 	m.mode = modeBusy
 	if line := m.statusLabel(); strings.Contains(line, "thinking") {
 		t.Fatalf("activity ignored status-line selection: %q", line)
+	}
+}
+
+func TestStatusLineModeIsOptionalAndTracksState(t *testing.T) {
+	state, err := tools.NewApprovalState(tools.ApprovalOnRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newTestModel(t)
+	m.deps.PolicyInfo.ApprovalState = state
+	m.deps.StatusLine.Fields = []string{statusFieldMode}
+	if got := m.statusLabel(); got != "mode=ask" {
+		t.Fatalf("mode field = %q, want mode=ask", got)
+	}
+	if err := state.SetYolo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.statusLabel(); got != "mode=yolo" {
+		t.Fatalf("mode field = %q, want mode=yolo", got)
 	}
 }
 

@@ -82,11 +82,11 @@ Codex-compatible Starlark `.rules` 前缀规则子集，不再支持 TOML `[perm
 sandbox 是独立层，详见 `docs/tool-policy.md`。
 
 
-权限状态栏只显示紧凑的 `cmd=ask|auto|plan|yolo`；启用 OS sandbox 时追加 `sb=rw|ro`，yolo 只显示 `YOLO=UNSAFE`。沙盒后端、有效路径、保护路径和 runtime 预算放在 `/permissions`，网络不再作为状态栏或配置参数。`plan` 与 yolo 都只属于当前 TUI 进程的临时模式，不写配置或 session ledger；yolo 还会在启动/TUI transcript、`/permissions` 和工具结果中持续显示危险旁路。
+在 `/statusline` 中选择 `mode` 后，权限状态显示为紧凑的 `mode=ask|auto|plan|yolo`；启用 OS sandbox 时 `/permissions` 会追加 `sb=rw|ro`，yolo 会显示 `YOLO=UNSAFE`。沙盒后端、有效路径、保护路径和 runtime 预算放在 `/permissions`，网络不再作为状态栏或配置参数。`plan` 与 yolo 都只属于当前 TUI 进程的临时模式，不写配置或 session ledger；yolo 还会在启动/TUI transcript、`/permissions` 和工具结果中持续显示危险旁路。
 
 ### 显式 YOLO 权限模式
 
-`--yolo` 是只允许交互 TUI 的危险启动参数，可用于裸命令、`chat`/`new` 和 `resume`；运行中的 idle TUI 也可显式执行 `/permissions yolo`。它不会加入 `Shift+Tab` 的 `ask -> auto -> plan -> ask` 循环；yolo 下必须显式执行 `/permissions ask|auto|plan` 才能离开。headless `exec` 和 informational 子命令拒绝 `--yolo`，不会静默忽略。
+`--yolo` 是只允许交互 TUI 的危险启动参数，可用于裸命令、`chat`/`new` 和 `resume`；运行中的 idle TUI 也可显式执行 `/permissions yolo`。`Shift+Tab` 按 `ask -> auto -> plan -> yolo -> ask` 循环；每次进入 yolo 都会显示危险警告。headless `exec` 和 informational 子命令拒绝 `--yolo`，不会静默忽略。
 
 yolo 同时绕过普通 approval/approver/session allow-deny 和 `shell`/`apply_patch` 的 OS sandbox worker，直接使用当前 host 的读写、进程执行和网络能力；这不表示 root、管理员或虚拟机外特权。approval bypass 与 sandbox bypass 是两个独立概念，本文实现明确同时开启二者。yolo 中仍会运行规则匹配、shell 工作目录与 `apply_patch` workspace/path/symlink 检查；但 `hardShellSafetyDeny` 只是字符串级的尽力而为防护，不是 shell 解析或宿主隔离，不能据此把 yolo 当作安全模式。普通模式 sandbox 不可用时仍返回 `sandbox_unavailable` 并 fail-closed，不会静默变成 yolo。
 
@@ -94,7 +94,7 @@ yolo 同时绕过普通 approval/approver/session allow-deny 和 `shell`/`apply_
 
 `model.provider` 只接受 `openai` 与 `anthropic`；省略时会规范为 `openai`，但建议始终显式填写。`model.reasoning_effort` 省略时固定为 `medium`：启动、恢复会话和模型选择都会把该值作为实际请求传给 provider，并写入会话账本，而不是只在状态栏显示。`model.context` 只有一个设置：`window_tokens`，即模型的完整物理上下文窗口。它必须与实际部署相符；状态栏和 `/context` 都以这个完整窗口为分母，绝不会显示“窗口减输出预留”这一误导性的容量。
 
-底部状态栏通过 `/statusline` 持久化选择字段和顺序：`model-with-reasoning`、`context-used`、`used-tokens`、`task-progress` 与 `activity`。其中 `activity` 独立显示 `thinking`、工具执行、流式输出、压缩和等待授权等即时状态，可按需关闭；状态栏颜色不提供单独配置。`/status` 只显示模型、推理强度和当前会话，API usage 在每轮 footer 或 `/sessions`，上下文与压缩诊断在 `/context`。
+底部状态栏通过 `/statusline` 持久化选择字段和顺序：`model-with-reasoning`、`context-used`、`used-tokens`、`task-progress`、`activity` 与可选的 `mode`。其中 `activity` 独立显示 `thinking`、工具执行、流式输出、压缩和等待授权等即时状态；`mode` 显示当前 `mode=ask|auto|plan|yolo`，两者都可按需关闭。状态栏颜色不提供单独配置。`/status` 只显示模型、推理强度和当前会话，API usage 在每轮 footer 或 `/sessions`，上下文与压缩诊断在 `/context`。
 
 使用 Anthropic 时，配置其公开的 Messages API（不是 Claude Code 的本地会话、OAuth 或订阅协议）：
 

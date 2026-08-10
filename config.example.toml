@@ -51,7 +51,8 @@ output_per_million = 0.0
 # /statusline. `activity` shows live states such as thinking, streaming,
 # tool execution, compaction, and pending approval.
 [ui]
-# status_line = ["model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity"]
+# Add "mode" to show mode=ask|auto|plan|yolo.
+# status_line = ["model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity", "mode"]
 
 [workspace]
 root = ""

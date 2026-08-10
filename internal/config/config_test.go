@@ -116,6 +116,13 @@ func TestUIStatusLineDefaultsAndValidatesConfiguredFields(t *testing.T) {
 			t.Fatalf("Load(%q) succeeded for an invalid status line", doc)
 		}
 	}
+	got, err = Load(writeConfiguration(t, validConfiguration+"\n[ui]\nstatus_line = [\"mode\"]\n"))
+	if err != nil {
+		t.Fatalf("Load(mode status line) error = %v", err)
+	}
+	if want := []string{"mode"}; !reflect.DeepEqual(got.UI.StatusLineFields(), want) {
+		t.Fatalf("mode status line = %#v, want %#v", got.UI.StatusLineFields(), want)
+	}
 }
 
 func TestSaveStatusLineConfigPreservesUISettingsAndSourceComments(t *testing.T) {

@@ -128,7 +128,7 @@ func TestPermissionsYoloIsExplicitAndVisible(t *testing.T) {
 	}
 }
 
-func TestYoloDoesNotEnterShiftTabCycleAndStartupWarningIsVisible(t *testing.T) {
+func TestYoloLeavesShiftTabCycleToAskAndStartupWarningIsVisible(t *testing.T) {
 	state, err := tools.NewApprovalState(tools.ApprovalYolo)
 	if err != nil {
 		t.Fatal(err)
@@ -149,11 +149,11 @@ func TestYoloDoesNotEnterShiftTabCycleAndStartupWarningIsVisible(t *testing.T) {
 		t.Fatal("Shift+Tab in yolo returned a command")
 	}
 	m = next.(*model)
-	if got := state.InteractiveMode(); got != "yolo" {
-		t.Fatalf("Shift+Tab left yolo mode as %q", got)
+	if got := state.InteractiveMode(); got != "ask" {
+		t.Fatalf("Shift+Tab mode = %q, want ask", got)
 	}
-	if !hasLineContaining(m.lines, lineError, "YOLO mode is explicit") {
-		t.Fatalf("Shift+Tab yolo guard missing: %#v", m.lines)
+	if !hasLineContaining(m.lines, lineSystem, "permission mode: ask") {
+		t.Fatalf("Shift+Tab ask confirmation missing: %#v", m.lines)
 	}
 }
 
@@ -213,7 +213,7 @@ func TestShiftTabCyclesPermissionModesWithoutStartingTurn(t *testing.T) {
 		},
 	})
 	m.textarea.SetValue("keep this draft")
-	for _, want := range []string{"auto", "plan", "ask", "auto"} {
+	for _, want := range []string{"auto", "plan", "yolo", "ask", "auto"} {
 		next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
 		if cmd != nil {
 			t.Fatalf("Shift+Tab %q returned a command", want)
@@ -227,6 +227,9 @@ func TestShiftTabCyclesPermissionModesWithoutStartingTurn(t *testing.T) {
 		}
 		if !hasLineContaining(m.lines, lineSystem, "permission mode: "+want) {
 			t.Fatalf("Shift+Tab confirmation for %q missing: %#v", want, m.lines)
+		}
+		if want == "yolo" && !hasLineContaining(m.lines, lineError, tools.YoloModeWarning) {
+			t.Fatalf("Shift+Tab yolo warning missing: %#v", m.lines)
 		}
 	}
 }
@@ -416,13 +419,13 @@ func TestPlanPromptFailureDoesNotStartTurnAndKeepsPlanMode(t *testing.T) {
 }
 
 func TestPermissionsPlanIsDocumentedInHelpAndSlashMenu(t *testing.T) {
-	if !strings.Contains(helpText(), "/permissions [ask|auto|plan]") {
+	if !strings.Contains(helpText(), "/permissions [ask|auto|plan|yolo]") {
 		t.Fatalf("help does not document plan mode: %s", helpText())
 	}
 	if !strings.Contains(helpText(), "/plan") {
 		t.Fatalf("help does not document the direct plan alias: %s", helpText())
 	}
-	if !strings.Contains(helpText(), "shift+tab cycle permission mode: ask -> auto -> plan -> ask") {
+	if !strings.Contains(helpText(), "shift+tab cycle permission mode: ask -> auto -> plan -> yolo -> ask") {
 		t.Fatalf("help does not document Shift+Tab mode cycle: %s", helpText())
 	}
 	if !strings.Contains(helpText(), "/permissions yolo") || !strings.Contains(helpText(), "hard denies/path checks") {
