@@ -59,8 +59,8 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"chat", "-h"}, "Start a new interactive chat"},
 		{[]string{"help", "exec"}, "Run one durable assistant turn without a TTY"},
 		{[]string{"exec", "-h"}, "Run one durable assistant turn without a TTY"},
-		{[]string{"help", "exec", "resume"}, "Open the explicitly named durable session"},
-		{[]string{"exec", "resume", "-h"}, "Open the explicitly named durable session"},
+		{[]string{"help", "exec", "resume"}, "Open the explicitly selected durable session"},
+		{[]string{"exec", "resume", "-h"}, "Open the explicitly selected durable session"},
 		{[]string{"help", "resume"}, "Resume a previously saved session"},
 		{[]string{"resume", "-h"}, "Resume a previously saved session"},
 		{[]string{"help", "fork"}, "Create an independent child of a saved session"},
@@ -254,7 +254,7 @@ func TestResumeRequiresID(t *testing.T) {
 
 func TestForkRequiresSelectorAndParsesPrompt(t *testing.T) {
 	_, _, err := executeForTest("fork")
-	if err == nil || !strings.Contains(err.Error(), "requires a session id or --last") {
+	if err == nil || !strings.Contains(err.Error(), "requires a session ID, name, or --last") {
 		t.Fatalf("fork without selector error = %v", err)
 	}
 
@@ -275,7 +275,7 @@ func TestForkRequiresSelectorAndParsesPrompt(t *testing.T) {
 func TestExecResumeRequiresExplicitIDOrLastAndDocumentsRecovery(t *testing.T) {
 	t.Parallel()
 	_, _, err := executeForTest("exec", "resume")
-	if err == nil || !strings.Contains(err.Error(), "session id is required") {
+	if err == nil || !strings.Contains(err.Error(), "session ID or name is required") {
 		t.Fatalf("error=%v, want explicit session-id-or-last error", err)
 	}
 

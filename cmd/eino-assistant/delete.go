@@ -16,7 +16,7 @@ func newDeleteCommand(opts *rootOptions) *cobra.Command {
 	var confirmed bool
 	var force bool
 	cmd := &cobra.Command{
-		Use:   "delete <SESSION_ID>",
+		Use:   "delete <SESSION_ID_OR_NAME>",
 		Short: "Permanently delete a saved session",
 		Long: "Permanently delete one saved session without starting the TUI or a model. " +
 			"Requires --yes or --force and refuses a session with an active turn or pending compaction.",
@@ -27,7 +27,7 @@ func newDeleteCommand(opts *rootOptions) *cobra.Command {
 			}
 			id := strings.TrimSpace(args[0])
 			if id == "" {
-				return errors.New("session id is required")
+				return errors.New("session ID or name is required")
 			}
 			if err := deleteSession(cmd.Context(), opts.configPath, id); err != nil {
 				return err
@@ -44,7 +44,7 @@ func newDeleteCommand(opts *rootOptions) *cobra.Command {
 func deleteSession(ctx context.Context, configPath, sessionID string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return errors.New("session id is required")
+		return errors.New("session ID or name is required")
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -59,6 +59,10 @@ func deleteSession(ctx context.Context, configPath, sessionID string) error {
 		return fmt.Errorf("open session store: %w", err)
 	}
 	defer threadStore.Close()
+	sessionID, err = resolveSessionSelector(ctx, threadStore, sessionID, sessionScopeAll)
+	if err != nil {
+		return err
+	}
 	if err := threadStore.DeleteThread(ctx, sessionID); err != nil {
 		return fmt.Errorf("delete session: %w", err)
 	}

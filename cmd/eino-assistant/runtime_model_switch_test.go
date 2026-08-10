@@ -465,12 +465,15 @@ func TestForkStartupSessionCreatesChildWithoutChangingSource(t *testing.T) {
 		t.Fatalf("LoadThread source before fork: %v", err)
 	}
 
-	child, result, err := forkStartupSession(ctx, threadStore, source.ID, runtimeSessionModel{}, chat.SessionOptions{Store: threadStore})
+	child, result, err := forkStartupSession(ctx, threadStore, source.ID, runtimeSessionModel{}, chat.SessionOptions{Store: threadStore, Title: "fork display name"})
 	if err != nil {
 		t.Fatalf("forkStartupSession: %v", err)
 	}
 	if child == nil || result.SourceID != source.ID || child.ID() != result.ChildID || child.ModelName() != "source-model" || child.ReasoningEffort() != "high" {
 		t.Fatalf("forked child/result = child:%#v result:%#v", child, result)
+	}
+	if result.ChildState.Meta.Title != "fork display name" {
+		t.Fatalf("fork child title = %q", result.ChildState.Meta.Title)
 	}
 	after, err := threadStore.LoadThread(ctx, source.ID)
 	if err != nil {

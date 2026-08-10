@@ -24,11 +24,13 @@
 
 `eino doctor` 可在不联网、不启动模型或 MCP server 的前提下检查本地配置、workspace、storage、已启用 MCP 的本地前置条件及 sandbox/approval 摘要；它不会读取 OAuth keyring 凭据。
 
-`eino fork <session-id> [prompt]` 会从指定 session 的最新 committed turn 创建独立 child，再打开 TUI；可用 `eino fork --last [prompt]` 明确选择当前 storage 中最新 session。首个 prompt 会直接作为 child 的普通模型输入，即使它以 `/` 开头也不会执行 TUI slash command。该命令暂不提供 session picker，因此必须给出 session ID 或 `--last`。
+`eino fork <session-id-or-name> [prompt]` 会从指定 session 的最新 committed turn 创建独立 child，再打开 TUI；可用 `eino fork --last [prompt]` 明确选择当前 storage 中最新 session。首个 prompt 会直接作为 child 的普通模型输入，即使它以 `/` 开头也不会执行 TUI slash command。该命令暂不提供 session picker，因此必须给出 session ID、完整 display name 或 `--last`。
 
-`eino delete <session-id> --yes` 会永久删除一个已保存 session；`--force` 是等价的显式确认写法。删除不启动 TUI 或模型，且会拒绝仍有 active turn 或 pending compaction 的 session，避免删除可能继续写入或需要恢复的 durable journal。删除不可恢复，可先用 `eino sessions` 核对 ID 或用 `eino export` 保留 transcript。
+`--name`（`-n`）是新建 chat 或 fork child 的 display name 入口，与旧有 `--title` 使用同一 durable 字段，不能同时给出。`resume`、`fork`、`exec resume`、`archive`、`unarchive`、`export` 与 `delete` 都可接受完整 display name；ID 始终优先，大小写不同、前缀或子串都不会猜测。名称重复时会列出候选 ID 并拒绝操作，供脚本稳定地改用 ID。
 
-`eino archive <session-id>` 会非破坏性地整理一个已结束的 session：journal、transcript、checkpoint、artifact 与 usage 都保留，但正常 `eino sessions`、`resume --last` 与 `fork --last` 不再选择它。可用 `eino sessions --archived` 查看，再以 `eino unarchive <session-id>` 恢复；仍有 active turn 或 pending compaction 的 session 必须先按正常恢复流程结束，不能直接改变归档状态。
+`eino delete <session-id-or-name> --yes` 会永久删除一个已保存 session；`--force` 是等价的显式确认写法。删除不启动 TUI 或模型，且会拒绝仍有 active turn 或 pending compaction 的 session，避免删除可能继续写入或需要恢复的 durable journal。删除不可恢复，可先用 `eino sessions` 核对 ID 或用 `eino export` 保留 transcript。
+
+`eino archive <session-id-or-name>` 会非破坏性地整理一个已结束的 session：journal、transcript、checkpoint、artifact 与 usage 都保留，但正常 `eino sessions`、`resume --last` 与 `fork --last` 不再选择它。可用 `eino sessions --archived` 查看，再以 `eino unarchive <session-id-or-name>` 恢复；仍有 active turn 或 pending compaction 的 session 必须先按正常恢复流程结束，不能直接改变归档状态。
 
 ## 安装
 

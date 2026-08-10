@@ -24,7 +24,7 @@ func newArchiveCommand(opts *rootOptions, archive bool) *cobra.Command {
 		long = "Restore one non-destructively archived session to normal session lists and resume selection. The session journal and transcript remain unchanged."
 	}
 	return &cobra.Command{
-		Use:   name + " <SESSION_ID>",
+		Use:   name + " <SESSION_ID_OR_NAME>",
 		Short: short,
 		Long:  long,
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -32,7 +32,7 @@ func newArchiveCommand(opts *rootOptions, archive bool) *cobra.Command {
 				return err
 			}
 			if strings.TrimSpace(args[0]) == "" {
-				return errors.New("session id is required")
+				return errors.New("session ID or name is required")
 			}
 			return nil
 		},
@@ -50,7 +50,7 @@ func newArchiveCommand(opts *rootOptions, archive bool) *cobra.Command {
 func setSessionArchived(ctx context.Context, configPath, sessionID string, archive bool) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return errors.New("session id is required")
+		return errors.New("session ID or name is required")
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -65,6 +65,14 @@ func setSessionArchived(ctx context.Context, configPath, sessionID string, archi
 		return fmt.Errorf("open session store: %w", err)
 	}
 	defer threadStore.Close()
+	scope := sessionScopeActive
+	if !archive {
+		scope = sessionScopeArchived
+	}
+	sessionID, err = resolveSessionSelector(ctx, threadStore, sessionID, scope)
+	if err != nil {
+		return err
+	}
 	state, err := threadStore.LoadThread(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)

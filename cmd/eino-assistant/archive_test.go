@@ -27,11 +27,11 @@ func TestArchiveCommandLifecycleAndArchivedListing(t *testing.T) {
 	var stdout bytes.Buffer
 	command := newArchiveCommand(&rootOptions{configPath: configPath}, true)
 	command.SetOut(&stdout)
-	command.SetArgs([]string{"archive-session"})
+	command.SetArgs([]string{"keep this"})
 	if err := command.Execute(); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
-	if stdout.String() != "archived session archive-session\n" {
+	if stdout.String() != "archived session keep this\n" {
 		t.Fatalf("archive output = %q", stdout.String())
 	}
 
@@ -57,11 +57,11 @@ func TestArchiveCommandLifecycleAndArchivedListing(t *testing.T) {
 	stdout.Reset()
 	command = newArchiveCommand(&rootOptions{configPath: configPath}, false)
 	command.SetOut(&stdout)
-	command.SetArgs([]string{"archive-session"})
+	command.SetArgs([]string{"keep this"})
 	if err := command.Execute(); err != nil {
 		t.Fatalf("unarchive: %v", err)
 	}
-	if stdout.String() != "unarchived session archive-session\n" {
+	if stdout.String() != "unarchived session keep this\n" {
 		t.Fatalf("unarchive output = %q", stdout.String())
 	}
 	active, err = threadStore.ListThreads(ctx)
@@ -97,7 +97,7 @@ func TestArchiveCommandPreservesLifecycleSafety(t *testing.T) {
 		t.Fatalf("archive active session removed journal: %v", err)
 	}
 
-	if err := setSessionArchived(ctx, writeSessionsConfig(t, dataDir), " ", true); err == nil || !strings.Contains(err.Error(), "session id is required") {
+	if err := setSessionArchived(ctx, writeSessionsConfig(t, dataDir), " ", true); err == nil || !strings.Contains(err.Error(), "session ID or name is required") {
 		t.Fatalf("empty archive id error = %v", err)
 	}
 }

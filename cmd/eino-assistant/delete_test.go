@@ -18,7 +18,7 @@ func TestDeleteCommandRequiresConfirmationAndDeletesInactiveSession(t *testing.T
 	}
 	defer threadStore.Close()
 	ctx := context.Background()
-	if _, err := threadStore.CreateThread(ctx, store.ThreadMeta{ID: "delete-confirm"}, "system"); err != nil {
+	if _, err := threadStore.CreateThread(ctx, store.ThreadMeta{ID: "delete-confirm", Title: "delete by name"}, "system"); err != nil {
 		t.Fatal(err)
 	}
 	configPath := writeSessionsConfig(t, dataDir)
@@ -26,7 +26,7 @@ func TestDeleteCommandRequiresConfirmationAndDeletesInactiveSession(t *testing.T
 	command := newDeleteCommand(&rootOptions{configPath: configPath})
 	command.SetOut(&bytes.Buffer{})
 	command.SetErr(&bytes.Buffer{})
-	command.SetArgs([]string{"delete-confirm"})
+	command.SetArgs([]string{"delete by name"})
 	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "--yes or --force") {
 		t.Fatalf("delete without confirmation error = %v", err)
 	}
@@ -37,11 +37,11 @@ func TestDeleteCommandRequiresConfirmationAndDeletesInactiveSession(t *testing.T
 	var stdout bytes.Buffer
 	command = newDeleteCommand(&rootOptions{configPath: configPath})
 	command.SetOut(&stdout)
-	command.SetArgs([]string{"delete-confirm", "--yes"})
+	command.SetArgs([]string{"delete by name", "--yes"})
 	if err := command.Execute(); err != nil {
 		t.Fatalf("confirmed delete: %v", err)
 	}
-	if stdout.String() != "deleted session delete-confirm\n" {
+	if stdout.String() != "deleted session delete by name\n" {
 		t.Fatalf("delete output = %q", stdout.String())
 	}
 	if _, err := threadStore.LoadThread(ctx, "delete-confirm"); err == nil {

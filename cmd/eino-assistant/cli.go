@@ -47,6 +47,8 @@ func newRootCommand() *cobra.Command {
 func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	configPath, configPathErr := config.UserConfigPath()
 	opts := &rootOptions{configPath: configPath, configPathErr: configPathErr}
+	var title string
+	var name string
 	if deps.interactive == nil {
 		deps.interactive = runTUI
 	}
@@ -59,12 +61,22 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 			"  %[1]s\n  %[1]s exec \"summarize this repository\"\n  %[1]s exec - < build.log\n  %[1]s resume 20260715-120000-abc123\n  %[1]s fork --last \"try another approach\"\n  %[1]s sessions\n  %[1]s mcp list\n  %[1]s version",
 			appName,
 		),
-		Args:          cobra.NoArgs,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.NoArgs(cmd, args); err != nil {
+				return err
+			}
+			_, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name"))
+			return err
+		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		// Bare invocation starts a new chat session.
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return deps.interactive(opts.configPath, sessionStart{modelName: opts.modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
+			resolvedTitle, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name"))
+			if err != nil {
+				return err
+			}
+			return deps.interactive(opts.configPath, sessionStart{title: resolvedTitle, modelName: opts.modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
 		},
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
@@ -81,6 +93,8 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	}
 
 	root.PersistentFlags().BoolVar(&opts.yolo, "yolo", false, "DANGEROUS: interactive tools bypass approval prompts and the OS sandbox")
+	root.Flags().StringVar(&title, "title", "", "optional title for the new session")
+	root.Flags().StringVarP(&name, "name", "n", "", "optional display name for the new session")
 	root.Flags().StringVarP(&opts.modelName, "model", "m", "", "model name for this interactive session (startup override)")
 
 	root.AddCommand(
@@ -108,18 +122,30 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 
 func newChatCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
 	var title string
+	var name string
 	var modelName string
 	cmd := &cobra.Command{
 		Use:     "chat",
 		Aliases: []string{"new"},
 		Short:   "Start a new interactive chat session (default)",
 		Long:    "Start a new interactive chat session in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override.",
-		Args:    cobra.NoArgs,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.NoArgs(cmd, args); err != nil {
+				return err
+			}
+			_, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name"))
+			return err
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return interactive(opts.configPath, sessionStart{title: strings.TrimSpace(title), modelName: modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
+			resolvedTitle, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name"))
+			if err != nil {
+				return err
+			}
+			return interactive(opts.configPath, sessionStart{title: resolvedTitle, modelName: modelName, yolo: opts.yolo}, cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&title, "title", "", "optional title for the new session")
+	cmd.Flags().StringVarP(&name, "name", "n", "", "optional display name for the new session")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
 	return cmd
 }
@@ -128,15 +154,15 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 	var recoverInterrupted bool
 	var modelName string
 	cmd := &cobra.Command{
-		Use:   "resume <session-id>",
+		Use:   "resume <SESSION_ID_OR_NAME>",
 		Short: "Resume a saved session in the TUI",
-		Long:  "Resume a previously saved session and open it in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override; it does not rewrite the saved session.\n\nList ids with:\n  " + appName + " sessions",
+		Long:  "Resume a previously saved session by ID or exact display name and open it in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override; it does not rewrite the saved session.\n\nList selectors with:\n  " + appName + " sessions",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return err
 			}
 			if strings.TrimSpace(args[0]) == "" {
-				return errors.New("session id is required")
+				return errors.New("session ID or name is required")
 			}
 			return nil
 		},
@@ -150,16 +176,21 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 }
 
 func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
+	var title string
+	var name string
 	var modelName string
 	lastFlag := &lastSessionFlagValue{}
 	cmd := &cobra.Command{
-		Use:   "fork [SESSION_ID] [PROMPT]",
+		Use:   "fork [SESSION_ID_OR_NAME] [PROMPT]",
 		Short: "Fork a saved session in the TUI",
 		Long: "Create an independent child of a saved session and open it in the TUI. " +
 			"The optional PROMPT starts the child immediately. Use --last to fork the newest saved session; with --last, all positional arguments are PROMPT. " +
 			"Requires an interactive terminal (stdin and stdout must be a TTY).\n\n" +
-			"A session picker is not available yet, so provide SESSION_ID or explicitly opt in to --last.",
+			"A session picker is not available yet, so provide an exact SESSION_ID or display name, or explicitly opt in to --last.",
 		Args: func(cmd *cobra.Command, args []string) error {
+			if _, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name")); err != nil {
+				return err
+			}
 			if lastFlag.positionalBefore {
 				return errors.New("session id cannot be combined with --last")
 			}
@@ -167,11 +198,16 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 			return err
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolvedTitle, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name"))
+			if err != nil {
+				return err
+			}
 			id, prompt, err := parseForkCommandArgs(args, lastFlag.value)
 			if err != nil {
 				return err
 			}
 			return interactive(opts.configPath, sessionStart{
+				title:         resolvedTitle,
 				forkID:        id,
 				forkLast:      lastFlag.value,
 				initialPrompt: prompt,
@@ -183,6 +219,8 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 	lastFlag.hasPositionalBefore = func() bool { return len(cmd.Flags().Args()) > 0 }
 	cmd.Flags().Var(lastFlag, "last", "fork the newest saved session")
 	cmd.Flags().Lookup("last").NoOptDefVal = "true"
+	cmd.Flags().StringVar(&title, "title", "", "optional display name for the forked session")
+	cmd.Flags().StringVarP(&name, "name", "n", "", "optional display name for the forked session")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
 	return cmd
 }
@@ -192,7 +230,7 @@ func parseForkCommandArgs(args []string, last bool) (id, prompt string, err erro
 		return "", strings.TrimSpace(strings.Join(args, " ")), nil
 	}
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
-		return "", "", errors.New("fork requires a session id or --last")
+		return "", "", errors.New("fork requires a session ID, name, or --last")
 	}
 	return strings.TrimSpace(args[0]), strings.TrimSpace(strings.Join(args[1:], " ")), nil
 }

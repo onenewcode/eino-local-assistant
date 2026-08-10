@@ -22,7 +22,7 @@ type sessionExport struct {
 func newExportCommand(opts *rootOptions) *cobra.Command {
 	var outputFormat string
 	cmd := &cobra.Command{
-		Use:   "export <session-id>",
+		Use:   "export <SESSION_ID_OR_NAME>",
 		Short: "Export a saved session",
 		Long:  "Export the complete visible transcript of a saved session as Markdown or JSON without opening the TUI or starting a model.",
 		Args:  cobra.ExactArgs(1),
@@ -52,7 +52,7 @@ func normalizeExportFormat(raw string) (string, error) {
 func exportSession(configPath, sessionID, format string, stdout io.Writer) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return fmt.Errorf("session id is required")
+		return fmt.Errorf("session ID or name is required")
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -68,6 +68,10 @@ func exportSession(configPath, sessionID, format string, stdout io.Writer) error
 	}
 	defer sessionStore.Close()
 	ctx := context.Background()
+	sessionID, err = resolveSessionSelector(ctx, sessionStore, sessionID, sessionScopeAll)
+	if err != nil {
+		return err
+	}
 	state, messages, err := sessionStore.LoadThreadTranscriptReadOnly(ctx, sessionID, 0)
 	if err != nil {
 		return fmt.Errorf("load session transcript: %w", err)

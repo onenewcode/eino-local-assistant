@@ -1028,7 +1028,7 @@ func TestExecResumeEphemeralKeepsResumeInputValidationBeforeOpening(t *testing.T
 				},
 			}
 			stdout, stderr, err := executeExecForTest(stdin, deps, tc.args...)
-			if err == nil || !strings.Contains(err.Error(), "session id") {
+			if err == nil || !strings.Contains(err.Error(), "session") {
 				t.Fatalf("error=%v, want resume input validation error", err)
 			}
 			if stdin.reads != 0 || openCalls != 0 || selectorCalls != 0 || stderr != "" {
@@ -1647,12 +1647,12 @@ func TestExecResumeJSONReportsPositionalInputFailuresBeforeStdinOrOpening(t *tes
 		{
 			name:    "missing id",
 			args:    []string{"exec", "resume", "--output-format", "json"},
-			wantErr: "session id is required",
+			wantErr: "session ID or name is required",
 		},
 		{
 			name:    "blank id",
 			args:    []string{"exec", "resume", "  ", "--output-format", "json", "continue"},
-			wantErr: "session id is required",
+			wantErr: "session ID or name is required",
 		},
 		{
 			name:    "too many prompt arguments",

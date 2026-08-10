@@ -204,6 +204,29 @@ func selectNewestExecSession(ctx context.Context, lister execThreadLister) (stri
 	return id, nil
 }
 
+// resolveStartupSessionSelectors replaces a human-facing display name with its
+// canonical durable ID before model inheritance or session opening begins.
+func resolveStartupSessionSelectors(ctx context.Context, threadStore *store.ThreadStore, start *sessionStart) error {
+	if start == nil {
+		return errors.New("session start is required")
+	}
+	if strings.TrimSpace(start.resumeID) != "" {
+		id, err := resolveSessionSelector(ctx, threadStore, start.resumeID, sessionScopeActive)
+		if err != nil {
+			return err
+		}
+		start.resumeID = id
+	}
+	if strings.TrimSpace(start.forkID) != "" && !start.forkLast {
+		id, err := resolveSessionSelector(ctx, threadStore, start.forkID, sessionScopeActive)
+		if err != nil {
+			return err
+		}
+		start.forkID = id
+	}
+	return nil
+}
+
 // forkStartupSession creates the durable child before constructing the TUI.
 // The source journal stays read-only; a child-open failure intentionally does
 // not roll back the already-published, independently recoverable child.
@@ -214,6 +237,12 @@ func forkStartupSession(ctx context.Context, threadStore *store.ThreadStore, sou
 	result, err := threadStore.ForkThread(ctx, sourceID, "", "")
 	if err != nil {
 		return nil, store.ForkResult{}, fmt.Errorf("fork session: %w", err)
+	}
+	if title := strings.TrimSpace(opts.Title); title != "" {
+		result.ChildState, err = threadStore.SetThreadTitle(ctx, result.ChildID, result.ChildState.Revision, title)
+		if err != nil {
+			return nil, result, fmt.Errorf("name forked session: %w", err)
+		}
 	}
 	child, err := chat.OpenSession(sessionModel, threadStore, result.ChildID, opts)
 	if err != nil {
@@ -475,6 +504,12 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		if err != nil {
 			return nil, fmt.Errorf("open durable source session store: %w", err)
 		}
+		sourceID, err = resolveSessionSelector(ctx, sourceStore, sourceID, sessionScopeActive)
+		if err != nil {
+			_ = sourceStore.Close()
+			return nil, err
+		}
+		start.resumeID = sourceID
 		sourceThreadPath, err = sourceStore.ThreadPath(sourceID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve durable source session path: %w", err)
@@ -512,6 +547,12 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 		}
 		sourceID = start.sourceSessionID()
 	}
+	if !start.ephemeral {
+		if err := resolveStartupSessionSelectors(ctx, sessionStore, &start); err != nil {
+			return nil, err
+		}
+	}
+	sourceID = start.sourceSessionID()
 	if sourceID != "" && !start.ephemeral {
 		sourceStore = sessionStore
 	}
@@ -710,6 +751,7 @@ func newCommandRuntime(ctx context.Context, configPath string, start sessionStar
 	var session *chat.Session
 	var initialSnapshot agent.PromptLayerSnapshot
 	if start.forkID != "" {
+		bundle.sessionOpts.Title = start.title
 		forkResult := store.ForkResult{}
 		session, forkResult, err = forkStartupSession(ctx, sessionStore, start.forkID, bundle.reactModel, bundle.sessionOpts)
 		if err != nil {

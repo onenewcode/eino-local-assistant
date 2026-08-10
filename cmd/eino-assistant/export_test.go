@@ -38,7 +38,7 @@ func TestExportSessionMarkdownAndJSON(t *testing.T) {
 	configPath := writeSessionsConfig(t, dataDir)
 
 	var markdown bytes.Buffer
-	if err := exportSession(configPath, "session-export", "markdown", &markdown); err != nil {
+	if err := exportSession(configPath, "export me", "markdown", &markdown); err != nil {
 		t.Fatalf("export markdown: %v", err)
 	}
 	for _, want := range []string{"# Session session-export", "Title: export me", "## System", "system instructions", "## User", "user input", "## Assistant", "assistant output"} {
@@ -69,7 +69,7 @@ func TestExportSessionRejectsInvalidFormatAndMissingSession(t *testing.T) {
 	if _, err := normalizeExportFormat("yaml"); err == nil || !strings.Contains(err.Error(), "markdown or json") {
 		t.Fatalf("normalizeExportFormat(yaml) error = %v", err)
 	}
-	if err := exportSession(writeSessionsConfig(t, t.TempDir()), "", "json", &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "session id is required") {
+	if err := exportSession(writeSessionsConfig(t, t.TempDir()), "", "json", &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "session ID or name is required") {
 		t.Fatalf("export empty session error = %v", err)
 	}
 }

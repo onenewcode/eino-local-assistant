@@ -410,10 +410,10 @@ func newExecResumeCommand(opts *rootOptions, deps execCommandDeps, outputFormat 
 	var resumeEphemeral bool
 	lastFlag := &lastSessionFlagValue{}
 	cmd := &cobra.Command{
-		Use:   "resume [SESSION_ID] [PROMPT]",
+		Use:   "resume [SESSION_ID_OR_NAME] [PROMPT]",
 		Short: "Resume one durable or ephemeral non-interactive session turn",
-		Long: "Open the explicitly named durable session when given a SESSION_ID, or select one with --last, and send one new assistant prompt without a TTY. " +
-			"Pass an explicit SESSION_ID for a stable identity, or opt in with --last to select the first newest thread from the current configuration's durable storage.data_dir. " +
+		Long: "Open the explicitly selected durable session when given a SESSION_ID or exact display name, or select one with --last, and send one new assistant prompt without a TTY. " +
+			"Pass an explicit SESSION_ID for a stable identity, or an exact display name for interactive use; opt in with --last to select the first newest thread from the current configuration's durable storage.data_dir. " +
 			"When --last is used, it must appear before an optional PROMPT and does not filter or recover sessions. Reads PROMPT from the argument or stdin. " +
 			"With --ephemeral, loads a locked snapshot of the selected durable session into a temporary ledger, runs only against that ledger, and leaves the durable source session unchanged; --last may be combined with --ephemeral. " +
 			"Use --recover only after confirming a previous process stopped, to explicitly terminally recover an interrupted turn or pending compaction before sending the new prompt. Use -m/--model and --reasoning-effort to override model selection for this invocation only; auto requests provider/model-default effort semantics.",
@@ -563,13 +563,13 @@ func validateExecResumeArgs(args []string, useLast, positionalBeforeLast bool) e
 		return nil
 	}
 	if len(args) == 0 {
-		return errors.New("session id is required")
+		return errors.New("session ID or name is required")
 	}
 	if len(args) > 2 {
 		return errors.New("exec resume accepts a session id and at most one prompt argument")
 	}
 	if strings.TrimSpace(args[0]) == "" {
-		return errors.New("session id is required")
+		return errors.New("session ID or name is required")
 	}
 	return nil
 }
