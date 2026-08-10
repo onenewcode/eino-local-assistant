@@ -245,20 +245,7 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
-func TestResumeRequiresID(t *testing.T) {
-	t.Parallel()
-	_, _, err := executeForTest("resume")
-	if err == nil {
-		t.Fatal("expected error when resume id is missing")
-	}
-}
-
-func TestForkRequiresSelectorAndParsesPrompt(t *testing.T) {
-	_, _, err := executeForTest("fork")
-	if err == nil || !strings.Contains(err.Error(), "requires a session ID, name, or --last") {
-		t.Fatalf("fork without selector error = %v", err)
-	}
-
+func TestForkParsesPromptAndRejectsConflictingSelectors(t *testing.T) {
 	id, prompt, err := parseForkCommandArgs([]string{"saved-session", "try", "another", "approach"}, false)
 	if err != nil || id != "saved-session" || prompt != "try another approach" {
 		t.Fatalf("explicit fork args = id:%q prompt:%q err:%v", id, prompt, err)
@@ -266,6 +253,10 @@ func TestForkRequiresSelectorAndParsesPrompt(t *testing.T) {
 	id, prompt, err = parseForkCommandArgs([]string{"try", "another", "approach"}, true)
 	if err != nil || id != "" || prompt != "try another approach" {
 		t.Fatalf("last fork args = id:%q prompt:%q err:%v", id, prompt, err)
+	}
+	id, prompt, err = parseForkCommandArgs(nil, false)
+	if err != nil || id != "" || prompt != "" {
+		t.Fatalf("picker fork args = id:%q prompt:%q err:%v", id, prompt, err)
 	}
 	_, _, err = executeForTest("fork", "saved-session", "--last")
 	if err == nil || !strings.Contains(err.Error(), "cannot be combined with --last") {

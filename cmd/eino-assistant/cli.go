@@ -36,8 +36,10 @@ type rootOptions struct {
 // commandDeps is immutable after construction. Tests create a fresh command
 // tree with a local session factory instead of mutating global runtime hooks.
 type commandDeps struct {
-	exec        execCommandDeps
-	interactive interactiveCommandRunner
+	exec              execCommandDeps
+	interactive       interactiveCommandRunner
+	sessionPicker     interactiveSessionPicker
+	selectLatestSaved latestInteractiveSessionSelector
 }
 
 type interactiveCommandRunner func(string, sessionStart, io.Writer) error
@@ -55,6 +57,12 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	var disallowedTools []string
 	if deps.interactive == nil {
 		deps.interactive = runTUI
+	}
+	if deps.sessionPicker == nil {
+		deps.sessionPicker = pickActiveSession
+	}
+	if deps.selectLatestSaved == nil {
+		deps.selectLatestSaved = selectLatestActiveSession
 	}
 
 	root := &cobra.Command{
@@ -110,8 +118,8 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 	root.AddCommand(
 		newChatCommand(opts, deps.interactive),
 		newExecCommand(opts, deps.exec),
-		newResumeCommand(opts, deps.interactive),
-		newForkCommand(opts, deps.interactive),
+		newResumeCommand(opts, deps.interactive, deps.sessionPicker, deps.selectLatestSaved),
+		newForkCommand(opts, deps.interactive, deps.sessionPicker),
 		newArchiveCommand(opts, true),
 		newArchiveCommand(opts, false),
 		newDeleteCommand(opts),
@@ -168,27 +176,56 @@ func newChatCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 	return cmd
 }
 
-func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
+func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner, picker interactiveSessionPicker, selectLatest latestInteractiveSessionSelector) *cobra.Command {
 	var recoverInterrupted bool
+	var resumeLast bool
 	var modelName string
 	var allowedTools []string
 	var disallowedTools []string
 	cmd := &cobra.Command{
-		Use:   "resume <SESSION_ID_OR_NAME>",
+		Use:   "resume [SESSION_ID_OR_NAME]",
 		Short: "Resume a saved session in the TUI",
-		Long:  "Resume a previously saved session by ID or exact display name and open it in the TUI.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override; it does not rewrite the saved session.\n\nList selectors with:\n  " + appName + " sessions",
+		Long:  "Resume a previously saved session by ID or exact display name and open it in the TUI. With no selector, opens an interactive picker of active saved sessions; use --last to resume the newest one without showing the picker.\nRequires an interactive terminal (stdin and stdout must be a TTY).\nUse -m/--model for a startup-only model override; it does not rewrite the saved session.\n\nList selectors with:\n  " + appName + " sessions",
 		Args: func(cmd *cobra.Command, args []string) error {
-			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+			if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
 				return err
 			}
-			if strings.TrimSpace(args[0]) == "" {
+			if resumeLast && len(args) > 0 {
+				return errors.New("session ID or name cannot be combined with --last")
+			}
+			if len(args) > 0 && strings.TrimSpace(args[0]) == "" {
 				return errors.New("session ID or name is required")
 			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			id := ""
+			if len(args) > 0 {
+				id = strings.TrimSpace(args[0])
+			} else if resumeLast {
+				if selectLatest == nil {
+					return errors.New("latest session selector is unavailable")
+				}
+				selected, err := selectLatest(cmd.Context(), opts.configPath)
+				if err != nil {
+					return fmt.Errorf("select latest session: %w", err)
+				}
+				id = strings.TrimSpace(selected)
+			} else {
+				if picker == nil {
+					return errors.New("session picker is unavailable")
+				}
+				selected, err := picker(cmd.Context(), opts.configPath, cmd.InOrStdin(), cmd.ErrOrStderr())
+				if err != nil {
+					return err
+				}
+				id = strings.TrimSpace(selected)
+			}
+			if id == "" {
+				return errors.New("session picker returned an empty session ID")
+			}
 			return interactive(opts.configPath, sessionStart{
-				resumeID:           strings.TrimSpace(args[0]),
+				resumeID:           id,
 				recoverInterrupted: recoverInterrupted,
 				modelName:          modelName,
 				toolSelection:      toolSelectionFromFlags(cmd, allowedTools, disallowedTools),
@@ -196,13 +233,14 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 			}, cmd.ErrOrStderr())
 		},
 	}
+	cmd.Flags().BoolVar(&resumeLast, "last", false, "resume the newest active saved session without showing the picker")
 	cmd.Flags().BoolVar(&recoverInterrupted, "recover", false, "explicitly terminate an interrupted active turn or pending compaction before resuming")
 	cmd.Flags().StringVarP(&modelName, "model", "m", "", "model name for this interactive session (startup override)")
 	addToolSelectionFlags(cmd.Flags(), &allowedTools, &disallowedTools)
 	return cmd
 }
 
-func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *cobra.Command {
+func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner, picker interactiveSessionPicker) *cobra.Command {
 	var title string
 	var name string
 	var modelName string
@@ -215,7 +253,7 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 		Long: "Create an independent child of a saved session and open it in the TUI. " +
 			"The optional PROMPT starts the child immediately. Use --last to fork the newest saved session; with --last, all positional arguments are PROMPT. " +
 			"Requires an interactive terminal (stdin and stdout must be a TTY).\n\n" +
-			"A session picker is not available yet, so provide an exact SESSION_ID or display name, or explicitly opt in to --last.",
+			"With no selector, opens an interactive picker of active saved sessions. Provide an exact SESSION_ID or display name for a direct target, or use --last for the newest session without showing the picker.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if _, err := resolveSessionTitle(title, name, cmd.Flags().Changed("title"), cmd.Flags().Changed("name")); err != nil {
 				return err
@@ -234,6 +272,19 @@ func newForkCommand(opts *rootOptions, interactive interactiveCommandRunner) *co
 			id, prompt, err := parseForkCommandArgs(args, lastFlag.value)
 			if err != nil {
 				return err
+			}
+			if id == "" && !lastFlag.value {
+				if picker == nil {
+					return errors.New("session picker is unavailable")
+				}
+				id, err = picker(cmd.Context(), opts.configPath, cmd.InOrStdin(), cmd.ErrOrStderr())
+				if err != nil {
+					return err
+				}
+				id = strings.TrimSpace(id)
+				if id == "" {
+					return errors.New("session picker returned an empty session ID")
+				}
 			}
 			return interactive(opts.configPath, sessionStart{
 				title:         resolvedTitle,
@@ -276,8 +327,11 @@ func parseForkCommandArgs(args []string, last bool) (id, prompt string, err erro
 	if last {
 		return "", strings.TrimSpace(strings.Join(args, " ")), nil
 	}
-	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
-		return "", "", errors.New("fork requires a session ID, name, or --last")
+	if len(args) == 0 {
+		return "", "", nil
+	}
+	if strings.TrimSpace(args[0]) == "" {
+		return "", "", errors.New("session ID or name is required")
 	}
 	return strings.TrimSpace(args[0]), strings.TrimSpace(strings.Join(args[1:], " ")), nil
 }
