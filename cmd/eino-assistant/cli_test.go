@@ -66,6 +66,7 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"sessions", "-h"}, "List saved sessions"},
 		{[]string{"help", "mcp"}, "Inspect configured MCP servers"},
 		{[]string{"mcp", "list", "-h"}, "output the configured servers as JSON"},
+		{[]string{"mcp", "get", "-h"}, "Show one configured MCP server"},
 		{[]string{"version", "-h"}, "Print version information"},
 	}
 	for _, tc := range cases {

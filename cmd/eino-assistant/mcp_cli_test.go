@@ -68,7 +68,7 @@ enabled = false
 	if strings.Contains(stdout, "do-not-print") {
 		t.Fatalf("mcp list JSON leaked environment value: %s", stdout)
 	}
-	var entries []mcpListEntry
+	var entries []mcpServerEntry
 	if err := json.Unmarshal([]byte(stdout), &entries); err != nil {
 		t.Fatalf("decode MCP list JSON: %v\n%s", err, stdout)
 	}
@@ -100,7 +100,7 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 		t.Fatalf("empty JSON list = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "--help")
-	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") {
+	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") {
 		t.Fatalf("mcp help = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "list", "--help")
@@ -109,6 +109,76 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 	}
 	if _, _, err := executeMCPCommandForTest("mcp", "list", "extra"); err == nil {
 		t.Fatal("mcp list should reject positional arguments")
+	}
+}
+
+func TestMCPGetShowsOneServerWithoutEnvironmentValues(t *testing.T) {
+	configPath := writeMCPListConfig(t, `[mcp]
+
+[[mcp.servers]]
+name = "local-tools"
+command = "npx"
+args = ["-y", "@example/server"]
+working_dir = `+strconv.Quote(t.TempDir())+`
+enabled = false
+
+[mcp.servers.env]
+API_TOKEN = "super-secret"
+LOG_LEVEL = "debug"
+
+[[mcp.servers]]
+name = "other"
+command = "other-command"
+`)
+	stdout, err := getMCPServerForTest(configPath, " local-tools ", false)
+	if err != nil {
+		t.Fatalf("mcp get failed: %v", err)
+	}
+	for _, want := range []string{"local-tools", "enabled: false", "transport: stdio", "command: npx", `args: "-y" "@example/server"`, "env_vars: API_TOKEN,LOG_LEVEL"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("mcp get missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, secret := range []string{"super-secret", "debug", "other-command"} {
+		if strings.Contains(stdout, secret) {
+			t.Fatalf("mcp get leaked or included %q:\n%s", secret, stdout)
+		}
+	}
+
+	jsonOutput, err := getMCPServerForTest(configPath, "local-tools", true)
+	if err != nil {
+		t.Fatalf("mcp get --json failed: %v", err)
+	}
+	if strings.Contains(jsonOutput, "super-secret") {
+		t.Fatalf("mcp get JSON leaked environment value: %s", jsonOutput)
+	}
+	var entry mcpServerEntry
+	if err := json.Unmarshal([]byte(jsonOutput), &entry); err != nil {
+		t.Fatalf("decode mcp get JSON: %v\n%s", err, jsonOutput)
+	}
+	if entry.Name != "local-tools" || entry.Enabled || entry.Transport.EnvVars[0] != "API_TOKEN" || entry.Transport.EnvVars[1] != "LOG_LEVEL" {
+		t.Fatalf("MCP get entry = %+v", entry)
+	}
+}
+
+func TestMCPGetRejectsMissingAndUnknownNames(t *testing.T) {
+	configPath := writeMCPListConfig(t, `[mcp]
+
+[[mcp.servers]]
+name = "local-tools"
+command = "mcp-server"
+`)
+	if _, err := getMCPServerForTest(configPath, "missing", false); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("unknown get error = %v", err)
+	}
+	stdout, _, err := executeMCPCommandForTest("mcp", "get", "--help")
+	if err != nil || !strings.Contains(stdout, "Show one configured MCP server") || !strings.Contains(stdout, "--json") || !strings.Contains(stdout, "without starting") {
+		t.Fatalf("mcp get help = %q, err=%v", stdout, err)
+	}
+	for _, args := range [][]string{{"mcp", "get"}, {"mcp", "get", "first", "second"}, {"mcp", "get", " "}} {
+		if _, _, err := executeMCPCommandForTest(args...); err == nil {
+			t.Fatalf("mcp get %q should reject invalid arguments", args)
+		}
 	}
 }
 
@@ -136,6 +206,12 @@ window_tokens = 32000
 func listMCPServersForTest(configPath string, jsonOutput bool) (string, error) {
 	var stdout bytes.Buffer
 	err := listMCPServers(configPath, jsonOutput, &stdout)
+	return stdout.String(), err
+}
+
+func getMCPServerForTest(configPath, name string, jsonOutput bool) (string, error) {
+	var stdout bytes.Buffer
+	err := getMCPServer(configPath, name, jsonOutput, &stdout)
 	return stdout.String(), err
 }
 

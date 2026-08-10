@@ -14,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-type mcpListEntry struct {
+type mcpServerEntry struct {
 	Name      string           `json:"name"`
 	Enabled   bool             `json:"enabled"`
 	Transport mcpTransportView `json:"transport"`
@@ -35,7 +35,7 @@ func newMCPCommand(opts *rootOptions) *cobra.Command {
 		Long:  "Inspect configured MCP servers from the user-level TOML configuration.",
 		Args:  cobra.NoArgs,
 	}
-	cmd.AddCommand(newMCPListCommand(opts))
+	cmd.AddCommand(newMCPListCommand(opts), newMCPGetCommand(opts))
 	return cmd
 }
 
@@ -54,30 +54,35 @@ func newMCPListCommand(opts *rootOptions) *cobra.Command {
 	return cmd
 }
 
+func newMCPGetCommand(opts *rootOptions) *cobra.Command {
+	var jsonOutput bool
+	cmd := &cobra.Command{
+		Use:   "get <name>",
+		Short: "Show one configured MCP server",
+		Long:  "Show one configured MCP server without starting it or performing health checks. Environment values are never printed.",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+				return err
+			}
+			if strings.TrimSpace(args[0]) == "" {
+				return fmt.Errorf("MCP server name is required")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return getMCPServer(opts.configPath, args[0], jsonOutput, cmd.OutOrStdout())
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output the configured server as JSON")
+	return cmd
+}
+
 func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}
-	entries := make([]mcpListEntry, 0, len(cfg.MCP.Servers))
-	for _, server := range cfg.MCP.Servers {
-		envVars := make([]string, 0, len(server.Env))
-		for name := range server.Env {
-			envVars = append(envVars, name)
-		}
-		sort.Strings(envVars)
-		entries = append(entries, mcpListEntry{
-			Name:    strings.TrimSpace(server.Name),
-			Enabled: server.IsEnabled(),
-			Transport: mcpTransportView{
-				Type:       "stdio",
-				Command:    strings.TrimSpace(server.Command),
-				Args:       append([]string{}, server.Args...),
-				WorkingDir: strings.TrimSpace(server.WorkingDir),
-				EnvVars:    envVars,
-			},
-		})
-	}
+	entries := mcpServerEntries(cfg.MCP.Servers)
 	if jsonOutput {
 		if err := json.NewEncoder(stdout).Encode(entries); err != nil {
 			return fmt.Errorf("write MCP server JSON: %w", err)
@@ -106,6 +111,67 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.Name, entry.Transport.Type, entry.Transport.Command, args, env, workingDir)
 	}
 	return tw.Flush()
+}
+
+func getMCPServer(configPath, name string, jsonOutput bool, stdout io.Writer) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	name = strings.TrimSpace(name)
+	for _, entry := range mcpServerEntries(cfg.MCP.Servers) {
+		if entry.Name != name {
+			continue
+		}
+		if jsonOutput {
+			if err := json.NewEncoder(stdout).Encode(entry); err != nil {
+				return fmt.Errorf("write MCP server JSON: %w", err)
+			}
+			return nil
+		}
+		return writeMCPServerDetails(stdout, entry)
+	}
+	return fmt.Errorf("MCP server %q is not configured", name)
+}
+
+func mcpServerEntries(servers []config.MCPServerConfig) []mcpServerEntry {
+	entries := make([]mcpServerEntry, 0, len(servers))
+	for _, server := range servers {
+		envVars := make([]string, 0, len(server.Env))
+		for name := range server.Env {
+			envVars = append(envVars, name)
+		}
+		sort.Strings(envVars)
+		entries = append(entries, mcpServerEntry{
+			Name:    strings.TrimSpace(server.Name),
+			Enabled: server.IsEnabled(),
+			Transport: mcpTransportView{
+				Type:       "stdio",
+				Command:    strings.TrimSpace(server.Command),
+				Args:       append([]string{}, server.Args...),
+				WorkingDir: strings.TrimSpace(server.WorkingDir),
+				EnvVars:    envVars,
+			},
+		})
+	}
+	return entries
+}
+
+func writeMCPServerDetails(stdout io.Writer, entry mcpServerEntry) error {
+	args := quotedArguments(entry.Transport.Args)
+	env := strings.Join(entry.Transport.EnvVars, ",")
+	workingDir := entry.Transport.WorkingDir
+	if args == "" {
+		args = "-"
+	}
+	if env == "" {
+		env = "-"
+	}
+	if workingDir == "" {
+		workingDir = "-"
+	}
+	_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  command: %s\n  args: %s\n  env_vars: %s\n  working_dir: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.Command, args, env, workingDir)
+	return err
 }
 
 func quotedArguments(args []string) string {
