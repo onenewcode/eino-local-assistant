@@ -385,6 +385,38 @@ func TestBackgroundAgentQueueRetentionLimitAndQueuedCancellation(t *testing.T) {
 	}
 }
 
+func TestBackgroundAgentCancelAllOnlyStopsBackgroundChildren(t *testing.T) {
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+			return "unused", nil
+		},
+	})
+	m.mode = modeBusy
+	m.turnID = 8
+	m.queue = []string{"parent follow-up"}
+	foregroundCancelled := false
+	m.turnCancel = func() { foregroundCancelled = true }
+	for index := 0; index < maxBackgroundAgents+2; index++ {
+		next, _ := m.submit("/agent task " + itoa(index+1))
+		m = next.(*model)
+	}
+
+	next, cmd := m.submit("/agents cancel all")
+	m = next.(*model)
+	if cmd != nil || m.mode != modeBusy || m.turnID != 8 || foregroundCancelled || !reflect.DeepEqual(m.queue, []string{"parent follow-up"}) ||
+		m.activeBackgroundAgents() != maxBackgroundAgents || m.queuedBackgroundAgents() != 0 ||
+		m.backgroundAgents["agent-5"].state != backgroundAgentCancelled || m.backgroundAgents["agent-6"].state != backgroundAgentCancelled ||
+		!hasLineContaining(m.lines, lineSystem, "cancellation requested for 4 running; 2 queued cancelled before start") {
+		t.Fatalf("cancel all changed parent state or child states: mode=%s turn=%d foregroundCancelled=%v queue=%#v tasks=%#v lines=%#v", modeName(m.mode), m.turnID, foregroundCancelled, m.queue, m.backgroundAgents, m.lines)
+	}
+	next, cmd = m.submit("/agents cancel all")
+	if cmd != nil || !hasLineContaining(next.(*model).lines, lineSystem, "no running or queued background agents") {
+		t.Fatalf("repeated cancel all should be a no-op: %#v", next.(*model).lines)
+	}
+}
+
 func TestBackgroundAgentAppendRequiresCompletedResultAndClipsComposerPayload(t *testing.T) {
 	m := newModel(Deps{Ctx: context.Background(), Session: mustSession(t, &staticModel{}, "system"), BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
 		return "unused", nil

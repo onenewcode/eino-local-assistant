@@ -229,15 +229,19 @@ func (m *model) cmdAgents(arg string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if len(fields) != 2 {
-		m.appendLine(lineError, "usage: /agents [show <id>|append <id>|cancel <id>]")
+		m.appendLine(lineError, "usage: /agents [show <id>|append <id>|cancel <id>|cancel all]")
 		return m, nil
+	}
+	action := strings.ToLower(fields[0])
+	if action == "cancel" && strings.EqualFold(fields[1], "all") {
+		return m.cancelAllBackgroundAgents()
 	}
 	task := m.backgroundAgents[fields[1]]
 	if task == nil {
 		m.appendLine(lineError, fmt.Sprintf("background agent %q was not found", fields[1]))
 		return m, nil
 	}
-	switch strings.ToLower(fields[0]) {
+	switch action {
 	case "show":
 		m.appendLine(lineSystem, renderBackgroundAgent(task))
 		m.appendLine(lineSep, "")
@@ -264,9 +268,24 @@ func (m *model) cmdAgents(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineSep, "")
 		return m, nil
 	default:
-		m.appendLine(lineError, "usage: /agents [show <id>|append <id>|cancel <id>]")
+		m.appendLine(lineError, "usage: /agents [show <id>|append <id>|cancel <id>|cancel all]")
 		return m, nil
 	}
+}
+
+// cancelAllBackgroundAgents leaves terminal records untouched and requests
+// cancellation only for this process-local child set. It never affects a
+// foreground turn, session, queue, or parent model request.
+func (m *model) cancelAllBackgroundAgents() (tea.Model, tea.Cmd) {
+	running, queued := m.cancelBackgroundAgents()
+	if running == 0 && queued == 0 {
+		m.appendLine(lineSystem, "no running or queued background agents to cancel")
+		m.appendLine(lineSep, "")
+		return m, nil
+	}
+	m.appendLine(lineSystem, fmt.Sprintf("background agent cancellation requested for %d running; %d queued cancelled before start", running, queued))
+	m.appendLine(lineSep, "")
+	return m, nil
 }
 
 // appendBackgroundAgentResult hands a completed child report to the user as
@@ -393,7 +412,7 @@ func (m *model) activeBackgroundAgents() int {
 	return active
 }
 
-func (m *model) cancelBackgroundAgents() {
+func (m *model) cancelBackgroundAgents() (running, queued int) {
 	for _, task := range m.backgroundAgents {
 		if task == nil {
 			continue
@@ -401,16 +420,22 @@ func (m *model) cancelBackgroundAgents() {
 		if task.state == backgroundAgentQueued {
 			task.state = backgroundAgentCancelled
 			task.finishedAt = time.Now()
+			queued++
 			continue
 		}
-		if !task.active() {
+		if task.state == backgroundAgentCancelling {
 			continue
 		}
+		if task.state != backgroundAgentWorking {
+			continue
+		}
+		running++
 		task.state = backgroundAgentCancelling
 		if task.cancel != nil {
 			task.cancel()
 		}
 	}
+	return running, queued
 }
 
 func (m *model) trimBackgroundAgents(limit int) {
