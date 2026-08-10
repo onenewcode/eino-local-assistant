@@ -17,7 +17,8 @@ const (
 	maxBackgroundAgentResult    = 64 * 1024
 	// The runtime snapshot is smaller than the regular /diff display because it
 	// shares one model request with the frozen session reference and task.
-	maxBackgroundAgentWorkspaceDiff = 64 * 1024
+	maxBackgroundAgentWorkspaceDiff  = 64 * 1024
+	maxBackgroundAgentWorkspaceFiles = 4
 	// A completed report can be larger than a sensible follow-up draft. Keep
 	// explicit user handoff bounded independently from result inspection.
 	maxBackgroundAgentAttachment = 16 * 1024
@@ -35,25 +36,27 @@ const (
 )
 
 type backgroundAgentTask struct {
-	id                string
-	prompt            string
-	workspaceDiff     bool
-	session           *chat.Session
-	sessionID         string
-	sessionGeneration uint64
-	startedAt         time.Time
-	finishedAt        time.Time
-	state             backgroundAgentState
-	cancel            context.CancelFunc
-	callback          BackgroundAgentCallback
-	workspaceDiffRead func(context.Context) (string, error)
-	answer            string
-	answerTruncated   bool
-	failure           string
+	id                 string
+	prompt             string
+	workspaceDiff      bool
+	workspaceFiles     []string
+	session            *chat.Session
+	sessionID          string
+	sessionGeneration  uint64
+	startedAt          time.Time
+	finishedAt         time.Time
+	state              backgroundAgentState
+	cancel             context.CancelFunc
+	callback           BackgroundAgentCallback
+	workspaceDiffRead  func(context.Context) (string, error)
+	workspaceFilesRead func(context.Context, []string) (string, error)
+	answer             string
+	answerTruncated    bool
+	failure            string
 }
 
-func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
-	prompt, includeWorkspaceDiff, usageErr := parseBackgroundAgentPrompt(prompt)
+func (m *model) cmdAgent(raw string) (tea.Model, tea.Cmd) {
+	prompt, includeWorkspaceDiff, workspaceFiles, usageErr := parseBackgroundAgentPrompt(raw)
 	if usageErr != "" {
 		m.appendLine(lineError, usageErr)
 		return m, nil
@@ -66,6 +69,11 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 	workspaceDiff := m.deps.WorkspaceDiff
 	if includeWorkspaceDiff && workspaceDiff == nil {
 		m.appendLine(lineError, "background agent unavailable: workspace diff snapshot is not configured")
+		return m, nil
+	}
+	workspaceFilesRead := m.deps.WorkspaceFiles
+	if len(workspaceFiles) > 0 && workspaceFilesRead == nil {
+		m.appendLine(lineError, "background agent unavailable: workspace file snapshot is not configured")
 		return m, nil
 	}
 	session, generation := m.activeSessionSnapshot()
@@ -86,21 +94,23 @@ func (m *model) cmdAgent(prompt string) (tea.Model, tea.Cmd) {
 	}
 	id := m.nextBackgroundAgentID()
 	task := &backgroundAgentTask{
-		id:                id,
-		prompt:            prompt,
-		workspaceDiff:     includeWorkspaceDiff,
-		session:           session,
-		sessionID:         session.ID(),
-		sessionGeneration: generation,
-		state:             backgroundAgentQueued,
-		callback:          callback,
-		workspaceDiffRead: workspaceDiff,
+		id:                 id,
+		prompt:             prompt,
+		workspaceDiff:      includeWorkspaceDiff,
+		workspaceFiles:     append([]string(nil), workspaceFiles...),
+		session:            session,
+		sessionID:          session.ID(),
+		sessionGeneration:  generation,
+		state:              backgroundAgentQueued,
+		callback:           callback,
+		workspaceDiffRead:  workspaceDiff,
+		workspaceFilesRead: workspaceFilesRead,
 	}
 	m.backgroundAgents[id] = task
 	m.backgroundAgentOrder = append(m.backgroundAgentOrder, id)
 	cmd := m.dispatchQueuedBackgroundAgents()
 	if task.state == backgroundAgentQueued {
-		m.appendLine(lineSystem, fmt.Sprintf("background agent %s queued (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff), backgroundAgentPreview(prompt)))
+		m.appendLine(lineSystem, fmt.Sprintf("background agent %s queued (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff, workspaceFiles), backgroundAgentPreview(prompt)))
 		m.appendLine(lineSep, "")
 	}
 	return m, cmd
@@ -141,12 +151,14 @@ func (m *model) startBackgroundAgent(task *backgroundAgentTask) tea.Cmd {
 	id := task.id
 	prompt := task.prompt
 	includeWorkspaceDiff := task.workspaceDiff
+	workspaceFiles := append([]string(nil), task.workspaceFiles...)
 	session := task.session
 	sessionID := task.sessionID
 	sessionGeneration := task.sessionGeneration
 	callback := task.callback
 	workspaceDiff := task.workspaceDiffRead
-	m.appendLine(lineSystem, fmt.Sprintf("background agent %s started (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff), backgroundAgentPreview(prompt)))
+	workspaceFilesRead := task.workspaceFilesRead
+	m.appendLine(lineSystem, fmt.Sprintf("background agent %s started (%s): %s", id, backgroundAgentScopeLabel(includeWorkspaceDiff, workspaceFiles), backgroundAgentPreview(prompt)))
 	m.appendLine(lineSep, "")
 
 	return func() tea.Msg {
@@ -162,6 +174,12 @@ func (m *model) startBackgroundAgent(task *backgroundAgentTask) tea.Cmd {
 				}
 			}
 			request = backgroundAgentWorkspacePrompt(prompt, diff)
+		} else if len(workspaceFiles) > 0 {
+			files, filesErr := workspaceFilesRead(ctx, workspaceFiles)
+			if filesErr != nil {
+				return backgroundAgentDoneMsg{id: id, sessionID: sessionID, sessionGeneration: sessionGeneration, err: fmt.Errorf("read workspace file snapshot: %w", filesErr)}
+			}
+			request = backgroundAgentWorkspaceFilesPrompt(prompt, files)
 		}
 		answer, err := callback(ctx, session, request)
 		return backgroundAgentDoneMsg{
@@ -174,26 +192,50 @@ func (m *model) startBackgroundAgent(task *backgroundAgentTask) tea.Cmd {
 	}
 }
 
-func parseBackgroundAgentPrompt(raw string) (prompt string, includeWorkspaceDiff bool, usageErr string) {
-	prompt = strings.TrimSpace(raw)
-	if prompt == "" {
-		return "", false, "usage: /agent [--diff] <analysis task>"
-	}
-	const diffFlag = "--diff"
-	if prompt == diffFlag {
-		return "", false, "usage: /agent [--diff] <analysis task>"
-	}
-	if strings.HasPrefix(prompt, diffFlag) {
-		suffix := strings.TrimPrefix(prompt, diffFlag)
-		if suffix != "" && strings.TrimSpace(suffix) != suffix {
-			prompt = strings.TrimSpace(suffix)
-			if prompt == "" {
-				return "", false, "usage: /agent [--diff] <analysis task>"
+func parseBackgroundAgentPrompt(raw string) (prompt string, includeWorkspaceDiff bool, workspaceFiles []string, usageErr string) {
+	const usage = "usage: /agent [--diff|--file <workspace-relative-path>]... <analysis task>"
+	remaining := strings.TrimSpace(raw)
+	for remaining != "" {
+		token, rest := splitBackgroundAgentToken(remaining)
+		switch token {
+		case "--diff":
+			if includeWorkspaceDiff {
+				return "", false, nil, "background agent option --diff may be specified once"
 			}
-			return prompt, true, ""
+			includeWorkspaceDiff = true
+			remaining = rest
+		case "--file":
+			path, afterPath := splitBackgroundAgentToken(rest)
+			if path == "" {
+				return "", false, nil, usage
+			}
+			workspaceFiles = append(workspaceFiles, path)
+			if len(workspaceFiles) > maxBackgroundAgentWorkspaceFiles {
+				return "", false, nil, fmt.Sprintf("background agent supports at most %d --file paths", maxBackgroundAgentWorkspaceFiles)
+			}
+			remaining = afterPath
+		default:
+			prompt = remaining
+			remaining = ""
 		}
 	}
-	return prompt, false, ""
+	if strings.TrimSpace(prompt) == "" {
+		return "", false, nil, usage
+	}
+	if includeWorkspaceDiff && len(workspaceFiles) > 0 {
+		return "", false, nil, "background agent options --diff and --file cannot be combined"
+	}
+	return strings.TrimSpace(prompt), includeWorkspaceDiff, workspaceFiles, ""
+}
+
+func splitBackgroundAgentToken(raw string) (token, remaining string) {
+	raw = strings.TrimSpace(raw)
+	for index, r := range raw {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return raw[:index], strings.TrimSpace(raw[index:])
+		}
+	}
+	return raw, ""
 }
 
 func backgroundAgentWorkspacePrompt(task, diff string) string {
@@ -214,9 +256,30 @@ func backgroundAgentWorkspacePrompt(task, diff string) string {
 	return b.String()
 }
 
-func backgroundAgentScopeLabel(includeWorkspaceDiff bool) string {
+func backgroundAgentWorkspaceFilesPrompt(task, files string) string {
+	payload := sanitizeDiffPayload(files, maxBackgroundAgentWorkspaceDiff)
+	if payload.text == "" {
+		payload.text = "(no content in the captured workspace file snapshot)"
+	}
+
+	var b strings.Builder
+	b.WriteString("ASSIGNED TASK\n")
+	b.WriteString(task)
+	b.WriteString("\n\n[WORKSPACE FILE SNAPSHOT - QUOTED REFERENCE ONLY]\n")
+	b.WriteString(payload.text)
+	if payload.truncated {
+		fmt.Fprintf(&b, "\n[Workspace file snapshot truncated after %d bytes.]", maxBackgroundAgentWorkspaceDiff)
+	}
+	b.WriteString("\n[END WORKSPACE FILE SNAPSHOT]")
+	return b.String()
+}
+
+func backgroundAgentScopeLabel(includeWorkspaceDiff bool, workspaceFiles []string) string {
 	if includeWorkspaceDiff {
 		return "read-only, no tools; workspace diff snapshot"
+	}
+	if len(workspaceFiles) > 0 {
+		return fmt.Sprintf("read-only, no tools; %d workspace file snapshot(s)", len(workspaceFiles))
 	}
 	return "read-only, no tools"
 }
@@ -479,7 +542,7 @@ func renderBackgroundAgents(m *model) string {
 		if task == nil {
 			continue
 		}
-		fmt.Fprintf(&b, "  %s [%s; %s] %s\n", task.id, task.state, backgroundAgentScopeLabel(task.workspaceDiff), backgroundAgentPreview(task.prompt))
+		fmt.Fprintf(&b, "  %s [%s; %s] %s\n", task.id, task.state, backgroundAgentScopeLabel(task.workspaceDiff, task.workspaceFiles), backgroundAgentPreview(task.prompt))
 	}
 	b.WriteString("Use /agents show <id> to inspect a finished result, /agents append <id> to draft it for explicit review, or /agents cancel <id> to stop an active agent.")
 	return strings.TrimRight(b.String(), "\n")
@@ -490,7 +553,7 @@ func renderBackgroundAgent(task *backgroundAgentTask) string {
 		return "Background agent\n  unavailable"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Background agent: %s\nState: %s\nScope: %s\nTask: %s\n", task.id, task.state, backgroundAgentScopeLabel(task.workspaceDiff), backgroundAgentPreview(task.prompt))
+	fmt.Fprintf(&b, "Background agent: %s\nState: %s\nScope: %s\nTask: %s\n", task.id, task.state, backgroundAgentScopeLabel(task.workspaceDiff, task.workspaceFiles), backgroundAgentPreview(task.prompt))
 	if task.active() {
 		b.WriteString("Result: not available until the agent reaches a terminal state")
 		return b.String()

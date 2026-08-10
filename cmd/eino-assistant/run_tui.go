@@ -176,6 +176,7 @@ func runTUI(configPath string, start sessionStart, stderr io.Writer) (runErr err
 		},
 		SideQuestion:    runtime.sideQuestion,
 		BackgroundAgent: runtime.backgroundAgent,
+		WorkspaceFiles:  runtime.backgroundAgentWorkspaceFiles,
 		WorkspaceReview: runtime.workspaceReview,
 		SwitchModel: func(ctx context.Context, session *chat.Session, name string) (tui.ModelSwitchResult, error) {
 			bundle, switchErr := runtime.switchModel(ctx, session, name)

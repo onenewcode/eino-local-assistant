@@ -141,6 +141,61 @@ func TestBackgroundAgentCanIncludeBoundedWorkspaceDiffSnapshot(t *testing.T) {
 	}
 }
 
+func TestBackgroundAgentCanIncludeWorkspaceFileSnapshots(t *testing.T) {
+	var gotPaths []string
+	var gotRequest string
+	m := newModel(Deps{
+		Ctx:     context.Background(),
+		Session: mustSession(t, &staticModel{}, "system"),
+		WorkspaceFiles: func(ctx context.Context, paths []string) (string, error) {
+			if ctx == nil {
+				t.Fatal("workspace files context was nil")
+			}
+			gotPaths = append([]string(nil), paths...)
+			return "[FILE one.go]\npackage one\x1b[2J", nil
+		},
+		BackgroundAgent: func(_ context.Context, _ *chat.Session, request string) (string, error) {
+			gotRequest = request
+			return "reviewed files", nil
+		},
+	})
+	next, cmd := m.submit("/agent --file one.go --file internal/two.go inspect the implementation")
+	mm := next.(*model)
+	task := mm.backgroundAgents["agent-1"]
+	if cmd == nil || task == nil || !reflect.DeepEqual(task.workspaceFiles, []string{"one.go", "internal/two.go"}) ||
+		!strings.Contains(renderBackgroundAgent(task), "2 workspace file snapshot") {
+		t.Fatalf("file-scoped task = %#v render=%q cmd=%v", task, renderBackgroundAgent(task), cmd)
+	}
+	msg := cmd().(backgroundAgentDoneMsg)
+	if !reflect.DeepEqual(gotPaths, []string{"one.go", "internal/two.go"}) ||
+		!strings.Contains(gotRequest, "[WORKSPACE FILE SNAPSHOT - QUOTED REFERENCE ONLY]") ||
+		!strings.Contains(gotRequest, "package one") || strings.Contains(gotRequest, "\x1b") {
+		t.Fatalf("file snapshot request paths=%#v request=%q", gotPaths, gotRequest)
+	}
+	next, _ = mm.Update(msg)
+	if got := next.(*model).backgroundAgents["agent-1"].state; got != backgroundAgentCompleted {
+		t.Fatalf("file-scoped task state = %s", got)
+	}
+}
+
+func TestBackgroundAgentFileOptionValidation(t *testing.T) {
+	m := newModel(Deps{Ctx: context.Background(), Session: mustSession(t, &staticModel{}, "system"), BackgroundAgent: func(context.Context, *chat.Session, string) (string, error) {
+		return "unused", nil
+	}})
+	for _, input := range []string{
+		"/agent --file one.go",
+		"/agent --diff --file one.go inspect",
+		"/agent --file a --file b --file c --file d --file e inspect",
+		"/agent --file one.go inspect",
+	} {
+		next, cmd := m.submit(input)
+		m = next.(*model)
+		if cmd != nil || !hasLineContaining(m.lines, lineError, "background agent") && !hasLineContaining(m.lines, lineError, "usage: /agent") {
+			t.Fatalf("file option validation %q: cmd=%v lines=%#v", input, cmd, m.lines)
+		}
+	}
+}
+
 func TestBackgroundAgentDiffRequestValidationAndSnapshotFailure(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -148,7 +203,7 @@ func TestBackgroundAgentDiffRequestValidationAndSnapshotFailure(t *testing.T) {
 		diff      func(context.Context) (string, error)
 		wantError string
 	}{
-		{name: "missing task", input: "/agent --diff", wantError: "usage: /agent [--diff] <analysis task>"},
+		{name: "missing task", input: "/agent --diff", wantError: "usage: /agent [--diff|--file <workspace-relative-path>]... <analysis task>"},
 		{name: "unconfigured diff", input: "/agent --diff inspect", wantError: "workspace diff snapshot is not configured"},
 		{name: "failed diff", input: "/agent --diff inspect", diff: func(context.Context) (string, error) { return "", errors.New("git unavailable\x1b[31m") }, wantError: "read workspace diff snapshot: git unavailable?"},
 	}
@@ -473,7 +528,7 @@ func TestBackgroundAgentAppendCanPrepareDraftWhileForegroundTurnIsBusy(t *testin
 func TestBackgroundAgentCommandUsageAndTaskSummary(t *testing.T) {
 	m := newTestModel(t)
 	next, cmd := m.submit("/agent")
-	if cmd != nil || !hasLineContaining(next.(*model).lines, lineError, "usage: /agent [--diff] <analysis task>") {
+	if cmd != nil || !hasLineContaining(next.(*model).lines, lineError, "usage: /agent [--diff|--file <workspace-relative-path>]... <analysis task>") {
 		t.Fatalf("agent usage = %#v", next.(*model).lines)
 	}
 	next, _ = m.submit("/agents")

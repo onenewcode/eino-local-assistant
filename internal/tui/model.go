@@ -211,6 +211,9 @@ type Deps struct {
 	// WorkspaceDiff reads a bounded, read-only Git snapshot. The callback owns
 	// the Git process boundary; TUI never constructs or executes shell input.
 	WorkspaceDiff func(context.Context) (string, error)
+	// WorkspaceFiles reads a bounded set of workspace-relative files. The
+	// callback owns path validation and file-system access.
+	WorkspaceFiles func(context.Context, []string) (string, error)
 	// WorkspaceReview performs one display-only review of a bounded diff.
 	WorkspaceReview func(context.Context, string) (string, error)
 	// ListProjectSkills and ReadProjectSkill expose the registry's bounded,
