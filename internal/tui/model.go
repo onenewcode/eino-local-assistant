@@ -301,6 +301,9 @@ type model struct {
 	// statusLinePicker keeps a private draft until Enter succeeds. Esc leaves
 	// the durable status line and current footer untouched.
 	statusLinePicker *statusLinePickerState
+	// sessionPicker is a non-durable search overlay for choosing another active
+	// session. It changes the active session only after Enter confirms a row.
+	sessionPicker *sessionPickerState
 	// taskPaneOpen exposes a compact, read-only task projection without making
 	// the controller's internal graph part of the command surface.
 	taskPaneOpen bool
@@ -820,6 +823,7 @@ func (m *model) resetSessionTransientState() {
 	m.modelPickerEfforts = nil
 	m.modelPickerEffortSel = 0
 	m.statusLinePicker = nil
+	m.sessionPicker = nil
 	m.taskStatusFingerprint = ""
 	m.clearBacktrack()
 	m.clearSlashMenu()
@@ -1012,6 +1016,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyEsc && m.mode == modeCompacting {
 			m.interruptCompaction()
 			return m, nil
+		}
+		if m.sessionPickerOpen() {
+			return m.handleSessionPickerKey(msg)
 		}
 		if m.statusLinePickerOpen() {
 			return m.handleStatusLinePickerKey(msg)
@@ -1369,6 +1376,8 @@ func (m *model) View() string {
 		helpTextLine = "↑↓/jk select effort · enter apply · esc back · alt+p close"
 	} else if m.modelPickerOpen() {
 		helpTextLine = "↑↓/jk select model · enter choose/apply · esc cancel · alt+p close"
+	} else if m.sessionPickerOpen() {
+		helpTextLine = "type to search · ↑↓/jk move · enter resume · esc cancel"
 	} else if m.statusLinePickerOpen() {
 		helpTextLine = "type to search · space toggle · ↑↓/jk move · enter save · esc cancel"
 	} else if m.queuePaneFocused {
@@ -1406,6 +1415,8 @@ func (m *model) View() string {
 		parts = append(parts, renderModelEffortPicker(m.width, m.selectedModelPickerEntry(), m.modelPickerEfforts, m.modelPickerEffortSel, m.deps.Status.ReasoningEffort))
 	} else if m.modelPickerOpen() {
 		parts = append(parts, renderModelPicker(m.width, m.modelPickerItems, m.modelPickerSel, m.currentModelIdentity()))
+	} else if m.sessionPickerOpen() {
+		parts = append(parts, m.sessionPickerView())
 	} else if m.statusLinePickerOpen() {
 		parts = append(parts, m.statusLinePickerView())
 	} else if m.backtrackState.mode == backtrackSelecting {
@@ -1479,10 +1490,10 @@ func (m *model) layout() {
 	}
 	m.textarea.SetWidth(innerW)
 	// viewport = total - composer border - status - help - optional task pane -
-	// queue pane - slash/approval/backtrack/status-line picker. Keep one spare row so modal
+	// queue pane - slash/approval/backtrack/status-line/session picker. Keep one spare row so modal
 	// pages retain their historical safety margin at small terminal heights.
 	composerHeight := m.textarea.Height() + 2
-	extra := m.taskPaneHeight() + m.queuePaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.statusLinePickerHeight() + m.backtrackOverlayHeight()
+	extra := m.taskPaneHeight() + m.queuePaneHeight() + m.slashMenuHeight() + m.modelPickerHeight() + m.statusLinePickerHeight() + m.sessionPickerHeight() + m.backtrackOverlayHeight()
 	if m.hasPendingApproval() {
 		extra = m.taskPaneHeight() + m.queuePaneHeight() + m.approvalModalHeight()
 	}
@@ -2204,7 +2215,7 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 	if len(list) > maxList {
 		fmt.Fprintf(&b, "… and %d more\n", len(list)-maxList)
 	}
-	b.WriteString("Use /resume <id> or /delete <id>.")
+	b.WriteString("Use /resume to choose, /resume <id>, or /delete <id>.")
 	m.appendLine(lineSystem, strings.TrimRight(b.String(), "\n"))
 	m.appendLine(lineSep, "")
 	return m, nil
@@ -2215,15 +2226,29 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "busy: finish or interrupt the current turn first")
 		return m, nil
 	}
+	if strings.TrimSpace(arg) == "" {
+		return m.openSessionPicker()
+	}
 	id, recoverInterrupted, ok := parseResumeArgs(arg)
 	if !ok {
-		m.appendLine(lineError, "usage: /resume <session-id> [--recover]")
+		m.appendLine(lineError, "usage: /resume [session-id] [--recover]")
 		return m, nil
 	}
 	if m.deps.Store == nil {
 		m.appendLine(lineError, "session store is not configured")
 		return m, nil
 	}
+	if m.activeSession() == nil {
+		m.appendLine(lineError, "session is unavailable")
+		return m, nil
+	}
+	return m.resumeSession(id, recoverInterrupted)
+}
+
+// resumeSession owns the state replacement that follows a confirmed target.
+// It deliberately leaves picker state untouched on errors so the caller can
+// choose another candidate or cancel without losing its composer draft.
+func (m *model) resumeSession(id string, recoverInterrupted bool) (tea.Model, tea.Cmd) {
 	current := m.activeSession()
 	if current == nil {
 		m.appendLine(lineError, "session is unavailable")

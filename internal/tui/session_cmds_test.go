@@ -647,7 +647,7 @@ func TestResumeRecoveryIsExplicitAndStrictlyParsed(t *testing.T) {
 		next, _ = mm.submit(input)
 		mm = next.(*model)
 		if len(mm.lines) != beforeLines+1 || mm.lines[len(mm.lines)-1].kind != lineError ||
-			!strings.Contains(mm.lines[len(mm.lines)-1].text, "usage: /resume <session-id> [--recover]") {
+			!strings.Contains(mm.lines[len(mm.lines)-1].text, "usage: /resume [session-id] [--recover]") {
 			t.Fatalf("unsupported resume args %q were not rejected cleanly: %#v", input, mm.lines)
 		}
 	}
