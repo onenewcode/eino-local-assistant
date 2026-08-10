@@ -91,6 +91,7 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newMCPCommand(opts),
 		newCompletionCommand(),
 		newInitCommand(),
+		newExportCommand(opts),
 		newVersionCommand(),
 	)
 

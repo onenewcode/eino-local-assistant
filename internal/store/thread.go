@@ -583,6 +583,31 @@ func (s *ThreadStore) LoadThreadTranscript(ctx context.Context, id string, limit
 	return state, recentMessages(messages, limit), nil
 }
 
+// LoadThreadTranscriptReadOnly replays the canonical journal under a shared
+// read lock without repairing the optional SQLite projection.
+func (s *ThreadStore) LoadThreadTranscriptReadOnly(ctx context.Context, id string, limit int) (ThreadState, []*schema.Message, error) {
+	var state ThreadState
+	var messages []*schema.Message
+	err := s.withReadOnlyThread(ctx, id, func(dir string, _ bool) error {
+		var events []ThreadEvent
+		var err error
+		state, events, _, err = replayJournalReadOnly(journalPath(dir, id), id)
+		if err != nil {
+			return err
+		}
+		messages, err = messagesFromEvents(events, state.SystemPrompt)
+		if err != nil {
+			return err
+		}
+		messages = recentMessages(messages, limit)
+		return nil
+	})
+	if err != nil {
+		return ThreadState{}, nil, err
+	}
+	return state, messages, nil
+}
+
 func (s *ThreadStore) LoadThreadOpenSnapshot(ctx context.Context, id string, limit int) (ThreadOpenSnapshot, error) {
 	dir, unlock, err := s.lockThread(ctx, id)
 	if err != nil {
