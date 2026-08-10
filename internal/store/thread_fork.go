@@ -139,6 +139,9 @@ func analyzeForkSource(sourceID string, boundaryMode forkBoundary, state ThreadS
 	if state.ID != sourceID {
 		return forkSource{}, fmt.Errorf("%w: source state id %q does not match %q", ErrJournalCorrupt, state.ID, sourceID)
 	}
+	if state.Meta.ArchivedAt != nil {
+		return forkSource{}, fmt.Errorf("%w: %q; run unarchive before forking", ErrThreadArchived, sourceID)
+	}
 	if state.PendingCompaction != nil {
 		return forkSource{}, ErrForkPendingCompaction
 	}

@@ -27,6 +27,9 @@ func (s *ThreadStore) StartCompaction(ctx context.Context, id string, expectedRe
 	if err := checkExpectedRevision(state, expectedRevision); err != nil {
 		return ThreadState{}, err
 	}
+	if state.Meta.ArchivedAt != nil {
+		return ThreadState{}, fmt.Errorf("%w: %q; run unarchive before starting work", ErrThreadArchived, state.ID)
+	}
 	if hasRecordedCompactionOperationID(state, input.OperationID) {
 		return ThreadState{}, fmt.Errorf("compaction operation %q already exists in journal", input.OperationID)
 	}

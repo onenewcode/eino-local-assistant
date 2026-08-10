@@ -36,6 +36,9 @@ type ThreadMeta struct {
 	ParentID           string `json:"parent_id,omitempty"`
 	ForkBoundaryTurnID string `json:"fork_boundary_turn_id,omitempty"`
 	ForkSourceHash     string `json:"fork_source_hash,omitempty"`
+	// ArchivedAt is set by a durable archive lifecycle event. Archived sessions
+	// retain their journal and transcript but are excluded from normal selection.
+	ArchivedAt *time.Time `json:"archived_at,omitempty"`
 
 	// Cumulative token/cost accounting, sourced only from usage.recorded events.
 	PromptTokens     int              `json:"prompt_tokens,omitempty"`
@@ -157,6 +160,15 @@ type ThreadForkRepository interface {
 // treating ForkThread's empty lastTurnID as a sentinel.
 type ThreadForkBeforeFirstRepository interface {
 	ForkThreadBeforeFirstTurn(ctx context.Context, sourceID, childID string) (ForkResult, error)
+}
+
+// ThreadArchiveRepository is the optional non-destructive session lifecycle
+// extension. It remains separate from ThreadRepository so existing fakes do
+// not need to implement archive state before they consume other APIs.
+type ThreadArchiveRepository interface {
+	ArchiveThread(ctx context.Context, id string, expectedRevision uint64) (ThreadState, error)
+	UnarchiveThread(ctx context.Context, id string, expectedRevision uint64) (ThreadState, error)
+	ListArchivedThreads(ctx context.Context) ([]ThreadMeta, error)
 }
 
 // TaskStateRepository is an optional extension for runtimes that need a

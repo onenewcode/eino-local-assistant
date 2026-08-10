@@ -806,6 +806,102 @@ func TestThreadStoreDeleteRejectsActiveLifecycle(t *testing.T) {
 	}
 }
 
+func TestThreadStoreArchiveLifecycle(t *testing.T) {
+	root := t.TempDir()
+	threadStore, err := NewThreadStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	state, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "thread-archive", Title: "keep history"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, err := threadStore.ArchiveThread(ctx, state.ID, state.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.Meta.ArchivedAt == nil {
+		t.Fatal("archive did not set archived timestamp")
+	}
+	if _, err := threadStore.ArchiveThread(ctx, state.ID, archived.Revision); !errors.Is(err, ErrThreadAlreadyArchived) {
+		t.Fatalf("repeat archive error = %v", err)
+	}
+	if _, err := threadStore.StartTurn(ctx, state.ID, archived.Revision, TurnStart{TurnID: "blocked", Input: "work"}); !errors.Is(err, ErrThreadArchived) {
+		t.Fatalf("start archived turn error = %v", err)
+	}
+	if _, err := threadStore.StartCompaction(ctx, state.ID, archived.Revision, CompactionStart{OperationID: "blocked-compaction"}); !errors.Is(err, ErrThreadArchived) {
+		t.Fatalf("start archived compaction error = %v", err)
+	}
+	if _, transcript, err := threadStore.LoadThreadTranscript(ctx, state.ID, 0); err != nil || len(transcript) != 1 || transcript[0].Content != "system" {
+		t.Fatalf("archive altered transcript = %#v, %v", transcript, err)
+	}
+	if active, err := threadStore.ListThreads(ctx); err != nil || len(active) != 0 {
+		t.Fatalf("active list after archive = %#v, %v", active, err)
+	}
+	if listed, err := threadStore.ListArchivedThreads(ctx); err != nil || len(listed) != 1 || listed[0].ID != state.ID || listed[0].ArchivedAt == nil {
+		t.Fatalf("archived list = %#v, %v", listed, err)
+	}
+	if _, err := threadStore.ForkThreadBeforeFirstTurn(ctx, state.ID, "archive-child"); !errors.Is(err, ErrThreadArchived) {
+		t.Fatalf("fork archived source error = %v", err)
+	}
+
+	restored, err := threadStore.UnarchiveThread(ctx, state.ID, archived.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Meta.ArchivedAt != nil {
+		t.Fatal("unarchive retained archived timestamp")
+	}
+	if _, err := threadStore.UnarchiveThread(ctx, state.ID, restored.Revision); !errors.Is(err, ErrThreadNotArchived) {
+		t.Fatalf("repeat unarchive error = %v", err)
+	}
+	if _, err := threadStore.StartTurn(ctx, state.ID, restored.Revision, TurnStart{TurnID: "allowed", Input: "work"}); err != nil {
+		t.Fatalf("start unarchived turn: %v", err)
+	}
+	if err := threadStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewThreadStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if loaded, err := reopened.LoadThread(ctx, state.ID); err != nil || loaded.Meta.ArchivedAt != nil {
+		t.Fatalf("replayed archive lifecycle = %#v, %v", loaded, err)
+	}
+}
+
+func TestThreadStoreArchiveRejectsActiveLifecycle(t *testing.T) {
+	threadStore, err := NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	state, err := threadStore.CreateThread(ctx, ThreadMeta{ID: "thread-archive-active"}, "system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartTurn(ctx, state.ID, state.Revision, TurnStart{TurnID: "active", Input: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := threadStore.ArchiveThread(ctx, state.ID, state.Revision); !errors.Is(err, ErrThreadArchiveActiveTurn) {
+		t.Fatalf("archive active turn error = %v", err)
+	}
+	state, err = threadStore.FailTurn(ctx, state.ID, state.Revision, TurnFailure{TurnID: "active", Error: "stop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = threadStore.StartCompaction(ctx, state.ID, state.Revision, CompactionStart{OperationID: "archive-pending"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := threadStore.ArchiveThread(ctx, state.ID, state.Revision); !errors.Is(err, ErrThreadArchivePendingCompaction) {
+		t.Fatalf("archive pending compaction error = %v", err)
+	}
+}
+
 func TestThreadStoreRejectsDuplicateIDAcrossDatePaths(t *testing.T) {
 	store, err := NewThreadStore(t.TempDir())
 	if err != nil {

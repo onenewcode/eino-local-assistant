@@ -25,6 +25,20 @@ func TestNewSessionRequiresThreadStore(t *testing.T) {
 	}
 }
 
+func TestOpenSessionRejectsArchivedThread(t *testing.T) {
+	threadStore := newDurableThreadStore(t)
+	state, err := threadStore.CreateThread(context.Background(), store.ThreadMeta{ID: "archived-session"}, "system instructions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := threadStore.ArchiveThread(context.Background(), state.ID, state.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenSession(&scriptedModel{}, threadStore, state.ID, SessionOptions{}); !errors.Is(err, store.ErrThreadArchived) {
+		t.Fatalf("open archived session error = %v", err)
+	}
+}
+
 func TestTurnTerminationUsesStableRuntimeDeadlineReason(t *testing.T) {
 	ctx, cancel, err := runtimeguard.WithTurnContext(context.Background(), runtimeguard.TurnOptions{Timeout: time.Nanosecond})
 	if err != nil {

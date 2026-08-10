@@ -440,6 +440,9 @@ func OpenSession(model Model, st store.ThreadRepository, id string, opts Session
 	if err != nil {
 		return nil, err
 	}
+	if state.Meta.ArchivedAt != nil {
+		return nil, fmt.Errorf("%w: %q; run unarchive before resuming", store.ErrThreadArchived, id)
+	}
 	if activeTurn := activeTurnID(turns); activeTurn != "" {
 		if !opts.RecoverInterrupted {
 			return nil, fmt.Errorf("%w %q; wait for it to finish or resume with explicit recovery", ErrThreadHasActiveTurn, activeTurn)

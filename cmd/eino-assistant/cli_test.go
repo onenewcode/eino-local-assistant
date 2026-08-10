@@ -40,7 +40,7 @@ func TestRootHelp(t *testing.T) {
 			if err != nil {
 				t.Fatalf("execute(%v): %v", args, err)
 			}
-			for _, want := range []string{"Usage:", "chat", "exec", "resume", "fork", "delete", "sessions", "mcp", "completion", "init", "export", "doctor", "version"} {
+			for _, want := range []string{"Usage:", "chat", "exec", "resume", "fork", "archive", "unarchive", "delete", "sessions", "mcp", "completion", "init", "export", "doctor", "version"} {
 				if !strings.Contains(stdout, want) {
 					t.Fatalf("help missing %q:\n%s", want, stdout)
 				}
@@ -65,10 +65,14 @@ func TestCommandHelp(t *testing.T) {
 		{[]string{"resume", "-h"}, "Resume a previously saved session"},
 		{[]string{"help", "fork"}, "Create an independent child of a saved session"},
 		{[]string{"fork", "-h"}, "fork the newest saved session"},
+		{[]string{"help", "archive"}, "Archive one saved session"},
+		{[]string{"archive", "-h"}, "unarchived before they can resume"},
+		{[]string{"help", "unarchive"}, "Restore one non-destructively archived session"},
+		{[]string{"unarchive", "-h"}, "normal session lists"},
 		{[]string{"help", "delete"}, "Permanently delete one saved session"},
 		{[]string{"delete", "-h"}, "--yes"},
-		{[]string{"help", "sessions"}, "List saved sessions"},
-		{[]string{"sessions", "-h"}, "List saved sessions"},
+		{[]string{"help", "sessions"}, "List active saved sessions"},
+		{[]string{"sessions", "-h"}, "List active saved sessions"},
 		{[]string{"help", "completion"}, "Generate a completion script"},
 		{[]string{"completion", "-h"}, "Generate a completion script"},
 		{[]string{"help", "init"}, "Create an AGENTS.md project instruction file"},

@@ -14,9 +14,9 @@
 - **混合上下文管理**：原始 turn 与 tool artifact 保留在账本中；模型工作集是结构化 checkpoint + 热 turn（任务可继续，不是全文回填）
 - **Token / 费用**：以服务商 usage 为准，累计 ReAct 与压缩中的全部模型调用；API usage、context 快照和本地规划估算分开显示
 - **进程可观测性**：标准库 `log/slog` 结构化日志，默认持久化到 `~/.eino-assistant/logs/eino-YYYY-MM-DD.log`（见 [docs/logging.md](docs/logging.md)）；会话账本仍是 resume 真源
-- **CLI 子命令**：`chat` / `resume` / `fork` / `delete` / `sessions` / `mcp` / `completion` / `init` / `export` / `doctor` / `version`（默认无子命令即 chat）
+- **CLI 子命令**：`chat` / `resume` / `fork` / `archive` / `unarchive` / `delete` / `sessions` / `mcp` / `completion` / `init` / `export` / `doctor` / `version`（默认无子命令即 chat）
 
-默认无子命令、`chat`/`new`、`resume` 与 `fork` 需要交互式终端；`exec`、`delete`、`sessions`、`mcp`、`completion`、`init`、`export`、`doctor`、`version` 与 `help` 可在管道或非 TTY 环境运行。管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
+默认无子命令、`chat`/`new`、`resume` 与 `fork` 需要交互式终端；`exec`、`archive`、`unarchive`、`delete`、`sessions`、`mcp`、`completion`、`init`、`export`、`doctor`、`version` 与 `help` 可在管道或非 TTY 环境运行。管道/非 TTY 输入进入 TUI 会直接报错退出。当前不包含跨会话向量检索或多 agent worker。
 
 在新项目中可用 `eino init` 创建最小 `AGENTS.md`，或以 `eino init path/to/AGENTS.md` 指定目标。该命令只会独占创建新文件，绝不会覆盖已有项目规则。
 
@@ -27,6 +27,8 @@
 `eino fork <session-id> [prompt]` 会从指定 session 的最新 committed turn 创建独立 child，再打开 TUI；可用 `eino fork --last [prompt]` 明确选择当前 storage 中最新 session。首个 prompt 会直接作为 child 的普通模型输入，即使它以 `/` 开头也不会执行 TUI slash command。该命令暂不提供 session picker，因此必须给出 session ID 或 `--last`。
 
 `eino delete <session-id> --yes` 会永久删除一个已保存 session；`--force` 是等价的显式确认写法。删除不启动 TUI 或模型，且会拒绝仍有 active turn 或 pending compaction 的 session，避免删除可能继续写入或需要恢复的 durable journal。删除不可恢复，可先用 `eino sessions` 核对 ID 或用 `eino export` 保留 transcript。
+
+`eino archive <session-id>` 会非破坏性地整理一个已结束的 session：journal、transcript、checkpoint、artifact 与 usage 都保留，但正常 `eino sessions`、`resume --last` 与 `fork --last` 不再选择它。可用 `eino sessions --archived` 查看，再以 `eino unarchive <session-id>` 恢复；仍有 active turn 或 pending compaction 的 session 必须先按正常恢复流程结束，不能直接改变归档状态。
 
 ## 安装
 

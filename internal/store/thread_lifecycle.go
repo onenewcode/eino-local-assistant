@@ -50,7 +50,7 @@ func validateLifecycleMutation(events []ThreadEvent, kind EventKind, turnID stri
 
 func (t *lifecycleTracker) apply(event ThreadEvent) error {
 	switch event.Kind {
-	case EventThreadCreated, EventTitleChanged, EventModelChanged, EventContextCompactionStarted, EventContextCompacted,
+	case EventThreadCreated, EventTitleChanged, EventModelChanged, EventThreadArchived, EventThreadUnarchived, EventContextCompactionStarted, EventContextCompacted,
 		EventContextCompactionFailed, EventContextCheckpointReset:
 		// Compaction lifecycle events are independent of an agent turn. They
 		// must not make an idle thread look like it has an unfinished turn.

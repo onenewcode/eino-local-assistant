@@ -23,6 +23,17 @@ var (
 	// ErrThreadDeletePendingCompaction prevents permanent removal while a
 	// compaction provider operation may still reconcile durable state.
 	ErrThreadDeletePendingCompaction = errors.New("cannot delete thread while compaction is pending")
+	// ErrThreadArchived means the non-destructive archive lifecycle must be
+	// reversed before a session can accept work or be opened.
+	ErrThreadArchived = errors.New("thread is archived")
+	// ErrThreadArchiveActiveTurn prevents archive state changes while a turn
+	// could still append durable lifecycle events.
+	ErrThreadArchiveActiveTurn = errors.New("cannot change archive state while a turn is active")
+	// ErrThreadArchivePendingCompaction prevents archive state changes while a
+	// provider-backed compaction operation might still reconcile its result.
+	ErrThreadArchivePendingCompaction = errors.New("cannot change archive state while compaction is pending")
+	ErrThreadAlreadyArchived          = errors.New("thread is already archived")
+	ErrThreadNotArchived              = errors.New("thread is not archived")
 	// ErrJournalCorrupt means a non-tail journal record failed integrity checks.
 	ErrJournalCorrupt = errors.New("thread journal is corrupt")
 	// ErrInvalidThreadLifecycle means an event violates the turn/tool state
@@ -62,16 +73,18 @@ var (
 type EventKind string
 
 const (
-	EventThreadCreated EventKind = "thread.created"
-	EventTurnStarted   EventKind = "turn.started"
-	EventToolStarted   EventKind = "tool.started"
-	EventToolCompleted EventKind = "tool.completed"
-	EventTurnCommitted EventKind = "turn.committed"
-	EventTurnCancelled EventKind = "turn.cancelled"
-	EventTurnFailed    EventKind = "turn.failed"
-	EventTitleChanged  EventKind = "title.changed"
-	EventModelChanged  EventKind = "model.changed"
-	EventUsageRecorded EventKind = "usage.recorded"
+	EventThreadCreated    EventKind = "thread.created"
+	EventTurnStarted      EventKind = "turn.started"
+	EventToolStarted      EventKind = "tool.started"
+	EventToolCompleted    EventKind = "tool.completed"
+	EventTurnCommitted    EventKind = "turn.committed"
+	EventTurnCancelled    EventKind = "turn.cancelled"
+	EventTurnFailed       EventKind = "turn.failed"
+	EventTitleChanged     EventKind = "title.changed"
+	EventModelChanged     EventKind = "model.changed"
+	EventThreadArchived   EventKind = "thread.archived"
+	EventThreadUnarchived EventKind = "thread.unarchived"
+	EventUsageRecorded    EventKind = "usage.recorded"
 	// EventTaskStateUpdated records the latest recoverable autonomous-task
 	// controller snapshot. The immutable tool and turn events remain the source
 	// of evidence; this is the compact execution-state projection used on resume.

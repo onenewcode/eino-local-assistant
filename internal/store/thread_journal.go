@@ -31,6 +31,10 @@ type titleUpdatedPayload struct {
 	Title string `json:"title"`
 }
 
+type threadArchivedPayload struct {
+	ArchivedAt time.Time `json:"archived_at"`
+}
+
 type checkpointCommittedPayload struct {
 	Checkpoint Checkpoint `json:"checkpoint"`
 }
@@ -384,6 +388,18 @@ func applyThreadEvent(state *ThreadState, event ThreadEvent) error {
 		}
 		state.Meta.Model = strings.TrimSpace(payload.Model)
 		state.Meta.ReasoningEffort = strings.TrimSpace(payload.ReasoningEffort)
+	case EventThreadArchived:
+		var payload threadArchivedPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode thread archive: %w", err)
+		}
+		if payload.ArchivedAt.IsZero() {
+			return fmt.Errorf("%w: archive timestamp is required", ErrJournalCorrupt)
+		}
+		archivedAt := payload.ArchivedAt.UTC()
+		state.Meta.ArchivedAt = &archivedAt
+	case EventThreadUnarchived:
+		state.Meta.ArchivedAt = nil
 	case EventContextCompactionStarted:
 		var payload CompactionStart
 		if err := json.Unmarshal(event.Payload, &payload); err != nil {

@@ -42,6 +42,7 @@ var _ ThreadModelRepository = (*ThreadStore)(nil)
 var _ ThreadModelBindingRepository = (*ThreadStore)(nil)
 var _ ThreadOpenSnapshotRepository = (*ThreadStore)(nil)
 var _ ThreadResumeSnapshotRepository = (*ThreadStore)(nil)
+var _ ThreadArchiveRepository = (*ThreadStore)(nil)
 
 type localThreadLock struct {
 	held chan struct{}
@@ -239,6 +240,9 @@ func (s *ThreadStore) createThread(ctx context.Context, meta ThreadMeta, systemP
 	meta.ID = id
 	meta.Title = strings.TrimSpace(meta.Title)
 	meta.ReasoningEffort = strings.TrimSpace(meta.ReasoningEffort)
+	if meta.ArchivedAt != nil {
+		return ThreadState{}, errors.New("new thread cannot be archived")
+	}
 	// A thread starts with an empty ledger. Only usage.recorded events may
 	// populate token, cost, or context projections after creation.
 	clearUsageProjection(&meta)
@@ -372,8 +376,18 @@ func (s *ThreadStore) DeleteThread(ctx context.Context, id string) error {
 	return nil
 }
 
-// ListThreads returns thread metadata sorted by most recent update first.
+// ListThreads returns active thread metadata sorted by most recent update first.
 func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
+	return s.listThreads(ctx, false)
+}
+
+// ListArchivedThreads returns archived thread metadata sorted by most recent
+// archive-state update first. Journals remain in place and remain exportable.
+func (s *ThreadStore) ListArchivedThreads(ctx context.Context) ([]ThreadMeta, error) {
+	return s.listThreads(ctx, true)
+}
+
+func (s *ThreadStore) listThreads(ctx context.Context, archived bool) ([]ThreadMeta, error) {
 	paths, err := s.activeThreadPaths()
 	if err != nil {
 		return nil, fmt.Errorf("list threads: %w", err)
@@ -383,7 +397,9 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 	for id, path := range paths {
 		if catalogErr == nil {
 			if entry, ok := entries[id]; ok && s.catalogEntryIsFresh(entry, path) {
-				metas = append(metas, entry.Meta)
+				if (entry.Meta.ArchivedAt != nil) == archived {
+					metas = append(metas, entry.Meta)
+				}
 				continue
 			}
 		}
@@ -391,15 +407,14 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 		if loadErr != nil {
 			return nil, fmt.Errorf("load thread %q metadata: %w", id, loadErr)
 		}
-		metas = append(metas, state.Meta)
+		if (state.Meta.ArchivedAt != nil) == archived {
+			metas = append(metas, state.Meta)
+		}
 	}
 	// A failed catalog read never hides journals. Pruning is only a best-effort
 	// cleanup after the single authoritative filesystem scan.
 	if catalogErr == nil {
 		_ = s.pruneSessionCatalog(paths)
-		if ordered, ok := s.orderedCatalogMetas(paths); ok {
-			return ordered, nil
-		}
 	}
 	return sortThreadMetas(metas), nil
 }
@@ -408,6 +423,16 @@ func (s *ThreadStore) ListThreads(ctx context.Context) ([]ThreadMeta, error) {
 // SQLite projection. It is used when selecting a source session that must
 // remain byte-for-byte untouched by an ephemeral run.
 func (s *ThreadStore) ListThreadsReadOnly(ctx context.Context) ([]ThreadMeta, error) {
+	return s.listThreadsReadOnly(ctx, false)
+}
+
+// ListArchivedThreadsReadOnly returns archive metadata without writing a
+// projection. It is useful for commands that inspect archived sessions only.
+func (s *ThreadStore) ListArchivedThreadsReadOnly(ctx context.Context) ([]ThreadMeta, error) {
+	return s.listThreadsReadOnly(ctx, true)
+}
+
+func (s *ThreadStore) listThreadsReadOnly(ctx context.Context, archived bool) ([]ThreadMeta, error) {
 	paths, err := s.activeThreadPaths()
 	if err != nil {
 		return nil, fmt.Errorf("list threads: %w", err)
@@ -419,7 +444,9 @@ func (s *ThreadStore) ListThreadsReadOnly(ctx context.Context) ([]ThreadMeta, er
 		if loadErr != nil {
 			return nil, fmt.Errorf("load thread %q metadata: %w", id, loadErr)
 		}
-		metas = append(metas, meta)
+		if (meta.ArchivedAt != nil) == archived {
+			metas = append(metas, meta)
+		}
 	}
 	return sortThreadMetas(metas), nil
 }
@@ -835,6 +862,52 @@ func (s *ThreadStore) SetThreadTitle(ctx context.Context, id string, expectedRev
 	return s.mutate(ctx, id, expectedRevision, EventTitleChanged, "", titleUpdatedPayload{Title: strings.TrimSpace(title)})
 }
 
+// ArchiveThread hides an idle session from normal listing and resume selection
+// without deleting its journal, transcript, checkpoints, or artifacts.
+func (s *ThreadStore) ArchiveThread(ctx context.Context, id string, expectedRevision uint64) (ThreadState, error) {
+	return s.setThreadArchived(ctx, id, expectedRevision, true)
+}
+
+// UnarchiveThread returns an archived idle session to normal selection.
+func (s *ThreadStore) UnarchiveThread(ctx context.Context, id string, expectedRevision uint64) (ThreadState, error) {
+	return s.setThreadArchived(ctx, id, expectedRevision, false)
+}
+
+func (s *ThreadStore) setThreadArchived(ctx context.Context, id string, expectedRevision uint64, archived bool) (ThreadState, error) {
+	dir, unlock, err := s.lockThread(ctx, id)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	defer unlock()
+	state, events, err := s.loadThreadLocked(dir, id)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	if err := checkExpectedRevision(state, expectedRevision); err != nil {
+		return ThreadState{}, err
+	}
+	tracker, err := lifecycleFromEvents(events)
+	if err != nil {
+		return ThreadState{}, err
+	}
+	if tracker.activeTurnID != "" {
+		return ThreadState{}, fmt.Errorf("%w: %q", ErrThreadArchiveActiveTurn, tracker.activeTurnID)
+	}
+	if state.PendingCompaction != nil {
+		return ThreadState{}, fmt.Errorf("%w: %q", ErrThreadArchivePendingCompaction, state.PendingCompaction.OperationID)
+	}
+	if archived {
+		if state.Meta.ArchivedAt != nil {
+			return ThreadState{}, fmt.Errorf("%w: %q", ErrThreadAlreadyArchived, id)
+		}
+		return s.appendLocked(dir, state, expectedRevision, EventThreadArchived, "", threadArchivedPayload{ArchivedAt: time.Now().UTC()})
+	}
+	if state.Meta.ArchivedAt == nil {
+		return ThreadState{}, fmt.Errorf("%w: %q", ErrThreadNotArchived, id)
+	}
+	return s.appendLocked(dir, state, expectedRevision, EventThreadUnarchived, "", struct{}{})
+}
+
 // SetThreadModel emits model.changed after checking the full durable lifecycle
 // under the write lock. The caller supplies a constructed provider separately;
 // this method only records the selected identity and never constructs one.
@@ -902,6 +975,9 @@ func (s *ThreadStore) mutateWithValidation(ctx context.Context, id string, expec
 	}
 	if err := checkExpectedRevision(state, expectedRevision); err != nil {
 		return ThreadState{}, err
+	}
+	if (kind == EventTurnStarted || kind == EventContextCompactionStarted) && state.Meta.ArchivedAt != nil {
+		return ThreadState{}, fmt.Errorf("%w: %q; run unarchive before starting work", ErrThreadArchived, state.ID)
 	}
 	if err := validateLifecycleMutation(events, kind, turnID, payload); err != nil {
 		return ThreadState{}, err

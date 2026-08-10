@@ -88,6 +88,8 @@ func newRootCommandWithDeps(deps commandDeps) *cobra.Command {
 		newExecCommand(opts, deps.exec),
 		newResumeCommand(opts, deps.interactive),
 		newForkCommand(opts, deps.interactive),
+		newArchiveCommand(opts, true),
+		newArchiveCommand(opts, false),
 		newDeleteCommand(opts),
 		newSessionsCommand(opts),
 		newMCPCommand(opts),
@@ -197,21 +199,23 @@ func parseForkCommandArgs(args []string, last bool) (id, prompt string, err erro
 
 func newSessionsCommand(opts *rootOptions) *cobra.Command {
 	var outputFormat string
+	var archived bool
 	cmd := &cobra.Command{
 		Use:     "sessions",
 		Aliases: []string{"ls"},
 		Short:   "List saved sessions",
-		Long:    "List saved sessions (most recent first). Does not require a TTY. Use --output-format json for machine-readable output.",
+		Long:    "List active saved sessions (most recent first). Use --archived to list non-destructively archived sessions. Does not require a TTY. Use --output-format json for machine-readable output.",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			format, err := normalizeSessionsOutputFormat(outputFormat)
 			if err != nil {
 				return err
 			}
-			return listSessionsWithFormat(opts.configPath, format, cmd.OutOrStdout())
+			return listSessionsWithScope(opts.configPath, format, archived, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&outputFormat, "output-format", sessionsOutputFormatText, "session list format: text or json")
+	cmd.Flags().BoolVar(&archived, "archived", false, "list archived sessions instead of active sessions")
 	return cmd
 }
 
@@ -271,6 +275,10 @@ func listSessions(configPath string, stdout io.Writer) error {
 }
 
 func listSessionsWithFormat(configPath, format string, stdout io.Writer) error {
+	return listSessionsWithScope(configPath, format, false, stdout)
+}
+
+func listSessionsWithScope(configPath, format string, archived bool, stdout io.Writer) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -284,7 +292,12 @@ func listSessionsWithFormat(configPath, format string, stdout io.Writer) error {
 		return fmt.Errorf("open session store: %w", err)
 	}
 
-	list, err := sessionStore.ListThreads(context.Background())
+	var list []store.ThreadMeta
+	if archived {
+		list, err = sessionStore.ListArchivedThreads(context.Background())
+	} else {
+		list, err = sessionStore.ListThreads(context.Background())
+	}
 	if err != nil {
 		return fmt.Errorf("list sessions: %w", err)
 	}
@@ -295,7 +308,11 @@ func listSessionsWithFormat(configPath, format string, stdout io.Writer) error {
 		return nil
 	}
 	if len(list) == 0 {
-		fmt.Fprintln(stdout, "no saved sessions")
+		if archived {
+			fmt.Fprintln(stdout, "no archived sessions")
+		} else {
+			fmt.Fprintln(stdout, "no saved sessions")
+		}
 		return nil
 	}
 
