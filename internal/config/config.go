@@ -8,9 +8,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
@@ -822,6 +824,165 @@ func RemoveMCPServer(path, name string) error {
 		return fmt.Errorf("validate updated configuration: %w", err)
 	}
 	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+// AddMCPServer appends one validated stdio MCP server to a user-owned TOML
+// config without reformatting unrelated settings or comments.
+func AddMCPServer(path string, server MCPServerConfig) error {
+	if strings.ToLower(filepath.Ext(path)) != ".toml" {
+		return errors.New("configuration file must use the .toml extension")
+	}
+	server.Name = strings.TrimSpace(server.Name)
+	server.Command = strings.TrimSpace(server.Command)
+	server.WorkingDir = strings.TrimSpace(server.WorkingDir)
+	if err := (MCPConfig{Servers: []MCPServerConfig{server}}).Validate(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect configuration: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("refusing to update a symbolic-link configuration file")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("configuration file must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read configuration: %w", err)
+	}
+	cfg, err := parseConfig(data)
+	if err != nil {
+		return err
+	}
+	servers := append(append([]MCPServerConfig(nil), cfg.MCP.Servers...), server)
+	if err := (MCPConfig{Servers: servers}).Validate(); err != nil {
+		return err
+	}
+	updated, err := appendMCPServerSource(string(data), server)
+	if err != nil {
+		return err
+	}
+	if _, err := parseConfig([]byte(updated)); err != nil {
+		return fmt.Errorf("validate updated configuration: %w", err)
+	}
+	return writeConfigAtomic(path, []byte(updated), info.Mode().Perm())
+}
+
+func appendMCPServerSource(source string, server MCPServerConfig) (string, error) {
+	block, err := formatMCPServerTOML(server)
+	if err != nil {
+		return "", err
+	}
+	if source != "" && !strings.HasSuffix(source, "\n") {
+		source += "\n"
+	}
+	return source + "\n" + block, nil
+}
+
+func formatMCPServerTOML(server MCPServerConfig) (string, error) {
+	name, err := formatMCPServerTOMLString(server.Name)
+	if err != nil {
+		return "", fmt.Errorf("format mcp server name: %w", err)
+	}
+	command, err := formatMCPServerTOMLString(server.Command)
+	if err != nil {
+		return "", fmt.Errorf("format mcp server command: %w", err)
+	}
+	var out strings.Builder
+	out.WriteString("[[mcp.servers]]\n")
+	fmt.Fprintf(&out, "name = %s\ncommand = %s\n", name, command)
+	if len(server.Args) > 0 {
+		args := make([]string, 0, len(server.Args))
+		for _, arg := range server.Args {
+			quoted, quoteErr := formatMCPServerTOMLString(arg)
+			if quoteErr != nil {
+				return "", fmt.Errorf("format mcp server argument: %w", quoteErr)
+			}
+			args = append(args, quoted)
+		}
+		fmt.Fprintf(&out, "args = [%s]\n", strings.Join(args, ", "))
+	}
+	if server.WorkingDir != "" {
+		quoted, quoteErr := formatMCPServerTOMLString(server.WorkingDir)
+		if quoteErr != nil {
+			return "", fmt.Errorf("format mcp server working directory: %w", quoteErr)
+		}
+		fmt.Fprintf(&out, "working_dir = %s\n", quoted)
+	}
+	if server.Enabled != nil {
+		fmt.Fprintf(&out, "enabled = %t\n", *server.Enabled)
+	}
+	if server.ConnectTimeoutSeconds > 0 {
+		fmt.Fprintf(&out, "connect_timeout_seconds = %d\n", server.ConnectTimeoutSeconds)
+	}
+	if len(server.Env) == 0 {
+		return out.String(), nil
+	}
+	envNames := make([]string, 0, len(server.Env))
+	for name := range server.Env {
+		envNames = append(envNames, name)
+	}
+	sort.Strings(envNames)
+	out.WriteString("\n[mcp.servers.env]\n")
+	for _, envName := range envNames {
+		quotedName, quoteErr := formatMCPServerTOMLEnvironmentName(envName)
+		if quoteErr != nil {
+			return "", fmt.Errorf("format mcp environment name: %w", quoteErr)
+		}
+		quotedValue, quoteErr := formatMCPServerTOMLString(server.Env[envName])
+		if quoteErr != nil {
+			return "", fmt.Errorf("format mcp environment value for %q: %w", envName, quoteErr)
+		}
+		fmt.Fprintf(&out, "%s = %s\n", quotedName, quotedValue)
+	}
+	return out.String(), nil
+}
+
+func formatMCPServerTOMLEnvironmentName(name string) (string, error) {
+	if isTOMLBareKey(name) {
+		return name, nil
+	}
+	return formatMCPServerTOMLString(name)
+}
+
+func isTOMLBareKey(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func formatMCPServerTOMLString(value string) (string, error) {
+	if !utf8.ValidString(value) {
+		return "", errors.New("value is not valid UTF-8")
+	}
+	var out strings.Builder
+	out.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '\\':
+			out.WriteString(`\\`)
+		case '"':
+			out.WriteString(`\"`)
+		case '\t':
+			out.WriteString(`\t`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				return "", errors.New("value contains an unsupported control character")
+			}
+			out.WriteRune(r)
+		}
+	}
+	out.WriteByte('"')
+	return out.String(), nil
 }
 
 type tomlSourceBlock struct {

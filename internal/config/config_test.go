@@ -322,6 +322,110 @@ still part of the value"""
 	}
 }
 
+func TestAddMCPServerPreservesExistingConfigurationAndSortsEnvironment(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`# preserve user comments
+[ui]
+status_line = ["mode"]
+`)
+	if err := AddMCPServer(path, MCPServerConfig{
+		Name:    " local-tools ",
+		Command: " mcp-server ",
+		Args:    []string{"--stdio", `quote"and\\slash`},
+		Env: map[string]string{
+			"Z_TOKEN": "secret",
+			"A_FLAG":  "enabled",
+		},
+	}); err != nil {
+		t.Fatalf("AddMCPServer() error = %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after add error = %v", err)
+	}
+	if len(got.MCP.Servers) != 1 {
+		t.Fatalf("MCP servers after add = %#v", got.MCP.Servers)
+	}
+	server := got.MCP.Servers[0]
+	if server.Name != "local-tools" || server.Command != "mcp-server" || !reflect.DeepEqual(server.Args, []string{"--stdio", `quote"and\\slash`}) || server.Env["Z_TOKEN"] != "secret" || server.Env["A_FLAG"] != "enabled" {
+		t.Fatalf("added MCP server = %#v", server)
+	}
+	if !server.IsEnabled() || server.ConnectTimeout() != 15*time.Second {
+		t.Fatalf("added MCP defaults = enabled=%t timeout=%s", server.IsEnabled(), server.ConnectTimeout())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(data)
+	for _, want := range []string{"# preserve user comments", "[ui]", "[[mcp.servers]]", "name = \"local-tools\"", "command = \"mcp-server\"", "A_FLAG = \"enabled\"", "Z_TOKEN = \"secret\""} {
+		if !strings.Contains(contents, want) {
+			t.Fatalf("updated config missing %q:\n%s", want, contents)
+		}
+	}
+	if strings.Index(contents, "A_FLAG") > strings.Index(contents, "Z_TOKEN") {
+		t.Fatalf("environment variables are not sorted:\n%s", contents)
+	}
+}
+
+func TestAddMCPServerRejectsDuplicateUnsafeInputAndSymbolicLinks(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "existing"
+command = "existing-command"
+`)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range []MCPServerConfig{
+		{Name: "existing", Command: "other-command"},
+		{Name: "unsafe", Command: "command", Env: map[string]string{"TOKEN": "line\nbreak"}},
+	} {
+		if err := AddMCPServer(path, server); err == nil {
+			t.Fatalf("AddMCPServer(%#v) succeeded", server)
+		}
+		after, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(after) != string(before) {
+			t.Fatalf("failed add modified configuration:\n%s", after)
+		}
+	}
+	link := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddMCPServer(link, MCPServerConfig{Name: "new", Command: "new-command"}); err == nil || !strings.Contains(err.Error(), "symbolic-link") {
+		t.Fatalf("symbolic link add error = %v", err)
+	}
+}
+
+func TestAddMCPServerAppendsAfterExistingEnvironmentTable(t *testing.T) {
+	path := writeConfiguration(t, validConfiguration+`
+[mcp]
+
+[[mcp.servers]]
+name = "existing"
+command = "existing-command"
+
+[mcp.servers.env]
+TOKEN = "existing-secret"
+`)
+	if err := AddMCPServer(path, MCPServerConfig{Name: "added", Command: "added-command", Env: map[string]string{"FLAG": "true"}}); err != nil {
+		t.Fatalf("AddMCPServer() error = %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() after add error = %v", err)
+	}
+	if len(got.MCP.Servers) != 2 || got.MCP.Servers[0].Name != "existing" || got.MCP.Servers[0].Env["TOKEN"] != "existing-secret" || got.MCP.Servers[1].Name != "added" || got.MCP.Servers[1].Env["FLAG"] != "true" {
+		t.Fatalf("MCP servers after append = %#v", got.MCP.Servers)
+	}
+}
+
 func TestLoadRejectsRemovedSystemPromptSetting(t *testing.T) {
 	doc := validConfiguration + "\n[assistant]\nsystem_prompt = \"custom\"\n"
 	_, err := Load(writeConfiguration(t, doc))

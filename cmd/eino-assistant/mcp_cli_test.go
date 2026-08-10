@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -100,7 +101,7 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 		t.Fatalf("empty JSON list = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "--help")
-	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "remove") {
+	if err != nil || !strings.Contains(stdout, "Inspect configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "remove") {
 		t.Fatalf("mcp help = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "list", "--help")
@@ -178,6 +179,58 @@ command = "mcp-server"
 	for _, args := range [][]string{{"mcp", "get"}, {"mcp", "get", "first", "second"}, {"mcp", "get", " "}} {
 		if _, _, err := executeMCPCommandForTest(args...); err == nil {
 			t.Fatalf("mcp get %q should reject invalid arguments", args)
+		}
+	}
+}
+
+func TestMCPAddWritesStdioServerWithoutStartingItOrPrintingSecrets(t *testing.T) {
+	configPath := writeMCPListConfig(t, `# retain this configuration comment
+`)
+	stdout, _, err := executeMCPCommandWithConfigForTest(configPath, "mcp", "add", " local-tools ", "--env", "Z_TOKEN=super-secret", "--env", "A_FLAG=enabled", "--", "does-not-exist", "--stdio", "two words")
+	if err != nil {
+		t.Fatalf("mcp add error = %v", err)
+	}
+	if strings.TrimSpace(stdout) != `Added MCP server "local-tools".` || strings.Contains(stdout, "super-secret") {
+		t.Fatalf("mcp add output = %q", stdout)
+	}
+	jsonOutput, err := listMCPServersForTest(configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(jsonOutput, "super-secret") || strings.Contains(jsonOutput, `"A_FLAG":"enabled"`) {
+		t.Fatalf("MCP list exposed environment value: %s", jsonOutput)
+	}
+	var entries []mcpServerEntry
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "local-tools" || !entries[0].Enabled || entries[0].Transport.Command != "does-not-exist" || !reflect.DeepEqual(entries[0].Transport.Args, []string{"--stdio", "two words"}) || !reflect.DeepEqual(entries[0].Transport.EnvVars, []string{"A_FLAG", "Z_TOKEN"}) {
+		t.Fatalf("added MCP list entry = %+v", entries)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "# retain this configuration comment") || !strings.Contains(string(data), "Z_TOKEN = \"super-secret\"") {
+		t.Fatalf("added config =\n%s", data)
+	}
+}
+
+func TestMCPAddRejectsInvalidCommandShapeAndEnvironment(t *testing.T) {
+	stdout, _, err := executeMCPCommandForTest("mcp", "add", "--help")
+	if err != nil || !strings.Contains(stdout, "Add one stdio MCP server") || !strings.Contains(stdout, "--env") || !strings.Contains(stdout, "Use -- before the command") {
+		t.Fatalf("mcp add help = %q, err=%v", stdout, err)
+	}
+	for _, args := range [][]string{
+		{"mcp", "add"},
+		{"mcp", "add", "name", "command"},
+		{"mcp", "add", "name", "--"},
+		{"mcp", "add", " ", "--", "command"},
+		{"mcp", "add", "name", "--env", "NOT_AN_ASSIGNMENT", "--", "command"},
+		{"mcp", "add", "name", "--env", "TOKEN=first", "--env", "TOKEN=second", "--", "command"},
+	} {
+		if _, _, err := executeMCPCommandForTest(args...); err == nil {
+			t.Fatalf("mcp add %q should reject invalid input", args)
 		}
 	}
 }
