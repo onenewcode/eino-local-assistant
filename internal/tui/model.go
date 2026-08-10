@@ -2215,7 +2215,7 @@ func (m *model) cmdSessions() (tea.Model, tea.Cmd) {
 	if len(list) > maxList {
 		fmt.Fprintf(&b, "… and %d more\n", len(list)-maxList)
 	}
-	b.WriteString("Use /resume to choose, /resume <id>, or /delete <id>.")
+	b.WriteString("Use /resume to choose, /resume <id>, /resume --last, or /delete <id>.")
 	m.appendLine(lineSystem, strings.TrimRight(b.String(), "\n"))
 	m.appendLine(lineSep, "")
 	return m, nil
@@ -2229,9 +2229,9 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 	if strings.TrimSpace(arg) == "" {
 		return m.openSessionPicker()
 	}
-	id, recoverInterrupted, ok := parseResumeArgs(arg)
+	id, resumeLast, recoverInterrupted, ok := parseResumeArgs(arg)
 	if !ok {
-		m.appendLine(lineError, "usage: /resume [session-id] [--recover]")
+		m.appendLine(lineError, "usage: /resume [session-id|--last] [--recover]")
 		return m, nil
 	}
 	if m.deps.Store == nil {
@@ -2242,7 +2242,41 @@ func (m *model) cmdResume(arg string) (tea.Model, tea.Cmd) {
 		m.appendLine(lineError, "session is unavailable")
 		return m, nil
 	}
+	if resumeLast {
+		return m.resumeLatestSession(recoverInterrupted)
+	}
 	return m.resumeSession(id, recoverInterrupted)
+}
+
+// resumeLatestSession uses the repository's newest-first active listing for
+// the explicit no-picker path. Reopening an already active session would
+// discard useful local chrome, so it is reported as a no-op instead.
+func (m *model) resumeLatestSession(recoverInterrupted bool) (tea.Model, tea.Cmd) {
+	current := m.activeSession()
+	if current == nil || m.deps.Store == nil {
+		m.appendLine(lineError, "session is unavailable")
+		return m, nil
+	}
+	list, err := m.deps.Store.ListThreads(m.processCtx())
+	if err != nil {
+		m.appendLine(lineError, "list sessions: "+err.Error())
+		return m, nil
+	}
+	for _, meta := range list {
+		id := strings.TrimSpace(meta.ID)
+		if id == "" || meta.ArchivedAt != nil {
+			continue
+		}
+		if id == current.ID() {
+			m.appendLine(lineSystem, "latest active session is already open")
+			m.appendLine(lineSep, "")
+			return m, nil
+		}
+		return m.resumeSession(id, recoverInterrupted)
+	}
+	m.appendLine(lineSystem, "no saved sessions available")
+	m.appendLine(lineSep, "")
+	return m, nil
 }
 
 // resumeSession owns the state replacement that follows a confirmed target.
@@ -2362,22 +2396,30 @@ func (m *model) cmdFork(arg string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// parseResumeArgs accepts one thread ID and an optional exact trailing
-// --recover acknowledgement. Thread IDs cannot contain whitespace.
-func parseResumeArgs(arg string) (id string, recoverInterrupted, ok bool) {
+// parseResumeArgs accepts one thread ID or --last and an optional exact
+// trailing --recover acknowledgement. Thread IDs cannot contain whitespace.
+func parseResumeArgs(arg string) (id string, resumeLast, recoverInterrupted, ok bool) {
 	fields := strings.Fields(arg)
 	switch len(fields) {
 	case 1:
-		if fields[0] == "--recover" {
-			return "", false, false
+		switch fields[0] {
+		case "--recover":
+			return "", false, false, false
+		case "--last":
+			return "", true, false, true
+		default:
+			return fields[0], false, false, true
 		}
-		return fields[0], false, true
 	case 2:
-		if fields[0] != "--recover" && fields[1] == "--recover" {
-			return fields[0], true, true
+		if fields[1] != "--recover" || fields[0] == "--recover" {
+			return "", false, false, false
 		}
+		if fields[0] == "--last" {
+			return "", true, true, true
+		}
+		return fields[0], false, true, true
 	}
-	return "", false, false
+	return "", false, false, false
 }
 
 func (m *model) appendLegacyCheckpointResetNotice(session *chat.Session) {

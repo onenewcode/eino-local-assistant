@@ -204,6 +204,107 @@ func TestResumeByIDDoesNotOpenSessionPicker(t *testing.T) {
 	}
 }
 
+func TestResumeLastSelectsNewestActiveSessionWithoutPicker(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		input   string
+		recover bool
+	}{
+		{name: "normal", input: "--last"},
+		{name: "explicit recovery", input: "--last --recover", recover: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, threadStore, active := newSessionPickerTestModel(t)
+			target := newSessionPickerTestSession(t, threadStore, "Newest target")
+			list := &sessionPickerListRepository{
+				ThreadRepository: threadStore,
+				entries: []store.ThreadMeta{
+					{ID: target.ID(), Title: target.Title()},
+					{ID: active.ID(), Title: active.Title()},
+				},
+			}
+			m.deps.Store = list
+			m.textarea.SetValue("draft that must survive --last")
+			var gotID string
+			var gotRecover bool
+			m.deps.OpenSession = func(_ context.Context, id string, recoverInterrupted bool) (SessionOpenResult, error) {
+				gotID = id
+				gotRecover = recoverInterrupted
+				return SessionOpenResult{Session: target}, nil
+			}
+
+			next, _ := m.cmdResume(tc.input)
+			m = next.(*model)
+			if list.calls != 1 || gotID != target.ID() || gotRecover != tc.recover {
+				t.Fatalf("--last selection = calls=%d id=%q recover=%v", list.calls, gotID, gotRecover)
+			}
+			if m.activeSession() != target || m.sessionPickerOpen() {
+				t.Fatalf("--last did not resume newest target without picker: active=%p picker=%v", m.activeSession(), m.sessionPickerOpen())
+			}
+			if m.textarea.Value() != "draft that must survive --last" {
+				t.Fatalf("--last changed composer draft: %q", m.textarea.Value())
+			}
+		})
+	}
+}
+
+func TestResumeLastDoesNotReopenCurrentSession(t *testing.T) {
+	m, threadStore, active := newSessionPickerTestModel(t)
+	target := newSessionPickerTestSession(t, threadStore, "Older target")
+	list := &sessionPickerListRepository{
+		ThreadRepository: threadStore,
+		entries: []store.ThreadMeta{
+			{ID: active.ID(), Title: active.Title()},
+			{ID: target.ID(), Title: target.Title()},
+		},
+	}
+	m.deps.Store = list
+	m.textarea.SetValue("draft must remain on no-op")
+	m.deps.OpenSession = func(context.Context, string, bool) (SessionOpenResult, error) {
+		t.Fatal("--last reopened the already active session")
+		return SessionOpenResult{}, nil
+	}
+
+	next, _ := m.cmdResume("--last")
+	m = next.(*model)
+	if list.calls != 1 || m.activeSession() != active || m.sessionPickerOpen() {
+		t.Fatalf("current latest changed state: calls=%d active=%p picker=%v", list.calls, m.activeSession(), m.sessionPickerOpen())
+	}
+	if m.textarea.Value() != "draft must remain on no-op" || !hasLineContaining(m.lines, lineSystem, "latest active session is already open") {
+		t.Fatalf("current latest did not preserve draft or report no-op: draft=%q lines=%#v", m.textarea.Value(), m.lines)
+	}
+}
+
+func TestResumeLastParsingAndListFailureAreSafe(t *testing.T) {
+	for _, tc := range []struct {
+		input       string
+		wantID      string
+		wantLast    bool
+		wantRecover bool
+		wantOK      bool
+	}{
+		{input: "--last", wantLast: true, wantOK: true},
+		{input: "--last --recover", wantLast: true, wantRecover: true, wantOK: true},
+		{input: "target --recover", wantID: "target", wantRecover: true, wantOK: true},
+		{input: "--recover", wantOK: false},
+		{input: "--recover --last", wantOK: false},
+		{input: "--last unexpected", wantOK: false},
+	} {
+		id, last, recoverInterrupted, ok := parseResumeArgs(tc.input)
+		if id != tc.wantID || last != tc.wantLast || recoverInterrupted != tc.wantRecover || ok != tc.wantOK {
+			t.Fatalf("parseResumeArgs(%q) = id=%q last=%v recover=%v ok=%v", tc.input, id, last, recoverInterrupted, ok)
+		}
+	}
+
+	m, threadStore, active := newSessionPickerTestModel(t)
+	m.deps.Store = &sessionPickerListRepository{ThreadRepository: threadStore, err: errors.New("metadata unavailable")}
+	next, _ := m.cmdResume("--last")
+	m = next.(*model)
+	if m.activeSession() != active || m.sessionPickerOpen() || !hasLineContaining(m.lines, lineError, "metadata unavailable") {
+		t.Fatalf("--last list failure changed state or hid error: active=%p picker=%v lines=%#v", m.activeSession(), m.sessionPickerOpen(), m.lines)
+	}
+}
+
 func TestSessionPickerRequiresAnotherActiveSession(t *testing.T) {
 	m, _, active := newSessionPickerTestModel(t)
 	next, _ := m.cmdResume("")
@@ -277,4 +378,19 @@ func newSessionPickerTestSession(t *testing.T, threadStore *store.ThreadStore, t
 		t.Fatalf("NewSession(%q): %v", title, err)
 	}
 	return session
+}
+
+type sessionPickerListRepository struct {
+	store.ThreadRepository
+	entries []store.ThreadMeta
+	err     error
+	calls   int
+}
+
+func (r *sessionPickerListRepository) ListThreads(context.Context) ([]store.ThreadMeta, error) {
+	r.calls++
+	if r.err != nil {
+		return nil, r.err
+	}
+	return append([]store.ThreadMeta(nil), r.entries...), nil
 }
