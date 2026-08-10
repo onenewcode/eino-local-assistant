@@ -57,7 +57,7 @@ eino
 
 ## MCP
 
-在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio 或 Streamable HTTP MCP server。TUI 和 `exec` 运行时会连接启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动本地 server、不连接远程端点，也不打印环境变量值；`eino mcp enable <name>` / `eino mcp disable <name>` 为未来 runtime 更新启用状态，`eino mcp remove <name>` 会原子删除该配置。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
+在用户级 `config.toml` 中用 `[[mcp.servers]]` 声明 stdio 或 Streamable HTTP MCP server。TUI 和 `exec` 运行时会连接启用的 server、发现其工具并注册为 `mcp__<server>__<tool>`；`eino mcp list` 与 `eino mcp get <name>` 只读取并显示静态配置，不启动本地 server、不连接远程端点，也不打印环境变量值或 OAuth token；`eino mcp login <name>` / `eino mcp logout <name>` 管理 remote OAuth 凭据，`eino mcp enable <name>` / `eino mcp disable <name>` 为未来 runtime 更新启用状态，`eino mcp remove <name>` 会原子删除该配置。读取命令的 `--json` 输出稳定的 name/enabled/transport 结构。
 
 可用显式命令行快速添加本地 stdio server（`--` 后才是要保存、但不会立即执行的 command）：
 
@@ -75,7 +75,17 @@ eino mcp add remote-tools --url https://mcp.example.com/mcp --bearer-token-env-v
 
 远程 URL 只接受绝对 `http` 或 `https` 地址，且不接受 URL 用户信息、query 或 fragment，避免把凭据变成可展示的端点字段。`--bearer-token-env-var` 只保存环境变量名，不写入或回显 token；运行时建连时读取 token，随后该 session 的每个远程 MCP 请求都会发送 bearer header。变量不存在或为空会明确失败，HTTP redirect 不会被跟随，避免将认证头转发给另一台主机。
 
-本轮尚未实现远程静态 headers、OAuth 登录/登出、凭据存储或 health/debug；需要其他认证方式的服务会在运行时连接失败，而不会暗中发送配置中的 secret。
+需要 OAuth 的 remote server 先按常规方式添加 URL（不要同时设置 bearer 环境变量），再显式登录：
+
+```sh
+eino mcp add remote-oauth --url https://mcp.example.com/mcp
+eino mcp login remote-oauth
+# 无图形环境可以手工打开输出的 URL；Ctrl-C 或 --timeout 会取消等待。
+eino mcp login remote-oauth --no-browser --timeout 5m
+eino mcp logout remote-oauth
+```
+
+`mcp login` 通过 MCP OAuth metadata discovery、dynamic client registration、PKCE 和仅绑定 `127.0.0.1` 的 loopback callback 获取 token；token 只保存到系统 keyring，并与配置 endpoint 精确绑定。运行时只会为已标记 OAuth 的 server 读取它；token 缺失、endpoint 变更、过期或被 server 拒绝时会明确提示再次运行 `eino mcp login <name>`，不会从 TUI 或 `exec` 暗中拉起浏览器。`mcp logout` 仅删除本地 keyring 凭据和 OAuth 标记，不承诺向 provider 发起 token revoke。当前不支持任意静态 headers、预注册 OAuth client、持久化 client registration、refresh token 或 health/debug。
 
 ```toml
 [[mcp.servers]]

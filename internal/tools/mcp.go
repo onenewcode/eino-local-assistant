@@ -12,10 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"eino-local-assistant/internal/mcpoauth"
+
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 	jsonschema "github.com/eino-contrib/jsonschema"
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/oauth2"
 )
 
 // MCPServerOptions describes one explicitly configured MCP server. An empty
@@ -29,8 +32,14 @@ type MCPServerOptions struct {
 	Env               map[string]string
 	URL               string
 	BearerTokenEnvVar string
+	OAuth             bool
+	OAuthTokenLoader  MCPOAuthTokenLoader
 	ConnectTimeout    time.Duration
 }
+
+// MCPOAuthTokenLoader makes an OAuth-enabled embedding explicit and keeps
+// system-keyring access out of callers that supply their own credential store.
+type MCPOAuthTokenLoader func(serverName, endpoint string) (*oauth2.Token, error)
 
 const (
 	mcpTransportStdio          = "stdio"
@@ -167,7 +176,22 @@ func mcpClientTransport(opts MCPServerOptions) (mcp.Transport, error) {
 		if err != nil {
 			return nil, err
 		}
+		if opts.OAuth && strings.TrimSpace(opts.BearerTokenEnvVar) != "" {
+			return nil, errors.New("MCP OAuth and bearer token environment variables cannot be used together")
+		}
 		var client *http.Client
+		var oauthHandler *storedMCPOAuthHandler
+		if opts.OAuth {
+			token, tokenErr := loadMCPStoredOAuthToken(opts, endpoint)
+			if tokenErr != nil {
+				return nil, tokenErr
+			}
+			if !token.Valid() {
+				return nil, fmt.Errorf("MCP OAuth credential for server %q has expired; run %q", opts.Name, "eino mcp login "+opts.Name)
+			}
+			client = newMCPNoRedirectHTTPClient()
+			oauthHandler = newStoredMCPOAuthHandler(opts.Name, token)
+		}
 		if envVar := strings.TrimSpace(opts.BearerTokenEnvVar); envVar != "" {
 			token, ok := os.LookupEnv(envVar)
 			if !ok || token == "" {
@@ -175,10 +199,34 @@ func mcpClientTransport(opts MCPServerOptions) (mcp.Transport, error) {
 			}
 			client = newMCPBearerTokenHTTPClient(token)
 		}
-		return &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: client}, nil
+		streamable := &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: client}
+		if oauthHandler != nil {
+			streamable.OAuthHandler = oauthHandler
+		}
+		return streamable, nil
 	default:
 		return nil, fmt.Errorf("unsupported MCP transport %q", transport)
 	}
+}
+
+func loadMCPStoredOAuthToken(opts MCPServerOptions, endpoint string) (*oauth2.Token, error) {
+	loader := opts.OAuthTokenLoader
+	if loader == nil {
+		loader = func(serverName, serverEndpoint string) (*oauth2.Token, error) {
+			return mcpoauth.NewSystemStore().Load(serverName, serverEndpoint)
+		}
+	}
+	token, err := loader(strings.TrimSpace(opts.Name), endpoint)
+	if errors.Is(err, mcpoauth.ErrNotFound) || errors.Is(err, mcpoauth.ErrEndpointMismatch) {
+		return nil, fmt.Errorf("MCP OAuth credential is unavailable for server %q; run %q", opts.Name, "eino mcp login "+opts.Name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load MCP OAuth credential for server %q: %w", opts.Name, err)
+	}
+	if token == nil || strings.TrimSpace(token.AccessToken) == "" {
+		return nil, fmt.Errorf("MCP OAuth credential is invalid for server %q; run %q", opts.Name, "eino mcp login "+opts.Name)
+	}
+	return token, nil
 }
 
 func newMCPBearerTokenHTTPClient(token string) *http.Client {
@@ -186,6 +234,15 @@ func newMCPBearerTokenHTTPClient(token string) *http.Client {
 		Transport: bearerTokenRoundTripper{base: http.DefaultTransport, token: token},
 		// A transport-level header injector would otherwise attach the token to a
 		// redirect target. Remote MCP endpoints must be addressed directly.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func newMCPNoRedirectHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: http.DefaultTransport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -202,6 +259,29 @@ func (t bearerTokenRoundTripper) RoundTrip(request *http.Request) (*http.Respons
 	clone.Header = request.Header.Clone()
 	clone.Header.Set("Authorization", "Bearer "+t.token)
 	return t.base.RoundTrip(clone)
+}
+
+// storedMCPOAuthHandler sends a saved token but never begins an interactive
+// flow. Runtime 401 responses must direct the user to explicit mcp login.
+type storedMCPOAuthHandler struct {
+	serverName string
+	token      *oauth2.Token
+}
+
+func newStoredMCPOAuthHandler(serverName string, token *oauth2.Token) *storedMCPOAuthHandler {
+	tokenCopy := *token
+	return &storedMCPOAuthHandler{serverName: strings.TrimSpace(serverName), token: &tokenCopy}
+}
+
+func (h *storedMCPOAuthHandler) TokenSource(context.Context) (oauth2.TokenSource, error) {
+	return oauth2.StaticTokenSource(h.token), nil
+}
+
+func (h *storedMCPOAuthHandler) Authorize(_ context.Context, _ *http.Request, response *http.Response) error {
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	return fmt.Errorf("MCP OAuth credential was rejected for server %q; run %q", h.serverName, "eino mcp login "+h.serverName)
 }
 
 func validStreamableMCPEndpoint(raw string) (string, error) {

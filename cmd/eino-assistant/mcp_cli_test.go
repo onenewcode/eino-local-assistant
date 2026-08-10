@@ -97,6 +97,7 @@ func TestMCPListAndGetShowStreamableHTTPEndpointsWithoutProcessFields(t *testing
 name = "remote-tools"
 type = "streamable_http"
 url = "https://mcp.example.test/v1/tools"
+oauth = true
 enabled = false
 `)
 	jsonOutput, err := listMCPServersForTest(configPath, true)
@@ -110,7 +111,7 @@ enabled = false
 	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
 		t.Fatalf("decode MCP list JSON: %v\n%s", err, jsonOutput)
 	}
-	if len(entries) != 1 || entries[0].Name != "remote-tools" || entries[0].Enabled || entries[0].Transport.Type != "streamable_http" || entries[0].Transport.URL != "https://mcp.example.test/v1/tools" {
+	if len(entries) != 1 || entries[0].Name != "remote-tools" || entries[0].Enabled || entries[0].Transport.Type != "streamable_http" || entries[0].Transport.URL != "https://mcp.example.test/v1/tools" || !entries[0].Transport.OAuth {
 		t.Fatalf("remote MCP entry = %+v", entries)
 	}
 
@@ -118,7 +119,7 @@ enabled = false
 	if err != nil {
 		t.Fatalf("mcp get failed: %v", err)
 	}
-	for _, want := range []string{"remote-tools", "enabled: false", "transport: streamable_http", "url: https://mcp.example.test/v1/tools"} {
+	for _, want := range []string{"remote-tools", "enabled: false", "transport: streamable_http", "url: https://mcp.example.test/v1/tools", "oauth: enabled"} {
 		if !strings.Contains(textOutput, want) {
 			t.Fatalf("mcp get missing %q:\n%s", want, textOutput)
 		}
@@ -139,7 +140,7 @@ func TestMCPListEmptyAndHelp(t *testing.T) {
 		t.Fatalf("empty JSON list = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "--help")
-	if err != nil || !strings.Contains(stdout, "Manage configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "enable") || !strings.Contains(stdout, "disable") || !strings.Contains(stdout, "remove") {
+	if err != nil || !strings.Contains(stdout, "Manage configured MCP servers") || !strings.Contains(stdout, "list") || !strings.Contains(stdout, "get") || !strings.Contains(stdout, "add") || !strings.Contains(stdout, "login") || !strings.Contains(stdout, "logout") || !strings.Contains(stdout, "enable") || !strings.Contains(stdout, "disable") || !strings.Contains(stdout, "remove") {
 		t.Fatalf("mcp help = %q, err=%v", stdout, err)
 	}
 	stdout, _, err = executeMCPCommandForTest("mcp", "list", "--help")

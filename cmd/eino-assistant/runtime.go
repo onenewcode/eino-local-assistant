@@ -746,6 +746,7 @@ func mcpServerOptions(servers []config.MCPServerConfig) []tools.MCPServerOptions
 			Env:               server.Env,
 			URL:               server.URL,
 			BearerTokenEnvVar: server.BearerTokenEnvVar,
+			OAuth:             server.OAuth,
 			ConnectTimeout:    server.ConnectTimeout(),
 		})
 	}

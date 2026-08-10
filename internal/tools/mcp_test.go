@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"eino-local-assistant/internal/mcpoauth"
+
 	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/oauth2"
 )
 
 func TestMCPServerProcess(t *testing.T) {
@@ -140,6 +143,94 @@ func TestMCPClientTransportRejectsMissingBearerToken(t *testing.T) {
 	}
 }
 
+func TestConnectStreamableHTTPMCPServerUsesStoredOAuthCredential(t *testing.T) {
+	const token = "test-oauth-token"
+	server := newMCPServerForTest()
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return server
+	}, &mcp.StreamableHTTPOptions{JSONResponse: true})
+	var missingAuthorization atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+token {
+			missingAuthorization.Add(1)
+			http.Error(writer, "missing OAuth token", http.StatusUnauthorized)
+			return
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	defer httpServer.Close()
+
+	set, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "remote-oauth", Type: mcpTransportStreamableHTTP, URL: httpServer.URL, OAuth: true, ConnectTimeout: time.Second,
+		OAuthTokenLoader: func(serverName, endpoint string) (*oauth2.Token, error) {
+			if serverName != "remote-oauth" || endpoint != httpServer.URL {
+				t.Fatalf("OAuth token load = server=%q endpoint=%q", serverName, endpoint)
+			}
+			return &oauth2.Token{AccessToken: token, Expiry: time.Now().Add(time.Hour)}, nil
+		},
+	}})
+	if err != nil {
+		t.Fatalf("ConnectMCPServers(OAuth) error = %v", err)
+	}
+	defer set.Close()
+	if len(set.Tools) != 1 || missingAuthorization.Load() != 0 {
+		t.Fatalf("OAuth MCP set = tools=%d missing_authorization=%d", len(set.Tools), missingAuthorization.Load())
+	}
+}
+
+func TestMCPClientTransportOAuthFailsClosedWithoutBrowserFallback(t *testing.T) {
+	for name, options := range map[string]MCPServerOptions{
+		"missing credential": {
+			Name: "remote", Type: mcpTransportStreamableHTTP, URL: "https://mcp.example.test", OAuth: true,
+			OAuthTokenLoader: func(string, string) (*oauth2.Token, error) {
+				return nil, mcpoauth.ErrNotFound
+			},
+		},
+		"expired credential": {
+			Name: "remote", Type: mcpTransportStreamableHTTP, URL: "https://mcp.example.test", OAuth: true,
+			OAuthTokenLoader: func(string, string) (*oauth2.Token, error) {
+				return &oauth2.Token{AccessToken: "expired", Expiry: time.Now().Add(-time.Hour)}, nil
+			},
+		},
+		"conflicting bearer": {
+			Name: "remote", Type: mcpTransportStreamableHTTP, URL: "https://mcp.example.test", OAuth: true, BearerTokenEnvVar: "EINO_MCP_TOKEN",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := mcpClientTransport(options)
+			if err == nil {
+				t.Fatalf("mcpClientTransport() error = %v", err)
+			}
+			if name != "conflicting bearer" && !strings.Contains(err.Error(), "eino mcp login remote") {
+				t.Fatalf("OAuth credential error = %v", err)
+			}
+			if name == "conflicting bearer" && !strings.Contains(err.Error(), "cannot be used together") {
+				t.Fatalf("conflicting auth error = %v", err)
+			}
+		})
+	}
+}
+
+func TestConnectMCPServerOAuthRejectionRequiresExplicitRelogin(t *testing.T) {
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer stale-token" {
+			t.Errorf("Authorization header = %q", request.Header.Get("Authorization"))
+		}
+		http.Error(writer, "expired", http.StatusUnauthorized)
+	}))
+	defer httpServer.Close()
+
+	_, err := ConnectMCPServers(context.Background(), []MCPServerOptions{{
+		Name: "remote", Type: mcpTransportStreamableHTTP, URL: httpServer.URL, OAuth: true,
+		OAuthTokenLoader: func(string, string) (*oauth2.Token, error) {
+			return &oauth2.Token{AccessToken: "stale-token", Expiry: time.Now().Add(time.Hour)}, nil
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "eino mcp login remote") {
+		t.Fatalf("rejected OAuth connection error = %v", err)
+	}
+}
+
 func TestMCPBearerTokenClientDoesNotFollowRedirects(t *testing.T) {
 	const token = "test-bearer-token"
 	var targetRequests atomic.Int32
@@ -163,6 +254,27 @@ func TestMCPBearerTokenClientDoesNotFollowRedirects(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusTemporaryRedirect || sourceAuthorization.Load() != 1 || targetRequests.Load() != 0 {
 		t.Fatalf("redirect response=%d source_auth=%d target_requests=%d", response.StatusCode, sourceAuthorization.Load(), targetRequests.Load())
+	}
+}
+
+func TestMCPOAuthHTTPClientDoesNotFollowRedirects(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetRequests.Add(1)
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	response, err := newMCPNoRedirectHTTPClient().Get(source.URL)
+	if err != nil {
+		t.Fatalf("GET redirect source: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTemporaryRedirect || targetRequests.Load() != 0 {
+		t.Fatalf("redirect response=%d target_requests=%d", response.StatusCode, targetRequests.Load())
 	}
 }
 

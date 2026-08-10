@@ -28,6 +28,7 @@ type mcpTransportView struct {
 	EnvVars           []string `json:"env_vars,omitempty"`
 	URL               string   `json:"url,omitempty"`
 	BearerTokenEnvVar string   `json:"bearer_token_env_var,omitempty"`
+	OAuth             bool     `json:"oauth,omitempty"`
 }
 
 func (v mcpTransportView) MarshalJSON() ([]byte, error) {
@@ -36,7 +37,8 @@ func (v mcpTransportView) MarshalJSON() ([]byte, error) {
 			Type              string `json:"type"`
 			URL               string `json:"url"`
 			BearerTokenEnvVar string `json:"bearer_token_env_var,omitempty"`
-		}{Type: v.Type, URL: v.URL, BearerTokenEnvVar: v.BearerTokenEnvVar})
+			OAuth             bool   `json:"oauth,omitempty"`
+		}{Type: v.Type, URL: v.URL, BearerTokenEnvVar: v.BearerTokenEnvVar, OAuth: v.OAuth})
 	}
 	return json.Marshal(struct {
 		Type       string   `json:"type"`
@@ -64,6 +66,8 @@ func newMCPCommand(opts *rootOptions) *cobra.Command {
 		newMCPListCommand(opts),
 		newMCPGetCommand(opts),
 		newMCPAddCommand(opts),
+		newMCPLoginCommand(opts),
+		newMCPLogoutCommand(opts),
 		newMCPEnableCommand(opts),
 		newMCPDisableCommand(opts),
 		newMCPRemoveCommand(opts),
@@ -252,6 +256,9 @@ func listMCPServers(configPath string, jsonOutput bool, stdout io.Writer) error 
 		args := quotedArguments(entry.Transport.Args)
 		env := strings.Join(entry.Transport.EnvVars, ",")
 		auth := entry.Transport.BearerTokenEnvVar
+		if entry.Transport.OAuth {
+			auth = "oauth"
+		}
 		workingDir := entry.Transport.WorkingDir
 		if args == "" {
 			args = "-"
@@ -298,6 +305,7 @@ func mcpServerEntries(servers []config.MCPServerConfig) []mcpServerEntry {
 		if transport.Type == config.MCPTransportStreamableHTTP {
 			transport.URL = strings.TrimSpace(server.URL)
 			transport.BearerTokenEnvVar = strings.TrimSpace(server.BearerTokenEnvVar)
+			transport.OAuth = server.OAuth
 			entries = append(entries, mcpServerEntry{
 				Name:      strings.TrimSpace(server.Name),
 				Enabled:   server.IsEnabled(),
@@ -334,12 +342,18 @@ func mcpTransportEndpoint(transport mcpTransportView) string {
 
 func writeMCPServerDetails(stdout io.Writer, entry mcpServerEntry) error {
 	if entry.Transport.Type == config.MCPTransportStreamableHTTP {
-		if entry.Transport.BearerTokenEnvVar == "" {
-			_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL)
+		if _, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintf(stdout, "%s\n  enabled: %t\n  transport: %s\n  url: %s\n  bearer_token_env_var: %s\n", entry.Name, entry.Enabled, entry.Transport.Type, entry.Transport.URL, entry.Transport.BearerTokenEnvVar)
-		return err
+		if entry.Transport.BearerTokenEnvVar != "" {
+			_, err := fmt.Fprintf(stdout, "  bearer_token_env_var: %s\n", entry.Transport.BearerTokenEnvVar)
+			return err
+		}
+		if entry.Transport.OAuth {
+			_, err := fmt.Fprintln(stdout, "  oauth: enabled")
+			return err
+		}
+		return nil
 	}
 	args := quotedArguments(entry.Transport.Args)
 	env := strings.Join(entry.Transport.EnvVars, ",")
