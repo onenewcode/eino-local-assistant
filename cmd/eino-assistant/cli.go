@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -141,16 +142,23 @@ func newResumeCommand(opts *rootOptions, interactive interactiveCommandRunner) *
 }
 
 func newSessionsCommand(opts *rootOptions) *cobra.Command {
-	return &cobra.Command{
+	var outputFormat string
+	cmd := &cobra.Command{
 		Use:     "sessions",
 		Aliases: []string{"ls"},
 		Short:   "List saved sessions",
-		Long:    "List saved sessions (most recent first). Does not require a TTY.",
+		Long:    "List saved sessions (most recent first). Does not require a TTY. Use --output-format json for machine-readable output.",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listSessions(opts.configPath, cmd.OutOrStdout())
+			format, err := normalizeSessionsOutputFormat(outputFormat)
+			if err != nil {
+				return err
+			}
+			return listSessionsWithFormat(opts.configPath, format, cmd.OutOrStdout())
 		},
 	}
+	cmd.Flags().StringVar(&outputFormat, "output-format", sessionsOutputFormatText, "session list format: text or json")
+	return cmd
 }
 
 func newVersionCommand() *cobra.Command {
@@ -165,7 +173,27 @@ func newVersionCommand() *cobra.Command {
 	}
 }
 
+const (
+	sessionsOutputFormatText = "text"
+	sessionsOutputFormatJSON = "json"
+)
+
+func normalizeSessionsOutputFormat(raw string) (string, error) {
+	format := strings.ToLower(strings.TrimSpace(raw))
+	if format == "" {
+		return sessionsOutputFormatText, nil
+	}
+	if format != sessionsOutputFormatText && format != sessionsOutputFormatJSON {
+		return "", fmt.Errorf("unsupported sessions output format %q (choose text or json)", raw)
+	}
+	return format, nil
+}
+
 func listSessions(configPath string, stdout io.Writer) error {
+	return listSessionsWithFormat(configPath, sessionsOutputFormatText, stdout)
+}
+
+func listSessionsWithFormat(configPath, format string, stdout io.Writer) error {
 	cfg, _, err := loadCommandConfig(configPath)
 	if err != nil {
 		return err
@@ -182,6 +210,12 @@ func listSessions(configPath string, stdout io.Writer) error {
 	list, err := sessionStore.ListThreads(context.Background())
 	if err != nil {
 		return fmt.Errorf("list sessions: %w", err)
+	}
+	if format == sessionsOutputFormatJSON {
+		if err := json.NewEncoder(stdout).Encode(list); err != nil {
+			return fmt.Errorf("write sessions JSON: %w", err)
+		}
+		return nil
 	}
 	if len(list) == 0 {
 		fmt.Fprintln(stdout, "no saved sessions")

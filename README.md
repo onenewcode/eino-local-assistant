@@ -7,7 +7,7 @@
 - **ReAct 工具循环**（Codex 子集）：`shell`、`apply_patch`，以及产品用 `get_current_time` / `read_artifact`；调用过程在 UI 中可见
 - **任务清单（Codex 风格）**：多步骤工作可用 `update_plan` 维护 checklist；仅用于进度展示，不挡交付，不授予写权限
 - **沙盒与运行时护栏**：`shell` / `apply_patch` 可按需在短生命周期 worker 中执行；默认关闭 OS sandbox，网络在所有模式下开放，并有总 turn / 模型决策 / tool-call 预算；显式 `--yolo`/`/permissions yolo` 会旁路 approval 与 OS sandbox，只保留尽力而为的命令和路径检查，不能作为安全边界
-- **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，并可通过 `internal/chat.Session.Fork`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
+- **线程账本**：每个会话以可审计、带 revision 的事件账本落盘；支持多会话 `/new` / `/sessions` / `/resume`，shell 可用 `eino sessions --output-format json` 读取机器可读元数据而不加载 transcript，并可通过 `internal/chat.Session.Fork`、TUI `/fork` 或 idle 两阶段 `Esc` backtrack 从 committed 前缀创建 source-preserving child
 - **用户与项目软指令**：从 `~/.eino-assistant/AGENTS.override.md` / `AGENTS.md` 选择用户指令，再加载 workspace 项目指令，有界注入新会话；TUI `/rules` 只查看当前 session 创建时捕获的 source metadata，不 reload 文件
 - **旁路问题（安全子集）**：TUI `/btw <question>`（`/side` 别名）使用当前 frozen session context 做 reference；不打断、不排队主 turn，不写主 ledger、usage 或 journal，不调用工具/子 agent
 - **跨会话语义记忆**：用户确认事实与自动 candidate 分层；支持查看、纠正、删除和启停生成

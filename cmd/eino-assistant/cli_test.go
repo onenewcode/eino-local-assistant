@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -344,4 +345,76 @@ func TestSessionsListsV2ThreadStore(t *testing.T) {
 	if strings.Contains(output, "\tTOKENS\t") {
 		t.Fatalf("sessions should not label API usage as TOKENS:\n%s", output)
 	}
+}
+
+func TestSessionsJSONOutputIsMachineReadable(t *testing.T) {
+	helpCommand := newSessionsCommand(&rootOptions{})
+	var help bytes.Buffer
+	helpCommand.SetOut(&help)
+	helpCommand.SetArgs([]string{"--help"})
+	if err := helpCommand.Execute(); err != nil || !strings.Contains(help.String(), "--output-format") {
+		t.Fatalf("sessions help = %q, err=%v", help.String(), err)
+	}
+
+	dataDir := t.TempDir()
+	threadStore, err := store.NewThreadStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := threadStore.CreateThread(context.Background(), store.ThreadMeta{ID: "session-json", Title: "machine readable"}, "secret system prompt"); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeSessionsConfig(t, dataDir)
+
+	command := newSessionsCommand(&rootOptions{configPath: configPath})
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetArgs([]string{"--output-format", "JSON"})
+	if err := command.Execute(); err != nil {
+		t.Fatalf("sessions --output-format json: %v", err)
+	}
+	var sessions []store.ThreadMeta
+	if err := json.Unmarshal(stdout.Bytes(), &sessions); err != nil {
+		t.Fatalf("decode sessions JSON %q: %v", stdout.String(), err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "session-json" || sessions[0].Title != "machine readable" {
+		t.Fatalf("sessions JSON = %+v", sessions)
+	}
+	if strings.Contains(stdout.String(), "secret system prompt") || strings.Contains(stdout.String(), "test-key") {
+		t.Fatalf("sessions JSON leaked transcript content: %s", stdout.String())
+	}
+
+	emptyCommand := newSessionsCommand(&rootOptions{configPath: writeSessionsConfig(t, t.TempDir())})
+	stdout.Reset()
+	emptyCommand.SetOut(&stdout)
+	emptyCommand.SetArgs([]string{"--output-format", "json"})
+	if err := emptyCommand.Execute(); err != nil || stdout.String() != "[]\n" {
+		t.Fatalf("empty sessions JSON = %q, err=%v", stdout.String(), err)
+	}
+	for _, raw := range []string{"", "text", " JSON "} {
+		if _, err := normalizeSessionsOutputFormat(raw); err != nil {
+			t.Fatalf("normalizeSessionsOutputFormat(%q): %v", raw, err)
+		}
+	}
+	if _, err := normalizeSessionsOutputFormat("yaml"); err == nil || !strings.Contains(err.Error(), "text or json") {
+		t.Fatalf("normalizeSessionsOutputFormat(yaml) error = %v", err)
+	}
+}
+
+func writeSessionsConfig(t *testing.T, dataDir string) string {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	configContents := "[model]\n" +
+		"base_url = \"https://api.example.test/v1\"\n" +
+		"api_key = \"test-key\"\n" +
+		"name = \"test-model\"\n" +
+		"timeout_seconds = 60\n" +
+		"[model.context]\n" +
+		"window_tokens = 32000\n" +
+		"[storage]\n" +
+		"data_dir = \"" + dataDir + "\"\n"
+	if err := os.WriteFile(configPath, []byte(configContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return configPath
 }
