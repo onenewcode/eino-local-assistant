@@ -104,6 +104,41 @@ func TestUpdatedPlanWrapKeepsContinuationWithinNarrowTerminal(t *testing.T) {
 	}
 }
 
+func TestUpdatedPlanShowsStateAndActionableGapBeforeDAGExists(t *testing.T) {
+	status := chat.TaskRunStatus{
+		Available:    true,
+		State:        "active",
+		Goal:         "implement a bounded task runtime",
+		PlanRequired: true,
+		Gaps:         []string{"create a task plan before continuing"},
+	}
+	rendered := renderUpdatedPlan(48, status)
+	for _, want := range []string{
+		"Updated Plan",
+		"State: active",
+		"Next: create a task plan",
+		"no task nodes are available yet",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("updated plan missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, line := range strings.Split(rendered, "\n") {
+		if got := lipgloss.Width(line); got > 48 {
+			t.Fatalf("summary line width = %d, want <= 48: %q", got, line)
+		}
+	}
+}
+
+func TestTaskStatusFingerprintIncludesActionableGap(t *testing.T) {
+	base := chat.TaskRunStatus{Available: true, State: "active", PlanRequired: true}
+	changed := base
+	changed.Gaps = []string{"create a task plan before continuing"}
+	if taskStatusFingerprint(base) == taskStatusFingerprint(changed) {
+		t.Fatal("a changed actionable gap must produce a new plan snapshot")
+	}
+}
+
 func TestTaskStatusEventBridgeCarriesSnapshot(t *testing.T) {
 	ch := make(chan tea.Msg, 1)
 	emit := emitFromTurnEvent(context.Background(), 3, 4, ch)

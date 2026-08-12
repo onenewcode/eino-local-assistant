@@ -15,7 +15,7 @@ import (
 // the transcript with identical cards.
 func taskStatusFingerprint(status chat.TaskRunStatus) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%t|%s|%s|%d|%d|%s", status.Available, status.State, status.Goal, status.DoneTasks, status.Tasks, strings.Join(status.ActiveTasks, ","))
+	fmt.Fprintf(&b, "%t|%s|%s|%d|%d|%d|%d|%t|%s|%s", status.Available, status.State, status.Goal, status.Requirements, status.Scenarios, status.DoneTasks, status.Tasks, status.PlanRequired, strings.Join(status.ActiveTasks, ","), strings.Join(status.Gaps, "\x1f"))
 	for _, item := range status.Items {
 		fmt.Fprintf(&b, "\n%s|%s|%s", item.ID, item.Goal, item.State)
 	}
@@ -28,6 +28,7 @@ func renderUpdatedPlan(width int, status chat.TaskRunStatus) string {
 	width = max(20, width)
 	var rows []string
 	rows = append(rows, taskPlanTitleStyle.Render("• Updated Plan"))
+	rows = append(rows, renderTaskPlanSummary(width, status)...)
 	if len(status.Items) == 0 {
 		rows = append(rows, taskPlanMutedStyle.Render("  no task nodes are available yet"))
 		return strings.Join(rows, "\n")
@@ -36,6 +37,21 @@ func renderUpdatedPlan(width int, status chat.TaskRunStatus) string {
 		rows = append(rows, renderPlanItem(width, item)...)
 	}
 	return strings.Join(rows, "\n")
+}
+
+// renderTaskPlanSummary keeps the run's state and actionable next step visible
+// even before the controller has materialized a DAG node or when every node is
+// otherwise unchanged. The gap is already a display-safe controller message.
+func renderTaskPlanSummary(width int, status chat.TaskRunStatus) []string {
+	state := taskPaneState(status.State)
+	if status.Tasks > 0 {
+		state = fmt.Sprintf("%s · %d/%d", state, status.DoneTasks, status.Tasks)
+	}
+	rows := renderPlanWrapped("  State: "+state, "    ", width, taskPlanMutedStyle)
+	if gap := taskPaneGaps(status); len(gap) > 0 {
+		rows = append(rows, renderPlanWrapped("  Next: "+gap[0], "       ", width, taskPlanBlockedStyle)...)
+	}
+	return rows
 }
 
 func renderPlanItem(width int, item chat.TaskListItem) []string {
