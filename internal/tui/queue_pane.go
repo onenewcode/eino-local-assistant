@@ -88,11 +88,16 @@ func (m *model) cancelSelectedQueuedFollowUp() (tea.Model, tea.Cmd) {
 	if len(m.queue) == 0 {
 		return m, nil
 	}
-	m.queue, _, _ = dropQueuedFollowUp(m.queue, m.queuePaneSelected+1)
+	index := m.queuePaneSelected + 1
+	var dropped string
+	m.queue, dropped, _ = dropQueuedFollowUp(m.queue, index)
 	if len(m.queue) == 0 {
 		m.queuePaused = false
 	}
 	m.normalizeQueuePaneSelection()
+	// Keep pane cancellation observable without treating the prompt as sent.
+	m.appendLine(lineSystem, fmt.Sprintf("queue cancelled (%d): %s", index, queuePreview(dropped)))
+	m.appendLine(lineSep, "")
 	if !m.queuePaneFocused {
 		m.textarea.Focus()
 	}

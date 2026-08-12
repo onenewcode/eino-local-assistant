@@ -52,8 +52,11 @@ func TestQueuePaneFocusNavigationAndCancel(t *testing.T) {
 	if !reflect.DeepEqual(mm.queue, []string{"first", "third"}) {
 		t.Fatalf("queue after cancel = %#v", mm.queue)
 	}
-	if hasLineContaining(mm.lines, lineUser, "second") || hasLineContaining(mm.lines, lineSystem, "second") {
-		t.Fatalf("cancelled prompt reached transcript: %#v", mm.lines)
+	if hasLineContaining(mm.lines, lineUser, "second") {
+		t.Fatalf("cancelled prompt reached user transcript: %#v", mm.lines)
+	}
+	if !hasLineContaining(mm.lines, lineSystem, "queue cancelled (2): second") {
+		t.Fatalf("cancel confirmation missing: %#v", mm.lines)
 	}
 }
 
