@@ -91,6 +91,16 @@ func TestSessionCtxFragmentOmitsUnknown(t *testing.T) {
 	}
 }
 
+func TestStatusLineContextLabelsUnknownMeasurement(t *testing.T) {
+	m := newTestModel(t)
+	if got := statusLineContext(m.deps.Session); got != "Context unknown" {
+		t.Fatalf("statusLineContext() = %q, want unknown measurement label", got)
+	}
+	if got := statusLineContext(nil); got != "Context unknown" {
+		t.Fatalf("statusLineContext(nil) = %q, want unknown measurement label", got)
+	}
+}
+
 func TestJoinStatusSuffix(t *testing.T) {
 	if got := joinStatusSuffix(statusExtras{}); got != "" {
 		t.Fatalf("empty extras=%q", got)

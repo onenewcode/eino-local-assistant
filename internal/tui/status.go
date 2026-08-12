@@ -85,7 +85,10 @@ func statusLineModelName(modelName string) string {
 func statusLineContext(session *chat.Session) string {
 	fragment := sessionCtxFragment(session)
 	if fragment == "" {
-		return "Context 0% used"
+		// A missing provider snapshot is not zero usage. Keep the distinction
+		// visible so the footer does not imply a measurement before the first
+		// request (or when the provider omits usage data).
+		return "Context unknown"
 	}
 	if start := strings.LastIndex(fragment, "("); start >= 0 && strings.HasSuffix(fragment, ")") {
 		return "Context " + fragment[start+1:len(fragment)-1] + " used"

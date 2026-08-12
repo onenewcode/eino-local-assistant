@@ -31,7 +31,7 @@ func TestStatusLineCommandOpensCodexStylePickerAndSavesDraft(t *testing.T) {
 	for _, want := range []string{
 		"Configure Status Line", "Type to search",
 		"model-with-reasoning", "context-used", "used-tokens", "task-progress", "activity", "mode",
-		"gpt-5.6-terra xhigh", "Context 0% used", "0 used", "Tasks 0/0",
+		"gpt-5.6-terra xhigh", "Context unknown", "0 used", "Tasks 0/0",
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("picker view missing %q:\n%s", want, view)
