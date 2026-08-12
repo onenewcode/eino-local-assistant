@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"eino-local-assistant/internal/chat"
 	"eino-local-assistant/internal/contextbuild"
@@ -132,6 +133,60 @@ func TestContextCommandSeparatesAPISnapshotFromPlannerEstimate(t *testing.T) {
 	}
 	if hasLineContaining(mm.lines, lineSystem, "\ncurrent=") {
 		t.Fatalf("/context should not present the planning estimate as current API context: %#v", mm.lines)
+	}
+}
+
+func TestContextCommandShowsPendingCompactionOperation(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewThreadStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewThreadStore: %v", err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	compactor := tuiCheckpointCompactor(func(_ context.Context, request contextbuild.CompactionRequest, _ contextbuild.CompactionUsageObserver) (contextbuild.Checkpoint, error) {
+		close(started)
+		<-release
+		return contextbuild.DeterministicCheckpoint(request)
+	})
+	session, err := chat.NewSession(contextPressureModel{}, "system", chat.SessionOptions{
+		Store: st, Compactor: compactor, Context: contextbuild.Config{WindowTokens: 1_000},
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if err := session.Ask(ctx, "first", nil); err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	resultCh := make(chan error, 1)
+	go func() {
+		_, compactErr := session.Compact(ctx, "")
+		resultCh <- compactErr
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	var state store.ThreadState
+	for {
+		state, err = st.LoadThread(ctx, session.ID())
+		if err != nil {
+			t.Fatalf("LoadThread: %v", err)
+		}
+		if state.PendingCompaction != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("compaction did not become pending")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	m := newModel(Deps{Ctx: ctx, Session: session, Store: st, Status: StatusInfo{Model: "test"}})
+	next, _ := m.submit("/context")
+	mm := next.(*model)
+	if !hasLineContaining(mm.lines, lineSystem, "pending_compaction="+state.PendingCompaction.OperationID+"  automatic=false") {
+		t.Fatalf("/context omitted pending compaction operation: %#v", mm.lines)
+	}
+	close(release)
+	if compactErr := <-resultCh; compactErr != nil {
+		t.Fatalf("Compact: %v", compactErr)
 	}
 }
 

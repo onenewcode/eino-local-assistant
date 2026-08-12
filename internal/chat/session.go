@@ -240,6 +240,7 @@ type ContextStatus struct {
 	MeasuredKnown             bool
 	OriginalTokens            int
 	ActiveCheckpointID        string
+	PendingCompaction         *store.CompactionOperation
 	AutoCompactionPaused      bool
 	AutoCompactionPauseReason string
 	LowGainStreak             uint64
@@ -332,6 +333,7 @@ type Session struct {
 	lowGainStreak             uint64
 	lastCompaction            *store.CompactionOutcome
 	lastCompactionUsage       *CompactionUsageSummary
+	pendingCompaction         *store.CompactionOperation
 	// checkpointResetDuringOpen reports only a reset performed by this specific
 	// OpenSession call, so UI entry points can notify once without replaying an
 	// old durable outcome on every later resume.
@@ -869,6 +871,10 @@ func (s *Session) ContextStatus() ContextStatus {
 	status.AutoCompactionPaused = s.autoCompactionPaused
 	status.AutoCompactionPauseReason = s.autoCompactionPauseReason
 	status.LowGainStreak = s.lowGainStreak
+	if s.pendingCompaction != nil {
+		pending := *s.pendingCompaction
+		status.PendingCompaction = &pending
+	}
 	if s.lastCompaction != nil {
 		outcome := *s.lastCompaction
 		status.LastCompaction = &outcome
@@ -2196,6 +2202,12 @@ func (s *Session) applyThreadStateLocked(state store.ThreadState) {
 	} else {
 		outcome := *state.LastCompaction
 		s.lastCompaction = &outcome
+	}
+	if state.PendingCompaction == nil {
+		s.pendingCompaction = nil
+	} else {
+		pending := *state.PendingCompaction
+		s.pendingCompaction = &pending
 	}
 	currentOperationID := ""
 	if s.lastCompaction != nil {

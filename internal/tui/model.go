@@ -2917,6 +2917,12 @@ func (m *model) cmdContext(arg string) (tea.Model, tea.Cmd) {
 		checkpoint,
 		status.AutoCompactionPaused,
 	)
+	if status.PendingCompaction != nil {
+		fmt.Fprintf(&b, "pending_compaction=%s  automatic=%v\n",
+			status.PendingCompaction.OperationID,
+			status.PendingCompaction.Automatic,
+		)
+	}
 	if status.AutoCompactionPauseReason != "" {
 		fmt.Fprintf(&b, "auto_pause_reason=%s\n", status.AutoCompactionPauseReason)
 	}
