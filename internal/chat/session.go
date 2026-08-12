@@ -998,6 +998,10 @@ func (s *Session) askThread(ctx context.Context, input string, onChunk func(stri
 			tracked := usageTracker.normalize(*event.ModelUsage)
 			normalized, record := s.normalizedModelUsage(turnID, tracked)
 			event.ModelUsage = &normalized
+			// Keep the latest provider snapshot visible to operators without
+			// copying prompt/response bodies into process logs. The durable
+			// ledger remains authoritative for the full usage record.
+			logModelUsage(ctx, normalized, record)
 			recorder.recordUsage(record)
 			if recorder.err() == nil {
 				// A provider usage event is emitted after one model request finishes,

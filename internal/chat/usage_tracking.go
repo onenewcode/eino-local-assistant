@@ -1,15 +1,35 @@
 package chat
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 
+	"eino-local-assistant/internal/logging"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
 	"github.com/cloudwego/eino/schema"
 )
+
+// logModelUsage records the provider's latest usage snapshot as structured
+// diagnostics. It intentionally excludes message/tool bodies; the session
+// ledger remains the source of truth for complete provenance.
+func logModelUsage(ctx context.Context, event ModelUsageEvent, record store.ModelUsage) {
+	logging.InfoContext(ctx, "model usage recorded",
+		"component", "chat",
+		"operation", event.Operation,
+		"call_id", event.CallID,
+		"available", event.Available,
+		"prompt_tokens", record.PromptTokens,
+		"completion_tokens", record.CompletionTokens,
+		"total_tokens", record.TotalTokens,
+		"cached_tokens", record.CachedTokens,
+		"reasoning_tokens", record.ReasoningTokens,
+		"context_window_tokens", record.ContextWindowTokens,
+	)
+}
 
 // turnUsageTracker assigns IDs to callbacks that do not supply one. Durable
 // deduplication belongs to the store so conflicting replays are never hidden.

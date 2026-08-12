@@ -1,20 +1,51 @@
 package chat
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"eino-local-assistant/internal/contextbuild"
+	"eino-local-assistant/internal/logging"
 	"eino-local-assistant/internal/store"
 	"eino-local-assistant/internal/usage"
 
 	"github.com/cloudwego/eino/schema"
 )
+
+func TestLogModelUsageStructuredSnapshot(t *testing.T) {
+	var buf bytes.Buffer
+	previous := slog.Default()
+	logging.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { logging.SetDefault(previous) })
+
+	logModelUsage(logging.With(context.Background(), "session_id", "s1", "turn_id", "t1"), ModelUsageEvent{
+		CallID:    "turn-1:model-1",
+		Operation: ModelUsageOperationAgent,
+		Available: true,
+	}, store.ModelUsage{PromptTokens: 120, CompletionTokens: 8, TotalTokens: 128, CachedTokens: 20, ContextWindowTokens: 1000})
+
+	var payload map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &payload); err != nil {
+		t.Fatalf("json.Unmarshal: %v; raw=%q", err, buf.String())
+	}
+	if payload["msg"] != "model usage recorded" || payload["session_id"] != "s1" || payload["turn_id"] != "t1" {
+		t.Fatalf("lifecycle attrs = %#v", payload)
+	}
+	if payload["prompt_tokens"] != float64(120) || payload["context_window_tokens"] != float64(1000) {
+		t.Fatalf("usage attrs = %#v", payload)
+	}
+	if strings.Contains(buf.String(), "question") || strings.Contains(buf.String(), "tool") {
+		t.Fatalf("usage log unexpectedly contains message/tool body: %s", buf.String())
+	}
+}
 
 func TestTurnUsageTrackerAssignsDistinctIDsForMissingCallIDs(t *testing.T) {
 	tracker := &turnUsageTracker{}
