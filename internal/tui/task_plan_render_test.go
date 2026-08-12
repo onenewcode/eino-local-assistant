@@ -104,19 +104,16 @@ func TestUpdatedPlanWrapKeepsContinuationWithinNarrowTerminal(t *testing.T) {
 	}
 }
 
-func TestUpdatedPlanShowsStateAndActionableGapBeforeDAGExists(t *testing.T) {
+func TestUpdatedPlanShowsStateBeforeChecklistExists(t *testing.T) {
 	status := chat.TaskRunStatus{
-		Available:    true,
-		State:        "active",
-		Goal:         "implement a bounded task runtime",
-		PlanRequired: true,
-		Gaps:         []string{"create a task plan before continuing"},
+		Available: true,
+		State:     "active",
+		Goal:      "implement a bounded task runtime",
 	}
 	rendered := renderUpdatedPlan(48, status)
 	for _, want := range []string{
 		"Updated Plan",
 		"State: active",
-		"Next: create a task plan",
 		"no task nodes are available yet",
 	} {
 		if !strings.Contains(rendered, want) {
@@ -130,12 +127,13 @@ func TestUpdatedPlanShowsStateAndActionableGapBeforeDAGExists(t *testing.T) {
 	}
 }
 
-func TestTaskStatusFingerprintIncludesActionableGap(t *testing.T) {
-	base := chat.TaskRunStatus{Available: true, State: "active", PlanRequired: true}
+func TestTaskStatusFingerprintIncludesProgress(t *testing.T) {
+	base := chat.TaskRunStatus{Available: true, State: "active"}
 	changed := base
-	changed.Gaps = []string{"create a task plan before continuing"}
+	changed.DoneTasks = 1
+	changed.Tasks = 2
 	if taskStatusFingerprint(base) == taskStatusFingerprint(changed) {
-		t.Fatal("a changed actionable gap must produce a new plan snapshot")
+		t.Fatal("changed progress must produce a new plan snapshot")
 	}
 }
 

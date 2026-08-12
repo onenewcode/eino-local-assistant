@@ -15,7 +15,7 @@ import (
 // the transcript with identical cards.
 func taskStatusFingerprint(status chat.TaskRunStatus) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%t|%s|%s|%d|%d|%d|%d|%t|%s|%s", status.Available, status.State, status.Goal, status.Requirements, status.Scenarios, status.DoneTasks, status.Tasks, status.PlanRequired, strings.Join(status.ActiveTasks, ","), strings.Join(status.Gaps, "\x1f"))
+	fmt.Fprintf(&b, "%t|%s|%s|%d|%d|%s", status.Available, status.State, status.Goal, status.DoneTasks, status.Tasks, strings.Join(status.ActiveTasks, ","))
 	for _, item := range status.Items {
 		fmt.Fprintf(&b, "\n%s|%s|%s", item.ID, item.Goal, item.State)
 	}
@@ -39,19 +39,14 @@ func renderUpdatedPlan(width int, status chat.TaskRunStatus) string {
 	return strings.Join(rows, "\n")
 }
 
-// renderTaskPlanSummary keeps the run's state and actionable next step visible
-// even before the controller has materialized a DAG node or when every node is
-// otherwise unchanged. The gap is already a display-safe controller message.
+// renderTaskPlanSummary keeps the run's state and progress visible before the
+// controller has materialized checklist rows.
 func renderTaskPlanSummary(width int, status chat.TaskRunStatus) []string {
 	state := taskPaneState(status.State)
 	if status.Tasks > 0 {
 		state = fmt.Sprintf("%s · %d/%d", state, status.DoneTasks, status.Tasks)
 	}
-	rows := renderPlanWrapped("  State: "+state, "    ", width, taskPlanMutedStyle)
-	if gap := taskPaneGaps(status); len(gap) > 0 {
-		rows = append(rows, renderPlanWrapped("  Next: "+gap[0], "       ", width, taskPlanBlockedStyle)...)
-	}
-	return rows
+	return renderPlanWrapped("  State: "+state, "    ", width, taskPlanMutedStyle)
 }
 
 func renderPlanItem(width int, item chat.TaskListItem) []string {
